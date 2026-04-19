@@ -22,8 +22,5 @@ env/
 .mypy_cache/
 .ruff_cache/
 
-# Chainlit
-.chainlit/
-
 # OS
 .DS_Store

@@ -1,4 +1,4 @@
-# sav-client
+# SAV Client
 
 Python client and CLI for the **FPB SAV2** basketball management system
 ([sav2.fpb.pt](https://sav2.fpb.pt)).
@@ -44,7 +44,6 @@ pip install -e .
 Create a `.env` file (or export the variables):
 
 ```
-SAV_BASE_URL=https://sav2.fpb.pt   # optional, this is the default
 SAV_USERNAME=your_username
 SAV_PASSWORD=your_password
 ```
@@ -119,10 +118,7 @@ See [`sav_client/AGENTS.md`](sav_client/AGENTS.md) for the full API reference.
 
 ## Agent / LLM reference
 
-Machine-readable documentation for AI agents is in:
-
-- [`sav_client/AGENTS.md`](sav_client/AGENTS.md) — Python library API
-- [`sav_cli/AGENTS.md`](sav_cli/AGENTS.md) — CLI command reference
+Machine-readable documentation for AI agents is im [`sav_client/AGENTS.md`](sav_client/AGENTS.md) — Python library API
 
 ---
 
