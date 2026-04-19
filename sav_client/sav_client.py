@@ -34,6 +34,7 @@ from .exceptions import (
   SavConnectionError,
   SavResponseError,
 )
+from .cache import Cache
 from .models import Player, Club, Game, LoginResult, Session
 from .utils import md5_hex, strip_html
 
@@ -104,6 +105,8 @@ class SavClient:
 
     # Populated after login()
     self.session: Session | None = None
+
+    self._cache = Cache()
 
     # Reuse a single requests.Session for connection pooling and automatic
     # cookie handling (the server may set cookies in addition to returning
@@ -759,7 +762,7 @@ class SavClient:
 
   def list_associations(self) -> list[Club]:
     """
-    Return all associations available in the system.
+    Return all associations available in the system (cached, TTL 7 days).
 
     Scraped from the server-rendered dropdown on the players search page.
 
@@ -773,7 +776,36 @@ class SavClient:
     """
     if self.session is None:
       raise SavResponseError("Must call login() before list_associations()")
+    return self._cache.get_associations(self._fetch_associations)
 
+  def list_clubs(self, association: int | None = None) -> list[Club]:
+    """
+    Return clubs, optionally filtered by association (cached, TTL 7 days).
+
+    When `association` is omitted the clubs in the logged-in organisation's
+    own association are returned (mirrors the "Clubes" dropdown default).
+
+    Args:
+        association: Numeric association ID (from list_associations()).
+                     If None, defaults to the session organisation's
+                     association.
+
+    Returns:
+        List of Club objects sorted by name.
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError("Must call login() before list_clubs()")
+    return self._cache.get_clubs(self._fetch_and_enrich_clubs, association=association)
+
+  def invalidate_cache(self) -> None:
+    """Clear all locally cached data (clubs, associations)."""
+    self._cache.invalidate()
+
+  def _fetch_associations(self) -> list[Club]:
     import re
 
     try:
@@ -793,48 +825,33 @@ class SavClient:
       key=lambda c: c.name,
     )
 
-  def list_clubs(self, association: int | None = None) -> list[Club]:
-    """
-    Return clubs, optionally filtered by association.
-
-    When `association` is omitted the clubs in the logged-in organisation's
-    own association are returned (mirrors the "Clubes" dropdown default).
-
-    Args:
-        association: Numeric association ID (from list_associations()).
-                     If None, defaults to the session organisation's
-                     association.
-
-    Returns:
-        List of Club objects sorted by name.
-
-    Raises:
-        SavResponseError:   If the response cannot be parsed.
-        SavConnectionError: On network errors.
-    """
-    if self.session is None:
-      raise SavResponseError("Must call login() before list_clubs()")
-
+  def _fetch_and_enrich_clubs(self, association: int | None) -> list[Club]:
     if association is not None:
       html = self._post_form(
         _CLUBS_BY_ASSOC_PATH,
         {"associacao": f"ass,{association}"},
         params={"op": _CLUBS_BY_ASSOC_OP},
       )
-      return self._parse_clubs_html(html)
+      clubs = self._parse_clubs_html(html)
+    else:
+      org = self.session.get("organizacao", 0)
+      text = self._post_form(
+        _CLUBS_BY_ORG_PATH, {"clube": org}, params={"op": _CLUBS_BY_ORG_OP}
+      )
+      try:
+        import json as _json
+        raw = _json.loads(text)
+      except ValueError as exc:
+        raise SavResponseError(
+          f"Clubs response was not valid JSON: {text[:200]!r}"
+        ) from exc
+      clubs = self._parse_clubs_response(raw)
 
-    org = self.session.get("organizacao", 0)
-    text = self._post_form(
-      _CLUBS_BY_ORG_PATH, {"clube": org}, params={"op": _CLUBS_BY_ORG_OP}
-    )
-    try:
-      import json as _json
-      raw = _json.loads(text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Clubs response was not valid JSON: {text[:200]!r}"
-      ) from exc
-    return self._parse_clubs_response(raw)
+    enriched = []
+    for c in clubs:
+      full_name, code = self._fetch_club_names(c.id)
+      enriched.append(Club(id=c.id, name=c.name, full_name=full_name, code=code))
+    return enriched
 
   # ------------------------------------------------------------------
   # Internal helpers

@@ -28,7 +28,6 @@ from sav_client.exceptions import (
   SavConnectionError,
   SavResponseError,
 )
-from sav_cli import cache
 
 _COL_SEP = "  "
 _ELLIPSIS = "…"
@@ -145,7 +144,7 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
     return [int(club)]
 
   try:
-    clubs = cache.get_clubs(client)
+    clubs = client.list_clubs()
   except Exception as e:
     raise click.ClickException(f"Could not fetch clubs list: {e}")
 
@@ -395,7 +394,7 @@ def clubs_cmd(ctx, query, association):
   client = _make_client()
 
   try:
-    results = cache.get_clubs(client, association=association)
+    results = client.list_clubs(association=association)
   except (SavConnectionError, SavResponseError) as e:
     raise click.ClickException(str(e))
 
@@ -711,39 +710,6 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
   _render_table(headers, rows, max_widths=[6, 12, 6, 24, 24, 30, 10, 16])
   click.echo(f"\n{len(results)} game(s) found.")
 
-
-@cli.command("cache")
-@click.option("--clear", is_flag=True, help="Clear all cached data.")
-def cache_cmd(clear):
-  """Show or clear the local cache."""
-  if clear:
-    cache.invalidate_clubs()
-    click.echo("Cache cleared.")
-    return
-
-  db_path = cache._CACHE_FILE
-  if not db_path.exists():
-    click.echo("No cache file found.")
-    return
-
-  import sqlite3, time
-  con = sqlite3.connect(db_path)
-  rows = con.execute(
-    "SELECT association_id, COUNT(*), MIN(cached_at) FROM clubs GROUP BY association_id"
-  ).fetchall()
-  con.close()
-
-  if not rows:
-    click.echo("Cache is empty.")
-    return
-
-  now = time.time()
-  click.echo(f"Cache file: {db_path}")
-  for assoc_id, count, cached_at in rows:
-    age_h = (now - cached_at) / 3600
-    label = "default" if assoc_id == -1 else str(assoc_id)
-    expires_h = (cache._DEFAULT_TTL - (now - cached_at)) / 3600
-    click.echo(f"  association={label}: {count} clubs, cached {age_h:.1f}h ago, expires in {expires_h:.1f}h")
 
 
 def main():
