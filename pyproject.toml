@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sav-client"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "python-dotenv>=1.0",
+    "beautifulsoup4>=4.12",
+    "click>=8.0",
+]
+
+[project.scripts]
+sav = "sav_cli.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sav_client*", "sav_cli*"]
+
+[tool.setuptools.package-data]
+sav_client = ["AGENTS.md"]
