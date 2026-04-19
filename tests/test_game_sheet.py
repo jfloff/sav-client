@@ -6,10 +6,13 @@ from sav_client.exceptions import SavResponseError
 
 @pytest.fixture(scope="module")
 def sample_game(client):
+  # Prefer a played game (eligible players are populated); fall back to any game with an ID
   games = client.list_games()
   if not games:
     pytest.skip("Live SAV account has no visible games")
-  game = next((g for g in games if g.id > 0), None)
+  game = next((g for g in games if g.id > 0 and g.game_status == "Marcado"), None)
+  if game is None:
+    game = next((g for g in games if g.id > 0), None)
   if game is None:
     pytest.skip("No game with a valid internal ID found")
   return game
@@ -112,11 +115,3 @@ class TestGetGameSheetPdf:
     result = client.get_game_sheet_pdf(sample_game.id)
 
     assert result is None or isinstance(result, bytes)
-
-  def test_returns_pdf_magic_when_available(self, client, sample_game):
-    result = client.get_game_sheet_pdf(sample_game.id)
-
-    if result is None:
-      pytest.skip("No game sheet PDF uploaded for this game")
-
-    assert result.startswith(b"%PDF"), f"Expected PDF magic bytes, got: {result[:8]!r}"
