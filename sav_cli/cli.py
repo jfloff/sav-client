@@ -200,7 +200,7 @@ def cli(ctx, output):
 @click.option("--name", default="", help="Filter by player name (partial).")
 @click.option("--license", "license_", default="", help="Filter by licence number.")
 @click.option("--number", default="", help="Filter by shirt number.")
-@click.option("--tier", default="", help="Filter by tier/escalão (e.g. 'Sénior').")
+@click.option("--tier", "tiers", default=None, multiple=True, help="Filter by tier/escalão; repeatable (e.g. --tier 'Mini 12' --tier 'Mini 10').")
 @click.option("--gender", default=0, type=int, help="Filter by gender code (0 = any).")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current). Use 0 for all seasons.")
 @click.option("--club", "clubs", default=None, multiple=True, help="Club ID or name fragment; repeatable (e.g. --club SBC --club 'Rio Maior').")
@@ -209,7 +209,7 @@ def cli(ctx, output):
 @click.option("--birth-date", default="", help="Filter by birth date (YYYY-MM-DD).")
 @click.option("--page", default=1, type=int, show_default=True, help="Result page.")
 @click.pass_context
-def players_cmd(ctx, name, license_, number, tier, gender, season, clubs, association, all_clubs, birth_date, page):
+def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, page):
   """Search and list players."""
   output = ctx.obj["output"]
   client = _make_client()
@@ -237,12 +237,14 @@ def players_cmd(ctx, name, license_, number, tier, gender, season, clubs, associ
     club_arg = None
     association_id = 0
 
+  tier_arg: str | list[str] = list(tiers) if len(tiers) > 1 else (tiers[0] if tiers else "")
+
   try:
     results = client.search_players(
       name=name,
       license=license_,
       number=number,
-      tier=tier,
+      tier=tier_arg,
       gender=gender,
       season=season,
       club=club_arg,

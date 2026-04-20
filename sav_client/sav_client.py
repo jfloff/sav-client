@@ -217,7 +217,7 @@ class SavClient:
     license: str = "",
     number: str = "",
     gender: int = 0,
-    tier: str = "",
+    tier: str | list[str] = "",
     season: int | None = None,
     association: int = 0,
     club: int | list[int] | None = None,
@@ -232,6 +232,9 @@ class SavClient:
     federation-wide).  Pass a list of IDs to search specific clubs in
     parallel and return a merged, deduplicated result.
 
+    Pass a list of strings to ``tier`` to search multiple tiers in parallel
+    and return a merged, deduplicated result.
+
     Args:
         name:        Filter by player name (partial match).
         license:     Filter by licence number (exact).  When set, all other
@@ -239,6 +242,7 @@ class SavClient:
         number:      Filter by shirt number.
         gender:      0 = any, or the server's numeric gender code.
         tier:        Filter by age/competition tier (escalão), e.g. "Sénior".
+                     Pass a list to search multiple tiers in parallel.
         season:      SAV2 epoch ID.  Defaults to the current session epoch.
                      Pass ``0`` to return players across all seasons.
         association: SAV2 association ID.  Defaults to 0 (any/auto).
@@ -257,6 +261,13 @@ class SavClient:
     """
     if self.session is None:
       raise SavResponseError("Must call login() before search_players()")
+
+    if isinstance(tier, list):
+      return self._search_tier_list(
+        tier, name=name, license=license, number=number, gender=gender,
+        season=season, association=association, club=club,
+        birth_date=birth_date,
+      )
 
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
@@ -280,6 +291,22 @@ class SavClient:
     return self._search_players_single(
       association=association, club=club, page=page, **filters,
     )
+
+  def _search_tier_list(self, tiers: list[str], *, max_workers: int = 8, **kwargs) -> list[Player]:
+    """Search multiple tiers in parallel and return deduplicated results."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    seen: dict[int, Player] = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(tiers))) as pool:
+      futures = {pool.submit(self.search_players, tier=t, **kwargs): t for t in tiers}
+      for future in as_completed(futures):
+        try:
+          for p in future.result():
+            if p.id not in seen:
+              seen[p.id] = p
+        except Exception:
+          logger.debug("Skipping tier=%r", futures[future], exc_info=True)
+    return list(seen.values())
 
   def _search_club_list(self, club_ids: list[int], *, max_workers: int = 8, **filters) -> list[Player]:
     """Search a specific list of clubs in parallel and return deduplicated results."""
