@@ -591,6 +591,7 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
   Use --players, --coaches, --staff to show only specific sections (default: all).
   With --out, --player, --coach-pri, or --coach-adj, --home or --away is required.
   """
+  output = ctx.obj["output"]
   is_pdf_mode = out_path is not None or players or coaches_pri or coaches_adj
   if is_pdf_mode and not team:
     raise click.UsageError("Specify either --home or --away when generating a PDF.")
@@ -620,9 +621,11 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
       f"Game {game_number!r} found but has no internal ID — cannot fetch eligible players."
     )
 
-  click.echo(
-    f"Game {game.number}: {game.home} vs {game.away}  |  {game.date} {game.time}  |  {game.venue}"
-  )
+  # Only print game header in human-readable mode
+  if output == "table":
+    click.echo(
+      f"Game {game.number}: {game.home} vs {game.away}  |  {game.date} {game.time}  |  {game.venue}"
+    )
 
   if is_pdf_mode:
     val = 1 if team == "home" else 2
@@ -646,8 +649,23 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
     click.echo(f"Saved {team} team PDF → {dest}")
     return
 
-  # List mode — show one or both teams
+  # List mode
   teams = [(1, "home")] if team == "home" else [(2, "away")] if team == "away" else [(1, "home"), (2, "away")]
+
+  if output == "json":
+    try:
+      result = {}
+      for val, label in teams:
+        result[label] = client.get_eligible_players(game.id, val=val)
+      # Single team: unwrap from the dict
+      if len(teams) == 1:
+        click.echo(json.dumps(list(result.values())[0], ensure_ascii=False, indent=2))
+      else:
+        click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    except (SavConnectionError, SavResponseError) as e:
+      raise click.ClickException(str(e))
+    return
+
   for val, _ in teams:
     _print_eligible(client, game, val, show_players=show_players, show_coaches=show_coaches, show_staff=show_staff)
 
