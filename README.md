@@ -118,7 +118,10 @@ See [`sav_client/AGENTS.md`](sav_client/AGENTS.md) for the full API reference.
 
 ## Agent / LLM reference
 
-Machine-readable documentation for AI agents is im [`sav_client/AGENTS.md`](sav_client/AGENTS.md) — Python library API
+Machine-readable documentation for AI agents:
+
+- [`sav_client/AGENTS.md`](sav_client/AGENTS.md) — Python library API
+- [`sav_cli/AGENTS.md`](sav_cli/AGENTS.md) — CLI command reference
 
 ---
 

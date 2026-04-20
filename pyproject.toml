@@ -22,3 +22,4 @@ include = ["sav_client*", "sav_cli*"]
 
 [tool.setuptools.package-data]
 sav_client = ["AGENTS.md"]
+sav_cli = ["AGENTS.md"]
