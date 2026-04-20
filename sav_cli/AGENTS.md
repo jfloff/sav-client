@@ -5,6 +5,24 @@ This document is the authoritative reference for AI agents using `sav`.
 
 ---
 
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| **game sheet** | Pre-game eligible players list printed before tip-off. Generated via `sav game-sheet --out`. |
+| **referee sheet** | Post-game document uploaded to SAV2 by the referee after the game. Retrieved via `get_game_sheet_pdf()` in the Python library — **no CLI command exists for this**. |
+| **licence** | Player registration number — a numeric string (e.g. `"301772"`). Used to identify players across all commands. |
+| **wallet** | Coach/official registration number — a separate numeric identifier, distinct from player licences. Used in `--coach-pri` / `--coach-adj` flags. |
+| **val** | Team selector used internally: `1` = home team, `2` = away team. The CLI exposes this as `--home` / `--away`. |
+| **coaches_pri** | Head coaches (treinadores principais) eligible for this game. |
+| **coaches_adj** | Adjunct/assistant coaches eligible for this game. |
+| **tier / escalão** | Age/competition category, e.g. `"Mini 12"`, `"Sub 14"`, `"Sénior"`. Free-text string as it appears in SAV2. |
+| **active** | `true` when the player is registered and eligible for the current season. The definitive eligibility signal — do not assume eligibility from presence in results alone. |
+| **association** | Regional basketball body (e.g. AB Santarém). Identified by a numeric `id` from `sav associations`. |
+| **game_status** | Lifecycle state of a game: `"Marcado"` (scheduled), `"Realizado"` (played), `"Não Marcado"` (unscheduled), `"Adiado"` (postponed), `"Anulado"` (cancelled). |
+
+---
+
 ## Setup
 
 Credentials are read from environment variables (or a `.env` file in the working directory):
@@ -172,8 +190,8 @@ sav --output json games --status all             # every status
 ```
 
 Key fields:
-- `id` — **internal SAV2 ID**, required for `sav game-sheet`. Not shown in the table view.
-- `number` — human-readable game number (e.g. `S14M-001`).
+- `number` — human-readable game number (e.g. `S14M-001`), used by `sav game-sheet`.
+- `id` — internal SAV2 ID. Not needed by any CLI command; present for completeness.
 - `game_status` values:
 
 | Value | Meaning |
@@ -193,6 +211,9 @@ List games across all statuses, with client-side date filtering. Unlike
 server drops completed games when date-filtering, so this command fetches the
 full season and filters locally.
 
+**Use this instead of `sav games` whenever you need `game_number` values for
+`sav game-sheet`**, especially for games that may already have been played.
+
 ```sh
 sav --output json game-sheets                               # all games, current season
 sav --output json game-sheets --date 19-04-2026            # single date
@@ -210,17 +231,19 @@ and `--date-to` to the same value.
 
 **JSON shape:** same as `sav games`.
 
-**Use `sav game-sheets` instead of `sav games` whenever you need game numbers
-for `sav game-sheet`, especially for completed games.**
-
 ---
 
 ### `sav game-sheet GAME_NUMBER`
 
-Show eligible players or generate a PDF for one or both teams.
+Show the eligible players list or generate the **pre-game game sheet PDF** for
+one or both teams.
 
 `GAME_NUMBER` is the human-readable number from `sav games` or `sav game-sheets`
 (e.g. `S14M-001`).
+
+> **Not to be confused with the referee sheet.** The referee sheet is the
+> post-game document uploaded by the referee — it is not accessible via the CLI.
+> Use `get_game_sheet_pdf()` from the Python library for that.
 
 #### List mode (default)
 
@@ -236,13 +259,37 @@ sav game-sheet S14M-001 --players --coaches  # players + coaches, both teams
 sav game-sheet S14M-001 --away --staff       # staff only, away team
 ```
 
-Section flags `--players`, `--coaches`, `--staff`: if none are set, all sections
-are shown.
+**Always use `--output json` when reading the output programmatically.**
+
+```sh
+sav --output json game-sheet S14M-001 --home
+```
+
+Single-team JSON shape:
+```json
+{
+  "game_number": "S14M-001",
+  "players":     [{"licence": "301772", "name": "João Silva", "birth_date": "1990-05-12", "status": "FBP"}],
+  "coaches_pri": [{"wallet": "44321", "name": "Carlos Coach", "grade": "...", "function": "..."}],
+  "coaches_adj": [],
+  "staff":       []
+}
+```
+
+Both-teams JSON shape (no `--home` / `--away`):
+```json
+{
+  "home": {"game_number": "S14M-001", "players": [...], "coaches_pri": [...], "coaches_adj": [...], "staff": [...]},
+  "away": {"game_number": "S14M-001", "players": [...], "coaches_pri": [...], "coaches_adj": [...], "staff": [...]}
+}
+```
+
+Section flags `--players`, `--coaches`, `--staff` apply to table output only; JSON always returns all keys.
 
 #### PDF mode
 
 Pass `--out` (and optionally `--player`, `--coach-pri`, `--coach-adj`) to generate
-the official eligible-players PDF. **`--home` or `--away` is required in PDF mode.**
+and save the pre-game game sheet PDF. **`--home` or `--away` is required in PDF mode.**
 
 ```sh
 # All eligible, default filename game_S14M-001_home.pdf
@@ -305,7 +352,7 @@ sav --output json players --license 301772
 Look at `"active": true`. A player with `active: false` is registered in SAV
 but not eligible for the current season.
 
-### Generate a game-sheet PDF
+### Generate a pre-game game sheet PDF
 
 1. Find the game number (use `game-sheets` — it handles completed games correctly):
    ```sh
@@ -313,7 +360,7 @@ but not eligible for the current season.
    ```
 2. Inspect eligible players and coaches (use `--coaches` to find wallet numbers):
    ```sh
-   sav game-sheet S14M-001 --home --coaches
+   sav --output json game-sheet S14M-001 --home --coaches
    ```
 3. Generate the PDF with selected players and coach:
    ```sh
