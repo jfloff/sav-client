@@ -56,6 +56,7 @@ SAV_PASSWORD=your_password
 # Players
 sav players
 sav players --name "João" --tier "Sénior"
+sav players --tier "Mini 12" --tier "Mini 10" --tier "Baby Basket" --all-clubs
 sav players --club "Rio Maior" --season 0
 sav --output json players --license 301772
 

@@ -78,6 +78,7 @@ sav --output json players
 sav --output json players --name "João"
 sav --output json players --license 301772
 sav --output json players --tier "Sénior"
+sav --output json players --tier "Mini 12" --tier "Mini 10" --tier "Baby Basket"   # multiple tiers
 sav --output json players --club 270
 sav --output json players --club "Rio Maior"          # name fragment, may match >1 club
 sav --output json players --club 270 --club 666       # multiple clubs
@@ -87,6 +88,8 @@ sav --output json players --season 0                  # all seasons
 sav --output json players --birth-date 1990-01-01
 sav --output json players --page 2
 ```
+
+**`--tier` is repeatable.** Pass it multiple times to search several tiers in parallel and get a combined, deduplicated result.
 
 **Mutual exclusions:** `--club` cannot be combined with `--association` or `--all-clubs`.
 

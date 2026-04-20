@@ -148,6 +148,7 @@ players = client.search_players()                          # own club, current s
 players = client.search_players(name="João")
 players = client.search_players(license="301772")          # exact match; other filters ignored by server
 players = client.search_players(tier="Sénior")
+players = client.search_players(tier=["Mini 12", "Mini 10", "Baby Basket"])  # parallel, deduplicated
 players = client.search_players(club=270)                  # specific club by ID
 players = client.search_players(club=[270, 666, 2430])     # multiple clubs, parallel, deduplicated
 players = client.search_players(club=0, association=7)     # all clubs in one association
@@ -165,7 +166,7 @@ players = client.search_players(page=2)                    # pagination (single-
 | `license` | `str` | `""` | Exact; overrides other filters server-side |
 | `number` | `str` | `""` | Shirt number |
 | `gender` | `int` | `0` | 0 = any |
-| `tier` | `str` | `""` | e.g. `"Sénior"` |
+| `tier` | `str\|list[str]` | `""` | e.g. `"Sénior"` or `["Mini 12", "Mini 10"]` — list runs in parallel |
 | `season` | `int\|None` | current | `0` = all seasons |
 | `club` | `int\|list[int]\|None` | own club | `None` = own; `0` = all; list = parallel search |
 | `association` | `int` | `0` | Used only when `club=0` |
