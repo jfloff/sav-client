@@ -104,7 +104,7 @@ sav --output json players --association "Santarém"    # all clubs in that assoc
 sav --output json players --all-clubs                 # federation-wide (slow)
 sav --output json players --season 0                  # all seasons
 sav --output json players --birth-date 1990-01-01
-sav --output json players --page 2
+sav --output json players --limit 50
 ```
 
 **`--tier` is repeatable.** Pass it multiple times to search several tiers in parallel and get a combined, deduplicated result.

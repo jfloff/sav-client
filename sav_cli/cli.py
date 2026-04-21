@@ -207,9 +207,9 @@ def cli(ctx, output):
 @click.option("--association", default=None, help="Association ID or name fragment (e.g. 'Santarém' or 7). Searches all clubs within it.")
 @click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations (federation-wide).")
 @click.option("--birth-date", default="", help="Filter by birth date (YYYY-MM-DD).")
-@click.option("--page", default=1, type=int, show_default=True, help="Result page.")
+@click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
 @click.pass_context
-def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, page):
+def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, limit):
   """Search and list players."""
   output = ctx.obj["output"]
   client = _make_client()
@@ -250,7 +250,7 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
       club=club_arg,
       association=association_id,
       birth_date=birth_date,
-      page=page,
+      limit=limit,
     )
   except (SavConnectionError, SavResponseError) as e:
     raise click.ClickException(str(e))

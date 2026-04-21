@@ -175,6 +175,7 @@ players = client.search_players(club=0)                    # all clubs, federati
 players = client.search_players(season=0)                  # all seasons
 players = client.search_players(birth_date="1990-05-12")
 players = client.search_players(page=2)                    # pagination (single-club only)
+players = client.search_players(club=0, limit=20)           # all-clubs, short-circuits after 20 unique hits
 ```
 
 **Parameter reference:**
@@ -191,6 +192,7 @@ players = client.search_players(page=2)                    # pagination (single-
 | `association` | `int` | `0` | Used only when `club=0` |
 | `birth_date` | `str` | `""` | `YYYY-MM-DD` |
 | `page` | `int` | `1` | Ignored for multi-club searches |
+| `limit` | `int\|None` | `None` | Cap total results; short-circuits parallel multi-club/multi-tier scans and cancels pending requests |
 
 **Mutual exclusion:** `club` (non-None, non-0) and `association` cannot be
 meaningfully combined — `association` is only used when `club=0`.

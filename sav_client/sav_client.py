@@ -223,6 +223,7 @@ class SavClient:
     club: int | list[int] | None = None,
     birth_date: str = "",
     page: int = 1,
+    limit: int | None = None,
   ) -> list[Player]:
     """
     Search for players in the SAV2 system.
@@ -251,6 +252,10 @@ class SavClient:
         birth_date:  Filter by birth date string (YYYY-MM-DD).
         page:        Result page number (1-based).  Ignored when multiple
                      clubs are searched.
+        limit:       Stop aggregating once this many unique players have been
+                     collected.  Only affects multi-club / multi-tier parallel
+                     searches — cancels remaining in-flight requests to short
+                     circuit wide scans (e.g. ``--all-clubs``).
 
     Returns:
         List of Player objects parsed from the HTML response.
@@ -266,7 +271,7 @@ class SavClient:
       return self._search_tier_list(
         tier, name=name, license=license, number=number, gender=gender,
         season=season, association=association, club=club,
-        birth_date=birth_date,
+        birth_date=birth_date, limit=limit,
       )
 
     if season is None:
@@ -280,19 +285,23 @@ class SavClient:
     )
 
     if isinstance(club, list):
-      return self._search_club_list(club, **filters)
+      return self._search_club_list(club, limit=limit, **filters)
 
     if club is None:
       club = int(self.session.get("organizacao") or 0)
 
     if club == 0:
-      return self._search_all_clubs(association=association, **filters)
+      return self._search_all_clubs(association=association, limit=limit, **filters)
 
-    return self._search_players_single(
+    results = self._search_players_single(
       association=association, club=club, page=page, **filters,
     )
+    return results[:limit] if limit is not None else results
 
-  def _search_tier_list(self, tiers: list[str], *, max_workers: int = 8, **kwargs) -> list[Player]:
+  def _search_tier_list(
+    self, tiers: list[str], *, max_workers: int = 8,
+    limit: int | None = None, **kwargs,
+  ) -> list[Player]:
     """Search multiple tiers in parallel and return deduplicated results."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -306,9 +315,16 @@ class SavClient:
               seen[p.id] = p
         except Exception:
           logger.debug("Skipping tier=%r", futures[future], exc_info=True)
-    return list(seen.values())
+        if limit is not None and len(seen) >= limit:
+          for f in futures:
+            f.cancel()
+          break
+    return list(seen.values())[:limit] if limit is not None else list(seen.values())
 
-  def _search_club_list(self, club_ids: list[int], *, max_workers: int = 8, **filters) -> list[Player]:
+  def _search_club_list(
+    self, club_ids: list[int], *, max_workers: int = 8,
+    limit: int | None = None, **filters,
+  ) -> list[Player]:
     """Search a specific list of clubs in parallel and return deduplicated results."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -325,13 +341,18 @@ class SavClient:
               seen[p.id] = p
         except Exception:
           logger.debug("Skipping club id=%s", futures[future], exc_info=True)
-    return list(seen.values())
+        if limit is not None and len(seen) >= limit:
+          for f in futures:
+            f.cancel()
+          break
+    return list(seen.values())[:limit] if limit is not None else list(seen.values())
 
   def _search_all_clubs(
     self,
     *,
     association: int = 0,
     max_workers: int = 8,
+    limit: int | None = None,
     **filters,
   ) -> list[Player]:
     """
@@ -377,7 +398,11 @@ class SavClient:
               seen[p.id] = p
         except Exception:
           logger.debug("Skipping club id=%s during all-clubs search", club_id, exc_info=True)
-    return list(seen.values())
+        if limit is not None and len(seen) >= limit:
+          for f in futures:
+            f.cancel()
+          break
+    return list(seen.values())[:limit] if limit is not None else list(seen.values())
 
   def _search_players_single(
     self,
