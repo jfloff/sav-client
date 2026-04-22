@@ -42,6 +42,31 @@ sav --output json --fields "name,license,active" players --tier "Sénior"
 
 Use `--fields` aggressively when feeding an LLM — payload shrinks from 12 keys × N rows to just what you need.
 
+## Error handling in JSON mode
+
+When `--output json` is set, errors emit a structured payload **on stderr** instead of the usual `Error: …` text. Exit code is non-zero.
+
+```json
+{"error": "No player found with licence(s): '99999999'.", "code": "not_found"}
+```
+
+Branch on `code` for programmatic error handling:
+
+| Code | Meaning |
+|------|---------|
+| `auth_failed` | Bad credentials |
+| `connection_error` | Network / DNS / HTTP |
+| `response_error` | Server returned malformed payload |
+| `config_error` | Missing/invalid env vars |
+| `not_found` | Licence/game/club/association didn't match |
+| `ambiguous_match` | Multiple matches; be more specific |
+| `no_internal_id` | Game row has no action button; sheet unavailable |
+| `no_pdf` | SAV2 returned nothing for this team |
+| `fetch_failed` | Could not load associations/clubs list |
+| `error` | Generic fallback |
+
+Usage errors (missing arg, invalid flag) still use Click's default formatter.
+
 ## Commands
 
 ### `sav associations`
@@ -85,9 +110,12 @@ sav --output json players --all-clubs                          # federation-wide
 sav --output json players --season 0                           # all seasons
 sav --output json players --birth-date 1990-01-01
 sav --output json players --limit 50                           # short-circuits wide scans
+sav --output json players --tier "Sénior" --count               # {"count": 23} — skips the payload
 ```
 
-`--tier` and `--club` are repeatable. `--club` is exclusive with `--association` / `--all-clubs`.
+`--tier` and `--club` are repeatable. `--club` is exclusive with `--association` / `--all-clubs`. `--count` is exclusive with `--limit`.
+
+Results are sorted by `id` for reproducible `--limit` output across runs. (Note: on `--all-clubs` with `--limit`, the short-circuit stops fetching once N unique players are collected — the *set* may vary across runs due to network timing, but the returned list is always sorted.)
 
 JSON element:
 ```json
@@ -99,13 +127,17 @@ JSON element:
 
 `license` is a string. Only `active: true` means currently eligible.
 
-### `sav player LICENCE_NUM`
+### `sav player LICENCE_NUM...`
 
-Single-player detail. Same JSON shape as a `players` element; add `--photo` to populate `photo_url`.
+Player detail for one or more licences. Multiple licences fetched in parallel. JSON/CSV always returns a **list**; a single licence yields a 1-element list.
 
 ```sh
-sav --output json player 301772 --photo
+sav --output json player 301772
+sav --output json player 301772 302000 303000        # batch, parallel
+sav --output json player 301772 --photo              # include photo_url
 ```
+
+Element shape matches a `players` row. Missing licences are logged to stderr as warnings; the command only errors (`code: not_found`) when **every** licence was missing.
 
 ### `sav games`
 
@@ -202,14 +234,4 @@ sav game-sheet S14M-001 --home --out /tmp/sheet.pdf \              # 3. render
 
 ## Errors
 
-Printed to stderr; non-zero exit.
-
-| Pattern | Meaning |
-|---------|---------|
-| `Authentication failed` | Bad creds or SAV2 unreachable |
-| `No player found with licence …` | Licence not in scope |
-| `No game found with number …` | Game not visible to this account |
-| `Game … has no internal ID` | Row has no action button; sheet unavailable |
-| `No club found matching …` | Run `sav clubs` to browse |
-| `Multiple associations match …` | Use numeric ID |
-| `No eligible players PDF available` | SAV2 returned nothing for this team |
+All errors go to stderr and exit non-zero. With `--output json`, they're emitted as structured JSON (see **Error handling in JSON mode** above).

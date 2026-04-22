@@ -121,6 +121,8 @@ client.search_players(season=0)                        # all seasons
 
 `club` (non-None, non-0) and `association` don't combine meaningfully — `association` only applies when `club=0`.
 
+Results are always sorted by `Player.id` before return, so `limit` slicing is reproducible for the same result set. (On `limit` + parallel scans the short-circuit may pick a different *subset* across runs due to network timing, but the returned list is always in stable order.)
+
 ### `get_player_detail(player_id, *, photo=False) → Player`
 
 Fetch photo URL. Returns a stub when `photo=False`. `player_id` is `Player.id` (internal), not licence.

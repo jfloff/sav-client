@@ -29,6 +29,38 @@ from sav_client.exceptions import (
   SavResponseError,
 )
 
+
+# Tracks the root --output flag so SavCliError.show() can format errors
+# appropriately even after Click has unwound the context stack.
+_OUTPUT_MODE: str = "table"
+
+
+class SavCliError(click.ClickException):
+  """CLI error with a machine-readable `code`. Emits JSON to stderr when --output json."""
+
+  exit_code = 1
+
+  def __init__(self, message: str, code: str = "error") -> None:
+    super().__init__(message)
+    self.code = code
+
+  def show(self, file=None) -> None:  # noqa: D401
+    if _OUTPUT_MODE == "json":
+      click.echo(
+        json.dumps({"error": self.message, "code": self.code}, ensure_ascii=False),
+        err=True,
+      )
+    else:
+      super().show(file)
+
+
+def _exc_code(exc: Exception) -> str:
+  if isinstance(exc, SavAuthError):       return "auth_failed"
+  if isinstance(exc, SavConnectionError): return "connection_error"
+  if isinstance(exc, SavResponseError):   return "response_error"
+  if isinstance(exc, SavConfigError):     return "config_error"
+  return "error"
+
 _COL_SEP = "  "
 _ELLIPSIS = "…"
 
@@ -112,21 +144,23 @@ def _resolve_association(client: SavClient, association: str) -> int:
   try:
     associations = client.list_associations()
   except Exception as e:
-    raise click.ClickException(f"Could not fetch associations list: {e}")
+    raise SavCliError(f"Could not fetch associations list: {e}", code="fetch_failed")
 
   q = association.lower()
   matches = [a for a in associations if q in a.name.lower()]
 
   if not matches:
-    raise click.ClickException(
+    raise SavCliError(
       f"No association found matching {association!r}. "
-      "Use 'sav associations' to list available associations."
+      "Use 'sav associations' to list available associations.",
+      code="not_found",
     )
   if len(matches) > 1:
     names = "\n  ".join(f"{a.id}: {a.name}" for a in matches)
-    raise click.ClickException(
+    raise SavCliError(
       f"Multiple associations match {association!r}:\n  {names}\n"
-      "Be more specific or use the numeric ID."
+      "Be more specific or use the numeric ID.",
+      code="ambiguous_match",
     )
   return matches[0].id
 
@@ -146,7 +180,7 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
   try:
     clubs = client.list_clubs()
   except Exception as e:
-    raise click.ClickException(f"Could not fetch clubs list: {e}")
+    raise SavCliError(f"Could not fetch clubs list: {e}", code="fetch_failed")
 
   q = club.lower()
   matches = [
@@ -155,9 +189,10 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
   ]
 
   if not matches:
-    raise click.ClickException(
+    raise SavCliError(
       f"No club found matching {club!r}. "
-      "Use 'sav clubs' to list available clubs."
+      "Use 'sav clubs' to list available clubs.",
+      code="not_found",
     )
 
   if len(matches) > 1:
@@ -171,13 +206,15 @@ def _make_client() -> SavClient:
   try:
     client = SavClient.from_env()
   except SavConfigError as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code="config_error")
   try:
     client.login()
   except SavAuthError as e:
-    raise click.ClickException(f"Authentication failed: {e}")
+    raise SavCliError(f"Authentication failed: {e}", code="auth_failed")
   except SavConnectionError as e:
-    raise click.ClickException(f"Connection error: {e}")
+    raise SavCliError(f"Connection error: {e}", code="connection_error")
+  except SavResponseError as e:
+    raise SavCliError(f"Login failed: {e}", code="response_error")
   return client
 
 
@@ -197,6 +234,8 @@ def _make_client() -> SavClient:
 @click.pass_context
 def cli(ctx, output, fields):
   """SAV2 API client."""
+  global _OUTPUT_MODE
+  _OUTPUT_MODE = output
   ctx.ensure_object(dict)
   ctx.obj["output"] = output
   ctx.obj["fields"] = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
@@ -227,8 +266,9 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
 @click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations (federation-wide).")
 @click.option("--birth-date", default="", help="Filter by birth date (YYYY-MM-DD).")
 @click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
+@click.option("--count", is_flag=True, default=False, help="Return only the number of matching players instead of the list.")
 @click.pass_context
-def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, limit):
+def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, limit, count):
   """Search and list players."""
   output = ctx.obj["output"]
   client = _make_client()
@@ -237,6 +277,8 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
     raise click.UsageError("--club cannot be combined with --association or --all-clubs.")
   if association is not None and all_clubs:
     raise click.UsageError("--association and --all-clubs are mutually exclusive.")
+  if count and limit is not None:
+    raise click.UsageError("--count and --limit are mutually exclusive.")
 
   if all_clubs:
     club_arg: int | list[int] | None = 0
@@ -272,10 +314,26 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
       limit=limit,
     )
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  if count:
+    n = len(results)
+    if output == "json":
+      click.echo(json.dumps({"count": n}))
+    elif output == "csv":
+      click.echo("count")
+      click.echo(n)
+    else:
+      click.echo(f"{n} player(s) match.")
+    return
 
   if not results:
-    click.echo("No players found.")
+    if output == "json":
+      click.echo("[]")
+    elif output == "csv":
+      pass
+    else:
+      click.echo("No players found.")
     return
 
   fields = ctx.obj.get("fields")
@@ -315,66 +373,92 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
 
 
 @cli.command("player")
-@click.argument("license_num")
-@click.option("--photo", is_flag=True, default=False, help="Fetch and include the player's photo URL.")
+@click.argument("license_nums", nargs=-1, required=True)
+@click.option("--photo", is_flag=True, default=False, help="Fetch and include each player's photo URL.")
 @click.pass_context
-def player_cmd(ctx, license_num, photo):
-  """Show detail for a single player by their licence number."""
+def player_cmd(ctx, license_nums, photo):
+  """Show detail for one or more players by licence number.
+
+  Pass multiple licence numbers to fetch them in parallel. JSON/CSV always
+  returns a list; a single licence returns a 1-element list.
+  """
+  from concurrent.futures import ThreadPoolExecutor
+  from dataclasses import replace
+
   output = ctx.obj["output"]
   client = _make_client()
 
-  try:
-    results = client.search_players(license=license_num)
-  except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
-
-  if not results:
-    raise click.ClickException(f"No player found with licence {license_num!r}.")
-
-  player = results[0]
-
-  if photo:
+  def _fetch(lic: str) -> Player | None:
     try:
-      from dataclasses import replace
-      detail = client.get_player_detail(player.id, photo=True)
-      player = replace(player, photo_url=detail.photo_url)
-    except (SavConnectionError, SavResponseError) as e:
-      raise click.ClickException(str(e))
+      results = client.search_players(license=lic)
+    except (SavConnectionError, SavResponseError):
+      return None
+    if not results:
+      return None
+    p = results[0]
+    if photo:
+      try:
+        detail = client.get_player_detail(p.id, photo=True)
+        p = replace(p, photo_url=detail.photo_url)
+      except (SavConnectionError, SavResponseError):
+        pass
+    return p
+
+  if len(license_nums) == 1:
+    fetched = [_fetch(license_nums[0])]
+  else:
+    with ThreadPoolExecutor(max_workers=min(8, len(license_nums))) as pool:
+      fetched = list(pool.map(_fetch, license_nums))
+
+  missing = [lic for lic, p in zip(license_nums, fetched) if p is None]
+  players = [p for p in fetched if p is not None]
+
+  if not players:
+    raise SavCliError(
+      f"No player found with licence(s): {', '.join(repr(l) for l in missing)}.",
+      code="not_found",
+    )
+  if missing:
+    click.echo(f"Warning: no player found for licence(s): {', '.join(missing)}", err=True)
 
   projection = ctx.obj.get("fields")
 
   if output == "json":
-    rows = _project([asdict(player)], projection)
-    click.echo(json.dumps(rows[0], ensure_ascii=False, indent=2))
+    rows = _project([asdict(p) for p in players], projection)
+    click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
     default_fields = ["id", "license", "name", "birth_date", "gender", "nationality",
                       "club", "association", "tier", "status", "season", "active", "photo_url"]
-    rows = _project([asdict(player)], projection)
+    rows = _project([asdict(p) for p in players], projection)
     csv_fields = projection or default_fields
     click.echo(",".join(csv_fields))
-    click.echo(",".join(str(rows[0][f]) for f in csv_fields))
+    for r in rows:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
     return
 
-  fields = [
-    ("License",     player.license),
-    ("Name",        player.name),
-    ("Birth Date",  player.birth_date),
-    ("Gender",      player.gender),
-    ("Nationality", player.nationality),
-    ("Club",        player.club),
-    ("Association", player.association),
-    ("Tier",        player.tier),
-    ("Status",      player.status),
-    ("Season",      player.season),
-    ("Active",      "yes" if player.active else ""),
-    ("Photo URL",   player.photo_url),
-  ]
-  width = max(len(k) for k, _ in fields)
-  for key, val in fields:
-    if val:
-      click.echo(f"{key:<{width}}  {val}")
+  for i, player in enumerate(players):
+    if i > 0:
+      click.echo()
+    fields = [
+      ("License",     player.license),
+      ("Name",        player.name),
+      ("Birth Date",  player.birth_date),
+      ("Gender",      player.gender),
+      ("Nationality", player.nationality),
+      ("Club",        player.club),
+      ("Association", player.association),
+      ("Tier",        player.tier),
+      ("Status",      player.status),
+      ("Season",      player.season),
+      ("Active",      "yes" if player.active else ""),
+      ("Photo URL",   player.photo_url),
+    ]
+    width = max(len(k) for k, _ in fields)
+    for key, val in fields:
+      if val:
+        click.echo(f"{key:<{width}}  {val}")
 
 
 @cli.command("associations")
@@ -387,7 +471,7 @@ def associations_cmd(ctx):
   try:
     results = client.list_associations()
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   if not results:
     click.echo("No associations found.")
@@ -430,7 +514,7 @@ def clubs_cmd(ctx, query, association):
   try:
     results = client.list_clubs(association=association)
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   if query:
     q = query.lower()
@@ -513,7 +597,7 @@ def games_cmd(ctx, season, date_from, date_to, tier, gender, status):
       gender=gender,
     )
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   if status.lower() != "all":
     results = [g for g in results if g.game_status == status]
@@ -565,7 +649,7 @@ def _print_eligible(client, game, val: int, *, show_players: bool, show_coaches:
   try:
     data = client.get_eligible_players(game.id, val=val)
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   players_data = data.get("players", [])
 
@@ -643,20 +727,22 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
   try:
     games = client.list_games(game_number=game_number)
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   games = [g for g in games if g.number == game_number]
   if not games:
-    raise click.ClickException(f"No game found with number {game_number!r}.")
+    raise SavCliError(f"No game found with number {game_number!r}.", code="not_found")
   if len(games) > 1:
-    raise click.ClickException(
-      f"Multiple games match number {game_number!r}; use a more specific filter."
+    raise SavCliError(
+      f"Multiple games match number {game_number!r}; use a more specific filter.",
+      code="ambiguous_match",
     )
 
   game = games[0]
   if game.id == 0:
-    raise click.ClickException(
-      f"Game {game_number!r} found but has no internal ID — cannot fetch eligible players."
+    raise SavCliError(
+      f"Game {game_number!r} found but has no internal ID — cannot fetch eligible players.",
+      code="no_internal_id",
     )
 
   # Only print game header in human-readable mode
@@ -679,9 +765,9 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
         coaches_adj=adj_list,
       )
     except (SavConnectionError, SavResponseError) as e:
-      raise click.ClickException(str(e))
+      raise SavCliError(str(e), code=_exc_code(e))
     if pdf is None:
-      raise click.ClickException(f"No eligible players PDF available for the {team} team.")
+      raise SavCliError(f"No eligible players PDF available for the {team} team.", code="no_pdf")
     with open(dest, "wb") as f:
       f.write(pdf)
     click.echo(f"Saved {team} team PDF → {dest}")
@@ -701,7 +787,7 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
       else:
         click.echo(json.dumps(result, ensure_ascii=False, indent=2))
     except (SavConnectionError, SavResponseError) as e:
-      raise click.ClickException(str(e))
+      raise SavCliError(str(e), code=_exc_code(e))
     return
 
   for val, _ in teams:
@@ -731,7 +817,7 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
     # Fetch all games for the season and filter by date client-side instead.
     results = client.list_games(season=season, tier=tier)
   except (SavConnectionError, SavResponseError) as e:
-    raise click.ClickException(str(e))
+    raise SavCliError(str(e), code=_exc_code(e))
 
   if competition:
     results = [g for g in results if competition.lower() in g.competition.lower()]

@@ -296,6 +296,7 @@ class SavClient:
     results = self._search_players_single(
       association=association, club=club, page=page, **filters,
     )
+    results = sorted(results, key=lambda p: p.id)
     return results[:limit] if limit is not None else results
 
   def _search_tier_list(
@@ -319,7 +320,8 @@ class SavClient:
           for f in futures:
             f.cancel()
           break
-    return list(seen.values())[:limit] if limit is not None else list(seen.values())
+    ordered = sorted(seen.values(), key=lambda p: p.id)
+    return ordered[:limit] if limit is not None else ordered
 
   def _search_club_list(
     self, club_ids: list[int], *, max_workers: int = 8,
@@ -345,7 +347,8 @@ class SavClient:
           for f in futures:
             f.cancel()
           break
-    return list(seen.values())[:limit] if limit is not None else list(seen.values())
+    ordered = sorted(seen.values(), key=lambda p: p.id)
+    return ordered[:limit] if limit is not None else ordered
 
   def _search_all_clubs(
     self,
@@ -402,7 +405,8 @@ class SavClient:
           for f in futures:
             f.cancel()
           break
-    return list(seen.values())[:limit] if limit is not None else list(seen.values())
+    ordered = sorted(seen.values(), key=lambda p: p.id)
+    return ordered[:limit] if limit is not None else ordered
 
   def _search_players_single(
     self,
