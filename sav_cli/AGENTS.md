@@ -1,386 +1,215 @@
 # sav — Agent Reference
 
-`sav` is a CLI client for the FPB SAV2 basketball management system.
-This document is the authoritative reference for AI agents using `sav`.
-
----
+CLI client for the FPB SAV2 basketball management system. Authoritative reference for AI agents.
 
 ## Terminology
 
 | Term | Meaning |
 |------|---------|
-| **game sheet** | Pre-game eligible players list printed before tip-off. Generated via `sav game-sheet --out`. |
-| **referee sheet** | Post-game document uploaded to SAV2 by the referee after the game. Retrieved via `get_game_sheet_pdf()` in the Python library — **no CLI command exists for this**. |
-| **licence** | Player registration number — a numeric string (e.g. `"301772"`). Used to identify players across all commands. |
-| **wallet** | Coach/official registration number — a separate numeric identifier, distinct from player licences. Used in `--coach-pri` / `--coach-adj` flags. |
-| **val** | Team selector used internally: `1` = home team, `2` = away team. The CLI exposes this as `--home` / `--away`. |
-| **coaches_pri** | Head coaches (treinadores principais) eligible for this game. |
-| **coaches_adj** | Adjunct/assistant coaches eligible for this game. |
-| **tier / escalão** | Age/competition category, e.g. `"Mini 12"`, `"Sub 14"`, `"Sénior"`. Free-text string as it appears in SAV2. |
-| **active** | `true` when the player is registered and eligible for the current season. The definitive eligibility signal — do not assume eligibility from presence in results alone. |
-| **association** | Regional basketball body (e.g. AB Santarém). Identified by a numeric `id` from `sav associations`. |
-| **game_status** | Lifecycle state of a game: `"Marcado"` (scheduled), `"Realizado"` (played), `"Não Marcado"` (unscheduled), `"Adiado"` (postponed), `"Anulado"` (cancelled). |
-
----
+| **game sheet** | Pre-game eligible players list. Generated via `sav game-sheet --out`. |
+| **referee sheet** | Post-game document uploaded by the referee. **No CLI command** — use `get_game_sheet_pdf()` in the library. |
+| **licence** | Player registration number (numeric string, e.g. `"301772"`). |
+| **wallet** | Coach registration number. Distinct from licences. Used with `--coach-pri` / `--coach-adj`. |
+| **val** | `1` = home, `2` = away. Exposed as `--home` / `--away`. |
+| **coaches_pri / coaches_adj** | Head / adjunct (assistant) coaches eligible for the game. |
+| **tier / escalão** | Age category, e.g. `"Mini 12"`, `"Sub 14"`, `"Sénior"`. Free-text. |
+| **active** | `true` = registered and eligible this season. Only definitive eligibility signal. |
+| **association** | Regional body (e.g. AB Santarém). Numeric `id` from `sav associations`. |
+| **game_status** | `"Marcado"` (scheduled) · `"Realizado"` (played) · `"Não Marcado"` · `"Adiado"` · `"Anulado"`. |
 
 ## Setup
 
-Credentials are read from environment variables (or a `.env` file in the working directory):
+Credentials come from env vars or a `.env` file. Every command auto-authenticates.
 
 ```
-SAV_BASE_URL   # optional, defaults to https://sav2.fpb.pt
+SAV_BASE_URL   # optional, default https://sav2.fpb.pt
 SAV_USERNAME   # required
 SAV_PASSWORD   # required
 ```
 
-Every command authenticates automatically. No explicit login step is needed.
+## Output
 
----
+Top-level flags (before the subcommand):
 
-## Output formats
+- `--output table` (default, human-only — **do not parse**)
+- `--output json` — use this when reading programmatically
+- `--output csv`
+- `--fields "a,b,c"` — projects JSON/CSV down to listed keys. Unknown keys error with the full field list. Applies to `associations`, `clubs`, `players`, `player`, `games`. Ignored for tables and `game-sheet`.
 
-All commands accept a top-level `--output` / `-o` flag:
+```sh
+sav --output json --fields "name,license,active" players --tier "Sénior"
+```
 
-| Flag | Use case |
-|------|----------|
-| `--output table` | Default. Human-readable. Do not parse this. |
-| `--output json` | Structured. **Use this when you need to read the output.** |
-| `--output csv` | Tabular. Use when feeding into another tool. |
-
-**Always pass `--output json` when you need to read command output programmatically.**
-
----
+Use `--fields` aggressively when feeding an LLM — payload shrinks from 12 keys × N rows to just what you need.
 
 ## Commands
 
 ### `sav associations`
 
-List all regional associations with their numeric IDs.
+Regional associations with IDs.
 
 ```sh
 sav --output json associations
+# [{"id": 7, "name": "AB Santarém"}, ...]
 ```
 
-**JSON shape:** `[{"id": 7, "name": "AB Santarém"}, ...]`
-
-Use this to discover `id` values needed by `sav clubs --association`.
-
----
+Feed `id` into `sav clubs --association`.
 
 ### `sav clubs [QUERY]`
 
-List clubs. `QUERY` is an optional case-insensitive substring matched against
-short name, full name, and code.
+Clubs, optionally filtered by case-insensitive substring against short name, full name, or code.
 
 ```sh
-sav --output json clubs                        # clubs in your own association
-sav --output json clubs "Rio Maior"            # filter by name fragment
-sav --output json clubs --association 7        # clubs in a specific association
+sav --output json clubs                        # own association
+sav --output json clubs "Rio Maior"            # name fragment
+sav --output json clubs --association 7
+# [{"id": 270, "name": "Rio Maior Basket", "full_name": "...", "code": "RMB"}]
 ```
 
-**JSON shape:** `[{"id": 270, "name": "Rio Maior Basket", "full_name": "...", "code": "RMB"}, ...]`
-
-Key fields:
-- `id` — numeric club ID, used by `sav players --club`
-- `name` — short display name
-- `code` — abbreviation (e.g. `SBC`)
-
----
+`id` feeds `sav players --club`.
 
 ### `sav players`
 
-Search players. All filters are optional and combinable.
+Search players. All filters combinable.
 
 ```sh
-sav --output json players
 sav --output json players --name "João"
 sav --output json players --license 301772
 sav --output json players --tier "Sénior"
-sav --output json players --tier "Mini 12" --tier "Mini 10" --tier "Baby Basket"   # multiple tiers
+sav --output json players --tier "Mini 12" --tier "Mini 10"    # parallel, deduplicated
 sav --output json players --club 270
-sav --output json players --club "Rio Maior"          # name fragment, may match >1 club
-sav --output json players --club 270 --club 666       # multiple clubs
-sav --output json players --association "Santarém"    # all clubs in that association
-sav --output json players --all-clubs                 # federation-wide (slow)
-sav --output json players --season 0                  # all seasons
+sav --output json players --club "Rio Maior"                   # fragment may match >1
+sav --output json players --club 270 --club 666                # multiple clubs
+sav --output json players --association "Santarém"             # all clubs in it
+sav --output json players --all-clubs                          # federation-wide (slow)
+sav --output json players --season 0                           # all seasons
 sav --output json players --birth-date 1990-01-01
-sav --output json players --limit 50
+sav --output json players --limit 50                           # short-circuits wide scans
 ```
 
-**`--tier` is repeatable.** Pass it multiple times to search several tiers in parallel and get a combined, deduplicated result.
+`--tier` and `--club` are repeatable. `--club` is exclusive with `--association` / `--all-clubs`.
 
-**Mutual exclusions:** `--club` cannot be combined with `--association` or `--all-clubs`.
-
-**JSON shape:**
+JSON element:
 ```json
-[{
-  "id": 12345,
-  "license": "301772",
-  "name": "João Silva",
-  "club": "Rio Maior Basket",
-  "association": "AB Santarém",
-  "tier": "Sénior",
-  "gender": "Masculino",
-  "birth_date": "1990-05-12",
-  "nationality": "Portuguesa",
-  "status": "FBP",
-  "season": "2025/2026",
-  "active": true,
-  "photo_url": ""
-}]
+{"id": 12345, "license": "301772", "name": "João Silva", "club": "Rio Maior Basket",
+ "association": "AB Santarém", "tier": "Sénior", "gender": "Masculino",
+ "birth_date": "1990-05-12", "nationality": "Portuguesa", "status": "FBP",
+ "season": "2025/2026", "active": true, "photo_url": ""}
 ```
 
-`license` is a string. `active` is a boolean — only `true` means the player is
-currently registered and eligible.
-
----
+`license` is a string. Only `active: true` means currently eligible.
 
 ### `sav player LICENCE_NUM`
 
-Fetch full detail for a single player by licence number.
+Single-player detail. Same JSON shape as a `players` element; add `--photo` to populate `photo_url`.
 
 ```sh
-sav --output json player 301772
-sav --output json player 301772 --photo   # also fetches photo_url
+sav --output json player 301772 --photo
 ```
-
-**JSON shape:** same as one element from `sav players`, with `photo_url` populated
-when `--photo` is passed.
-
----
 
 ### `sav games`
 
-List games for the authenticated profile's club. Defaults to scheduled
-(`Marcado`) games for the current season.
+Games for the authenticated club. Defaults to current season, `Marcado` status.
 
 ```sh
 sav --output json games
 sav --output json games --date-from 01-04-2025 --date-to 30-04-2025
 sav --output json games --tier "Sub 14"
 sav --output json games --status "Não Marcado"
-sav --output json games --status all             # every status
+sav --output json games --status all
 ```
 
-**Date format:** `DD-MM-YYYY`.
+Dates are `DD-MM-YYYY`.
 
-**`--status` default is `Marcado`.** Pass `--status all` to see every status.
-
-**JSON shape:**
+JSON element:
 ```json
-[{
-  "id": 98765,
-  "number": "S14M-001",
-  "competition": "Campeonato Nacional Sub 14",
-  "phase": "1ª Fase - Série A",
-  "round": "1",
-  "date": "12-04-2025",
-  "time": "10:00",
-  "home": "Rio Maior Basket",
-  "away": "Santarém BC",
-  "home_score": "",
-  "away_score": "",
-  "venue": "Pavilhão Municipal",
-  "game_status": "Marcado",
-  "result_status": "Sem Resultado",
-  "tier": "Sub 14",
-  "gender": "Masculino",
-  "level": "Sub 14 F"
-}]
+{"id": 98765, "number": "S14M-001", "competition": "...", "phase": "...", "round": "1",
+ "date": "12-04-2025", "time": "10:00", "home": "Rio Maior Basket", "away": "Santarém BC",
+ "home_score": "", "away_score": "", "venue": "...", "game_status": "Marcado",
+ "result_status": "Sem Resultado", "tier": "Sub 14", "gender": "Masculino", "level": "Sub 14 F"}
 ```
 
-Key fields:
-- `number` — human-readable game number (e.g. `S14M-001`), used by `sav game-sheet`.
-- `id` — internal SAV2 ID. Not needed by any CLI command; present for completeness.
-- `game_status` values:
-
-| Value | Meaning |
-|-------|---------|
-| `"Marcado"` | Scheduled (default filter) |
-| `"Não Marcado"` | Unscheduled |
-| `"Realizado"` | Played / completed |
-| `"Anulado"` | Cancelled |
-| `"Adiado"` | Postponed |
-
----
+`number` feeds `sav game-sheet`. `id` is internal; no CLI needs it.
 
 ### `sav game-sheets`
 
-List games across all statuses, with client-side date filtering. Unlike
-`sav games`, this works correctly for completed (`Realizado`) games — the SAV2
-server drops completed games when date-filtering, so this command fetches the
-full season and filters locally.
-
-**Use this instead of `sav games` whenever you need `game_number` values for
-`sav game-sheet`**, especially for games that may already have been played.
+**Prefer this over `sav games` whenever you need `number` values** — especially for played games. SAV2 drops `Realizado` games from server-side date filters; this command fetches the full season and filters locally.
 
 ```sh
-sav --output json game-sheets                               # all games, current season
-sav --output json game-sheets --date 19-04-2026            # single date
+sav --output json game-sheets
+sav --output json game-sheets --date 19-04-2026                       # single day
 sav --output json game-sheets --date-from 01-04-2026 --date-to 30-04-2026
 sav --output json game-sheets --tier "Sub 14"
-sav --output json game-sheets --competition "Ribas"        # name fragment, case-insensitive
-sav --output json game-sheets --status Realizado           # played games only
-sav --output json game-sheets --date 19-04-2026 --tier "Sub 14"
+sav --output json game-sheets --competition "Ribas"                   # fragment
+sav --output json game-sheets --status Realizado
 ```
 
-**Date format:** `DD-MM-YYYY`. `--date` is shorthand for setting both `--date-from`
-and `--date-to` to the same value.
-
-**`--status` is optional** — omit to see all statuses.
-
-**JSON shape:** same as `sav games`.
-
----
+`--date` is shorthand for setting both bounds. `--status` optional (all by default). JSON shape matches `sav games`.
 
 ### `sav game-sheet GAME_NUMBER`
 
-Show the eligible players list or generate the **pre-game game sheet PDF** for
-one or both teams.
+Eligible players list or **pre-game PDF**. `GAME_NUMBER` from `sav games` / `sav game-sheets` (e.g. `S14M-001`).
 
-`GAME_NUMBER` is the human-readable number from `sav games` or `sav game-sheets`
-(e.g. `S14M-001`).
+> Not the referee sheet — that's the post-game uploaded doc, library-only via `get_game_sheet_pdf()`.
 
-> **Not to be confused with the referee sheet.** The referee sheet is the
-> post-game document uploaded by the referee — it is not accessible via the CLI.
-> Use `get_game_sheet_pdf()` from the Python library for that.
-
-#### List mode (default)
-
-`--home` and `--away` are optional. When neither is given, both teams are shown.
+**List mode** (no `--out`). `--home` / `--away` optional; both shown if omitted.
 
 ```sh
 sav game-sheet S14M-001                      # both teams, all sections
-sav game-sheet S14M-001 --home               # home team only
-sav game-sheet S14M-001 --away               # away team only
-sav game-sheet S14M-001 --coaches            # coaches only, both teams
-sav game-sheet S14M-001 --home --players     # players only, home team
-sav game-sheet S14M-001 --players --coaches  # players + coaches, both teams
-sav game-sheet S14M-001 --away --staff       # staff only, away team
-```
-
-**Always use `--output json` when reading the output programmatically.**
-
-```sh
+sav game-sheet S14M-001 --home --players
+sav game-sheet S14M-001 --away --staff
 sav --output json game-sheet S14M-001 --home
 ```
 
-Single-team JSON shape:
+Section flags (`--players`, `--coaches`, `--staff`) affect table output only; JSON always returns all keys.
+
+Single-team JSON:
 ```json
-{
-  "game_number": "S14M-001",
-  "players":     [{"licence": "301772", "name": "João Silva", "birth_date": "1990-05-12", "status": "FBP"}],
-  "coaches_pri": [{"wallet": "44321", "name": "Carlos Coach", "grade": "...", "function": "..."}],
-  "coaches_adj": [],
-  "staff":       []
-}
+{"game_number": "S14M-001",
+ "players":     [{"licence": "301772", "name": "...", "birth_date": "...", "status": "FBP"}],
+ "coaches_pri": [{"wallet": "44321", "name": "...", "grade": "...", "function": "..."}],
+ "coaches_adj": [], "staff": []}
 ```
 
-Both-teams JSON shape (no `--home` / `--away`):
-```json
-{
-  "home": {"game_number": "S14M-001", "players": [...], "coaches_pri": [...], "coaches_adj": [...], "staff": [...]},
-  "away": {"game_number": "S14M-001", "players": [...], "coaches_pri": [...], "coaches_adj": [...], "staff": [...]}
-}
-```
+Both teams: `{"home": {...}, "away": {...}}`.
 
-Section flags `--players`, `--coaches`, `--staff` apply to table output only; JSON always returns all keys.
-
-#### PDF mode
-
-Pass `--out` (and optionally `--player`, `--coach-pri`, `--coach-adj`) to generate
-and save the pre-game game sheet PDF. **`--home` or `--away` is required in PDF mode.**
+**PDF mode** — `--out` plus `--home` or `--away` (required).
 
 ```sh
-# All eligible, default filename game_S14M-001_home.pdf
-sav game-sheet S14M-001 --home --out
-
-# Custom path
-sav game-sheet S14M-001 --home --out /tmp/lineup.pdf
-
-# Specific players (licence numbers)
+sav game-sheet S14M-001 --home --out                               # all eligible
+sav game-sheet S14M-001 --home --out /tmp/lineup.pdf               # custom path
 sav game-sheet S14M-001 --home --out --player 301772 --player 285943
-
-# Specific head coach (wallet number)
-sav game-sheet S14M-001 --home --out --coach-pri 44321
-
-# Specific adjunct coach
-sav game-sheet S14M-001 --home --out --coach-adj 55432
+sav game-sheet S14M-001 --home --out --coach-pri 44321 --coach-adj 55432
 ```
 
-Defaults when generating a PDF:
-- `--player` not set → all eligible players included.
-- `--coach-pri` not set → all head coaches included.
-- `--coach-adj` not set → all adjunct coaches included.
-- OUTROS TREINADORES and ENQUADRAMENTO HUMANO are always excluded (no CLI flags for them).
+Defaults: all eligible players / coaches included; OUTROS TREINADORES and ENQUADRAMENTO HUMANO always excluded (no CLI flags). `--out` with no path writes `game_<NUMBER>_<home|away>.pdf` in cwd.
 
-**Important — coach pool vs PDF slot:** `coaches_pri` and `coaches_adj` from the
-eligible list are eligibility pools, not exclusive slots. A coach who appears only
-in `coaches_pri` can still be passed as `--coach-adj` and vice versa. Search both
-pools when matching a name to a wallet number. Only reject if the coach is absent
-from both pools entirely.
+**Coach pool vs PDF slot:** `coaches_pri` and `coaches_adj` are eligibility pools, not exclusive slots. A coach listed only in `coaches_pri` can still be passed as `--coach-adj`. Search **both pools** when matching a name → wallet; only reject when absent from both.
 
-`--out` without a path saves as `game_<NUMBER>_<home|away>.pdf` in the current directory.
+## Workflows
 
----
+**Find active player:** `sav --output json players --name "João Silva"` → filter `active: true`. Narrow with `--tier` / `--club` if ambiguous.
 
-## Typical agent workflows
+**Resolve club ID:** `sav --output json clubs "Rio Maior"` → use `id`.
 
-### Find a player by name
-
+**Generate game sheet PDF:**
 ```sh
-sav --output json players --name "João Silva"
+sav --output json game-sheets --date 19-04-2026                    # 1. find game number
+sav --output json game-sheet S14M-001 --home                       # 2. inspect eligible + wallets
+sav game-sheet S14M-001 --home --out /tmp/sheet.pdf \              # 3. render
+  --player 301772 --player 285943 --coach-pri 44321
 ```
 
-If results are ambiguous, narrow with `--tier`, `--club`, or `--association`.
-Use the `license` field from the result for follow-up calls.
+## Errors
 
-### Look up a club ID from a name
+Printed to stderr; non-zero exit.
 
-```sh
-sav --output json clubs "Rio Maior"
-```
-
-Use the `id` field in subsequent `sav players --club <id>` calls.
-
-### Check whether a player is currently active
-
-```sh
-sav --output json players --license 301772
-```
-
-Look at `"active": true`. A player with `active: false` is registered in SAV
-but not eligible for the current season.
-
-### Generate a pre-game game sheet PDF
-
-1. Find the game number (use `game-sheets` — it handles completed games correctly):
-   ```sh
-   sav --output json game-sheets --date 19-04-2026
-   ```
-2. Inspect eligible players and coaches (use `--coaches` to find wallet numbers):
-   ```sh
-   sav --output json game-sheet S14M-001 --home --coaches
-   ```
-3. Generate the PDF with selected players and coach:
-   ```sh
-   sav game-sheet S14M-001 --home --out /tmp/sheet.pdf \
-     --player 301772 --player 285943 \
-     --coach-pri 44321
-   ```
-
----
-
-## Error handling
-
-All errors are printed to stderr and the process exits with a non-zero code.
-
-| Error message pattern | Meaning |
-|-----------------------|---------|
-| `Authentication failed` | Wrong credentials or SAV2 unreachable |
-| `No player found with licence …` | Licence does not exist in the current search scope |
-| `No game found with number …` | Game number not visible to this account |
-| `Game … has no internal ID` | The game row has no SAV2 action button; sheet unavailable |
-| `No club found matching …` | Name fragment matched nothing; run `sav clubs` to browse |
-| `Multiple associations match …` | Be more specific or use the numeric ID |
-| `No eligible players PDF available` | SAV2 returned no eligible page for this team |
+| Pattern | Meaning |
+|---------|---------|
+| `Authentication failed` | Bad creds or SAV2 unreachable |
+| `No player found with licence …` | Licence not in scope |
+| `No game found with number …` | Game not visible to this account |
+| `Game … has no internal ID` | Row has no action button; sheet unavailable |
+| `No club found matching …` | Run `sav clubs` to browse |
+| `Multiple associations match …` | Use numeric ID |
+| `No eligible players PDF available` | SAV2 returned nothing for this team |

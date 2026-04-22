@@ -189,11 +189,30 @@ def _make_client() -> SavClient:
   show_default=True,
   help="Output format.",
 )
+@click.option(
+  "--fields",
+  default=None,
+  help="Comma-separated field projection for JSON/CSV output (e.g. 'name,license,active'). Ignored for table output.",
+)
 @click.pass_context
-def cli(ctx, output):
+def cli(ctx, output, fields):
   """SAV2 API client."""
   ctx.ensure_object(dict)
   ctx.obj["output"] = output
+  ctx.obj["fields"] = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
+
+
+def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
+  """Project each row dict down to the requested fields."""
+  if not fields:
+    return rows
+  if rows:
+    unknown = [f for f in fields if f not in rows[0]]
+    if unknown:
+      raise click.UsageError(
+        f"Unknown field(s): {', '.join(unknown)}. Available: {', '.join(rows[0].keys())}"
+      )
+  return [{f: r[f] for f in fields} for r in rows]
 
 
 @cli.command("players")
@@ -259,17 +278,21 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
     click.echo("No players found.")
     return
 
+  fields = ctx.obj.get("fields")
+
   if output == "json":
-    click.echo(json.dumps([asdict(a) for a in results], ensure_ascii=False, indent=2))
+    rows = _project([asdict(a) for a in results], fields)
+    click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
-    fields = ["id", "license", "name", "association", "club", "tier", "gender",
-              "season", "status", "birth_date", "nationality", "active"]
-    click.echo(",".join(fields))
-    for a in results:
-      row = asdict(a)
-      click.echo(",".join(str(row[f]) for f in fields))
+    default_fields = ["id", "license", "name", "association", "club", "tier", "gender",
+                      "season", "status", "birth_date", "nationality", "active"]
+    rows = _project([asdict(a) for a in results], fields)
+    csv_fields = fields or default_fields
+    click.echo(",".join(csv_fields))
+    for r in rows:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
     return
 
   headers = ["License", "Name", "Club", "Tier", "Gender", "Season", "Birth Date", "Active"]
@@ -318,16 +341,20 @@ def player_cmd(ctx, license_num, photo):
     except (SavConnectionError, SavResponseError) as e:
       raise click.ClickException(str(e))
 
+  projection = ctx.obj.get("fields")
+
   if output == "json":
-    click.echo(json.dumps(asdict(player), ensure_ascii=False, indent=2))
+    rows = _project([asdict(player)], projection)
+    click.echo(json.dumps(rows[0], ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
-    csv_fields = ["id", "license", "name", "birth_date", "gender", "nationality",
-                  "club", "association", "tier", "status", "season", "active", "photo_url"]
+    default_fields = ["id", "license", "name", "birth_date", "gender", "nationality",
+                      "club", "association", "tier", "status", "season", "active", "photo_url"]
+    rows = _project([asdict(player)], projection)
+    csv_fields = projection or default_fields
     click.echo(",".join(csv_fields))
-    row = asdict(player)
-    click.echo(",".join(str(row[f]) for f in csv_fields))
+    click.echo(",".join(str(rows[0][f]) for f in csv_fields))
     return
 
   fields = [
@@ -366,14 +393,19 @@ def associations_cmd(ctx):
     click.echo("No associations found.")
     return
 
+  fields = ctx.obj.get("fields")
+  data = [{"id": a.id, "name": a.name} for a in results]
+
   if output == "json":
-    click.echo(json.dumps([{"id": a.id, "name": a.name} for a in results], ensure_ascii=False, indent=2))
+    click.echo(json.dumps(_project(data, fields), ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
-    click.echo("id,name")
-    for a in results:
-      click.echo(f"{a.id},{a.name}")
+    projected = _project(data, fields)
+    csv_fields = fields or ["id", "name"]
+    click.echo(",".join(csv_fields))
+    for r in projected:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
     return
 
   headers = ["ID", "Name"]
@@ -411,17 +443,19 @@ def clubs_cmd(ctx, query, association):
     click.echo("No clubs found.")
     return
 
+  fields = ctx.obj.get("fields")
+  data = [{"id": c.id, "name": c.name, "full_name": c.full_name, "code": c.code} for c in results]
+
   if output == "json":
-    click.echo(json.dumps(
-      [{"id": c.id, "name": c.name, "full_name": c.full_name, "code": c.code} for c in results],
-      ensure_ascii=False, indent=2,
-    ))
+    click.echo(json.dumps(_project(data, fields), ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
-    click.echo("id,name,full_name,code")
-    for c in results:
-      click.echo(f"{c.id},{c.name},{c.full_name},{c.code}")
+    projected = _project(data, fields)
+    csv_fields = fields or ["id", "name", "full_name", "code"]
+    click.echo(",".join(csv_fields))
+    for r in projected:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
     return
 
   headers = ["ID", "Name", "Full Name", "Code"]
@@ -490,17 +524,21 @@ def games_cmd(ctx, season, date_from, date_to, tier, gender, status):
     click.echo("No games found.")
     return
 
+  fields = ctx.obj.get("fields")
+
   if output == "json":
-    click.echo(json.dumps([asdict(g) for g in results], ensure_ascii=False, indent=2))
+    rows = _project([asdict(g) for g in results], fields)
+    click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
     return
 
   if output == "csv":
-    fields = ["number", "date", "time", "home", "away", "home_score",
-              "away_score", "competition", "tier", "venue", "game_status"]
-    click.echo(",".join(fields))
-    for g in results:
-      row = asdict(g)
-      click.echo(",".join(str(row[f]) for f in fields))
+    default_fields = ["number", "date", "time", "home", "away", "home_score",
+                      "away_score", "competition", "tier", "venue", "game_status"]
+    rows = _project([asdict(g) for g in results], fields)
+    csv_fields = fields or default_fields
+    click.echo(",".join(csv_fields))
+    for r in rows:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
     return
 
   headers = ["#", "Date", "Time", "Home", "Away", "Score", "Tier", "Status"]
