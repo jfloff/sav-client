@@ -96,6 +96,7 @@ Must be first. Raises `SavAuthError` on bad credentials.
 client.search_players()                                # own club, current season
 client.search_players(license="301772")                # exact; other filters ignored server-side
 client.search_players(tier="Sénior")
+client.search_players(status="active")                 # client-side active/inactive filter
 client.search_players(tier=["Mini 12", "Mini 10"])     # parallel, deduplicated
 client.search_players(club=270)
 client.search_players(club=[270, 666, 2430])           # parallel, deduplicated
@@ -110,6 +111,7 @@ client.search_players(season=0)                        # all seasons
 | `name` | `str` | `""` | Partial match |
 | `license` | `str` | `""` | Exact; overrides others server-side |
 | `number` | `str` | `""` | Shirt number |
+| `status` | `str` | `""` | Eligibility status: `"active"`, `"inactive"`, or `"all"` |
 | `gender` | `int` | `0` | 0 = any |
 | `tier` | `str\|list[str]` | `""` | List runs in parallel |
 | `season` | `int\|None` | current | `0` = all seasons |

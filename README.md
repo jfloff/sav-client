@@ -11,7 +11,7 @@ manually.
 
 ## Features
 
-- **Player search** — filter by name, licence, club, association, tier, season
+- **Player search** — filter by name, licence, club, association, tier, season, status
 - **Player detail** — fetch full profile including photo URL
 - **Club & association listing** — browse the federation hierarchy
 - **Game listing** — query scheduled and played games with flexible filters
@@ -56,6 +56,7 @@ SAV_PASSWORD=your_password
 # Players
 sav players
 sav players --name "João" --tier "Sénior"
+sav players --status active
 sav players --tier "Mini 12" --tier "Mini 10" --tier "Baby Basket" --all-clubs
 sav players --club "Rio Maior" --season 0
 sav --output json players --license 301772
@@ -96,7 +97,7 @@ client = SavClient.from_env()
 client.login()
 
 # Search players
-players = client.search_players(name="João", tier="Sénior")
+players = client.search_players(name="João", tier="Sénior", status="active")
 
 # List games
 games = client.list_games(date_from="01-04-2026", date_to="30-04-2026")

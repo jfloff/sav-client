@@ -258,6 +258,13 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
 @click.option("--name", default="", help="Filter by player name (partial).")
 @click.option("--license", "license_", default="", help="Filter by licence number.")
 @click.option("--number", default="", help="Filter by shirt number.")
+@click.option(
+  "--status",
+  default="all",
+  show_default=True,
+  type=click.Choice(["active", "inactive", "all"], case_sensitive=False),
+  help="Filter by player eligibility status.",
+)
 @click.option("--tier", "tiers", default=None, multiple=True, help="Filter by tier/escalão; repeatable (e.g. --tier 'Mini 12' --tier 'Mini 10').")
 @click.option("--gender", default=0, type=int, help="Filter by gender code (0 = any).")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current). Use 0 for all seasons.")
@@ -268,7 +275,7 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
 @click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching players instead of the list.")
 @click.pass_context
-def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, association, all_clubs, birth_date, limit, count):
+def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_date, limit, count):
   """Search and list players."""
   output = ctx.obj["output"]
   client = _make_client()
@@ -305,6 +312,7 @@ def players_cmd(ctx, name, license_, number, tiers, gender, season, clubs, assoc
       name=name,
       license=license_,
       number=number,
+      status=status,
       tier=tier_arg,
       gender=gender,
       season=season,

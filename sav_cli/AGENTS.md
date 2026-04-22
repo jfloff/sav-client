@@ -100,6 +100,7 @@ Search players. All filters combinable.
 ```sh
 sav --output json players --name "João"
 sav --output json players --license 301772
+sav --output json players --status active
 sav --output json players --tier "Sénior"
 sav --output json players --tier "Mini 12" --tier "Mini 10"    # parallel, deduplicated
 sav --output json players --club 270
@@ -114,6 +115,8 @@ sav --output json players --tier "Sénior" --count               # {"count": 23}
 ```
 
 `--tier` and `--club` are repeatable. `--club` is exclusive with `--association` / `--all-clubs`. `--count` is exclusive with `--limit`.
+
+`--status` filters on the parsed player eligibility state: `active`, `inactive`, or `all`. It is applied client-side using the `active` flag.
 
 Results are sorted by `id` for reproducible `--limit` output across runs. (Note: on `--all-clubs` with `--limit`, the short-circuit stops fetching once N unique players are collected — the *set* may vary across runs due to network timing, but the returned list is always sorted.)
 

@@ -216,6 +216,7 @@ class SavClient:
     name: str = "",
     license: str = "",
     number: str = "",
+    status: str = "",
     gender: int = 0,
     tier: str | list[str] = "",
     season: int | None = None,
@@ -241,6 +242,10 @@ class SavClient:
         license:     Filter by licence number (exact).  When set, all other
                      filters are ignored by the server.
         number:      Filter by shirt number.
+        status:      Filter by eligibility status: ``"active"``,
+                     ``"inactive"``, or ``"all"``. Applied client-side using
+                     ``Player.active`` because SAV2's player search request
+                     parameter is not yet documented in this client.
         gender:      0 = any, or the server's numeric gender code.
         tier:        Filter by age/competition tier (escalão), e.g. "Sénior".
                      Pass a list to search multiple tiers in parallel.
@@ -267,12 +272,17 @@ class SavClient:
     if self.session is None:
       raise SavResponseError("Must call login() before search_players()")
 
+    status_filter = self._parse_player_status_filter(status)
+    parallel_limit = None if status_filter is not None else limit
+
     if isinstance(tier, list):
-      return self._search_tier_list(
+      results = self._search_tier_list(
         tier, name=name, license=license, number=number, gender=gender,
         season=season, association=association, club=club,
-        birth_date=birth_date, limit=limit,
+        birth_date=birth_date, status=status, limit=parallel_limit,
       )
+      results = self._filter_players_status(results, status_filter)
+      return results[:limit] if limit is not None else results
 
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
@@ -285,19 +295,46 @@ class SavClient:
     )
 
     if isinstance(club, list):
-      return self._search_club_list(club, limit=limit, **filters)
+      results = self._search_club_list(club, limit=parallel_limit, **filters)
+      results = self._filter_players_status(results, status_filter)
+      return results[:limit] if limit is not None else results
 
     if club is None:
       club = int(self.session.get("organizacao") or 0)
 
     if club == 0:
-      return self._search_all_clubs(association=association, limit=limit, **filters)
+      results = self._search_all_clubs(association=association, limit=parallel_limit, **filters)
+      results = self._filter_players_status(results, status_filter)
+      return results[:limit] if limit is not None else results
 
     results = self._search_players_single(
       association=association, club=club, page=page, **filters,
     )
+    results = self._filter_players_status(results, status_filter)
     results = sorted(results, key=lambda p: p.id)
     return results[:limit] if limit is not None else results
+
+  @staticmethod
+  def _parse_player_status_filter(status: str) -> bool | None:
+    """Normalise a player status filter to active/inactive/all."""
+    wanted = status.strip().lower()
+    if not wanted or wanted == "all":
+      return None
+    if wanted == "active":
+      return True
+    if wanted == "inactive":
+      return False
+    raise ValueError("status must be 'active', 'inactive', or 'all'")
+
+  @staticmethod
+  def _filter_players_status(players: list[Player], status_filter: bool | None) -> list[Player]:
+    """Filter players by their parsed active/inactive eligibility flag."""
+    if status_filter is None:
+      return sorted(players, key=lambda p: p.id)
+    return sorted(
+      [p for p in players if p.active is status_filter],
+      key=lambda p: p.id,
+    )
 
   def _search_tier_list(
     self, tiers: list[str], *, max_workers: int = 8,

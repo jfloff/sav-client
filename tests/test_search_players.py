@@ -1,6 +1,7 @@
 import pytest
 
 from sav_client import SavClient
+from sav_client.models import Player
 from sav_client.exceptions import SavResponseError
 
 
@@ -61,3 +62,108 @@ class TestSearchPlayers:
 
     assert results
     assert any(player.license == sample_player.license for player in results)
+
+  def test_can_filter_players_by_active_status_case_insensitively(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+
+    def fake_search_single(**kwargs):
+      return [
+        Player(
+          id=1,
+          license="100",
+          name="A",
+          association="AB X",
+          club="Club X",
+          tier="Mini 12",
+          gender="Masculino",
+          birth_date="2015-01-01",
+          nationality="Portuguesa",
+          status="FBP",
+          season="2025/2026",
+          active=True,
+        ),
+        Player(
+          id=2,
+          license="101",
+          name="B",
+          association="AB X",
+          club="Club X",
+          tier="Mini 12",
+          gender="Masculino",
+          birth_date="2015-01-02",
+          nationality="Portuguesa",
+          status="Local",
+          season="2025/2026",
+          active=False,
+        ),
+      ]
+
+    monkeypatch.setattr(client, "_search_players_single", fake_search_single)
+
+    results = client.search_players(status="ACTIVE")
+
+    assert [player.id for player in results] == [1]
+    assert results[0].active is True
+
+  def test_status_filter_applies_before_final_limit_for_parallel_searches(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    captured = {}
+
+    def fake_search_club_list(club_ids, *, limit=None, **filters):
+      captured["club_ids"] = club_ids
+      captured["limit"] = limit
+      captured["filters"] = filters
+      return [
+        Player(
+          id=1,
+          license="100",
+          name="A",
+          association="AB X",
+          club="Club X",
+          tier="Mini 12",
+          gender="Masculino",
+          birth_date="2015-01-01",
+          nationality="Portuguesa",
+          status="Local",
+          season="2025/2026",
+          active=False,
+        ),
+        Player(
+          id=2,
+          license="101",
+          name="B",
+          association="AB X",
+          club="Club Y",
+          tier="Mini 12",
+          gender="Feminino",
+          birth_date="2015-01-02",
+          nationality="Portuguesa",
+          status="FBP",
+          season="2025/2026",
+          active=True,
+        ),
+        Player(
+          id=3,
+          license="102",
+          name="C",
+          association="AB X",
+          club="Club Z",
+          tier="Mini 12",
+          gender="Feminino",
+          birth_date="2015-01-03",
+          nationality="Portuguesa",
+          status="FBP",
+          season="2025/2026",
+          active=True,
+        ),
+      ]
+
+    monkeypatch.setattr(client, "_search_club_list", fake_search_club_list)
+
+    results = client.search_players(club=[10, 11], status="active", limit=1)
+
+    assert captured["club_ids"] == [10, 11]
+    assert captured["limit"] is None
+    assert [player.id for player in results] == [2]
