@@ -157,3 +157,97 @@ def test_player_forwards_all_clubs_scope(monkeypatch):
   assert result.exit_code == 0
   assert captured[0]["club"] == 0
   assert captured[0]["association"] is None
+
+
+def test_players_resolves_club_query_with_acronym_style_name(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def list_clubs(self, **kwargs):
+      return [
+        type("ClubStub", (), {
+          "id": 7,
+          "name": "Santarém Basket Clube",
+          "full_name": "Santarém Basket Clube",
+          "code": "SBC",
+        })()
+      ]
+
+    def search_players(self, **kwargs):
+      captured.update(kwargs)
+      return [
+        Player(
+          id=1,
+          license="100",
+          name="A",
+          association="AB X",
+          club="Santarém Basket Clube",
+          tier="Mini 12",
+          gender="Masculino",
+          birth_date="2015-01-01",
+          nationality="Portuguesa",
+          status="FBP",
+          season="2025/2026",
+          active=True,
+        )
+      ]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["--output", "json", "players", "--club", "Santarém BC"],
+  )
+
+  assert result.exit_code == 0
+  assert captured["club"] == 7
+
+
+def test_players_resolves_club_query_with_fuzzy_fallback(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def list_clubs(self, **kwargs):
+      return [
+        type("ClubStub", (), {
+          "id": 7,
+          "name": "Santarém Basket Clube",
+          "full_name": "Santarém Basket Clube",
+          "code": "SBC",
+        })()
+      ]
+
+    def search_players(self, **kwargs):
+      captured.update(kwargs)
+      return [
+        Player(
+          id=1,
+          license="100",
+          name="A",
+          association="AB X",
+          club="Santarém Basket Clube",
+          tier="Mini 12",
+          gender="Masculino",
+          birth_date="2015-01-01",
+          nationality="Portuguesa",
+          status="FBP",
+          season="2025/2026",
+          active=True,
+        )
+      ]
+
+  def fake_score(query, candidates):
+    return 91.0 if "santarem basket clube" in candidates else 0.0
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_rapidfuzz_best_score", fake_score)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["--output", "json", "players", "--club", "Santaram Bsket Clbe"],
+  )
+
+  assert result.exit_code == 0
+  assert captured["club"] == 7

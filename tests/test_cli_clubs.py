@@ -38,3 +38,46 @@ def test_clubs_forwards_all_associations(monkeypatch):
 
   assert result.exit_code == 0
   assert captured == {"association": None, "all_associations": True}
+
+
+def test_clubs_query_matches_acronym_style_name(monkeypatch):
+  class StubClient:
+    def list_clubs(self, **kwargs):
+      return [
+        Club(id=1, name="Santarém Basket Clube", full_name="Santarém Basket Clube", code="SBC")
+      ]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["--output", "json", "clubs", "--all-associations", "Santarém BC"],
+  )
+
+  assert result.exit_code == 0
+  assert '"Santarém Basket Clube"' in result.output
+
+
+def test_clubs_query_uses_fuzzy_fallback(monkeypatch):
+  class StubClient:
+    def list_clubs(self, **kwargs):
+      return [
+        Club(id=1, name="Santarém Basket Clube", full_name="Santarém Basket Clube", code="SBC"),
+        Club(id=2, name="Outro Clube", full_name="Outro Clube", code="OC"),
+      ]
+
+  def fake_score(query, candidates):
+    return 90.0 if "santarem basket clube" in candidates else 10.0
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_rapidfuzz_best_score", fake_score)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["--output", "json", "clubs", "--all-associations", "Santaram Bsket Clbe"],
+  )
+
+  assert result.exit_code == 0
+  assert '"Santarém Basket Clube"' in result.output

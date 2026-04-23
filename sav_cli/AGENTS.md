@@ -91,9 +91,7 @@ sav --output json clubs --all-associations
 # [{"id": 270, "name": "Rio Maior Basket", "full_name": "...", "code": "RMB"}]
 ```
 
-`id` feeds `sav players --club`.
-Exactly one scope is required: `--association` or `--all-associations`.
-Exactly one scope is required: `--association` or `--all-associations`.
+`id` feeds `sav players --club`. Exactly one scope is required: `--association` or `--all-associations`.
 
 ### `sav players`
 
@@ -214,6 +212,8 @@ Single-team JSON:
 
 Both teams: `{"home": {...}, "away": {...}}`.
 
+**When reading programmatically, always pass `--home` or `--away`.** The both-teams `{home, away}` shape is for human inspection; splitting the call keeps the JSON shape flat and predictable.
+
 **PDF mode** — `--out` plus `--home` or `--away` (required).
 
 ```sh
@@ -229,7 +229,7 @@ Defaults: all eligible players / coaches included; OUTROS TREINADORES and ENQUAD
 
 ## Workflows
 
-**Find active player:** `sav --output json players --name "João Silva"` → filter `active: true`. Narrow with `--tier` / `--club` if ambiguous.
+**Find active player:** `sav --output json players --name "João Silva" --status active --all-clubs`. Narrow with `--tier` / `--club` if ambiguous. Pair with `--limit` if you only need one or two hits.
 
 **Resolve club ID:** `sav --output json clubs "Rio Maior"` → use `id`.
 

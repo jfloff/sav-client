@@ -199,7 +199,12 @@ All regional associations. Only `id` and `name` populated.
 
 ### `list_clubs(association=None, *, all_associations=False) → list[Club]`
 
-Clubs in an explicit association scope.
+Clubs in an explicit association scope. **Exactly one of `association` (int) or `all_associations=True` must be provided** — passing neither or both raises `SavConfigError`. Results are cached per scope.
+
+```python
+client.list_clubs(association=7)          # clubs in one association
+client.list_clubs(all_associations=True)  # every club across every association (slow first call, cached thereafter)
+```
 
 ## Exceptions
 
@@ -218,8 +223,8 @@ from sav_client.exceptions import SavError, SavAuthError, SavConnectionError
 ## Workflows
 
 ```python
-# Active player by name
-active = [p for p in client.search_players(name="João Silva", club=0) if p.active]
+# Active player by name (status filter applied inside search_players)
+active = client.search_players(name="João Silva", status="active", club=0)
 
 # Club ID from name
 assoc = next(a for a in client.list_associations() if "Santarém" in a.name)

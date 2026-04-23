@@ -15,7 +15,9 @@ Usage
 from __future__ import annotations
 
 import json
+import re
 import shutil
+import unicodedata
 from dataclasses import asdict
 from typing import Any
 
@@ -188,11 +190,7 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
   except Exception as e:
     raise SavCliError(f"Could not fetch clubs list: {e}", code="fetch_failed")
 
-  q = club.lower()
-  matches = [
-    c for c in clubs
-    if q in c.name.lower() or q in c.full_name.lower() or q in c.code.lower()
-  ]
+  matches = _find_club_matches(clubs, club)
 
   if not matches:
     raise SavCliError(
@@ -206,6 +204,104 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
     click.echo(f"Matched {len(matches)} clubs for {club!r}: {names}", err=True)
 
   return [c.id for c in matches]
+
+
+def _normalise_text(value: str) -> str:
+  """Lowercase, strip accents, and collapse punctuation/spacing for search."""
+  ascii_value = "".join(
+    ch for ch in unicodedata.normalize("NFKD", value)
+    if not unicodedata.combining(ch)
+  )
+  return " ".join(re.sub(r"[^a-z0-9]+", " ", ascii_value.lower()).split())
+
+
+def _field_aliases(value: str) -> tuple[str, set[str], set[str]]:
+  """Return normalised field text plus token/acronym aliases for fuzzy matching."""
+  normalised = _normalise_text(value)
+  if not normalised:
+    return "", set(), set()
+
+  tokens = tuple(normalised.split())
+  aliases = {normalised, "".join(tokens)}
+  if tokens:
+    aliases.add("".join(token[0] for token in tokens))
+    if len(tokens) >= 2:
+      for start in range(1, len(tokens)):
+        aliases.add("".join(token[0] for token in tokens[start:]))
+  return normalised, set(tokens), {a for a in aliases if a}
+
+
+def _club_matches_query(club: Any, query: str) -> bool:
+  """Match a club query against name/full-name/code with accent-tolerant aliases."""
+  normalised_query = _normalise_text(query)
+  if not normalised_query:
+    return True
+
+  query_tokens = normalised_query.split()
+  for raw in (getattr(club, "name", ""), getattr(club, "full_name", ""), getattr(club, "code", "")):
+    field_text, field_tokens, aliases = _field_aliases(raw)
+    if not field_text:
+      continue
+    if normalised_query in field_text or normalised_query in aliases:
+      return True
+    if all(token in field_tokens or token in aliases for token in query_tokens):
+      return True
+  return False
+
+
+def _club_match_candidates(club: Any) -> list[str]:
+  """Build normalised candidate strings for fuzzy club matching."""
+  candidates: set[str] = set()
+  for raw in (getattr(club, "name", ""), getattr(club, "full_name", ""), getattr(club, "code", "")):
+    field_text, field_tokens, aliases = _field_aliases(raw)
+    if field_text:
+      candidates.add(field_text)
+    candidates.update(field_tokens)
+    candidates.update(aliases)
+  return sorted(c for c in candidates if c)
+
+
+def _rapidfuzz_best_score(query: str, candidates: list[str]) -> float:
+  """Return the best fuzzy score for a query/candidate set, or 0 when unavailable."""
+  try:
+    from rapidfuzz import fuzz
+  except ImportError:
+    return 0.0
+
+  normalised_query = _normalise_text(query)
+  if not normalised_query:
+    return 0.0
+
+  best = 0.0
+  for candidate in candidates:
+    best = max(
+      best,
+      fuzz.ratio(normalised_query, candidate),
+      fuzz.partial_ratio(normalised_query, candidate),
+      fuzz.token_sort_ratio(normalised_query, candidate),
+      fuzz.token_set_ratio(normalised_query, candidate),
+    )
+  return float(best)
+
+
+def _find_club_matches(clubs: list[Any], query: str) -> list[Any]:
+  """Find direct matches first, then fuzzy matches ranked by score."""
+  direct_matches = [c for c in clubs if _club_matches_query(c, query)]
+  if direct_matches:
+    return direct_matches
+
+  scored: list[tuple[float, Any]] = []
+  for club in clubs:
+    score = _rapidfuzz_best_score(query, _club_match_candidates(club))
+    if score >= 82:
+      scored.append((score, club))
+
+  if not scored:
+    return []
+
+  scored.sort(key=lambda item: (-item[0], getattr(item[1], "name", "")))
+  best_score = scored[0][0]
+  return [club for score, club in scored if score >= best_score - 3]
 
 
 def _make_client() -> SavClient:
@@ -566,11 +662,7 @@ def clubs_cmd(ctx, query, association, all_associations):
     raise SavCliError(str(e), code=_exc_code(e))
 
   if query:
-    q = query.lower()
-    results = [
-      c for c in results
-      if q in c.name.lower() or q in c.full_name.lower() or q in c.code.lower()
-    ]
+    results = _find_club_matches(results, query)
 
   if not results:
     click.echo("No clubs found.")
