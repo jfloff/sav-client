@@ -222,7 +222,7 @@ class SavClient:
     season: int | None = None,
     association: int | None = None,
     club: int | list[int] | None = None,
-    birth_date: str = "",
+    birth_year: int | list[int] | None = None,
     page: int = 1,
     limit: int | None = None,
   ) -> list[Player]:
@@ -255,7 +255,9 @@ class SavClient:
                      all-clubs search.
         club:        SAV2 club ID, list of IDs, or ``0`` for all clubs.
                      Required explicitly for predictable search scope.
-        birth_date:  Filter by birth date string (YYYY-MM-DD).
+        birth_year:  Filter by birth year. Pass a single int or a list of ints
+                     (OR semantics). Applied client-side against the year
+                     component of ``Player.birth_date``.
         page:        Result page number (1-based).  Ignored when multiple
                      clubs are searched.
         limit:       Stop aggregating once this many unique players have been
@@ -283,16 +285,25 @@ class SavClient:
       )
 
     status_filter = self._parse_player_status_filter(status)
-    parallel_limit = None if status_filter is not None else limit
+    birth_years = self._parse_birth_year_filter(birth_year)
+    # Status and birth-year are applied client-side after the server returns,
+    # so a parallel short-circuit on `limit` would cut off pre-filter.
+    parallel_limit = (
+      None if status_filter is not None or birth_years is not None else limit
+    )
+
+    def _post_filter(results: list[Player]) -> list[Player]:
+      results = self._filter_players_status(results, status_filter)
+      results = self._filter_players_birth_year(results, birth_years)
+      return results[:limit] if limit is not None else results
 
     if isinstance(tier, list):
       results = self._search_tier_list(
         tier, name=name, license=license, number=number, gender=gender,
         season=season, association=association, club=club,
-        birth_date=birth_date, status=status, limit=parallel_limit,
+        status=status, limit=parallel_limit,
       )
-      results = self._filter_players_status(results, status_filter)
-      return results[:limit] if limit is not None else results
+      return _post_filter(results)
 
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
@@ -301,25 +312,21 @@ class SavClient:
 
     filters = dict(
       name=name, license=license, number=number, gender=gender,
-      tier=tier, season=season, birth_date=birth_date,
+      tier=tier, season=season,
     )
 
     if isinstance(club, list):
       results = self._search_club_list(club, limit=parallel_limit, **filters)
-      results = self._filter_players_status(results, status_filter)
-      return results[:limit] if limit is not None else results
+      return _post_filter(results)
 
     if club == 0:
       results = self._search_all_clubs(association=association, limit=parallel_limit, **filters)
-      results = self._filter_players_status(results, status_filter)
-      return results[:limit] if limit is not None else results
+      return _post_filter(results)
 
     results = self._search_players_single(
       association=association, club=club, page=page, **filters,
     )
-    results = self._filter_players_status(results, status_filter)
-    results = sorted(results, key=lambda p: p.id)
-    return results[:limit] if limit is not None else results
+    return _post_filter(sorted(results, key=lambda p: p.id))
 
   @staticmethod
   def _parse_player_status_filter(status: str) -> bool | None:
@@ -339,9 +346,35 @@ class SavClient:
     if status_filter is None:
       return sorted(players, key=lambda p: p.id)
     return sorted(
-      [p for p in players if p.active is status_filter],
+      [p for p in players if p.active == status_filter],
       key=lambda p: p.id,
     )
+
+  @staticmethod
+  def _parse_birth_year_filter(birth_year: int | list[int] | None) -> set[int] | None:
+    """Normalise birth_year input to a set of ints, or None for no filter."""
+    if birth_year is None:
+      return None
+    years = [birth_year] if isinstance(birth_year, int) else list(birth_year)
+    result: set[int] = set()
+    for y in years:
+      try:
+        result.add(int(y))
+      except (TypeError, ValueError):
+        raise ValueError(f"birth_year must be int or list[int], got {y!r}")
+    return result or None
+
+  @staticmethod
+  def _filter_players_birth_year(
+    players: list[Player], birth_years: set[int] | None,
+  ) -> list[Player]:
+    """Filter players whose birth_date year matches any of the requested years."""
+    if not birth_years:
+      return players
+    def _year_of(p: Player) -> int | None:
+      head = (p.birth_date or "").split("-", 1)[0]
+      return int(head) if head.isdigit() else None
+    return [p for p in players if _year_of(p) in birth_years]
 
   def _search_tier_list(
     self, tiers: list[str], *, max_workers: int = 8,
@@ -430,7 +463,7 @@ class SavClient:
       if not clubs_by_id:
         org = int(self.session.get("organizacao") or 0)
         if org:
-          clubs_by_id[org] = Club(id=org, name=str(org))
+          clubs_by_id[org] = Club(id=org, name=f"Club {org}")
 
     def _fetch(club_id: int) -> list[Player]:
       return self._search_players_single(club=club_id, page=1, **filters)
@@ -464,7 +497,6 @@ class SavClient:
     season: int = 0,
     association: int | None = None,
     club: int,
-    birth_date: str = "",
     page: int = 1,
   ) -> list[Player]:
     """Issue a single search request for one club and return results."""
@@ -480,7 +512,7 @@ class SavClient:
       "user": self.session.get("user", ""),
       "organizacao": self.session.get("organizacao", 0),
       "numpag": page,
-      "nr_dtnasc": birth_date,
+      "nr_dtnasc": "",
       "nr_clube": club,
     }
 

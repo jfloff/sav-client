@@ -94,17 +94,19 @@ Must be first. Raises `SavAuthError` on bad credentials.
 
 ```python
 client.search_players(club=270)                        # explicit single-club scope
-client.search_players(license="301772", club=0)        # exact; other filters ignored server-side
+client.search_players(license="301772", club=0)        # exact licence lookup still needs a scope
 client.search_players(tier="Sénior", club=270)
 client.search_players(status="active", club=270)       # client-side active/inactive filter
 client.search_players(tier=["Mini 12", "Mini 10"], club=0)  # parallel, deduplicated
-client.search_players(club=270)
+client.search_players(birth_year=[2008, 2009], club=0) # client-side year filter (OR)
 client.search_players(club=[270, 666, 2430])           # parallel, deduplicated
 client.search_players(club=0, association=7)           # all clubs in association
 client.search_players(club=0)                          # federation-wide (slow)
 client.search_players(club=0, limit=20)                # short-circuits after 20 unique hits
 client.search_players(season=0, club=0)                # all seasons
 ```
+
+`club=None` and `association=0` raise `ValueError`. `status` and `birth_year` are applied client-side *after* fetch, so `limit` cannot short-circuit parallel scans when either is set (correctness over speed).
 
 | Param | Type | Default | Notes |
 |-------|------|---------|-------|
@@ -117,7 +119,7 @@ client.search_players(season=0, club=0)                # all seasons
 | `season` | `int\|None` | current | `0` = all seasons |
 | `club` | `int\|list[int]\|None` | required | `0` = all; list = parallel |
 | `association` | `int\|None` | `None` | `None` = no filter; only meaningful when `club=0` |
-| `birth_date` | `str` | `""` | `YYYY-MM-DD` |
+| `birth_year` | `int\|list[int]\|None` | `None` | Client-side filter on `Player.birth_date` year; list = OR |
 | `page` | `int` | `1` | Ignored for multi-club |
 | `limit` | `int\|None` | `None` | Caps results; short-circuits parallel scans |
 
@@ -199,7 +201,7 @@ All regional associations. Only `id` and `name` populated.
 
 ### `list_clubs(association=None, *, all_associations=False) → list[Club]`
 
-Clubs in an explicit association scope. **Exactly one of `association` (int) or `all_associations=True` must be provided** — passing neither or both raises `SavConfigError`. Results are cached per scope.
+Clubs in an explicit association scope. **Exactly one of `association` (int) or `all_associations=True` must be provided** — passing neither or both raises `ValueError`. Results are cached per scope.
 
 ```python
 client.list_clubs(association=7)          # clubs in one association

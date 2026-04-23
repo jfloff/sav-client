@@ -36,6 +36,11 @@ from sav_client.exceptions import (
 # appropriately even after Click has unwound the context stack.
 _OUTPUT_MODE: str = "table"
 
+# Cap on how many clubs a single --club fragment may resolve to before we
+# refuse to fan out the search. Short/ambiguous queries can otherwise silently
+# trigger parallel searches against dozens of clubs.
+_CLUB_MATCH_LIMIT = 5
+
 
 class SavCliError(click.ClickException):
   """CLI error with a machine-readable `code`. Emits JSON to stderr when --output json."""
@@ -199,6 +204,14 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
       code="not_found",
     )
 
+  if len(matches) > _CLUB_MATCH_LIMIT:
+    names = "\n  ".join(f"{c.id}: {c.name}" for c in matches[:_CLUB_MATCH_LIMIT])
+    raise SavCliError(
+      f"{len(matches)} clubs match {club!r}; be more specific or use the numeric ID. "
+      f"First {_CLUB_MATCH_LIMIT}:\n  {names}",
+      code="ambiguous_match",
+    )
+
   if len(matches) > 1:
     names = ", ".join(c.name for c in matches)
     click.echo(f"Matched {len(matches)} clubs for {club!r}: {names}", err=True)
@@ -223,12 +236,12 @@ def _field_aliases(value: str) -> tuple[str, set[str], set[str]]:
 
   tokens = tuple(normalised.split())
   aliases = {normalised, "".join(tokens)}
-  if tokens:
+  if len(tokens) >= 2:
     aliases.add("".join(token[0] for token in tokens))
-    if len(tokens) >= 2:
-      for start in range(1, len(tokens)):
-        aliases.add("".join(token[0] for token in tokens[start:]))
-  return normalised, set(tokens), {a for a in aliases if a}
+    # Tail acronyms stopping at 2 remaining tokens so we never generate a 1-letter alias.
+    for start in range(1, len(tokens) - 1):
+      aliases.add("".join(token[0] for token in tokens[start:]))
+  return normalised, set(tokens), {a for a in aliases if len(a) >= 2}
 
 
 def _club_matches_query(club: Any, query: str) -> bool:
@@ -249,7 +262,7 @@ def _club_matches_query(club: Any, query: str) -> bool:
   return False
 
 
-def _club_match_candidates(club: Any) -> list[str]:
+def _club_match_candidates(club: Any) -> set[str]:
   """Build normalised candidate strings for fuzzy club matching."""
   candidates: set[str] = set()
   for raw in (getattr(club, "name", ""), getattr(club, "full_name", ""), getattr(club, "code", "")):
@@ -258,15 +271,12 @@ def _club_match_candidates(club: Any) -> list[str]:
       candidates.add(field_text)
     candidates.update(field_tokens)
     candidates.update(aliases)
-  return sorted(c for c in candidates if c)
+  return {c for c in candidates if c}
 
 
-def _rapidfuzz_best_score(query: str, candidates: list[str]) -> float:
-  """Return the best fuzzy score for a query/candidate set, or 0 when unavailable."""
-  try:
-    from rapidfuzz import fuzz
-  except ImportError:
-    return 0.0
+def _rapidfuzz_best_score(query: str, candidates: set[str]) -> float:
+  """Return the best fuzzy score for a query/candidate set."""
+  from rapidfuzz import fuzz
 
   normalised_query = _normalise_text(query)
   if not normalised_query:
@@ -376,11 +386,11 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
   help="Association ID or name fragment (e.g. 'Santarém' or 7). When omitted, association is not filtered.",
 )
 @click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations (federation-wide).")
-@click.option("--birth-date", default="", help="Filter by birth date (YYYY-MM-DD).")
+@click.option("--birth-year", "birth_years", default=None, multiple=True, type=int, help="Filter by birth year; repeatable (e.g. --birth-year 2008 --birth-year 2009).")
 @click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching players instead of the list.")
 @click.pass_context
-def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_date, limit, count):
+def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_years, limit, count):
   """Search and list players. Requires exactly one of --club, --association, or --all-clubs."""
   output = ctx.obj["output"]
 
@@ -426,7 +436,7 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
       season=season,
       club=club_arg,
       association=association_id,
-      birth_date=birth_date,
+      birth_year=list(birth_years) if birth_years else None,
       limit=limit,
     )
   except (SavConnectionError, SavResponseError) as e:

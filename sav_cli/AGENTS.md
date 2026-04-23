@@ -59,7 +59,7 @@ Branch on `code` for programmatic error handling:
 | `response_error` | Server returned malformed payload |
 | `config_error` | Missing/invalid env vars |
 | `not_found` | Licence/game/club/association didn't match |
-| `ambiguous_match` | Multiple matches; be more specific |
+| `ambiguous_match` | Multiple matches; be more specific (also fires when a `--club` fragment resolves to more than 5 clubs) |
 | `no_internal_id` | Game row has no action button; sheet unavailable |
 | `no_pdf` | SAV2 returned nothing for this team |
 | `fetch_failed` | Could not load associations/clubs list |
@@ -82,7 +82,7 @@ Feed `id` into `sav clubs --association`.
 
 ### `sav clubs [QUERY]`
 
-Clubs, optionally filtered by case-insensitive substring against short name, full name, or code.
+Clubs, optionally filtered by QUERY against short name, full name, or code (accent-tolerant substring + acronym alias + rapidfuzz fallback at score ≥ 82).
 
 ```sh
 sav --output json clubs --association 7
@@ -104,12 +104,12 @@ sav --output json players --status active --club 270
 sav --output json players --tier "Sénior" --club 270
 sav --output json players --tier "Mini 12" --tier "Mini 10" --all-clubs   # parallel, deduplicated
 sav --output json players --club 270
-sav --output json players --club "Rio Maior"                   # fragment may match >1
+sav --output json players --club "Rio Maior"                   # fragment may match >1 (errors with ambiguous_match if >5)
 sav --output json players --club 270 --club 666                # multiple clubs
 sav --output json players --association "Santarém"             # all clubs in it
 sav --output json players --all-clubs                          # federation-wide (slow)
 sav --output json players --season 0 --all-clubs               # all seasons
-sav --output json players --birth-date 1990-01-01 --club 270
+sav --output json players --birth-year 2008 --birth-year 2009 --all-clubs
 sav --output json players --limit 50 --all-clubs               # short-circuits wide scans
 sav --output json players --tier "Sénior" --count --club 270   # {"count": 23} — skips the payload
 ```
