@@ -85,38 +85,42 @@ Feed `id` into `sav clubs --association`.
 Clubs, optionally filtered by case-insensitive substring against short name, full name, or code.
 
 ```sh
-sav --output json clubs                        # own association
-sav --output json clubs "Rio Maior"            # name fragment
 sav --output json clubs --association 7
+sav --output json clubs "Rio Maior" --association 7
+sav --output json clubs --all-associations
 # [{"id": 270, "name": "Rio Maior Basket", "full_name": "...", "code": "RMB"}]
 ```
 
 `id` feeds `sav players --club`.
+Exactly one scope is required: `--association` or `--all-associations`.
+Exactly one scope is required: `--association` or `--all-associations`.
 
 ### `sav players`
 
 Search players. All filters combinable.
 
 ```sh
-sav --output json players --name "João"
-sav --output json players --license 301772
-sav --output json players --status active
-sav --output json players --tier "Sénior"
-sav --output json players --tier "Mini 12" --tier "Mini 10"    # parallel, deduplicated
+sav --output json players --name "João" --club 270
+sav --output json players --license 301772 --all-clubs
+sav --output json players --status active --club 270
+sav --output json players --tier "Sénior" --club 270
+sav --output json players --tier "Mini 12" --tier "Mini 10" --all-clubs   # parallel, deduplicated
 sav --output json players --club 270
 sav --output json players --club "Rio Maior"                   # fragment may match >1
 sav --output json players --club 270 --club 666                # multiple clubs
 sav --output json players --association "Santarém"             # all clubs in it
 sav --output json players --all-clubs                          # federation-wide (slow)
-sav --output json players --season 0                           # all seasons
-sav --output json players --birth-date 1990-01-01
-sav --output json players --limit 50                           # short-circuits wide scans
-sav --output json players --tier "Sénior" --count               # {"count": 23} — skips the payload
+sav --output json players --season 0 --all-clubs               # all seasons
+sav --output json players --birth-date 1990-01-01 --club 270
+sav --output json players --limit 50 --all-clubs               # short-circuits wide scans
+sav --output json players --tier "Sénior" --count --club 270   # {"count": 23} — skips the payload
 ```
 
+Exactly one scope is required: `--club`, `--association`, or `--all-clubs`.
 `--tier` and `--club` are repeatable. `--club` is exclusive with `--association` / `--all-clubs`. `--count` is exclusive with `--limit`.
 
 `--status` filters on the parsed player eligibility state: `active`, `inactive`, or `all`. It is applied client-side using the `active` flag.
+`--association` is one possible scope; use `--all-clubs` to search across all associations explicitly.
 
 Results are sorted by `id` for reproducible `--limit` output across runs. (Note: on `--all-clubs` with `--limit`, the short-circuit stops fetching once N unique players are collected — the *set* may vary across runs due to network timing, but the returned list is always sorted.)
 
@@ -135,10 +139,12 @@ JSON element:
 Player detail for one or more licences. Multiple licences fetched in parallel. JSON/CSV always returns a **list**; a single licence yields a 1-element list.
 
 ```sh
-sav --output json player 301772
-sav --output json player 301772 302000 303000        # batch, parallel
-sav --output json player 301772 --photo              # include photo_url
+sav --output json player 301772 --all-clubs
+sav --output json player 301772 302000 303000 --all-clubs   # batch, parallel
+sav --output json player 301772 --photo --club 270          # include photo_url
 ```
+
+Exactly one scope is required: `--club`, `--association`, or `--all-clubs`.
 
 Element shape matches a `players` row. Missing licences are logged to stderr as warnings; the command only errors (`code: not_found`) when **every** licence was missing.
 

@@ -3,10 +3,10 @@ Command-line interface for sav-client.
 
 Usage
 -----
-    sav players
-    sav players --name "João" --tier "Sénior"
-    sav players --license 301772
-    sav --output json players
+    sav players --club 270
+    sav players --name "João" --tier "Sénior" --club 270
+    sav players --license 301772 --all-clubs
+    sav --output json players --all-clubs
     sav --output csv games
     sav game-sheets
     sav game-sheets --tier "Sénior" --date-from 01-01-2026
@@ -139,7 +139,13 @@ def _render_table(
 def _resolve_association(client: SavClient, association: str) -> int:
   """Resolve an association argument to a numeric ID (name fragment or number)."""
   if association.lstrip("-").isdigit():
-    return int(association)
+    association_id = int(association)
+    if association_id == 0:
+      raise click.UsageError(
+        "--association no longer accepts 0. Omit --association to avoid filtering, "
+        "or use --all-clubs for federation-wide search."
+      )
+    return association_id
 
   try:
     associations = client.list_associations()
@@ -178,7 +184,7 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
     return [int(club)]
 
   try:
-    clubs = client.list_clubs()
+    clubs = client.list_clubs(all_associations=True)
   except Exception as e:
     raise SavCliError(f"Could not fetch clubs list: {e}", code="fetch_failed")
 
@@ -269,27 +275,33 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
 @click.option("--gender", default=0, type=int, help="Filter by gender code (0 = any).")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current). Use 0 for all seasons.")
 @click.option("--club", "clubs", default=None, multiple=True, help="Club ID or name fragment; repeatable (e.g. --club SBC --club 'Rio Maior').")
-@click.option("--association", default=None, help="Association ID or name fragment (e.g. 'Santarém' or 7). Searches all clubs within it.")
+@click.option(
+  "--association", default=None,
+  help="Association ID or name fragment (e.g. 'Santarém' or 7). When omitted, association is not filtered.",
+)
 @click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations (federation-wide).")
 @click.option("--birth-date", default="", help="Filter by birth date (YYYY-MM-DD).")
 @click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching players instead of the list.")
 @click.pass_context
 def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_date, limit, count):
-  """Search and list players."""
+  """Search and list players. Requires exactly one of --club, --association, or --all-clubs."""
   output = ctx.obj["output"]
-  client = _make_client()
 
   if clubs and (association is not None or all_clubs):
     raise click.UsageError("--club cannot be combined with --association or --all-clubs.")
   if association is not None and all_clubs:
     raise click.UsageError("--association and --all-clubs are mutually exclusive.")
+  if not clubs and association is None and not all_clubs:
+    raise click.UsageError("One of --club, --association, or --all-clubs is required.")
   if count and limit is not None:
     raise click.UsageError("--count and --limit are mutually exclusive.")
 
+  client = _make_client()
+
   if all_clubs:
     club_arg: int | list[int] | None = 0
-    association_id = 0
+    association_id = None
     click.echo("Searching all clubs across all associations (this may take a while)…", err=True)
   elif association is not None:
     association_id = _resolve_association(client, association)
@@ -300,10 +312,10 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
     for c in clubs:
       club_ids.extend(_resolve_clubs(client, c))
     club_arg = club_ids[0] if len(club_ids) == 1 else club_ids
-    association_id = 0
+    association_id = None
   else:
     club_arg = None
-    association_id = 0
+    association_id = None
 
   tier_arg: str | list[str] = list(tiers) if len(tiers) > 1 else (tiers[0] if tiers else "")
 
@@ -383,8 +395,11 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
 @cli.command("player")
 @click.argument("license_nums", nargs=-1, required=True)
 @click.option("--photo", is_flag=True, default=False, help="Fetch and include each player's photo URL.")
+@click.option("--club", "clubs", default=None, multiple=True, help="Club ID or name fragment; repeatable.")
+@click.option("--association", default=None, help="Association ID or name fragment.")
+@click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations.")
 @click.pass_context
-def player_cmd(ctx, license_nums, photo):
+def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
   """Show detail for one or more players by licence number.
 
   Pass multiple licence numbers to fetch them in parallel. JSON/CSV always
@@ -394,11 +409,31 @@ def player_cmd(ctx, license_nums, photo):
   from dataclasses import replace
 
   output = ctx.obj["output"]
+  if clubs and (association is not None or all_clubs):
+    raise click.UsageError("--club cannot be combined with --association or --all-clubs.")
+  if association is not None and all_clubs:
+    raise click.UsageError("--association and --all-clubs are mutually exclusive.")
+  if not clubs and association is None and not all_clubs:
+    raise click.UsageError("One of --club, --association, or --all-clubs is required.")
+
   client = _make_client()
+
+  if all_clubs:
+    club_arg: int | list[int] = 0
+    association_id = None
+  elif association is not None:
+    association_id = _resolve_association(client, association)
+    club_arg = 0
+  else:
+    club_ids: list[int] = []
+    for c in clubs:
+      club_ids.extend(_resolve_clubs(client, c))
+    club_arg = club_ids[0] if len(club_ids) == 1 else club_ids
+    association_id = None
 
   def _fetch(lic: str) -> Player | None:
     try:
-      results = client.search_players(license=lic)
+      results = client.search_players(license=lic, club=club_arg, association=association_id)
     except (SavConnectionError, SavResponseError):
       return None
     if not results:
@@ -508,19 +543,25 @@ def associations_cmd(ctx):
 
 @cli.command("clubs")
 @click.argument("query", default="", required=False)
-@click.option("--association", default=None, type=int, help="Association ID (from 'sav associations'). Defaults to your own.")
+@click.option("--association", default=None, type=int, help="Association ID (from 'sav associations').")
+@click.option("--all-associations", is_flag=True, default=False, help="Search clubs across every association.")
 @click.pass_context
-def clubs_cmd(ctx, query, association):
+def clubs_cmd(ctx, query, association, all_associations):
   """List clubs, optionally filtered by a name/code query.
 
   QUERY is an optional case-insensitive substring matched against the short
   name, full name, and code of each club (e.g. "Rio Maior" or "SBC").
   """
   output = ctx.obj["output"]
+  if association is None and not all_associations:
+    raise click.UsageError("One of --association or --all-associations is required.")
+  if association is not None and all_associations:
+    raise click.UsageError("--association and --all-associations are mutually exclusive.")
+
   client = _make_client()
 
   try:
-    results = client.list_clubs(association=association)
+    results = client.list_clubs(association=association, all_associations=all_associations)
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 

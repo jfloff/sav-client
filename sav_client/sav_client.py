@@ -220,7 +220,7 @@ class SavClient:
     gender: int = 0,
     tier: str | list[str] = "",
     season: int | None = None,
-    association: int = 0,
+    association: int | None = None,
     club: int | list[int] | None = None,
     birth_date: str = "",
     page: int = 1,
@@ -229,10 +229,9 @@ class SavClient:
     """
     Search for players in the SAV2 system.
 
-    When ``club`` is omitted the logged-in club is used.  Pass ``club=0``
-    to search across all clubs (scoped by ``association`` when non-zero, or
-    federation-wide).  Pass a list of IDs to search specific clubs in
-    parallel and return a merged, deduplicated result.
+    Pass ``club=0`` to search across all clubs (scoped by ``association``
+    when provided, or federation-wide). Pass a list of IDs to search
+    specific clubs in parallel and return a merged, deduplicated result.
 
     Pass a list of strings to ``tier`` to search multiple tiers in parallel
     and return a merged, deduplicated result.
@@ -251,9 +250,11 @@ class SavClient:
                      Pass a list to search multiple tiers in parallel.
         season:      SAV2 epoch ID.  Defaults to the current session epoch.
                      Pass ``0`` to return players across all seasons.
-        association: SAV2 association ID.  Defaults to 0 (any/auto).
-        club:        SAV2 club ID, list of IDs, or None (own club).
-                     Pass ``0`` to search all clubs.
+        association: SAV2 association ID. ``None`` means no association
+                     filter. Pass a real association ID when narrowing an
+                     all-clubs search.
+        club:        SAV2 club ID, list of IDs, or ``0`` for all clubs.
+                     Required explicitly for predictable search scope.
         birth_date:  Filter by birth date string (YYYY-MM-DD).
         page:        Result page number (1-based).  Ignored when multiple
                      clubs are searched.
@@ -271,6 +272,15 @@ class SavClient:
     """
     if self.session is None:
       raise SavResponseError("Must call login() before search_players()")
+    if association == 0:
+      raise ValueError(
+        "association=0 is no longer supported. Omit association for no filter, "
+        "or use club=0 with association=None for federation-wide search."
+      )
+    if club is None:
+      raise ValueError(
+        "club is required. Pass a club id/list, or 0 for all clubs."
+      )
 
     status_filter = self._parse_player_status_filter(status)
     parallel_limit = None if status_filter is not None else limit
@@ -298,9 +308,6 @@ class SavClient:
       results = self._search_club_list(club, limit=parallel_limit, **filters)
       results = self._filter_players_status(results, status_filter)
       return results[:limit] if limit is not None else results
-
-    if club is None:
-      club = int(self.session.get("organizacao") or 0)
 
     if club == 0:
       results = self._search_all_clubs(association=association, limit=parallel_limit, **filters)
@@ -390,7 +397,7 @@ class SavClient:
   def _search_all_clubs(
     self,
     *,
-    association: int = 0,
+    association: int | None = None,
     max_workers: int = 8,
     limit: int | None = None,
     **filters,
@@ -398,15 +405,15 @@ class SavClient:
     """
     Search every club in parallel and aggregate results, deduplicating by player id.
 
-    When ``association`` is non-zero, only clubs from that association are
-    searched.  Otherwise every club across every association is searched.
+    When ``association`` is provided, only clubs from that association are
+    searched. Otherwise every club across every association is searched.
     Up to ``max_workers`` clubs are queried concurrently.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     clubs_by_id: dict[int, Any] = {}
 
-    if association != 0:
+    if association is not None:
       for c in self.list_clubs(association=association):
         clubs_by_id[c.id] = c
     else:
@@ -421,8 +428,9 @@ class SavClient:
         logger.debug("Could not fetch associations; falling back to own", exc_info=True)
 
       if not clubs_by_id:
-        for c in self.list_clubs():
-          clubs_by_id[c.id] = c
+        org = int(self.session.get("organizacao") or 0)
+        if org:
+          clubs_by_id[org] = Club(id=org, name=str(org))
 
     def _fetch(club_id: int) -> list[Player]:
       return self._search_players_single(club=club_id, page=1, **filters)
@@ -454,7 +462,7 @@ class SavClient:
     gender: int = 0,
     tier: str = "",
     season: int = 0,
-    association: int = 0,
+    association: int | None = None,
     club: int,
     birth_date: str = "",
     page: int = 1,
@@ -466,7 +474,7 @@ class SavClient:
       "jc_findByNumber": number,
       "jc_sexo": gender,
       "jc_escalao": tier,
-      "jc_associacao": association,
+      "jc_associacao": "" if association is None else association,
       "jc_epoca": season,
       "perfil": self.session.get("perfil", 0),
       "user": self.session.get("user", ""),
@@ -871,17 +879,18 @@ class SavClient:
       raise SavResponseError("Must call login() before list_associations()")
     return self._cache.get_associations(self._fetch_associations)
 
-  def list_clubs(self, association: int | None = None) -> list[Club]:
+  def list_clubs(
+    self,
+    association: int | None = None,
+    *,
+    all_associations: bool = False,
+  ) -> list[Club]:
     """
-    Return clubs, optionally filtered by association (cached, TTL 7 days).
-
-    When `association` is omitted the clubs in the logged-in organisation's
-    own association are returned (mirrors the "Clubes" dropdown default).
+    Return clubs for an explicit association scope (cached, TTL 7 days).
 
     Args:
         association: Numeric association ID (from list_associations()).
-                     If None, defaults to the session organisation's
-                     association.
+        all_associations: When True, aggregate clubs from every association.
 
     Returns:
         List of Club objects sorted by name.
@@ -892,6 +901,18 @@ class SavClient:
     """
     if self.session is None:
       raise SavResponseError("Must call login() before list_clubs()")
+    if association is None and not all_associations:
+      raise ValueError(
+        "association or all_associations=True is required for explicit club scope."
+      )
+    if association is not None and all_associations:
+      raise ValueError("association and all_associations=True are mutually exclusive.")
+    if all_associations:
+      clubs_by_id: dict[int, Club] = {}
+      for assoc in self.list_associations():
+        for club in self.list_clubs(association=assoc.id):
+          clubs_by_id[club.id] = club
+      return sorted(clubs_by_id.values(), key=lambda c: c.name)
     return self._cache.get_clubs(self._fetch_and_enrich_clubs, association=association)
 
   def invalidate_cache(self) -> None:
@@ -919,26 +940,14 @@ class SavClient:
     )
 
   def _fetch_and_enrich_clubs(self, association: int | None) -> list[Club]:
-    if association is not None:
-      html = self._post_form(
-        _CLUBS_BY_ASSOC_PATH,
-        {"associacao": f"ass,{association}"},
-        params={"op": _CLUBS_BY_ASSOC_OP},
-      )
-      clubs = self._parse_clubs_html(html)
-    else:
-      org = self.session.get("organizacao", 0)
-      text = self._post_form(
-        _CLUBS_BY_ORG_PATH, {"clube": org}, params={"op": _CLUBS_BY_ORG_OP}
-      )
-      try:
-        import json as _json
-        raw = _json.loads(text)
-      except ValueError as exc:
-        raise SavResponseError(
-          f"Clubs response was not valid JSON: {text[:200]!r}"
-        ) from exc
-      clubs = self._parse_clubs_response(raw)
+    if association is None:
+      raise ValueError("association is required when fetching clubs for a single scope.")
+    html = self._post_form(
+      _CLUBS_BY_ASSOC_PATH,
+      {"associacao": f"ass,{association}"},
+      params={"op": _CLUBS_BY_ASSOC_OP},
+    )
+    clubs = self._parse_clubs_html(html)
 
     enriched = []
     for c in clubs:

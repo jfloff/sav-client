@@ -11,8 +11,15 @@ class TestSearchPlayers:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.search_players()
 
+  def test_requires_explicit_club_scope(self):
+    c = SavClient("https://sav2.fpb.pt", "user", "pass")
+    c.session = {"epoca_id": 123, "organizacao": 456}
+    with pytest.raises(ValueError, match="club is required"):
+      c.search_players()
+
   def test_returns_players_from_live_search(self, client):
-    results = client.search_players()
+    club_id = int(client.session.get("organizacao") or 0)
+    results = client.search_players(club=club_id)
 
     assert isinstance(results, list)
     assert results
@@ -24,21 +31,25 @@ class TestSearchPlayers:
     assert first.club
 
   def test_can_find_player_by_license(self, client, sample_player):
-    results = client.search_players(license=sample_player.license)
+    results = client.search_players(license=sample_player.license, club=0)
 
     assert results
     assert any(player.id == sample_player.id for player in results)
 
   def test_can_search_all_seasons_for_sample_player(self, client, sample_player):
-    results = client.search_players(license=sample_player.license, season=0)
+    results = client.search_players(license=sample_player.license, season=0, club=0)
 
     assert results
     assert any(player.license == sample_player.license for player in results)
 
   def test_can_search_players_across_multiple_clubs(self, client):
-    clubs = client.list_clubs()
+    clubs = []
+    for association in client.list_associations():
+      clubs = client.list_clubs(association=association.id)
+      if len(clubs) >= 2:
+        break
     if len(clubs) < 2:
-      pytest.skip("Need at least 2 clubs to test multi-club search")
+      pytest.skip("Need at least 2 clubs in one association to test multi-club search")
 
     ids = [clubs[0].id, clubs[1].id]
     results = client.search_players(club=ids)
@@ -101,7 +112,7 @@ class TestSearchPlayers:
 
     monkeypatch.setattr(client, "_search_players_single", fake_search_single)
 
-    results = client.search_players(status="ACTIVE")
+    results = client.search_players(status="ACTIVE", club=789)
 
     assert [player.id for player in results] == [1]
     assert results[0].active is True
@@ -167,3 +178,40 @@ class TestSearchPlayers:
     assert captured["club_ids"] == [10, 11]
     assert captured["limit"] is None
     assert [player.id for player in results] == [2]
+
+  def test_omitted_association_is_forwarded_as_none(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    captured = {}
+
+    def fake_search_single(**kwargs):
+      captured.update(kwargs)
+      return []
+
+    monkeypatch.setattr(client, "_search_players_single", fake_search_single)
+
+    client.search_players(club=789)
+
+    assert captured["association"] is None
+
+  def test_association_zero_is_rejected(self):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+
+    with pytest.raises(ValueError, match="association=0 is no longer supported"):
+      client.search_players(club=0, association=0)
+
+  def test_omitted_association_is_sent_as_empty_string_in_request_payload(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "tester"}
+    captured = {}
+
+    monkeypatch.setattr(client, "_post_form", lambda path, payload, params=None: captured.update({
+      "path": path,
+      "payload": payload,
+      "params": params,
+    }) or "<table><tbody></tbody></table>")
+
+    client._search_players_single(club=789, association=None)
+
+    assert captured["payload"]["jc_associacao"] == ""

@@ -54,12 +54,11 @@ SAV_PASSWORD=your_password
 
 ```bash
 # Players
-sav players
-sav players --name "João" --tier "Sénior"
-sav players --status active
+sav players --club "Rio Maior" --name "João" --tier "Sénior"
+sav players --club "Rio Maior" --status active
 sav players --tier "Mini 12" --tier "Mini 10" --tier "Baby Basket" --all-clubs
 sav players --club "Rio Maior" --season 0
-sav --output json players --license 301772
+sav --output json players --license 301772 --all-clubs
 
 # Games
 sav games
@@ -79,8 +78,8 @@ sav game-sheet 841 --home --out
 sav game-sheet 841 --home --out sheet.pdf --player 301772 --coach-pri 44321
 
 # Clubs & associations
-sav clubs
-sav clubs "Rio Maior"
+sav clubs --association 7
+sav clubs "Rio Maior" --all-associations
 sav associations
 ```
 
@@ -97,7 +96,7 @@ client = SavClient.from_env()
 client.login()
 
 # Search players
-players = client.search_players(name="João", tier="Sénior", status="active")
+players = client.search_players(name="João", tier="Sénior", status="active", club=270)
 
 # List games
 games = client.list_games(date_from="01-04-2026", date_to="30-04-2026")

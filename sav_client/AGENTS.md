@@ -93,17 +93,17 @@ Must be first. Raises `SavAuthError` on bad credentials.
 ### `search_players(**kwargs) → list[Player]`
 
 ```python
-client.search_players()                                # own club, current season
-client.search_players(license="301772")                # exact; other filters ignored server-side
-client.search_players(tier="Sénior")
-client.search_players(status="active")                 # client-side active/inactive filter
-client.search_players(tier=["Mini 12", "Mini 10"])     # parallel, deduplicated
+client.search_players(club=270)                        # explicit single-club scope
+client.search_players(license="301772", club=0)        # exact; other filters ignored server-side
+client.search_players(tier="Sénior", club=270)
+client.search_players(status="active", club=270)       # client-side active/inactive filter
+client.search_players(tier=["Mini 12", "Mini 10"], club=0)  # parallel, deduplicated
 client.search_players(club=270)
 client.search_players(club=[270, 666, 2430])           # parallel, deduplicated
 client.search_players(club=0, association=7)           # all clubs in association
 client.search_players(club=0)                          # federation-wide (slow)
 client.search_players(club=0, limit=20)                # short-circuits after 20 unique hits
-client.search_players(season=0)                        # all seasons
+client.search_players(season=0, club=0)                # all seasons
 ```
 
 | Param | Type | Default | Notes |
@@ -115,8 +115,8 @@ client.search_players(season=0)                        # all seasons
 | `gender` | `int` | `0` | 0 = any |
 | `tier` | `str\|list[str]` | `""` | List runs in parallel |
 | `season` | `int\|None` | current | `0` = all seasons |
-| `club` | `int\|list[int]\|None` | own | `None` = own; `0` = all; list = parallel |
-| `association` | `int` | `0` | Only used when `club=0` |
+| `club` | `int\|list[int]\|None` | required | `0` = all; list = parallel |
+| `association` | `int\|None` | `None` | `None` = no filter; only meaningful when `club=0` |
 | `birth_date` | `str` | `""` | `YYYY-MM-DD` |
 | `page` | `int` | `1` | Ignored for multi-club |
 | `limit` | `int\|None` | `None` | Caps results; short-circuits parallel scans |
@@ -197,9 +197,9 @@ pdf = client.get_game_sheet_pdf(game.id)
 
 All regional associations. Only `id` and `name` populated.
 
-### `list_clubs(association=None) → list[Club]`
+### `list_clubs(association=None, *, all_associations=False) → list[Club]`
 
-Clubs in an association; `None` = own association.
+Clubs in an explicit association scope.
 
 ## Exceptions
 
@@ -219,7 +219,7 @@ from sav_client.exceptions import SavError, SavAuthError, SavConnectionError
 
 ```python
 # Active player by name
-active = [p for p in client.search_players(name="João Silva") if p.active]
+active = [p for p in client.search_players(name="João Silva", club=0) if p.active]
 
 # Club ID from name
 assoc = next(a for a in client.list_associations() if "Santarém" in a.name)

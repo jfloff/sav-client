@@ -10,8 +10,14 @@ class TestListClubs:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.list_clubs()
 
-  def test_lists_live_clubs_for_logged_in_scope(self, client):
-    results = client.list_clubs()
+  def test_requires_explicit_association_scope(self):
+    c = SavClient("https://sav2.fpb.pt", "user", "pass")
+    c.session = {"organizacao": 456}
+    with pytest.raises(ValueError, match="association or all_associations=True is required"):
+      c.list_clubs()
+
+  def test_lists_live_clubs_for_all_associations(self, client):
+    results = client.list_clubs(all_associations=True)
 
     assert results
     assert all(club.id > 0 for club in results)

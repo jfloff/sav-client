@@ -12,7 +12,8 @@ def client():
 
 @pytest.fixture(scope="session")
 def sample_player(client):
-  players = client.search_players()
+  club_id = int(client.session.get("organizacao") or 0)
+  players = client.search_players(club=club_id)
   if not players:
     pytest.skip("Live SAV account has no visible players to use as a sample")
   return players[0]
