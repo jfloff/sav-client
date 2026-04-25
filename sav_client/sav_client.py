@@ -506,7 +506,7 @@ class SavClient:
       "jc_findByNumber": number,
       "jc_sexo": gender,
       "jc_escalao": tier,
-      "jc_associacao": "" if association is None else association,
+      "jc_associacao": 0 if association is None else association,
       "jc_epoca": season,
       "perfil": self.session.get("perfil", 0),
       "user": self.session.get("user", ""),
