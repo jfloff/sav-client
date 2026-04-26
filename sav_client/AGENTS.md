@@ -18,6 +18,10 @@ Python library for automating the FPB SAV2 basketball management system. Authori
 | **association / associação** | Regional body. Numeric `id` from `list_associations()`. |
 | **season / época** | Epoch ID. `None` = current; `0` = all seasons. |
 | **game_status** | `"Marcado"` (scheduled) · `"Realizado"` (played) · `"Não Marcado"` · `"Adiado"` · `"Anulado"`. |
+| **batch** (lote / guia) | A "Lote de Inscrição" — a group of player registration requests of one type, locked to one tier+gender. |
+| **batch type** | `1` = 1ª Inscrição · `2` = Revalidação · `3` = Transferência · `4` = Subida de escalão. |
+| **batch state** | `1` = Em construção (open, accepts items) · plus Devolvida / Em Validação / Em Pagamento. |
+| **gender_id** | `1` = Masculino, `2` = Feminino. |
 
 ## Setup
 
@@ -76,6 +80,24 @@ class Club:
     name: str        # short display
     full_name: str   # official
     code: str        # abbreviation, e.g. "SBC"
+
+@dataclass(frozen=True)
+class PlayerRegistrationBatch:
+    id: int           # internal — feeds add_player_to / remove_player_from / delete
+    number: str       # human-readable batch number
+    type_id: int      # 1=1ª Inscrição, 2=Revalidação, 3=Transferência, 4=Subida
+    type: str         # display name
+    association_id: int; association: str
+    club_id: int; club: str
+    tier_id: int; tier: str        # e.g. (5, "Sub 14")
+    gender_id: int; gender: str    # 1/Masculino, 2/Feminino
+    state_id: int; state: str      # 1=Em construção (open) + Devolvida/Em Validação/Em Pagamento
+    state_date: str   # ISO
+    item_count: int   # players currently in the batch
+    season_id: int; season: str
+
+    @property
+    def is_open(self) -> bool: ...   # True iff state_id == 1
 ```
 
 `list_associations()` also returns `Club` — only `id` and `name` populated there.
@@ -208,6 +230,94 @@ client.list_clubs(association=7)          # clubs in one association
 client.list_clubs(all_associations=True)  # every club across every association (slow first call, cached thereafter)
 ```
 
+## Player registration batches
+
+Batches ("Lotes" / "Guias de Inscrição") group player registration requests of one type, locked to a single (tier, gender) combination. Only batches in state `Em construção` (`is_open == True`, `state_id == 1`) accept new items.
+
+> **Currently `add_player_to_registration_batch()` only supports Revalidação (type=2).** 1ª Inscrição, Transferência, and Subida have different field surfaces and aren't implemented yet.
+
+### `list_player_registration_batches(*, season=None) → list[PlayerRegistrationBatch]`
+
+All batches visible to the authenticated club (every state). `season=None` uses the current epoch.
+
+```python
+batches = client.list_player_registration_batches()
+open_revalidations = [b for b in batches if b.is_open and b.type_id == 2]
+```
+
+### `list_player_registration_tiers(*, gender_id) → dict[int, str]`
+
+Tier ID → display name (e.g. `{5: "Sub 14", ...}`). The tier set differs by gender — `gender_id` (1 or 2) is required. Used internally by `create_player_registration_batch()` to resolve a tier name string.
+
+### `create_player_registration_batch(*, type, tier, gender_id, association_id=None, club_id=None, season=None) → int`
+
+Create a new batch, return its `id`. SAV2 does **not** prevent duplicate open batches — call `find_open_player_registration_batch()` first if you want to reuse one.
+
+```python
+batch_id = client.create_player_registration_batch(
+    type=2, tier="Sub 14", gender_id=1,           # tier accepts name or ID
+)
+```
+
+`association_id` / `club_id` default to the session's organization. `tier` accepts a name (resolved via `list_player_registration_tiers`) or a numeric ID.
+
+### `find_open_player_registration_batch(*, type, tier_id, gender_id, season=None) → PlayerRegistrationBatch | None`
+
+First open batch matching the (type, tier_id, gender_id) triple, or `None`. `tier_id` is **numeric**, not a name.
+
+```python
+batch = client.find_open_player_registration_batch(type=2, tier_id=5, gender_id=1)
+batch_id = batch.id if batch else client.create_player_registration_batch(
+    type=2, tier=5, gender_id=1,
+)
+```
+
+### `delete_player_registration_batch(batch_id) → None`
+
+Delete a batch by ID. Only `Em construção` batches can be deleted; the server response is currently ignored, so the call only raises on transport errors.
+
+### `add_player_to_registration_batch(batch_id, license, *, ...) → int`
+
+Walk the SAV2 multi-step enrolment wizard (load player → save step 1 → save step 2 → insurance/taxa cascades → pre-commit → commit). Returns the player's internal SAV2 id.
+
+```python
+client.add_player_to_registration_batch(batch_id, 301772)                     # all auto-derived
+client.add_player_to_registration_batch(batch_id, 301772, exam_date="2026-04-20")
+client.add_player_to_registration_batch(                                      # minor — guardian required
+    batch_id, 285943,
+    guardian_name="...", guardian_relation=1,
+    guardian_phone="91...", guardian_email="...",
+)
+```
+
+| Param | Type | Default | Notes |
+|-------|------|---------|-------|
+| `batch_id` | `int` | required | Must be open Revalidação |
+| `license` | `int` | required | Must appear in the batch's eligible-revalidations list |
+| `id_type`, `id_number`, `id_expiry` | `int`/`str`/`str` | `None` | Step 1 ID overrides — `None` = keep stored |
+| `telemovel`, `telefone`, `email` | `str` | `None` | Step 1 contact overrides |
+| `nome_pai`, `nome_mae` | `str` | `None` | Step 1 parent overrides |
+| `morada`, `cod_postal`, `localidade_txt` | `str` | `None` | Step 2 address overrides |
+| `distrito_id`, `concelho_id` | `int` | `None` | Step 2 address overrides |
+| `taxa_id` | `int` | auto | Auto-picked when only one option exists; required when ambiguous |
+| `exam_date` | `str` | today | `YYYY-MM-DD`. Medical exam is always assumed done (`exame=1`) |
+| `promote_to_tier_id` | `int` | `None` | Subida only; usually unset |
+| `guardian_name`, `guardian_relation`, `guardian_phone`, `guardian_email` | mixed | `None` | **Required when player is a minor** |
+| `consent_data`, `consent_communications` | `bool` | `True` | GDPR consents |
+| `consent_marketing` | `bool` | `False` | GDPR consent |
+
+Raises `SavConfigError` for missing minor-guardian fields or non-Revalidação batches; `SavResponseError` if the commit fails. The licence must appear in the batch's server-side eligible list — passing one that doesn't raises `ValueError` with the eligible count for context.
+
+### `remove_player_from_registration_batch(batch_id, license) → None`
+
+Remove a player from an open batch by licence. Internally loads the batch's rendered rows (op=10), maps `license → item_id` from each row's `eliJogador(item_id, ...)` button, then fires op=29 with that `item_id`. Raises `SavResponseError` if the licence isn't currently in the batch (with the current licence list for debugging).
+
+```python
+client.remove_player_from_registration_batch(batch_id, 301772)
+```
+
+> The id passed to op=29 is the per-row **batch-item id**, not the player's internal SAV2 id. (They occasionally happen to match, but the parser never relies on that.)
+
 ## Exceptions
 
 ```
@@ -240,4 +350,14 @@ open("game_sheet.pdf", "wb").write(pdf)
 
 # Referee sheet (may be absent)
 pdf = client.get_game_sheet_pdf(game.id)
+
+# Revalidate a player — reuse open batch or create one, then add
+batch = client.find_open_player_registration_batch(type=2, tier_id=5, gender_id=1)
+batch_id = batch.id if batch else client.create_player_registration_batch(
+    type=2, tier=5, gender_id=1,
+)
+client.add_player_to_registration_batch(batch_id, 301772)
+
+# Pull a player back out of a batch
+client.remove_player_from_registration_batch(batch_id, 301772)
 ```
