@@ -35,7 +35,7 @@ from .exceptions import (
   SavResponseError,
 )
 from .cache import Cache
-from .models import Player, Club, Game, LoginResult, Session
+from .models import Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
 from .utils import md5_hex, strip_html
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,29 @@ _CLUB_DETAIL_PATH = "php/clubesdb.php"
 _CLUB_DETAIL_OP = "9"
 _GAME_SHEET_PATH = "php/maindb.php"
 _GAME_SHEET_OP = "29"
+_REGISTRATIONS_PATH = "php/incricoesdb.php"
+_REGISTRATIONS_LIST_OP = "170"
+_REGISTRATIONS_TIERS_OP = "3"
+_REGISTRATIONS_CREATE_OP = "4"
+_REGISTRATIONS_DELETE_OP = "9"
+_REGISTRATIONS_BATCH_DETAIL_OP = "10"
+_REGISTRATIONS_REMOVE_ITEM_OP = "29"
+_REGISTRATIONS_LIST_REVALIDABLE_OP = "139"
+_REGISTRATIONS_LOAD_PLAYER_OP = "35"
+_REGISTRATIONS_SAVE_STEP1_OP = "33"
+_REGISTRATIONS_SAVE_STEP2_OP = "31"
+_REGISTRATIONS_LOAD_SEGURO_OP = "87"
+_REGISTRATIONS_LOAD_COMPANHIA_OP = "175"
+_REGISTRATIONS_LOAD_APOLICE_OP = "24"
+_REGISTRATIONS_TAXA_PRECHECK_OP = "162"
+_REGISTRATIONS_LOAD_TAXA_OP = "26"
+_REGISTRATIONS_PRECOMMIT_OP = "165"
+_REGISTRATIONS_COMMIT_OP = "36"
+_REGISTRATIONS_AGENTE_PLAYER = 1
+_REGISTRATIONS_STATE_OPEN = 1
+_REGISTRATIONS_TYPE_REVALIDACAO = 2
+_REGISTRATIONS_TIPOSEGURO_FEDERACAO = 1
+_REGISTRATIONS_PORTUGAL_ID = 155
 _DEFAULT_TIMEOUT = 30
 
 
@@ -114,7 +137,6 @@ class SavClient:
     self._http = requests.Session()
     self._http.headers.update(
       {
-        "Content-Type": "application/json",
         "Accept": "application/json",
         # Mimic the browser user-agent the system expects
         "User-Agent": (
@@ -124,6 +146,9 @@ class SavClient:
         ),
       }
     )
+    # Note: Content-Type is intentionally NOT set as a session default — it
+    # would override per-request values set automatically by `json=` (JSON)
+    # or `files=` (multipart with boundary). Each call sets its own.
 
     logger.debug("SavClient initialised for %s (user=%s)", self.base_url, username)
 
@@ -892,6 +917,1048 @@ class SavClient:
       )
 
     return pdf_resp.content
+
+  def list_player_registration_batches(
+    self,
+    *,
+    season: int | None = None,
+  ) -> list[PlayerRegistrationBatch]:
+    """
+    Return player registration batches ("Lotes" / "Guias de Inscrição")
+    visible to the authenticated club for one season.
+
+    The Pesquisa Lotes page renders four states (`Em construção`,
+    `Devolvida`, `Em Validação`, `Em Pagamento`); this method returns all
+    of them. To find a batch you can still add players to, prefer
+    ``find_open_player_registration_batch()`` or filter by
+    ``Batch.is_open``.
+
+    Args:
+        season: SAV2 epoch ID. Defaults to the current session epoch.
+
+    Returns:
+        List of PlayerRegistrationBatch objects, ordered as the server
+        returns them (most recent first).
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before list_player_registration_batches()"
+      )
+
+    if season is None:
+      season = int(self.session.get("epoca_id") or 0)
+
+    import json as _json
+
+    info = {
+      "epoca": str(season),
+      "perfil": self.session.get("perfil", 0),
+      "user": self.session.get("user", ""),
+      "organizacao": self.session.get("organizacao", 0),
+      "agente": _REGISTRATIONS_AGENTE_PLAYER,
+    }
+    payload = {"info": _json.dumps(info)}
+
+    raw = self._post_form(
+      _REGISTRATIONS_PATH,
+      payload,
+      params={"op": _REGISTRATIONS_LIST_OP},
+    )
+
+    try:
+      data = _json.loads(raw)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse registration batches response: {raw[:200]!r}"
+      ) from exc
+
+    rows = data.get("data") or []
+    return [self._parse_registration_batch(row) for row in rows]
+
+  def list_player_registration_tiers(
+    self, *, gender_id: int,
+  ) -> dict[int, str]:
+    """
+    Return the registration tiers (escalões) available for a given gender,
+    as a mapping of numeric tier ID -> human name (e.g. 5 -> "Sub 14").
+
+    The set differs by gender (some categories are male- or female-only),
+    so a gender_id is required.
+
+    Args:
+        gender_id: 1=Masculino, 2=Feminino.
+
+    Returns:
+        Dict mapping tier ID to display name. The "Não selecionado" placeholder
+        (id=0) is excluded.
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before list_player_registration_tiers()"
+      )
+    if gender_id not in (1, 2):
+      raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)")
+
+    import re
+
+    url = self._url(_REGISTRATIONS_PATH)
+    try:
+      resp = self._http.get(
+        url,
+        params={"op": _REGISTRATIONS_TIERS_OP, "genero": gender_id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not fetch tiers: {exc}") from exc
+
+    options = re.findall(r"<option value='(\d+)'\s*>([^<]+)</option>", resp.text)
+    return {int(i): name.strip() for i, name in options if int(i) != 0}
+
+  def _resolve_club_association_id(self, club_id: int) -> int:
+    """Walk associations to find the one containing the club. Cached per client."""
+    cache = getattr(self, "_club_assoc_cache", None)
+    if cache is None:
+      cache = {}
+      self._club_assoc_cache = cache
+    if club_id in cache:
+      return cache[club_id]
+    for assoc in self.list_associations():
+      try:
+        clubs = self.list_clubs(association=assoc.id)
+      except Exception:
+        continue
+      if any(c.id == club_id for c in clubs):
+        cache[club_id] = assoc.id
+        return assoc.id
+    raise ValueError(
+      f"Could not find association for club_id={club_id}; pass association_id explicitly."
+    )
+
+  def _resolve_tier_id(self, tier: int | str, gender_id: int) -> int:
+    """Accept a tier name or ID and return the numeric ID."""
+    if isinstance(tier, int):
+      return tier
+    if isinstance(tier, str) and tier.strip().isdigit():
+      return int(tier.strip())
+    tiers = self.list_player_registration_tiers(gender_id=gender_id)
+    wanted = tier.strip().casefold()
+    for tier_id, name in tiers.items():
+      if name.strip().casefold() == wanted:
+        return tier_id
+    available = ", ".join(sorted(tiers.values()))
+    raise ValueError(
+      f"Tier {tier!r} not found for gender_id={gender_id}. Available: {available}"
+    )
+
+  def create_player_registration_batch(
+    self,
+    *,
+    type: int,
+    tier: int | str,
+    gender_id: int,
+    association_id: int | None = None,
+    club_id: int | None = None,
+    season: int | None = None,
+  ) -> int:
+    """
+    Create a new player registration batch ("Lote") for one
+    (type, tier, gender) combination.
+
+    SAV2 does NOT prevent duplicate open batches: calling this twice
+    with the same args yields two distinct "Em construção" batches.
+    Callers that want to reuse an existing batch must check first via
+    ``find_open_player_registration_batch()``.
+
+    Args:
+        type:           1=1ª Inscrição, 2=Revalidação, 3=Transferência,
+                        4=Subida de escalão.
+        tier:           Tier ID (e.g. 5) or display name (e.g. "Sub 14").
+        gender_id:      1=Masculino, 2=Feminino.
+        association_id: Defaults to the session's organization association.
+                        Required only when the user can manage multiple
+                        associations.
+        club_id:        Defaults to the session's organization. Required only
+                        when the user can manage multiple clubs.
+        season:         SAV2 epoch ID. Defaults to the current session epoch.
+
+    Returns:
+        The new batch's internal ID (the same value as ``Batch.id`` from
+        ``list_player_registration_batches()``).
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed or signals failure.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before create_player_registration_batch()"
+      )
+
+    tier_id = self._resolve_tier_id(tier, gender_id)
+    if season is None:
+      season = int(self.session.get("epoca_id") or 0)
+    if club_id is None:
+      club_id = int(self.session.get("organizacao") or 0)
+    if association_id is None:
+      association_id = self._resolve_club_association_id(club_id)
+
+    params = {
+      "op": _REGISTRATIONS_CREATE_OP,
+      "tipo": type,
+      "agente": _REGISTRATIONS_AGENTE_PLAYER,
+      "associacao": f"ass,{association_id}",
+      "escalao": tier_id,
+      "genero": gender_id,
+      "clube": club_id,
+      "epoca": season,
+    }
+
+    url = self._url(_REGISTRATIONS_PATH)
+    logger.info("Creating player registration batch: %s", params)
+    try:
+      resp = self._http.get(url, params=params, timeout=self._timeout)
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not create batch: {exc}") from exc
+
+    import json as _json
+    text = resp.text
+    logger.info("Create batch response: %s", text[:500])
+
+    try:
+      data = _json.loads(text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse create-batch response: {text[:200]!r}"
+      ) from exc
+
+    new_id = data.get("id")
+    if not isinstance(new_id, int):
+      raise SavResponseError(
+        f"Create batch did not return an id: {data!r}"
+      )
+    return new_id
+
+  def delete_player_registration_batch(self, batch_id: int) -> None:
+    """
+    Delete a player registration batch ("Lote") by ID.
+
+    Only batches in state "Em construção" (open) can be deleted; submitted
+    batches typically cannot. The server response is currently ignored —
+    this method raises only on transport/HTTP errors.
+
+    Args:
+        batch_id: The internal batch ID (``Batch.id``).
+
+    Raises:
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before delete_player_registration_batch()"
+      )
+
+    url = self._url(_REGISTRATIONS_PATH)
+    logger.info("Deleting player registration batch id=%s", batch_id)
+    try:
+      resp = self._http.get(
+        url,
+        params={"op": _REGISTRATIONS_DELETE_OP, "id": batch_id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not delete batch: {exc}") from exc
+
+    logger.info("Delete batch response: %s", resp.text[:200])
+
+  def remove_player_from_registration_batch(
+    self,
+    batch_id: int,
+    license: int,
+  ) -> None:
+    """
+    Remove a single player (by licence) from an open registration batch.
+
+    Loads the batch's items via op=10, finds the row whose licence matches,
+    then fires op=29 with that row's `item_id`. The id passed to op=29 is
+    the per-row batch-item id (from `eliJogador(item_id,...)` in the
+    rendered HTML), *not* the player's internal id from op=35.
+
+    Args:
+        batch_id: Target batch.
+        license:  Licence number of the player to remove.
+
+    Raises:
+        SavConnectionError: On network errors.
+        SavResponseError:   If the licence isn't currently in the batch.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before remove_player_from_registration_batch()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    items = self._load_batch_items(batch)
+    item = next((it for it in items if it["license"] == license), None)
+    if item is None:
+      raise SavResponseError(
+        f"Licence {license} is not in batch {batch_id} "
+        f"(current licences: {[it['license'] for it in items]})"
+      )
+    item_id = int(item["item_id"])
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_REMOVE_ITEM_OP,
+          "id": item_id,
+          "tipo": batch.type_id,
+          "guia": batch.id,
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not remove player {license} from batch {batch_id}: {exc}"
+      ) from exc
+
+    logger.info(
+      "Removed player license=%s (item_id=%s) from batch %s — response: %s",
+      license, item_id, batch.id, resp.text[:200],
+    )
+
+  def find_open_player_registration_batch(
+    self,
+    *,
+    type: int,
+    tier_id: int,
+    gender_id: int,
+    season: int | None = None,
+  ) -> PlayerRegistrationBatch | None:
+    """
+    Return the first open ("Em construção") player registration batch
+    matching the requested type/tier/gender, or None if none exists.
+
+    A batch is locked to a single (type, tier, gender) combination, so
+    items can only be added to a matching open batch. When more than one
+    matches, the most recent (server-order first) is returned.
+
+    Args:
+        type:      Registration type ID:
+                   1=1ª Inscrição, 2=Revalidação, 3=Transferência,
+                   4=Subida de escalão.
+        tier_id:   Numeric escalão ID (e.g. 5 = Sub 14).
+        gender_id: 1=Masculino, 2=Feminino.
+        season:    SAV2 epoch ID. Defaults to the current session epoch.
+
+    Returns:
+        Matching PlayerRegistrationBatch, or None if no open batch fits.
+    """
+    batches = self.list_player_registration_batches(season=season)
+    for b in batches:
+      if (
+        b.is_open
+        and b.type_id == type
+        and b.tier_id == tier_id
+        and b.gender_id == gender_id
+      ):
+        return b
+    return None
+
+  def add_player_to_registration_batch(
+    self,
+    batch_id: int,
+    license: int,
+    *,
+    # ─── STEP 1 — Personal data (op=33) ───────────────────────────────────────
+    # Auto-derived from op=35: nome, data_nascimento, genero, nacionalidade,
+    # paisnascimento, nif. None on overrides = keep player's stored value.
+    id_type: int | None = None,
+    id_number: str | None = None,
+    id_expiry: str | None = None,
+    telemovel: str | None = None,
+    telefone: str | None = None,
+    email: str | None = None,
+    nome_pai: str | None = None,
+    nome_mae: str | None = None,
+    # ─── STEP 2 — Address (op=31) ─────────────────────────────────────────────
+    # Auto-derived: pais (always Portugal=155, locked in UI).
+    morada: str | None = None,
+    cod_postal: str | None = None,
+    localidade_txt: str | None = None,
+    distrito_id: int | None = None,
+    concelho_id: int | None = None,
+    # ─── STEP 3 — Sport-specific + consents (op=36) ───────────────────────────
+    # Auto-derived from batch metadata: tipo, escalao, epoca, transf=0.
+    # Auto-derived from op=87/175 cascade: tipoSeguro=1, seguro, comp.
+    # Auto-derived from op=31 prefill: estatuto, menor_idade.
+    # Auto-derived from op=26 (errors with available list when ambiguous): taxa.
+    taxa_id: int | None = None,
+    exam_date: str | None = None,
+    promote_to_tier_id: int | None = None,
+    guardian_name: str | None = None,
+    guardian_relation: int | None = None,
+    guardian_phone: str | None = None,
+    guardian_email: str | None = None,
+    consent_data: bool = True,
+    consent_communications: bool = True,
+    consent_marketing: bool = False,
+  ) -> int:
+    """
+    Add a player to an open Revalidação batch by walking the SAV2 multi-step
+    enrolment wizard (load player → save step 1 → save step 2 → insurance
+    cascade → pre-commit → commit) and return the player's internal SAV2 id.
+
+    Currently only Revalidação (type_id=2) is supported; 1ª Inscrição,
+    Transferência, and Subida have different field surfaces and follow-up
+    in a later release.
+
+    Args:
+        batch_id: Target open batch (must be in 'Em construção' state).
+        license:  Licence number of the player to revalidate.
+
+        Step 1 overrides (None = keep stored value from player record):
+          id_type, id_number, id_expiry, telemovel, telefone, email,
+          nome_pai, nome_mae.
+
+        Step 2 overrides (None = keep stored value):
+          morada, cod_postal, localidade_txt, distrito_id, concelho_id.
+
+        Step 3:
+          exam_date:           YYYY-MM-DD; defaults to today when omitted.
+                               (The medical exam itself is always assumed done.)
+          promote_to_tier_id:  Numeric escalão ID for Subida; usually unset.
+          guardian_*:          Required when the player is a minor; raises
+                               SavConfigError otherwise.
+          consent_*:           GDPR consents.
+
+    Returns:
+        Internal SAV2 user id of the added player.
+
+    Raises:
+        SavConfigError:    Missing guardian fields for a minor; or batch is
+                           not a Revalidação.
+        SavResponseError:  Server signals failure on commit.
+        SavConnectionError: Network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before add_player_to_registration_batch()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+    if not batch.is_open:
+      raise ValueError(
+        f"Batch {batch.id} is not open (state={batch.state!r}); "
+        "items can only be added to 'Em construção' batches."
+      )
+    if batch.type_id != _REGISTRATIONS_TYPE_REVALIDACAO:
+      raise NotImplementedError(
+        f"Only Revalidação batches are supported (type_id=2); "
+        f"got type_id={batch.type_id} ({batch.type!r})."
+      )
+
+    eligible = self._list_revalidable_licenses(batch)
+    if license not in eligible:
+      raise ValueError(
+        f"Licence {license} is not eligible for revalidation in batch "
+        f"{batch.id} ({batch.tier} {batch.gender}). The server's eligible "
+        f"list has {len(eligible)} player(s); pass one of those licences."
+      )
+
+    # ── STEP 1: Load player demographics, save personal data ──────────────────
+    record = self._load_player_record(batch.id, license)
+    internal_id = int(record["id"])
+
+    step1_send = self._build_step1_send(
+      record,
+      id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+      telemovel=telemovel, telefone=telefone, email=email,
+      nome_pai=nome_pai, nome_mae=nome_mae,
+    )
+    step2_prefill = self._save_registration_step1(batch.id, internal_id, step1_send)
+
+    # ── STEP 2: Save address, get step 3 prefill ──────────────────────────────
+    step2_send = self._build_step2_send(
+      step2_prefill,
+      morada=morada, cod_postal=cod_postal, localidade_txt=localidade_txt,
+      distrito_id=distrito_id, concelho_id=concelho_id,
+    )
+    step3_prefill = self._save_registration_step2(
+      batch.type_id, batch.id, internal_id, license, step2_send,
+    )
+
+    # ── Validate guardian fields for minors ───────────────────────────────────
+    is_minor = bool(step3_prefill.get("menor_idade"))
+    if is_minor:
+      missing = [
+        n for n, v in [
+          ("guardian_name", guardian_name),
+          ("guardian_relation", guardian_relation),
+          ("guardian_phone", guardian_phone),
+          ("guardian_email", guardian_email),
+        ]
+        if not v
+      ]
+      if missing:
+        raise SavConfigError(
+          f"Player (license={license}) is a minor; missing required fields: "
+          f"{', '.join(missing)}"
+        )
+
+    # ── Insurance cascade ─────────────────────────────────────────────────────
+    # Note: only companhia is used downstream — seguro_id is fetched and used
+    # internally by op=175 to derive companhia, then discarded.
+    escalao = int(step3_prefill.get("escalao") or batch.tier_id)
+    _, companhia_id = self._resolve_insurance_cascade(
+      internal_id, batch, escalao,
+    )
+
+    # ── Taxa (registration fee) cascade — auto-pick when only one option ──────
+    estatuto = step3_prefill.get("estatuto", "")
+    if taxa_id is None:
+      taxa_id = self._resolve_taxa_id(batch, internal_id, estatuto)
+
+    # ── Pre-commit hook + final commit ────────────────────────────────────────
+    self._registration_precommit(batch.id, internal_id)
+
+    if exam_date is None:
+      from datetime import date
+      exam_date = date.today().isoformat()
+
+    commit_body = {
+      "guiaid": batch.id,
+      "userid": internal_id,
+      "transf": 0,
+      "estatuto": str(step3_prefill.get("estatuto", "")),
+      "exame": "1",
+      "sub": str(promote_to_tier_id) if promote_to_tier_id is not None else "-1",
+      "obs": "",
+      "dataexame": exam_date,
+      "escalaosubida_txt": "- Não selecionado –",
+      "taxa": str(taxa_id),
+      "comp": str(companhia_id),
+      "nomeEncarregado": guardian_name or "",
+      "tipoRegulacao": str(guardian_relation) if guardian_relation else "0",
+      "telefoneEncarregado": guardian_phone or "",
+      "emailEncarregado": guardian_email or "",
+      "consentimentoDados": 1 if consent_data else 0,
+      "comunicacoes": 1 if consent_communications else 0,
+      "marketing": 1 if consent_marketing else 0,
+    }
+
+    result = self._registration_commit(commit_body)
+    if result.get("val") != 1:
+      raise SavResponseError(
+        f"Add player commit failed: {result.get('msg') or result!r}"
+      )
+    logger.info(
+      "Added player license=%s (id=%s) to batch %s — validity: %s",
+      license, internal_id, batch.id, result.get("resultfunction"),
+    )
+    return internal_id
+
+  # ------------------------------------------------------------------
+  # Registration wizard helpers
+  # ------------------------------------------------------------------
+
+  @staticmethod
+  def _serialize_send(fields: list[tuple[str, str, Any]]) -> str:
+    """
+    Serialise (key, type, value) tuples into SAV2's quirky comma-separated
+    format used by ops 33 (step 1) and 31 (step 2).
+
+    `type` is "str" (value double-quoted) or "int" (bare numeric). None or
+    empty values are emitted as bare ``NULL``. A trailing comma is appended
+    to mimic the browser's output exactly.
+    """
+    parts: list[str] = []
+    for key, typ, value in fields:
+      if value is None or value == "":
+        parts.append(f"{key}=NULL")
+      elif typ == "str":
+        parts.append(f'{key}="{value}"')
+      elif typ == "int":
+        parts.append(f"{key}={int(value)}")
+      else:
+        raise ValueError(f"Unknown send-format type {typ!r}")
+    return ",".join(parts) + ","
+
+  def _list_revalidable_licenses(
+    self, batch: PlayerRegistrationBatch,
+  ) -> set[int]:
+    """
+    Op=139 — list licences eligible for revalidation in a batch.
+
+    The server scopes the result by the batch's club, type, and (implicitly
+    via guia) tier+gender. Returns a bare ``<option>`` HTML list keyed by
+    licence number; we collect the licences as ints, dropping the empty
+    placeholder.
+    """
+    import re
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LIST_REVALIDABLE_OP},
+        data={"clube": batch.club_id, "tipo": batch.type_id, "guia": batch.id},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not list revalidable players for batch {batch.id}: {exc}"
+      ) from exc
+    return {
+      int(m) for m in re.findall(r"<option value='(\d+)'", resp.text) if int(m) > 0
+    }
+
+  def _load_batch_items(
+    self, batch: PlayerRegistrationBatch,
+  ) -> list[dict[str, Any]]:
+    """
+    Op=10 — render a batch's player rows and parse out (item_id, license).
+
+    The op returns JSON wrapping the batch panel HTML in `msg`. Each row's
+    delete button carries `onclick='eliJogador(item_id, batch_id, tipo)'`
+    where ``item_id`` is the per-row id we need for op=29 (it is *not* the
+    player's internal id from op=35).
+    """
+    import json as _json
+    import re
+    from bs4 import BeautifulSoup
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_BATCH_DETAIL_OP,
+          "id": batch.id,
+          "tipo": batch.type_id,
+          "perfil": self.session.get("perfil", 0),
+          "user": self.session.get("user", ""),
+          "organizacao": self.session.get("organizacao", 0),
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not load batch {batch.id} detail: {exc}"
+      ) from exc
+    try:
+      data = _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Batch detail not valid JSON: {resp.text[:200]!r}"
+      ) from exc
+
+    soup = BeautifulSoup(data.get("msg", ""), "html.parser")
+    items: list[dict[str, Any]] = []
+    for row in soup.select("table#main5 tbody tr"):
+      btn = row.find(attrs={"onclick": re.compile(r"eliJogador\(")})
+      if btn is None:
+        continue
+      m = re.search(r"eliJogador\((\d+)\s*,", btn["onclick"])
+      if not m:
+        continue
+      item_id = int(m.group(1))
+      cells = [td.get_text(strip=True) for td in row.find_all("td")]
+      # Columns: [icon, licença, nome, nasc, nacionalidade, estatuto, taxa, seguro, exame, subida]
+      if len(cells) < 3:
+        continue
+      try:
+        license = int(cells[1])
+      except ValueError:
+        continue
+      items.append({"item_id": item_id, "license": license, "name": cells[2]})
+    return items
+
+  def _load_player_record(self, batch_id: int, license: int) -> dict[str, Any]:
+    """Op=35 — fetch a player's stored demographics for prefill."""
+    import json as _json
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_PLAYER_OP,
+          "licenca": license,
+          "guia": batch_id,
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not load player record: {exc}") from exc
+    try:
+      data = _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse player record: {resp.text[:200]!r}"
+      ) from exc
+    if not data.get("id"):
+      raise SavResponseError(
+        f"Player record for licence {license!r} not found: {data!r}"
+      )
+    return data
+
+  def _build_step1_send(
+    self,
+    record: dict[str, Any],
+    *,
+    id_type: int | None,
+    id_number: str | None,
+    id_expiry: str | None,
+    telemovel: str | None,
+    telefone: str | None,
+    email: str | None,
+    nome_pai: str | None,
+    nome_mae: str | None,
+  ) -> str:
+    """Build the step-1 `send` payload from the op=35 record + caller overrides."""
+    def _pick(override: Any, stored: Any) -> Any:
+      return override if override is not None else stored
+
+    return self._serialize_send([
+      ("data_nascimento",        "str", record.get("nasc")),
+      ("email",                  "str", _pick(email, record.get("email"))),
+      ("genero_id",              "int", record.get("genero")),
+      ("telemovel",              "str", _pick(telemovel, record.get("tele"))),
+      ("telefone",               "str", _pick(telefone, record.get("telef"))),
+      ("profissao",              "int", record.get("profissao")),
+      ("nif",                    "str", record.get("nif")),
+      ("nome_mae",               "str", _pick(nome_mae, record.get("mae"))),
+      ("nome_pai",               "str", _pick(nome_pai, record.get("pai"))),
+      ("nacionalidade",          "int", record.get("nacional")),
+      # paisnascimento is quoted in the browser payload despite being an int — UI quirk we mirror
+      ("paisnascimento",         "str", record.get("naturalidade")),
+      ("tipo_identificacao",     "int", _pick(id_type, record.get("tipo"))),
+      ("n_identificacao",        "str", _pick(id_number, record.get("numi"))),
+      ("data_val_identificacao", "str", _pick(id_expiry, record.get("dataval"))),
+      ("estado_civil",           "int", record.get("estcivil")),
+      ("hab_literarias",         "int", record.get("hab")),
+    ])
+
+  def _save_registration_step1(
+    self, batch_id: int, internal_id: int, send: str,
+  ) -> dict[str, Any]:
+    """Op=33 — save personal data; response carries step 2's address prefill."""
+    import json as _json
+    import urllib.parse
+
+    # The `send` value embeds raw `=` and `,` chars; preserve them through
+    # URL encoding (browser leaves them, requests would normally encode `=`).
+    query = (
+      f"op={_REGISTRATIONS_SAVE_STEP1_OP}"
+      f"&id={internal_id}&guia={batch_id}"
+      f"&send={urllib.parse.quote(send, safe='=,')}"
+    )
+    url = f"{self._url(_REGISTRATIONS_PATH)}?{query}"
+
+    try:
+      resp = self._http.get(url, timeout=self._timeout)
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not save step 1: {exc}") from exc
+    try:
+      return _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse step 1 response: {resp.text[:200]!r}"
+      ) from exc
+
+  @staticmethod
+  def _build_step2_send(
+    prefill: dict[str, Any],
+    *,
+    morada: str | None,
+    cod_postal: str | None,
+    localidade_txt: str | None,
+    distrito_id: int | None,
+    concelho_id: int | None,
+  ) -> str:
+    """Build the step-2 `send` payload — pais is locked to Portugal."""
+    def _pick(override: Any, stored: Any) -> Any:
+      return override if override is not None else stored
+
+    return SavClient._serialize_send([
+      ("pais",           "int", _REGISTRATIONS_PORTUGAL_ID),
+      ("distrito",       "int", _pick(distrito_id, prefill.get("distrito"))),
+      ("concelho",       "int", _pick(concelho_id, prefill.get("concelho"))),
+      ("localidade",     "int", prefill.get("localidade")),
+      ("morada",         "str", _pick(morada, prefill.get("morada"))),
+      ("cod_postal",     "str", _pick(cod_postal, prefill.get("codpostal"))),
+      ("localidade_txt", "str", _pick(localidade_txt, prefill.get("localidade_txt"))),
+    ])
+
+  def _save_registration_step2(
+    self,
+    batch_type: int,
+    batch_id: int,
+    internal_id: int,
+    license: int,
+    send: str,
+  ) -> dict[str, Any]:
+    """Op=31 — multipart POST that saves address + returns step 3 prefill."""
+    import json as _json
+    files = {
+      "tipo":    (None, str(batch_type)),
+      "guiaid":  (None, str(batch_id)),
+      "id":      (None, str(internal_id)),
+      "licenca": (None, str(license)),
+      "send":    (None, send),
+    }
+    url = self._url(_REGISTRATIONS_PATH)
+    try:
+      # Override the session's default JSON content-type by passing a custom
+      # headers dict that excludes Content-Type (requests sets multipart).
+      resp = self._http.post(
+        url,
+        params={"op": _REGISTRATIONS_SAVE_STEP2_OP},
+        files=files,
+        timeout=self._timeout,
+        headers={"Accept": "*/*"},
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not save step 2: {exc}") from exc
+    try:
+      return _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse step 2 response: {resp.text[:200]!r}"
+      ) from exc
+
+  def _resolve_insurance_cascade(
+    self, internal_id: int, batch: PlayerRegistrationBatch, escalao: int,
+  ) -> tuple[int, int]:
+    """
+    Run the seguro → companhia → apolice cascade.
+
+    Returns ``(seguro_id, companhia_id)``. The op=24 apolice fetch is fired
+    for parity with the browser flow but its value (a string like
+    ``100.268/1-2-16``) is not needed for the commit.
+
+    Note: the JSON key `companhia` is overloaded by the server — in op=87 it
+    actually carries the *seguro* id, while in op=175 it carries the
+    insurer (seguradora) id. They are distinct entities despite the name.
+    """
+    import json as _json
+
+    season_param = f"'{batch.season}'"  # The literal `'2025/2026'` form
+
+    # op=87: pick tipoSeguro=1 → returns seguro id (despite key name 'companhia')
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_SEGURO_OP,
+          "id": internal_id,
+          "agente": _REGISTRATIONS_AGENTE_PLAYER,
+          "epoca": season_param,
+          "guia": batch.id,
+          "tiposeguro": _REGISTRATIONS_TIPOSEGURO_FEDERACAO,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      seguro_id = int(_json.loads(r.text)["companhia"])
+    except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+      raise SavConnectionError(f"Insurance cascade op=87 failed: {exc}") from exc
+
+    # op=175: with seguro id → returns companhia (seguradora) id
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_COMPANHIA_OP,
+          "seguro": seguro_id,
+          "escalao": escalao,
+          "guia": batch.id,
+          "epoca": season_param,
+          "nivel": 0,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      companhia_id = int(_json.loads(r.text)["companhia"])
+    except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+      raise SavConnectionError(f"Insurance cascade op=175 failed: {exc}") from exc
+
+    # op=24: apolice (display-only, ignored)
+    try:
+      self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_APOLICE_OP, "companhia": companhia_id},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=24 apolice fetch failed — non-fatal, ignoring", exc_info=True)
+
+    return seguro_id, companhia_id
+
+  def _resolve_taxa_id(
+    self,
+    batch: PlayerRegistrationBatch,
+    internal_id: int,
+    estatuto: str | int,
+  ) -> int:
+    """
+    Resolve the registration fee (taxa) id via the op=162 → op=26 cascade.
+
+    op=162 is a per-batch pre-check that returns ``"1"`` when taxa selection
+    is required; we fire it for parity with the browser flow. op=26 returns
+    the actual ``<option>`` HTML for the taxa dropdown, scoped by
+    (estatuto, batch, esc, user). When exactly one real option is present
+    we auto-pick it; otherwise we raise with the full list so the caller
+    can pass ``taxa_id`` explicitly.
+    """
+    import re
+
+    # op=162 (precondition flag — fire-and-forget for parity)
+    try:
+      self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_TAXA_PRECHECK_OP},
+        data={"guiaid": batch.id},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=162 taxa pre-check failed — non-fatal", exc_info=True)
+
+    # op=26 — taxa options HTML
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_TAXA_OP,
+          "estatuto": estatuto,
+          "guia": batch.id,
+          "esc": 1,  # observed constant; meaning unclear (likely a UI flag)
+          "user": internal_id,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not load taxa options: {exc}") from exc
+
+    import json as _json
+    try:
+      msg = _json.loads(r.text).get("msg", "")
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse taxa response: {r.text[:200]!r}"
+      ) from exc
+
+    options = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='(-?\d+)'[^>]*>\s*([^<]+?)\s*<", msg
+      )
+      if int(val) > 0
+    }
+
+    if len(options) == 1:
+      return next(iter(options))
+    if not options:
+      raise SavResponseError(
+        f"No taxa options returned for batch {batch.id}, player {internal_id}: "
+        f"{msg!r}"
+      )
+    listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
+    raise SavConfigError(
+      f"Multiple taxa options for batch {batch.id}, player {internal_id}: "
+      f"{listing}. Pass taxa_id= to disambiguate."
+    )
+
+  def _registration_precommit(self, batch_id: int, internal_id: int) -> None:
+    """Op=165 — pre-commit log/lock hook fired right before op=36."""
+    try:
+      self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRECOMMIT_OP},
+        data={"guiaid": batch_id, "userid": internal_id},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=165 pre-commit hook failed — non-fatal", exc_info=True)
+
+  def _registration_commit(self, body: dict[str, Any]) -> dict[str, Any]:
+    """Op=36 — final commit. Body is JSON sent with text/plain Content-Type."""
+    import json as _json
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_COMMIT_OP},
+        data=_json.dumps(body, ensure_ascii=False),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not commit registration: {exc}") from exc
+    try:
+      return _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse commit response: {resp.text[:200]!r}"
+      ) from exc
+
+  @staticmethod
+  def _parse_registration_batch(row: dict[str, Any]) -> PlayerRegistrationBatch:
+    """Map an op=170 row into a PlayerRegistrationBatch."""
+    def _int(value: Any, default: int = 0) -> int:
+      try:
+        return int(value)
+      except (TypeError, ValueError):
+        return default
+
+    return PlayerRegistrationBatch(
+      id=_int(row.get("guia_id")),
+      number=str(row.get("numero_guia", "")),
+      type_id=_int(row.get("idtipo_guia")),
+      type=str(row.get("tipo_guia", "")),
+      association_id=_int(row.get("idassociacao")),
+      association=str(row.get("associacao", "")),
+      club_id=_int(row.get("idclube")),
+      club=str(row.get("clube", "")),
+      tier_id=_int(row.get("idescalao")),
+      tier=str(row.get("escalao", "")),
+      gender_id=_int(row.get("idgenero")),
+      gender=str(row.get("genero", "")),
+      state_id=_int(row.get("idestado")),
+      state=str(row.get("estado", "")),
+      state_date=str(row.get("dataestado", "")),
+      item_count=_int(row.get("num")),
+      season_id=_int(row.get("idepoca")),
+      season=str(row.get("epoca", "")),
+    )
 
   def list_associations(self) -> list[Club]:
     """

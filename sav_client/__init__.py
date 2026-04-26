@@ -9,7 +9,7 @@ from .exceptions import (
     SavError,
     SavResponseError,
 )
-from .models import Player, Club, Game, LoginResult, Session
+from .models import Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
 from .sav_client import SavClient
 
 __all__ = [
@@ -20,6 +20,7 @@ __all__ = [
     "Player",
     "Club",
     "Game",
+    "PlayerRegistrationBatch",
     # exceptions
     "SavError",
     "SavConfigError",

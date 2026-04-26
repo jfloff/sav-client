@@ -169,6 +169,64 @@ class Player:
 
 
 @dataclass(frozen=True)
+class PlayerRegistrationBatch:
+  """
+  Represents a player registration batch ("Lote" / "Guia") from the
+  Pesquisa Lotes page.
+
+  A batch groups player registration requests of one type (1ª Inscrição,
+  Revalidação, Transferência, Subida) constrained to a single tier+gender.
+  Only batches in state "Em construção" (idestado=1) are open for new items.
+
+  Attributes:
+      id:           Internal SAV2 batch ID (`guia_id`).
+      number:       Human-readable batch number (`numero_guia`).
+      type_id:      1=1ª Inscrição, 2=Revalidação, 3=Transferência, 4=Subida.
+      type:         Type display name (e.g. "1ª Inscrição").
+      association_id, association: Regional association.
+      club_id, club:               Owning club.
+      tier_id, tier:               Tier/escalão (e.g. id=5, name="Sub 14").
+      gender_id, gender:           1=Masculino, 2=Feminino.
+      state_id, state:             1=Em construção, plus Devolvida/Em
+                                    Validação/Em Pagamento.
+      state_date:   ISO date the batch entered its current state.
+      item_count:   Number of players currently in the batch.
+      season_id, season: Season epoch.
+  """
+
+  id: int
+  number: str
+  type_id: int
+  type: str
+  association_id: int
+  association: str
+  club_id: int
+  club: str
+  tier_id: int
+  tier: str
+  gender_id: int
+  gender: str
+  state_id: int
+  state: str
+  state_date: str
+  item_count: int
+  season_id: int
+  season: str
+
+  @property
+  def is_open(self) -> bool:
+    """True when the batch is in 'Em construção' state and accepts items."""
+    return self.state_id == 1
+
+  def __repr__(self) -> str:
+    return (
+      f"PlayerRegistrationBatch(id={self.id}, number={self.number!r}, "
+      f"type={self.type!r}, tier={self.tier!r}, gender={self.gender!r}, "
+      f"state={self.state!r}, items={self.item_count})"
+    )
+
+
+@dataclass(frozen=True)
 class LoginResult:
     """
     Result of a login attempt.
