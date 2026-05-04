@@ -15,9 +15,7 @@ Usage
 from __future__ import annotations
 
 import json
-import re
 import shutil
-import unicodedata
 from dataclasses import asdict
 from typing import Any
 
@@ -29,6 +27,17 @@ from sav_client.exceptions import (
   SavConfigError,
   SavConnectionError,
   SavResponseError,
+)
+from sav_shared import (
+  create_and_fetch_batch,
+  derive_enrollment_params,
+  filter_games,
+  find_club_matches,
+  game_sort_key,
+  KWARG_TO_SAV_KEY,
+  parse_missing_guardian_fields,
+  REGISTRATION_TYPE_LABELS,
+  resolve_player_candidates,
 )
 
 
@@ -195,7 +204,7 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
   except Exception as e:
     raise SavCliError(f"Could not fetch clubs list: {e}", code="fetch_failed")
 
-  matches = _find_club_matches(clubs, club)
+  matches = find_club_matches(clubs, club)
 
   if not matches:
     raise SavCliError(
@@ -217,101 +226,6 @@ def _resolve_clubs(client: SavClient, club: str) -> list[int]:
     click.echo(f"Matched {len(matches)} clubs for {club!r}: {names}", err=True)
 
   return [c.id for c in matches]
-
-
-def _normalise_text(value: str) -> str:
-  """Lowercase, strip accents, and collapse punctuation/spacing for search."""
-  ascii_value = "".join(
-    ch for ch in unicodedata.normalize("NFKD", value)
-    if not unicodedata.combining(ch)
-  )
-  return " ".join(re.sub(r"[^a-z0-9]+", " ", ascii_value.lower()).split())
-
-
-def _field_aliases(value: str) -> tuple[str, set[str], set[str]]:
-  """Return normalised field text plus token/acronym aliases for fuzzy matching."""
-  normalised = _normalise_text(value)
-  if not normalised:
-    return "", set(), set()
-
-  tokens = tuple(normalised.split())
-  aliases = {normalised, "".join(tokens)}
-  if len(tokens) >= 2:
-    aliases.add("".join(token[0] for token in tokens))
-    # Tail acronyms stopping at 2 remaining tokens so we never generate a 1-letter alias.
-    for start in range(1, len(tokens) - 1):
-      aliases.add("".join(token[0] for token in tokens[start:]))
-  return normalised, set(tokens), {a for a in aliases if len(a) >= 2}
-
-
-def _club_matches_query(club: Any, query: str) -> bool:
-  """Match a club query against name/full-name/code with accent-tolerant aliases."""
-  normalised_query = _normalise_text(query)
-  if not normalised_query:
-    return True
-
-  query_tokens = normalised_query.split()
-  for raw in (getattr(club, "name", ""), getattr(club, "full_name", ""), getattr(club, "code", "")):
-    field_text, field_tokens, aliases = _field_aliases(raw)
-    if not field_text:
-      continue
-    if normalised_query in field_text or normalised_query in aliases:
-      return True
-    if all(token in field_tokens or token in aliases for token in query_tokens):
-      return True
-  return False
-
-
-def _club_match_candidates(club: Any) -> set[str]:
-  """Build normalised candidate strings for fuzzy club matching."""
-  candidates: set[str] = set()
-  for raw in (getattr(club, "name", ""), getattr(club, "full_name", ""), getattr(club, "code", "")):
-    field_text, field_tokens, aliases = _field_aliases(raw)
-    if field_text:
-      candidates.add(field_text)
-    candidates.update(field_tokens)
-    candidates.update(aliases)
-  return {c for c in candidates if c}
-
-
-def _rapidfuzz_best_score(query: str, candidates: set[str]) -> float:
-  """Return the best fuzzy score for a query/candidate set."""
-  from rapidfuzz import fuzz
-
-  normalised_query = _normalise_text(query)
-  if not normalised_query:
-    return 0.0
-
-  best = 0.0
-  for candidate in candidates:
-    best = max(
-      best,
-      fuzz.ratio(normalised_query, candidate),
-      fuzz.partial_ratio(normalised_query, candidate),
-      fuzz.token_sort_ratio(normalised_query, candidate),
-      fuzz.token_set_ratio(normalised_query, candidate),
-    )
-  return float(best)
-
-
-def _find_club_matches(clubs: list[Any], query: str) -> list[Any]:
-  """Find direct matches first, then fuzzy matches ranked by score."""
-  direct_matches = [c for c in clubs if _club_matches_query(c, query)]
-  if direct_matches:
-    return direct_matches
-
-  scored: list[tuple[float, Any]] = []
-  for club in clubs:
-    score = _rapidfuzz_best_score(query, _club_match_candidates(club))
-    if score >= 82:
-      scored.append((score, club))
-
-  if not scored:
-    return []
-
-  scored.sort(key=lambda item: (-item[0], getattr(item[1], "name", "")))
-  best_score = scored[0][0]
-  return [club for score, club in scored if score >= best_score - 3]
 
 
 def _make_client() -> SavClient:
@@ -672,7 +586,7 @@ def clubs_cmd(ctx, query, association, all_associations):
     raise SavCliError(str(e), code=_exc_code(e))
 
   if query:
-    results = _find_club_matches(results, query)
+    results = find_club_matches(results, query)
 
   if not results:
     click.echo("No clubs found.")
@@ -699,28 +613,6 @@ def clubs_cmd(ctx, query, association, all_associations):
   click.echo(f"\n{len(results)} club(s) found.")
 
 
-def _normalise_date(date_ddmmyyyy: str) -> str:
-  """Convert DD-MM-YYYY to YYYY-MM-DD for lexicographic comparison."""
-  try:
-    d, m, y = date_ddmmyyyy.split("-")
-    return f"{y}-{m}-{d}"
-  except Exception:
-    return date_ddmmyyyy
-
-
-def _game_sort_key(g) -> tuple:
-  """Return a (date, time) tuple for sorting games chronologically."""
-  try:
-    d, m, y = g.date.split("-")
-    date_key = (int(y), int(m), int(d))
-  except Exception:
-    date_key = (9999, 99, 99)
-  try:
-    h, mi = g.time.split(":")
-    time_key = (int(h), int(mi))
-  except Exception:
-    time_key = (99, 99)
-  return date_key + time_key
 
 
 @cli.command("games")
@@ -753,7 +645,7 @@ def games_cmd(ctx, season, date_from, date_to, tier, gender, status):
   if status.lower() != "all":
     results = [g for g in results if g.game_status == status]
 
-  results = sorted(results, key=_game_sort_key)
+  results = sorted(results, key=game_sort_key)
 
   if not results:
     click.echo("No games found.")
@@ -970,16 +862,11 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 
-  if competition:
-    results = [g for g in results if competition.lower() in g.competition.lower()]
-  if status:
-    results = [g for g in results if g.game_status == status]
-
-  if date_from:
-    results = [g for g in results if _normalise_date(g.date) >= _normalise_date(date_from)]
-  if date_to:
-    results = [g for g in results if _normalise_date(g.date) <= _normalise_date(date_to)]
-  results = sorted(results, key=_game_sort_key)
+  results = filter_games(
+    results, competition=competition, status=status,
+    date_from=date_from, date_to=date_to,
+  )
+  results = sorted(results, key=game_sort_key)
 
   if not results:
     click.echo("No games found.")
@@ -1005,6 +892,263 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
   _render_table(headers, rows, max_widths=[6, 12, 6, 24, 24, 30, 10, 16])
   click.echo(f"\n{len(results)} game(s) found.")
 
+
+
+# ── enroll helpers ────────────────────────────────────────────────────────────
+
+def _resolve_enroll_batch(
+  client: Any,
+  reg_type: int,
+  tier_id: int,
+  gender_id: int,
+  tiers: dict[int, str],
+) -> tuple[int, Any]:
+  """Interactively find an open batch or create one. Returns (batch_id, batch)."""
+  type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
+  gender_label = "Feminino" if gender_id == 2 else "Masculino"
+  tier_name = tiers.get(tier_id, str(tier_id))
+
+  def _create() -> tuple[int, Any]:
+    try:
+      return create_and_fetch_batch(
+        client, type=reg_type, tier_id=tier_id, gender_id=gender_id,
+      )
+    except RuntimeError as exc:
+      raise SavCliError(str(exc), code="batch_error")
+
+  existing = client.find_open_player_registration_batch(
+    type=reg_type, tier_id=tier_id, gender_id=gender_id,
+  )
+
+  if existing:
+    click.echo(
+      f"\nOpen batch found: #{existing.number} "
+      f"({type_label} · {existing.tier} · {gender_label} · "
+      f"{existing.item_count} player(s) already added)"
+    )
+    choice = click.prompt(
+      "Append to existing or create new?",
+      type=click.Choice(["append", "new"]),
+      default="append",
+    )
+    if choice == "new":
+      if not click.confirm(
+        f"Create new {type_label} batch ({tier_name} · {gender_label})?"
+      ):
+        raise click.Abort()
+      return _create()
+    return existing.id, existing
+
+  click.echo(f"\nNo open batch for {type_label} · {tier_name} · {gender_label}.")
+  if not click.confirm("Create new batch?"):
+    raise click.Abort()
+  return _create()
+
+
+def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
+  """Return the player licence from OCR / name search / manual input, or None to skip."""
+  try:
+    eligible = client._list_revalidable_licenses(batch)
+  except Exception as exc:
+    raise SavCliError(f"Could not fetch eligible players: {exc}", code="fetch_failed")
+
+  license, candidates, ocr_name, _ = resolve_player_candidates(
+    parsed, eligible, client, batch.club_id,
+  )
+  if license is not None:
+    return license
+
+  if len(candidates) > 1:
+    click.echo(f"  Multiple players match {ocr_name!r}:")
+    for i, p in enumerate(candidates, 1):
+      click.echo(f"    {i}.  {p.name}  (licence {p.license})")
+    idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
+    return int(candidates[idx - 1].license)
+
+  if ocr_name:
+    click.echo(f"  Player not found for {ocr_name!r} in eligible list.")
+  else:
+    click.echo("  Could not determine player from OCR.")
+
+  while True:
+    raw = click.prompt("  Licence number (blank to skip)", default="")
+    if not raw:
+      return None
+    try:
+      lic = int(raw)
+    except ValueError:
+      click.echo("  Not a valid number.")
+      continue
+    if lic not in eligible:
+      click.echo(f"  Licence {lic} is not in the eligible list for this batch.")
+      if not click.confirm("  Use it anyway?"):
+        continue
+    return lic
+
+
+def _prompt_field(kwarg: str, hint: str = "") -> Any:
+  """Prompt the user for one field value, returning the entered value or None."""
+  label = f"    {kwarg}" + (f"  ({hint})" if hint else "")
+  if kwarg == "guardian_relation":
+    click.echo(f"{label}")
+    click.echo("      1=Pai  2=Mãe  3=Tutor")
+    return int(click.prompt("      Relation", type=click.Choice(["1", "2", "3"])))
+  entered = click.prompt(label, default="")
+  return entered if entered else None
+
+
+def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None:
+  """
+  Show reconciliation summary and prompt for needs_review fields.
+  Returns final kwargs dict (license already popped out) or None to skip.
+  """
+  kwargs = dict(result.kwargs)
+  any_changes = bool(result.updated or result.kept or result.needs_review)
+
+  if result.updated:
+    click.echo("  Updated (OCR overrides SAV):")
+    for kwarg, (sav_val, ocr_val) in result.updated.items():
+      click.echo(f"    {kwarg}:  {sav_val!r}  →  {ocr_val!r}")
+
+  if result.kept:
+    click.echo("  Kept from SAV (close enough):")
+    for kwarg, (sav_val, ocr_val, sim) in result.kept.items():
+      click.echo(f"    {kwarg}:  {sav_val!r}  (OCR: {ocr_val!r}, {sim:.0%} match)")
+
+  if result.needs_review:
+    click.echo("  Needs review (low OCR confidence):")
+    for kwarg in result.needs_review:
+      sav_key = KWARG_TO_SAV_KEY.get(kwarg, "")
+      sav_val = str(sav_profile.get(sav_key) or "") if sav_key else ""
+      ocr_val = kwargs.get(kwarg)
+      if ocr_val is not None:
+        hint = f"OCR: {ocr_val!r}" + (f", SAV: {sav_val!r}" if sav_val else "")
+      elif sav_val:
+        hint = f"SAV: {sav_val!r} (kept if blank)"
+      else:
+        hint = "no value found"
+      val = _prompt_field(kwarg, hint)
+      if val is not None:
+        kwargs[kwarg] = val
+
+  name_str = sav_profile.get("nome", "") or ""
+  player_label = f"{name_str} (licence {license})" if name_str else f"licence {license}"
+
+  if not any_changes:
+    click.echo(f"  No changes — {player_label}.")
+
+  if not click.confirm(f"  Submit {player_label}?", default=True):
+    return None
+
+  kwargs.pop("license", None)
+  return kwargs
+
+
+@cli.command("enroll")
+@click.argument("pdfs", nargs=-1, required=True, type=click.Path(exists=True))
+@click.pass_context
+def enroll_cmd(ctx, pdfs):
+  """Enroll players from FPB registration PDFs into SAV."""
+  try:
+    from sav_parsers import (
+      classify,
+      parse_fpb_mod1,
+      reconcile_fpb_mod1,
+      log_training_mismatches,
+    )
+  except ImportError as exc:
+    raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+
+  client = _make_client()
+
+  batch_id: int | None = None
+  batch: Any = None
+
+  for pdf_path in pdfs:
+    click.echo(f"\n── {pdf_path} ──")
+
+    # Step 1 — classify
+    try:
+      doc_type = classify(pdf_path)
+    except Exception as exc:
+      click.echo(f"  classify error: {exc}", err=True)
+      continue
+    if doc_type != "fpb-mod1":
+      click.echo(f"  Unsupported document type {doc_type!r} — skipped.")
+      continue
+
+    # Step 2 — parse
+    try:
+      parsed = parse_fpb_mod1(pdf_path)
+    except Exception as exc:
+      click.echo(f"  parse error: {exc}", err=True)
+      continue
+
+    # Step 4 — resolve batch (once per invocation, derived from first PDF)
+    if batch is None:
+      try:
+        reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
+        batch_id, batch = _resolve_enroll_batch(
+          client, reg_type, tier_id, gender_id, tiers,
+        )
+      except ValueError as exc:
+        raise SavCliError(str(exc), code="parse_error")
+      except click.Abort:
+        return
+      except (SavConnectionError, SavResponseError) as exc:
+        raise SavCliError(str(exc), code=_exc_code(exc))
+
+    # Step 5 — resolve player licence
+    try:
+      license = _resolve_enroll_player(client, batch, parsed)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    if license is None:
+      click.echo("  Skipped.")
+      continue
+
+    # Step 6 — fetch SAV profile
+    try:
+      sav_profile = client._load_player_record(batch_id, license)
+    except (SavConnectionError, SavResponseError) as exc:
+      click.echo(f"  Could not load player record: {exc}", err=True)
+      continue
+
+    # Step 7 — reconcile OCR vs SAV
+    try:
+      result = reconcile_fpb_mod1(parsed, sav_profile)
+    except Exception as exc:
+      click.echo(f"  reconcile error: {exc}", err=True)
+      continue
+
+    # Step 8 — confirm with user
+    kwargs = _confirm_enroll(result, sav_profile, license)
+    if kwargs is None:
+      click.echo("  Skipped.")
+      continue
+
+    # Step 9 — submit (retry loop for missing guardian fields)
+    submitted = False
+    while not submitted:
+      try:
+        client.add_player_to_registration_batch(batch_id, license, **kwargs)
+        click.echo(f"  Added licence {license} to batch #{batch_id}.")
+        submitted = True
+      except SavConfigError as exc:
+        click.echo(f"  Guardian info required for minor:")
+        for field_name in parse_missing_guardian_fields(exc):
+          val = _prompt_field(field_name)
+          if val is not None:
+            kwargs[field_name] = val
+      except (SavConnectionError, SavResponseError) as exc:
+        raise SavCliError(str(exc), code=_exc_code(exc))
+
+    # Step 10 — log mismatches for retraining
+    if result.mismatches:
+      try:
+        log_training_mismatches(doc_type, result.mismatches)
+      except Exception as exc:
+        click.echo(f"  Warning: could not log mismatches: {exc}", err=True)
 
 
 def main():

@@ -83,6 +83,16 @@ _REGISTRATIONS_STATE_OPEN = 1
 _REGISTRATIONS_TYPE_REVALIDACAO = 2
 _REGISTRATIONS_TIPOSEGURO_FEDERACAO = 1
 _REGISTRATIONS_PORTUGAL_ID = 155
+# id_type / tipo_identificacao values (from <select id="tipoi"> in club registration form)
+_ID_TYPE_CARTAO_CIDADAO = 1        # Cartão de Cidadão
+_ID_TYPE_PASSAPORTE = 2            # Passaporte
+_ID_TYPE_TITULO_RESIDENCIA = 3     # Título de residência
+_ID_TYPE_BI_COMUNITARIO = 5        # BI Cidadão Comunitário
+# guardian_relation / tipoRegulacao values (from <select id="tipoRegulacao"> in SAV2 form)
+_GUARDIAN_RELATION_NONE = 0        # - Não selecionado –
+_GUARDIAN_RELATION_PAI = 1         # Pai
+_GUARDIAN_RELATION_MAE = 2         # Mãe
+_GUARDIAN_RELATION_TUTOR = 3       # Tutor
 _DEFAULT_TIMEOUT = 30
 
 

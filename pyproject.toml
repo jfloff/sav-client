@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.10.6"
+version = "0.12.3"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -12,14 +12,16 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "click>=8.0",
     "rapidfuzz>=3.9",
+    "mcp>=1.0",
 ]
 
 [project.scripts]
 sav = "sav_cli.cli:main"
+sav-mcp = "sav_mcp.server:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["sav_client*", "sav_cli*"]
+include = ["sav_client*", "sav_cli*", "sav_mcp*", "sav_shared*"]
 
 [tool.setuptools.package-data]
 sav_client = ["AGENTS.md"]
