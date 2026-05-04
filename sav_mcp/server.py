@@ -186,6 +186,17 @@ def list_game_sheets(
     return [game_to_dict(g) for g in results]
 
 
+def _resolve_game(client: SavClient, game_number: str) -> Any:
+    """Look up a game by its human-readable number. Raises ValueError if missing/unfetchable."""
+    games = [g for g in client.list_games(game_number=game_number) if g.number == game_number]
+    if not games:
+        raise ValueError(f"No game found with number {game_number!r}")
+    game = games[0]
+    if game.id == 0:
+        raise ValueError(f"Game {game_number!r} has no internal ID — cannot fetch sheet")
+    return game
+
+
 @server.tool()
 def get_game_sheet(game_number: str, team: str) -> dict:
     """
@@ -198,14 +209,7 @@ def get_game_sheet(game_number: str, team: str) -> dict:
         raise ValueError("team must be 'home' or 'away'")
 
     client = _get_client()
-    games = client.list_games(game_number=game_number)
-    games = [g for g in games if g.number == game_number]
-    if not games:
-        raise ValueError(f"No game found with number {game_number!r}")
-    game = games[0]
-    if game.id == 0:
-        raise ValueError(f"Game {game_number!r} has no internal ID — cannot fetch sheet")
-
+    game = _resolve_game(client, game_number)
     val = 1 if team == "home" else 2
     data = client.get_eligible_players(game.id, val=val)
 
@@ -218,6 +222,48 @@ def get_game_sheet(game_number: str, team: str) -> dict:
         "coaches_pri": data.get("coaches_pri", []),
         "coaches_adj": data.get("coaches_adj", []),
         "staff": data.get("staff", []),
+    }
+
+
+@server.tool()
+def generate_game_sheet_pdf(
+    game_number: str,
+    team: str,
+    player_licences: list[int] | None = None,
+    coaches_pri: list[int] | None = None,
+    coaches_adj: list[int] | None = None,
+) -> dict:
+    """
+    Generate the eligible-players PDF for one team and return it base64-encoded.
+
+    game_number: the human-readable game number (from list_games).
+    team: "home" or "away".
+    player_licences: licence numbers to include. Omit to include every eligible player.
+    coaches_pri: head-coach wallet numbers to include. Omit to include all eligible.
+    coaches_adj: adjunct-coach wallet numbers to include. Omit to include all eligible.
+
+    Returns ``{filename, size_bytes, pdf_b64}``. Decode pdf_b64 to obtain the PDF bytes.
+    """
+    if team not in ("home", "away"):
+        raise ValueError("team must be 'home' or 'away'")
+
+    client = _get_client()
+    game = _resolve_game(client, game_number)
+    val = 1 if team == "home" else 2
+
+    pdf = client.get_eligible_players_pdf(
+        game.id, val=val,
+        player_licences=player_licences,
+        coaches_pri=coaches_pri,
+        coaches_adj=coaches_adj,
+    )
+    if pdf is None:
+        raise ValueError(f"No eligible-players PDF available for the {team} team of game {game_number!r}")
+
+    return {
+        "filename": f"game_{game.number}_{team}.pdf",
+        "size_bytes": len(pdf),
+        "pdf_b64": base64.b64encode(pdf).decode("ascii"),
     }
 
 
@@ -250,7 +296,6 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
 
     Every kwarg in result.kwargs gets an entry with a status:
       updated      — OCR value overrides SAV
-      match        — SAV value kept (OCR was close enough)
       needs_review — low OCR confidence, user must decide
       ocr          — field not reconciled against SAV (id_type, guardian_*, consent_*)
     """
@@ -263,16 +308,6 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
             "kwarg": kwarg, "label": label,
             "sav_value": sav_val, "ocr_value": ocr_val,
             "final_value": ocr_val, "status": "updated",
-        })
-        shown.add(kwarg)
-
-    for kwarg, (sav_val, ocr_val, sim) in result.kept.items():
-        label, _ = ENROLLMENT_FIELD_META.get(kwarg, (kwarg, ""))
-        fields.append({
-            "kwarg": kwarg, "label": label,
-            "sav_value": sav_val, "ocr_value": ocr_val,
-            "final_value": sav_val, "status": "match",
-            "similarity": round(sim, 2),
         })
         shown.add(kwarg)
 
