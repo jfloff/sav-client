@@ -296,6 +296,7 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
 
     Every kwarg in result.kwargs gets an entry with a status:
       updated      — OCR value overrides SAV
+      match        — SAV value kept (OCR was close enough)
       needs_review — low OCR confidence, user must decide
       ocr          — field not reconciled against SAV (id_type, guardian_*, consent_*)
     """
@@ -308,6 +309,16 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
             "kwarg": kwarg, "label": label,
             "sav_value": sav_val, "ocr_value": ocr_val,
             "final_value": ocr_val, "status": "updated",
+        })
+        shown.add(kwarg)
+
+    for kwarg, (sav_val, ocr_val, sim) in result.kept.items():
+        label, _ = ENROLLMENT_FIELD_META.get(kwarg, (kwarg, ""))
+        fields.append({
+            "kwarg": kwarg, "label": label,
+            "sav_value": sav_val, "ocr_value": ocr_val,
+            "final_value": sav_val, "status": "match",
+            "similarity": round(sim, 2),
         })
         shown.add(kwarg)
 
@@ -369,7 +380,9 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type!r}"})
                 continue
 
-            parsed = parse_fpb_mod1(tmp_path)
+            parse_result = parse_fpb_mod1(tmp_path)
+            parsed = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
             reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
             tier_name = tiers.get(tier_id, str(tier_id))
         except Exception as exc:
@@ -382,6 +395,7 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
         form_id = str(uuid.uuid4())
         _forms[form_id] = {
             "parsed": parsed,
+            "processing_id": processing_id,
             "doc_type": doc_type,
             "reg_type": reg_type,
             "tier_id": tier_id,
@@ -503,7 +517,7 @@ def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
     The reconciliation result is cached internally so submit_enrollment can
     use it without repeating the network call.
     """
-    from sav_parsers import reconcile_fpb_mod1
+    from sav_shared import reconcile_fpb_mod1
 
     form = _forms.get(form_id)
     if form is None:
@@ -547,7 +561,8 @@ def submit_enrollment(
         guardian info is absent — call submit_enrollment again with those fields
         added to field_overrides.
     """
-    from sav_parsers import log_training_mismatches
+    from sav_parsers import close_processing
+    from sav_shared import KWARG_TO_ENTITY
 
     form = _forms.get(form_id)
     if form is None:
@@ -572,8 +587,16 @@ def submit_enrollment(
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
         }
 
+    # Only send corrections the user explicitly answered (needs_review).
+    # Updated/kept were silent paths — staging them risks dataset noise.
+    corrections: dict[str, str] = {}
+    for kwarg in result.needs_review:
+        entity = KWARG_TO_ENTITY.get(kwarg)
+        val = kwargs.get(kwarg)
+        if entity and val is not None:
+            corrections[entity] = str(val)
     try:
-        log_training_mismatches(form["doc_type"], result.mismatches)
+        close_processing(form["processing_id"], corrections=corrections or None)
     except Exception:
         pass
 

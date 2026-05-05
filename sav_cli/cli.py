@@ -1050,12 +1050,8 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
 def enroll_cmd(ctx, pdfs):
   """Enroll players from FPB registration PDFs into SAV."""
   try:
-    from sav_parsers import (
-      classify,
-      parse_fpb_mod1,
-      reconcile_fpb_mod1,
-      log_training_mismatches,
-    )
+    from sav_parsers import classify, close_processing, parse_fpb_mod1
+    from sav_shared import KWARG_TO_ENTITY, reconcile_fpb_mod1
   except ImportError as exc:
     raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
 
@@ -1079,76 +1075,99 @@ def enroll_cmd(ctx, pdfs):
 
     # Step 2 — parse
     try:
-      parsed = parse_fpb_mod1(pdf_path)
+      parse_result = parse_fpb_mod1(pdf_path)
+      parsed = parse_result["fields"]
+      processing_id = parse_result["processing_id"]
     except Exception as exc:
       click.echo(f"  parse error: {exc}", err=True)
       continue
 
-    # Step 4 — resolve batch (once per invocation, derived from first PDF)
-    if batch is None:
+    # Once parse_fpb_mod1 has created a processing session, we must close it
+    # on every exit path or the dir leaks under files/processing/<id>/ until
+    # gc sweeps it. close_called flips to True at step 10 (success path);
+    # the finally falls back to a no-corrections close for any earlier exit.
+    close_called = False
+    try:
+      # Step 4 — resolve batch (once per invocation, derived from first PDF)
+      if batch is None:
+        try:
+          reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
+          batch_id, batch = _resolve_enroll_batch(
+            client, reg_type, tier_id, gender_id, tiers,
+          )
+        except ValueError as exc:
+          raise SavCliError(str(exc), code="parse_error")
+        except click.Abort:
+          return
+        except (SavConnectionError, SavResponseError) as exc:
+          raise SavCliError(str(exc), code=_exc_code(exc))
+
+      # Step 5 — resolve player licence
       try:
-        reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
-        batch_id, batch = _resolve_enroll_batch(
-          client, reg_type, tier_id, gender_id, tiers,
-        )
-      except ValueError as exc:
-        raise SavCliError(str(exc), code="parse_error")
-      except click.Abort:
-        return
+        license = _resolve_enroll_player(client, batch, parsed)
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(str(exc), code=_exc_code(exc))
+      if license is None:
+        click.echo("  Skipped.")
+        continue
 
-    # Step 5 — resolve player licence
-    try:
-      license = _resolve_enroll_player(client, batch, parsed)
-    except (SavConnectionError, SavResponseError) as exc:
-      raise SavCliError(str(exc), code=_exc_code(exc))
-    if license is None:
-      click.echo("  Skipped.")
-      continue
-
-    # Step 6 — fetch SAV profile
-    try:
-      sav_profile = client._load_player_record(batch_id, license)
-    except (SavConnectionError, SavResponseError) as exc:
-      click.echo(f"  Could not load player record: {exc}", err=True)
-      continue
-
-    # Step 7 — reconcile OCR vs SAV
-    try:
-      result = reconcile_fpb_mod1(parsed, sav_profile)
-    except Exception as exc:
-      click.echo(f"  reconcile error: {exc}", err=True)
-      continue
-
-    # Step 8 — confirm with user
-    kwargs = _confirm_enroll(result, sav_profile, license)
-    if kwargs is None:
-      click.echo("  Skipped.")
-      continue
-
-    # Step 9 — submit (retry loop for missing guardian fields)
-    submitted = False
-    while not submitted:
+      # Step 6 — fetch SAV profile
       try:
-        client.add_player_to_registration_batch(batch_id, license, **kwargs)
-        click.echo(f"  Added licence {license} to batch #{batch_id}.")
-        submitted = True
-      except SavConfigError as exc:
-        click.echo(f"  Guardian info required for minor:")
-        for field_name in parse_missing_guardian_fields(exc):
-          val = _prompt_field(field_name)
-          if val is not None:
-            kwargs[field_name] = val
+        sav_profile = client._load_player_record(batch_id, license)
       except (SavConnectionError, SavResponseError) as exc:
-        raise SavCliError(str(exc), code=_exc_code(exc))
+        click.echo(f"  Could not load player record: {exc}", err=True)
+        continue
 
-    # Step 10 — log mismatches for retraining
-    if result.mismatches:
+      # Step 7 — reconcile OCR vs SAV
       try:
-        log_training_mismatches(doc_type, result.mismatches)
+        result = reconcile_fpb_mod1(parsed, sav_profile)
       except Exception as exc:
-        click.echo(f"  Warning: could not log mismatches: {exc}", err=True)
+        click.echo(f"  reconcile error: {exc}", err=True)
+        continue
+
+      # Step 8 — confirm with user
+      kwargs = _confirm_enroll(result, sav_profile, license)
+      if kwargs is None:
+        click.echo("  Skipped.")
+        continue
+
+      # Step 9 — submit (retry loop for missing guardian fields)
+      submitted = False
+      while not submitted:
+        try:
+          client.add_player_to_registration_batch(batch_id, license, **kwargs)
+          click.echo(f"  Added licence {license} to batch #{batch_id}.")
+          submitted = True
+        except SavConfigError as exc:
+          click.echo(f"  Guardian info required for minor:")
+          for field_name in parse_missing_guardian_fields(exc):
+            val = _prompt_field(field_name)
+            if val is not None:
+              kwargs[field_name] = val
+        except (SavConnectionError, SavResponseError) as exc:
+          raise SavCliError(str(exc), code=_exc_code(exc))
+
+      # Step 10 — close processing session; only send corrections the user
+      # explicitly answered (needs_review). Updated and kept were silent paths
+      # from the user's perspective, so we don't stage them as labeled training
+      # data — that would risk noise in the dataset.
+      corrections: dict[str, str] = {}
+      for kwarg in result.needs_review:
+        entity = KWARG_TO_ENTITY.get(kwarg)
+        val = kwargs.get(kwarg)
+        if entity and val is not None:
+          corrections[entity] = str(val)
+      close_called = True
+      try:
+        close_processing(processing_id, corrections=corrections or None)
+      except Exception as exc:
+        click.echo(f"  Warning: could not close processing {processing_id}: {exc}", err=True)
+    finally:
+      if not close_called:
+        try:
+          close_processing(processing_id)
+        except Exception:
+          pass
 
 
 def main():
