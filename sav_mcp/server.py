@@ -117,6 +117,28 @@ def get_player(license: str, club_id: int | None = None) -> dict | None:
     return player_to_dict(results[0])
 
 
+@server.tool()
+def get_player_profile(license: str, club_id: int | None = None) -> dict:
+    """
+    Read-only player profile suitable for OCR reconciliation.
+
+    Single fetch from jogadoresdb.php?op=2 — the same data the enrollment
+    wizard prefills from. Richer than get_player: includes address fields
+    (morada, codpostal, localidade_txt, distrito, concelho), document IDs
+    (numi, dataval, tipo), and contact details (tele, telef, email, nif).
+
+    Distrito and concelho come back as integer ID strings; use
+    list_associations / list_clubs-style consumers if names are needed
+    (the distrito static map and concelho list are exposed elsewhere).
+
+    club_id, when supplied, scopes the bridge search and avoids the slow
+    federation-wide path on cache miss. Omit to use whatever's already
+    cached from prior search_players / resolve_player calls.
+    """
+    client = _get_client()
+    return client.load_player_profile(int(license), club_id=club_id)
+
+
 # ── Clubs & associations ──────────────────────────────────────────────────────
 
 @server.tool()
@@ -383,7 +405,8 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             parse_result = parse_fpb_mod1(tmp_path)
             parsed = parse_result["fields"]
             processing_id = parse_result["processing_id"]
-            reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
+            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+            tiers = client.list_player_registration_tiers(gender_id=gender_id)
             tier_name = tiers.get(tier_id, str(tier_id))
         except Exception as exc:
             results.append({"index": i, "error": str(exc)})
@@ -524,8 +547,10 @@ def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
         raise ValueError(f"Unknown form_id: {form_id!r}")
 
     client = _get_client()
-    sav_profile = client._load_player_record(batch_id, license)
-    result = reconcile_fpb_mod1(form["parsed"], sav_profile)
+    # resolve_player runs first in this workflow → search_players already
+    # populated the license→id cache, so this is free.
+    sav_profile = client.load_player_profile(license)
+    result = reconcile_fpb_mod1(form["parsed"], sav_profile, client=client)
 
     form["reconcile_result"] = result
     form["sav_profile"] = sav_profile
@@ -589,12 +614,15 @@ def submit_enrollment(
 
     # Only send corrections the user explicitly answered (needs_review).
     # Updated/kept were silent paths — staging them risks dataset noise.
+    # retrain_corrections are SAV-side truths for read-only fields (nif,
+    # data_nascimento) — always merged so the labeled doc anchors to them.
     corrections: dict[str, str] = {}
     for kwarg in result.needs_review:
         entity = KWARG_TO_ENTITY.get(kwarg)
         val = kwargs.get(kwarg)
         if entity and val is not None:
             corrections[entity] = str(val)
+    corrections.update(result.retrain_corrections)
     try:
         close_processing(form["processing_id"], corrections=corrections or None)
     except Exception:

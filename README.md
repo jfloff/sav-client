@@ -29,6 +29,9 @@ Requires Python 3.11+.
 pip install git+https://github.com/jfloff/sav-client.git
 ```
 
+This install now also pulls [`sav-parsers`](https://github.com/jfloff/sav-parsers)
+directly from GitHub for the enrollment/OCR flows.
+
 Or clone and install in editable mode for development:
 
 ```bash
@@ -36,6 +39,9 @@ git clone https://github.com/jfloff/sav-client.git
 cd sav-client
 pip install -e .
 ```
+
+If you plan to use `sav enroll` or the MCP enrollment tools, also configure the
+Document AI environment described in the `sav-parsers` README.
 
 ---
 

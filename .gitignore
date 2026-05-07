@@ -13,6 +13,7 @@ env/
 
 # Environment / secrets
 .env
+credentials.json
 
 # Claude Code
 .claude/
@@ -24,3 +25,6 @@ env/
 
 # OS
 .DS_Store
+
+# Files
+files/*

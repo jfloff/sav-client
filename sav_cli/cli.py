@@ -31,8 +31,12 @@ from sav_client.exceptions import (
 from sav_shared import (
   create_and_fetch_batch,
   derive_enrollment_params,
+  distrito_name,
+  ENROLLMENT_FIELD_META,
   filter_games,
   find_club_matches,
+  find_distrito_id,
+  find_id_by_name,
   game_sort_key,
   KWARG_TO_SAV_KEY,
   parse_missing_guardian_fields,
@@ -524,6 +528,64 @@ def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
         click.echo(f"{key:<{width}}  {val}")
 
 
+@cli.command("profile")
+@click.argument("license_num", type=int)
+@click.pass_context
+def profile_cmd(ctx, license_num):
+  """Show the SAV2 player profile for one license number.
+
+  Read-only fetch from jogadoresdb.php?op=2 — the athlete-form view the
+  enrollment wizard prefills from. Returns the full canonical profile
+  (personal data + address). License alone is enough; internal id is
+  resolved transparently via the cached search.
+  """
+  output = ctx.obj["output"]
+  client = _make_client()
+
+  try:
+    profile = client.load_player_profile(license_num)
+  except (SavConnectionError, SavResponseError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  fields_proj = ctx.obj.get("fields")
+
+  if output == "json":
+    rows = _project([profile], fields_proj)
+    click.echo(json.dumps(rows[0] if rows else profile, ensure_ascii=False, indent=2))
+    return
+
+  if output == "csv":
+    rows = _project([profile], fields_proj)
+    keys = fields_proj or list(profile.keys())
+    click.echo(",".join(keys))
+    if rows:
+      click.echo(",".join(str(rows[0].get(k, "")) for k in keys))
+    return
+
+  # Table view: key/value with distrito and concelho IDs resolved to names
+  # for readability. The per-distrito concelho list is cached client-side.
+  display = dict(profile)
+  raw_distrito = profile.get("distrito")
+  if raw_distrito:
+    name = distrito_name(raw_distrito)
+    if name:
+      display["distrito"] = f"{raw_distrito} ({name})"
+
+  raw_concelho = profile.get("concelho")
+  if str(raw_concelho or "").isdigit() and str(raw_distrito or "").isdigit():
+    try:
+      concelhos = client.list_concelhos(int(raw_distrito))
+      name = concelhos.get(int(raw_concelho))
+      if name:
+        display["concelho"] = f"{raw_concelho} ({name})"
+    except (SavConnectionError, SavResponseError):
+      pass
+
+  width = max(len(k) for k in display)
+  for key, val in display.items():
+    click.echo(f"{key:<{width}}  {val}")
+
+
 @cli.command("associations")
 @click.pass_context
 def associations_cmd(ctx):
@@ -901,11 +963,11 @@ def _resolve_enroll_batch(
   reg_type: int,
   tier_id: int,
   gender_id: int,
-  tiers: dict[int, str],
 ) -> tuple[int, Any]:
   """Interactively find an open batch or create one. Returns (batch_id, batch)."""
   type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
   gender_label = "Feminino" if gender_id == 2 else "Masculino"
+  tiers = client.list_player_registration_tiers(gender_id=gender_id)
   tier_name = tiers.get(tier_id, str(tier_id))
 
   def _create() -> tuple[int, Any]:
@@ -952,7 +1014,7 @@ def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
   except Exception as exc:
     raise SavCliError(f"Could not fetch eligible players: {exc}", code="fetch_failed")
 
-  license, candidates, ocr_name, _ = resolve_player_candidates(
+  license, candidates, ocr_name, ocr_license = resolve_player_candidates(
     parsed, eligible, client, batch.club_id,
   )
   if license is not None:
@@ -965,7 +1027,11 @@ def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
     idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
     return int(candidates[idx - 1].license)
 
-  if ocr_name:
+  if ocr_license is not None:
+    click.echo(f"  OCR licence {ocr_license} is not in the eligible list for this batch.")
+    if click.confirm("  Use it anyway?"):
+      return ocr_license
+  elif ocr_name:
     click.echo(f"  Player not found for {ocr_name!r} in eligible list.")
   else:
     click.echo("  Could not determine player from OCR.")
@@ -1028,7 +1094,23 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
       else:
         hint = "no value found"
       val = _prompt_field(kwarg, hint)
-      if val is not None:
+      if val is None:
+        continue
+      if kwarg == "distrito_id":
+        resolved = find_distrito_id(val) if isinstance(val, str) else None
+        if resolved is None:
+          click.echo(f"    {val!r} is not a known distrito — keeping SAV value.")
+          continue
+        kwargs[kwarg] = resolved
+      elif kwarg == "concelho_id":
+        resolved = find_id_by_name(val, result.concelhos) if isinstance(val, str) else None
+        if resolved is None:
+          known = ", ".join(sorted(result.concelhos.values())) or "(none — distrito unknown)"
+          click.echo(f"    {val!r} is not a known concelho for this distrito.")
+          click.echo(f"    Known: {known}")
+          continue
+        kwargs[kwarg] = resolved
+      else:
         kwargs[kwarg] = val
 
   name_str = sav_profile.get("nome", "") or ""
@@ -1037,11 +1119,92 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
   if not any_changes:
     click.echo(f"  No changes — {player_label}.")
 
+  _print_submission_summary(kwargs, result, sav_profile)
+
   if not click.confirm(f"  Submit {player_label}?", default=True):
     return None
 
   kwargs.pop("license", None)
   return kwargs
+
+
+def _format_submit_value(
+  val: Any,
+  kwarg: str | None = None,
+  *,
+  concelhos: dict[int, str] | None = None,
+) -> str:
+  if isinstance(val, bool):
+    return "yes" if val else "no"
+  if val is None or val == "":
+    return "—"
+  if kwarg == "distrito_id":
+    # When val is the resolved int we want the name; when val is the raw
+    # OCR text (held in result.ocr) we want it verbatim. distrito_name()
+    # returns "" for non-int input, so falling back to str(val) covers both.
+    return distrito_name(val) or str(val)
+  if kwarg == "concelho_id" and concelhos and not isinstance(val, str):
+    try:
+      return concelhos.get(int(val), str(val))
+    except (ValueError, TypeError):
+      return str(val)
+  return str(val)
+
+
+def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> None:
+  """Render the final pre-submit table: SAV vs OCR side-by-side, plus the chosen value.
+
+  Final column shows what SAV will see (kept SAV value, OCR override, or user-typed)
+  with a source tag in parens. Empty SAV/OCR cells render as em-dash.
+  """
+  rows: list[tuple[str, str, str, str]] = []
+  for kwarg, (label, sav_key) in ENROLLMENT_FIELD_META.items():
+    sav_raw = sav_profile.get(sav_key) if sav_key else None
+    ocr_raw = result.ocr.get(kwarg)
+    has_sav = sav_raw not in (None, "")
+    has_ocr = ocr_raw not in (None, "")
+
+    if kwarg in kwargs:
+      final_raw = kwargs[kwarg]
+      if final_raw in (None, ""):
+        continue
+      if kwarg in result.updated:
+        source = "OCR over SAV"
+      elif kwarg in result.needs_review:
+        source = "user"
+      else:
+        source = "OCR"
+    elif has_sav:
+      final_raw = sav_raw
+      if kwarg in result.retrain_corrections:
+        source = "SAV (OCR mismatch — will retrain)"
+      elif kwarg in result.kept:
+        source = "SAV kept (close to OCR)"
+      elif kwarg in result.needs_review:
+        source = "SAV kept (review skipped)"
+      else:
+        source = "SAV"
+    else:
+      continue
+
+    sav_str   = _format_submit_value(sav_raw, kwarg, concelhos=result.concelhos) if has_sav else "—"
+    ocr_str   = _format_submit_value(ocr_raw, kwarg, concelhos=result.concelhos) if has_ocr else "—"
+    final_str = f"{_format_submit_value(final_raw, kwarg, concelhos=result.concelhos)}  [{source}]"
+    rows.append((label, sav_str, ocr_str, final_str))
+
+  if not rows:
+    return
+
+  click.echo("\n  Submission summary:")
+  label_w = max(len("Field"), max(len(r[0]) for r in rows))
+  sav_w   = max(len("SAV"),   max(len(r[1]) for r in rows))
+  ocr_w   = max(len("OCR"),   max(len(r[2]) for r in rows))
+
+  click.echo(f"    {'Field'.ljust(label_w)}  {'SAV'.ljust(sav_w)}  {'OCR'.ljust(ocr_w)}  Final")
+  click.echo(f"    {'-'*label_w}  {'-'*sav_w}  {'-'*ocr_w}  -----")
+  for label, sav, ocr, final in rows:
+    click.echo(f"    {label.ljust(label_w)}  {sav.ljust(sav_w)}  {ocr.ljust(ocr_w)}  {final}")
+  click.echo("")
 
 
 @cli.command("enroll")
@@ -1091,9 +1254,9 @@ def enroll_cmd(ctx, pdfs):
       # Step 4 — resolve batch (once per invocation, derived from first PDF)
       if batch is None:
         try:
-          reg_type, tier_id, gender_id, tiers = derive_enrollment_params(parsed, client)
+          reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
           batch_id, batch = _resolve_enroll_batch(
-            client, reg_type, tier_id, gender_id, tiers,
+            client, reg_type, tier_id, gender_id,
           )
         except ValueError as exc:
           raise SavCliError(str(exc), code="parse_error")
@@ -1111,16 +1274,22 @@ def enroll_cmd(ctx, pdfs):
         click.echo("  Skipped.")
         continue
 
-      # Step 6 — fetch SAV profile
+      # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
+      # server-side validation surfaces at real submit.
       try:
-        sav_profile = client._load_player_record(batch_id, license)
+        sav_profile = client.load_player_profile(license, club_id=batch.club_id)
       except (SavConnectionError, SavResponseError) as exc:
-        click.echo(f"  Could not load player record: {exc}", err=True)
+        click.echo(f"  Could not load player profile: {exc}", err=True)
         continue
 
-      # Step 7 — reconcile OCR vs SAV
+      # Step 7 — reconcile OCR vs SAV. reconcile_fpb_mod1 fetches the
+      # distrito-scoped concelho list itself (cached client-side); without it
+      # concelho silently falls to needs_review.
       try:
-        result = reconcile_fpb_mod1(parsed, sav_profile)
+        result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
+      except (SavConnectionError, SavResponseError) as exc:
+        click.echo(f"  Could not load concelhos: {exc}", err=True)
+        continue
       except Exception as exc:
         click.echo(f"  reconcile error: {exc}", err=True)
         continue
@@ -1157,6 +1326,7 @@ def enroll_cmd(ctx, pdfs):
         val = kwargs.get(kwarg)
         if entity and val is not None:
           corrections[entity] = str(val)
+      corrections.update(result.retrain_corrections)
       close_called = True
       try:
         close_processing(processing_id, corrections=corrections or None)

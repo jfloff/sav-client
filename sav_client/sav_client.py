@@ -71,6 +71,7 @@ _REGISTRATIONS_LIST_REVALIDABLE_OP = "139"
 _REGISTRATIONS_LOAD_PLAYER_OP = "35"
 _REGISTRATIONS_SAVE_STEP1_OP = "33"
 _REGISTRATIONS_SAVE_STEP2_OP = "31"
+_REGISTRATIONS_LIST_CONCELHOS_OP = "18"
 _REGISTRATIONS_LOAD_SEGURO_OP = "87"
 _REGISTRATIONS_LOAD_COMPANHIA_OP = "175"
 _REGISTRATIONS_LOAD_APOLICE_OP = "24"
@@ -553,7 +554,16 @@ class SavClient:
 
     logger.info("Searching players club=%s filters: %s", club, payload)
     html = self._post_form(_ATHLETES_PATH, payload, params={"op": _ATHLETES_OP})
-    return self._parse_players_response(html)
+    players = self._parse_players_response(html)
+    # Opportunistic license → internal id cache fill (persisted in SQLite).
+    pairs: list[tuple[int, int]] = []
+    for p in players:
+      try:
+        pairs.append((int(p.license), p.id))
+      except (ValueError, TypeError):
+        continue
+    self._cache.record_player_ids(pairs)
+    return players
 
   def get_player_detail(self, player_id: int, *, photo: bool = False) -> Player:
     """
@@ -995,6 +1005,7 @@ class SavClient:
     """
     Return the registration tiers (escalões) available for a given gender,
     as a mapping of numeric tier ID -> human name (e.g. 5 -> "Sub 14").
+    Cached 7 days.
 
     The set differs by gender (some categories are male- or female-only),
     so a gender_id is required.
@@ -1017,6 +1028,9 @@ class SavClient:
     if gender_id not in (1, 2):
       raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)")
 
+    return self._cache.get_tiers(self._fetch_tiers, gender_id=gender_id)
+
+  def _fetch_tiers(self, gender_id: int) -> dict[int, str]:
     import re
 
     url = self._url(_REGISTRATIONS_PATH)
@@ -1606,6 +1620,128 @@ class SavClient:
         continue
       items.append({"item_id": item_id, "license": license, "name": cells[2]})
     return items
+
+  def list_concelhos(self, distrito_id: int) -> dict[int, str]:
+    """Op=18 — concelhos under a given distrito (id → name), cached 7 days.
+
+    The SAV2 wizard renders concelho as a dropdown that's populated on
+    distrito change; this hits the same endpoint the browser does. Returns
+    an empty dict for distrito_id=0 (no selection).
+    """
+    if not distrito_id:
+      return {}
+    return self._cache.get_concelhos(self._fetch_concelhos, distrito_id=distrito_id)
+
+  def _fetch_concelhos(self, distrito_id: int) -> dict[int, str]:
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LIST_CONCELHOS_OP, "dist": distrito_id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not load concelhos: {exc}") from exc
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(resp.text, "html.parser")
+    out: dict[int, str] = {}
+    for opt in soup.find_all("option"):
+      raw = (opt.get("value") or "").strip()
+      if not raw or raw == "0":
+        continue
+      try:
+        out[int(raw)] = opt.get_text(strip=True)
+      except ValueError:
+        continue
+    return out
+
+  def load_player_profile(
+    self, license: int, *, club_id: int | None = None,
+  ) -> dict[str, Any]:
+    """Read-only player profile by license, suitable for OCR reconciliation.
+
+    Single source: op=2 (jogadoresdb.php) — the athlete form view, which
+    carries everything we reconcile (personal data + the address block).
+    No wizard saves, no validation gates; server-side validation surfaces
+    only at real submit, which is where it belongs.
+
+    license → internal-id is bridged via search_players, with two perf
+    helpers:
+      - hits the SQLite-persisted license_to_id cache when this licence
+        has been seen before (in this run or any prior CLI invocation);
+      - club_id, when given, scopes the bridge search instead of the slow
+        federation-wide path.
+
+    Field IDs in the rendered op=2 HTML are translated to the canonical
+    keys used elsewhere (datenasc → nasc, numid → numi, telem → tele,
+    cod2 → codpostal, localidadestring → localidade_txt, tipoi → tipo,
+    …) so the result drops cleanly into reconcile_fpb_mod1 alongside the
+    op=35 record.
+    """
+    if self.session is None:
+      raise SavResponseError("Must call login() before load_player_profile()")
+
+    player_id = self._cache.get_player_id(int(license))
+    if player_id is None:
+      results = self.search_players(license=str(license), club=club_id or 0)
+      if not results:
+        raise SavResponseError(f"No player with license {license}")
+      player_id = results[0].id
+
+    payload = {
+      "user_id":     player_id,
+      "user":        self.session.get("user", ""),
+      "perfil":      self.session.get("perfil", 0),
+      "organizacao": self.session.get("organizacao", 0),
+    }
+    text = self._post_form(_ATHLETE_DETAIL_PATH, payload, params={"op": _ATHLETE_DETAIL_OP})
+    try:
+      import json as _json
+      raw = _json.loads(text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Athlete profile response was not valid JSON: {text[:200]!r}"
+      ) from exc
+    if "msg" not in raw:
+      raise SavResponseError(
+        f"Athlete profile response missing 'msg': keys={list(raw.keys())}"
+      )
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(raw["msg"], "html.parser")
+
+    def text_value(elem_id: str) -> str:
+      el = soup.find(id=elem_id)
+      return (el.get("value", "") or "").strip() if el else ""
+
+    def select_value(elem_id: str) -> str:
+      sel = soup.find("select", id=elem_id)
+      if not sel:
+        return ""
+      opt = sel.find("option", selected=True)
+      return ((opt.get("value") or "").strip()) if opt else ""
+
+    profile = {
+      "nome":           raw.get("nome") or text_value("nome"),
+      "nasc":           text_value("datenasc"),
+      "tipo":           select_value("tipoi"),
+      "numi":           text_value("numid"),
+      "dataval":        text_value("dateval"),
+      "nif":            text_value("nif"),
+      "tele":           text_value("telem"),
+      "telef":          text_value("telefo"),
+      "email":          text_value("email"),
+      "nacional":       select_value("nacionalidade"),
+      "naturalidade":   select_value("paisNascimento"),
+      "morada":         text_value("morada"),
+      "codpostal":      text_value("cod2"),
+      "localidade_txt": text_value("localidadestring"),
+      "distrito":       select_value("distrito"),
+      "concelho":       select_value("concelho"),
+    }
+    # Empty values dropped so they don't shadow op=35's data on merge.
+    return {k: v for k, v in profile.items() if v}
 
   def _load_player_record(self, batch_id: int, license: int) -> dict[str, Any]:
     """Op=35 — fetch a player's stored demographics for prefill."""

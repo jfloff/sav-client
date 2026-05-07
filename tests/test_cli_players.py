@@ -1,6 +1,7 @@
 from click.testing import CliRunner
 
 from sav_cli import cli as cli_module
+import sav_shared
 from sav_client.models import Player
 
 
@@ -241,7 +242,7 @@ def test_players_resolves_club_query_with_fuzzy_fallback(monkeypatch):
     return 91.0 if "santarem basket clube" in candidates else 0.0
 
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
-  monkeypatch.setattr(cli_module, "_rapidfuzz_best_score", fake_score)
+  monkeypatch.setattr(sav_shared, "_rapidfuzz_best_score", fake_score)
 
   runner = CliRunner()
   result = runner.invoke(

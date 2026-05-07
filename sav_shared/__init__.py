@@ -11,9 +11,20 @@ import re
 import unicodedata
 from typing import Any
 
+from .fields import ENROLLMENT_FIELD_META, FIELDS, FieldDef, KWARG_TO_ENTITY
+from .lookups import (
+    DISTRITOS,
+    GENERO,
+    GUARDIAN_RELATIONS,
+    ID_TYPES,
+    REGISTRATION_TYPE_LABELS,
+    distrito_name,
+    find_distrito_id,
+    find_id_by_name,
+)
 from .fpb_mod1 import (
-    KWARG_TO_ENTITY,
     ReconcileResult,
+    effective_distrito_id,
     fpb_mod1_to_sav_kwargs,
     reconcile_fpb_mod1,
 )
@@ -82,31 +93,6 @@ def batch_to_dict(b: Any) -> dict:
 
 # ── Enrollment domain ─────────────────────────────────────────────────────────
 
-REGISTRATION_TYPE_LABELS: dict[int, str] = {
-    1: "1ª Inscrição",
-    2: "Revalidação",
-    3: "Transferência",
-    4: "Subida",
-}
-
-# kwarg → (human label, sav_profile key for reconciliation display)
-ENROLLMENT_FIELD_META: dict[str, tuple[str, str]] = {
-    "id_type":                ("Tipo de Documento",          "tipo"),
-    "id_number":              ("Nº Identificação",           "numi"),
-    "id_expiry":              ("Validade Documento",         "dataval"),
-    "telemovel":              ("Telemóvel",                  "tele"),
-    "morada":                 ("Morada",                     "morada"),
-    "localidade_txt":         ("Localidade",                 "localidade_txt"),
-    "cod_postal":             ("Código Postal",              "cod_postal"),
-    "guardian_name":          ("Nome Encarregado",           ""),
-    "guardian_relation":      ("Relação Encarregado",        ""),
-    "guardian_phone":         ("Telefone Encarregado",       ""),
-    "guardian_email":         ("Email Encarregado",          ""),
-    "consent_data":           ("Consentimento Dados",        ""),
-    "consent_communications": ("Consentimento Comunicações", ""),
-    "consent_marketing":      ("Consentimento Marketing",    ""),
-}
-
 # kwarg → sav_profile key, for reconciled fields only (sav_key non-empty)
 KWARG_TO_SAV_KEY: dict[str, str] = {
     kwarg: sav_key
@@ -132,12 +118,13 @@ def escalao_field_to_name(field_key: str) -> str:
 
 def derive_enrollment_params(
     parsed: dict, client: Any,
-) -> tuple[int, int, int, dict[int, str]]:
+) -> tuple[int, int, int]:
     """
-    Return (reg_type, tier_id, gender_id, tiers) from parsed OCR fields.
+    Return (reg_type, tier_id, gender_id) from parsed OCR fields.
 
-    `tiers` is the gender-scoped id→name mapping so callers can display tier
-    names without an extra network round-trip.
+    The gender-scoped tier lookup is cached on the client, so callers that
+    need the {id → name} map for display can re-call
+    list_player_registration_tiers(gender_id=...) for free.
 
     Raises ValueError when no tier is detected or the name doesn't match SAV.
     """
@@ -164,7 +151,7 @@ def derive_enrollment_params(
         raise ValueError(
             f"Tier {raw_name!r} not found for {gender_label}. Available: {available}"
         )
-    return reg_type, match[0], gender_id, tiers
+    return reg_type, match[0], gender_id
 
 
 def parse_missing_guardian_fields(exc: Exception) -> list[str]:
@@ -219,6 +206,13 @@ def resolve_player_candidates(
             ocr_license = None
         if ocr_license is not None and ocr_license in eligible_set:
             return ocr_license, [], None, ocr_license
+
+    # If OCR gave us a licence but it isn't eligible, stop here — the form
+    # already identifies the player, so a name-search fallback would just
+    # surface noise. Bubble the OCR licence up to the manual-entry prompt
+    # so the caller can override (already-registered players, etc.).
+    if ocr_license is not None:
+        return None, [], None, ocr_license
 
     name_field = parsed.get("nome_completo")
     name_val = str(name_field.value) if name_field and name_field.value else ""

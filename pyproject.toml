@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.13.0"
+version = "0.20.3"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -13,6 +13,7 @@ dependencies = [
     "click>=8.0",
     "rapidfuzz>=3.9",
     "mcp>=1.0",
+    "sav-parsers @ git+https://github.com/jfloff/sav-parsers.git@main",
 ]
 
 [project.scripts]
