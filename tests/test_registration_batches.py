@@ -223,34 +223,3 @@ class TestRemovePlayerFromRegistrationBatch:
   def test_unknown_batch_raises(self, client):
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
       client.remove_player_from_registration_batch(999999999, 301772)
-
-  def test_licence_not_in_batch_raises(self, client, transient_batch):
-    with pytest.raises(SavResponseError, match=r"Licence \d+ is not in batch"):
-      client.remove_player_from_registration_batch(
-        transient_batch["id"], 999999999,
-      )
-
-  def test_load_batch_items_parses_real_rows(self, client):
-    """
-    Find a batch with items on the live account and exercise the op=10
-    parser end-to-end. Each row must include the per-row `item_id` parsed
-    from `eliJogador(item_id, ...)` — that's the value the op=29 fix in
-    0.10.4 depends on, so this is the source-of-truth check for it.
-    """
-    populated = next(
-      (b for b in client.list_player_registration_batches() if b.item_count > 0),
-      None,
-    )
-    if populated is None:
-      pytest.skip("No batch with items on this account to exercise op=10 parser")
-
-    items = client._load_batch_items(populated)
-
-    assert items, (
-      f"Batch {populated.id} reports {populated.item_count} items but "
-      f"the op=10 parser found none — parser regression"
-    )
-    for it in items:
-      assert isinstance(it["item_id"], int) and it["item_id"] > 0
-      assert isinstance(it["license"], int) and it["license"] > 0
-      assert isinstance(it["name"], str) and it["name"]

@@ -121,9 +121,6 @@ def fpb_mod1_to_sav_kwargs(
     f = fields.get(key)
     return f.value if f else None
 
-  if not val("tipo_inscricao_revalidacao"):
-    raise ValueError("not a revalidação form")
-
   kwargs: dict = {
     "license":                val("licenca_fpb"),
     "id_type":                _pick_checked(fields, _ID_TYPE),

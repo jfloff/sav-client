@@ -65,7 +65,6 @@ _REGISTRATIONS_LIST_OP = "170"
 _REGISTRATIONS_TIERS_OP = "3"
 _REGISTRATIONS_CREATE_OP = "4"
 _REGISTRATIONS_DELETE_OP = "9"
-_REGISTRATIONS_BATCH_DETAIL_OP = "10"
 _REGISTRATIONS_REMOVE_ITEM_OP = "29"
 _REGISTRATIONS_LIST_REVALIDABLE_OP = "139"
 _REGISTRATIONS_LOAD_PLAYER_OP = "35"
@@ -79,9 +78,17 @@ _REGISTRATIONS_TAXA_PRECHECK_OP = "162"
 _REGISTRATIONS_LOAD_TAXA_OP = "26"
 _REGISTRATIONS_PRECOMMIT_OP = "165"
 _REGISTRATIONS_COMMIT_OP = "36"
+_REGISTRATIONS_DOC_LIST_OP = "91"
+_REGISTRATIONS_DOC_UPLOAD_OP = "92"
+_REGISTRATIONS_DOC_DELETE_OP = "94"
 _REGISTRATIONS_AGENTE_PLAYER = 1
 _REGISTRATIONS_STATE_OPEN = 1
 _REGISTRATIONS_TYPE_REVALIDACAO = 2
+# tipo_doc values (from <select id="tipo1"> in the upload modal)
+_REGISTRATIONS_DOC_TIPO_MODELO_1 = 1   # Modelo 1 - Inscrição jogadores
+_REGISTRATIONS_DOC_TIPO_EXAME_MEDICO = 2
+_REGISTRATIONS_DOC_TIPO_MODELO_4 = 6
+_REGISTRATIONS_DOC_TIPO_DOC_IDENTIFICACAO = 18
 _REGISTRATIONS_TIPOSEGURO_FEDERACAO = 1
 _REGISTRATIONS_PORTUGAL_ID = 155
 # id_type / tipo_identificacao values (from <select id="tipoi"> in club registration form)
@@ -1213,18 +1220,12 @@ class SavClient:
     """
     Remove a single player (by licence) from an open registration batch.
 
-    Loads the batch's items via op=10, finds the row whose licence matches,
-    then fires op=29 with that row's `item_id`. The id passed to op=29 is
-    the per-row batch-item id (from `eliJogador(item_id,...)` in the
-    rendered HTML), *not* the player's internal id from op=35.
-
     Args:
         batch_id: Target batch.
         license:  Licence number of the player to remove.
 
     Raises:
         SavConnectionError: On network errors.
-        SavResponseError:   If the licence isn't currently in the batch.
     """
     if self.session is None:
       raise SavResponseError(
@@ -1238,21 +1239,12 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
 
-    items = self._load_batch_items(batch)
-    item = next((it for it in items if it["license"] == license), None)
-    if item is None:
-      raise SavResponseError(
-        f"Licence {license} is not in batch {batch_id} "
-        f"(current licences: {[it['license'] for it in items]})"
-      )
-    item_id = int(item["item_id"])
-
     try:
       resp = self._http.get(
         self._url(_REGISTRATIONS_PATH),
         params={
           "op": _REGISTRATIONS_REMOVE_ITEM_OP,
-          "id": item_id,
+          "id": license,
           "tipo": batch.type_id,
           "guia": batch.id,
         },
@@ -1265,8 +1257,8 @@ class SavClient:
       ) from exc
 
     logger.info(
-      "Removed player license=%s (item_id=%s) from batch %s — response: %s",
-      license, item_id, batch.id, resp.text[:200],
+      "Removed player license=%s from batch %s — response: %s",
+      license, batch.id, resp.text[:200],
     )
 
   def find_open_player_registration_batch(
@@ -1505,6 +1497,257 @@ class SavClient:
     )
     return internal_id
 
+  def upload_player_registration_document(
+    self,
+    batch_id: int,
+    license: int,
+    file_path: Any,
+    *,
+    tipo_doc: int = _REGISTRATIONS_DOC_TIPO_MODELO_1,
+    internal_id: int | None = None,
+  ) -> None:
+    """
+    Upload a document (PDF or JPG) attached to a player's registration.
+
+    Mirrors the SAV2 upload modal flow: op=91 fetches the existing doc list
+    (so we can pick the next ``n`` slot), then op=92 POSTs the file as a
+    multipart ``file0`` field. The ``inscricao`` query-param is the player's
+    internal id (op=35) — same value returned by
+    ``add_player_to_registration_batch()``.
+
+    Args:
+        batch_id:    Target batch (guia).
+        license:     Player licence.
+        file_path:   Path to a ``.pdf`` or ``.jpg``/``.jpeg`` file.
+        tipo_doc:    Document type id (default: 1 = Modelo 1).
+                     Common values: 1 Modelo 1, 2 Exame Médico, 6 Modelo 4,
+                     18 Doc. Identificação. The full list lives in the
+                     upload modal's ``<select id="tipo1">``.
+        internal_id: Player's internal SAV2 id. When omitted, looked up via
+                     op=35 — pass the value returned by
+                     ``add_player_to_registration_batch()`` to skip that hop.
+
+    Raises:
+        SavResponseError:   not logged in, or server signals failure.
+        SavConnectionError: network errors.
+        FileNotFoundError:  the file doesn't exist.
+        ValueError:         unsupported file type, or batch_id not found.
+    """
+    from pathlib import Path
+
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before upload_player_registration_document()"
+      )
+
+    path = Path(file_path)
+    if not path.is_file():
+      raise FileNotFoundError(f"File not found: {file_path}")
+
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+      content_type = "application/pdf"
+    elif suffix in (".jpg", ".jpeg"):
+      content_type = "image/jpeg"
+    else:
+      raise ValueError(
+        f"Unsupported file type {suffix!r}; SAV2 accepts .pdf and .jpg only."
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    if internal_id is None:
+      internal_id = int(self._load_player_record(batch.id, license)["id"])
+
+    n, _ = self._fetch_registration_documents(batch, license)
+
+    url = (
+      f"{self._url(_REGISTRATIONS_PATH)}?"
+      f"op={_REGISTRATIONS_DOC_UPLOAD_OP}"
+      f"&inscricao={internal_id}&n={n}&licenca={license}"
+      f"&tipo_doc={tipo_doc}&agente={_REGISTRATIONS_AGENTE_PLAYER}"
+    )
+
+    import json as _json
+    with path.open("rb") as fh:
+      files = {"file0": (path.name, fh, content_type)}
+      try:
+        resp = self._http.post(
+          url, files=files, timeout=self._timeout, headers={"Accept": "*/*"},
+        )
+        resp.raise_for_status()
+      except requests.exceptions.RequestException as exc:
+        raise SavConnectionError(f"Could not upload document: {exc}") from exc
+    try:
+      data = _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse upload response: {resp.text[:200]!r}"
+      ) from exc
+    if data.get("val") != 1:
+      raise SavResponseError(
+        f"Document upload failed: {data!r}"
+      )
+    logger.info(
+      "Uploaded %s (tipo_doc=%s, n=%s) for license=%s in batch %s",
+      path.name, tipo_doc, n, license, batch.id,
+    )
+
+  def delete_player_registration_document(self, doc_id: int) -> None:
+    """
+    Delete a previously uploaded registration document by its galeria id.
+
+    The galeria id is the first argument of the ``deleteDoc(...)`` onclick
+    handler in the upload modal — exposed via
+    ``list_player_registration_documents()``.
+
+    Args:
+        doc_id: Galeria id of the document to delete.
+
+    Raises:
+        SavResponseError:   not logged in, or server signals failure.
+        SavConnectionError: network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before delete_player_registration_document()"
+      )
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_DOC_DELETE_OP,
+          "galeria": doc_id,
+          "agente": _REGISTRATIONS_AGENTE_PLAYER,
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not delete document {doc_id}: {exc}"
+      ) from exc
+    logger.info("Deleted registration document galeria=%s", doc_id)
+
+  def list_player_registration_documents(
+    self, batch_id: int, license: int,
+  ) -> list[dict[str, int]]:
+    """
+    List the documents currently uploaded for a player in a batch.
+
+    Returns one ``{"doc_id": int, "tipo_doc": int}`` entry per document, in
+    the order the SAV2 server lists them. ``doc_id`` is the galeria id used
+    by ``delete_player_registration_document()``; ``tipo_doc`` matches the
+    upload modal's type select (1 = Modelo 1, 2 = Exame Médico, ...).
+
+    Raises:
+        SavResponseError:   not logged in.
+        SavConnectionError: network errors.
+        ValueError:         batch_id not found.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before list_player_registration_documents()"
+      )
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+    _, docs = self._fetch_registration_documents(batch, license)
+    return docs
+
+  def replace_player_registration_document(
+    self,
+    batch_id: int,
+    license: int,
+    file_path: Any,
+    *,
+    tipo_doc: int = _REGISTRATIONS_DOC_TIPO_MODELO_1,
+    internal_id: int | None = None,
+  ) -> None:
+    """
+    Replace any existing documents of ``tipo_doc`` for this player+batch with
+    ``file_path``: delete each match via op=94, then upload the new file.
+
+    Idempotent on the upload side — when no existing doc of ``tipo_doc`` is
+    found, behaves like a plain upload. Args mirror
+    ``upload_player_registration_document()``.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before replace_player_registration_document()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    if internal_id is None:
+      internal_id = int(self._load_player_record(batch.id, license)["id"])
+
+    _, docs = self._fetch_registration_documents(batch, license)
+    for doc in docs:
+      if doc["tipo_doc"] == tipo_doc:
+        self.delete_player_registration_document(doc["doc_id"])
+
+    self.upload_player_registration_document(
+      batch_id, license, file_path,
+      tipo_doc=tipo_doc, internal_id=internal_id,
+    )
+
+  def _fetch_registration_documents(
+    self, batch: PlayerRegistrationBatch, license: int,
+  ) -> tuple[int, list[dict[str, int]]]:
+    """
+    Op=91 — fetch a player's existing registration documents.
+
+    Returns ``(next_slot, docs)`` where:
+      - ``next_slot`` is the ``num`` field (1-indexed slot for the next
+        upload via op=92).
+      - ``docs`` is a list of ``{"doc_id": int, "tipo_doc": int}`` parsed
+        from each row's ``deleteDoc(doc_id, licenca, guia, tipo_doc, ...)``
+        onclick handler in the embedded HTML.
+    """
+    import json as _json
+    import re
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_DOC_LIST_OP,
+          "guia": batch.id,
+          "licenca": license,
+          "agente": _REGISTRATIONS_AGENTE_PLAYER,
+          "tipo": batch.type_id,
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+      data = _json.loads(resp.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(
+        f"Could not list registration documents for license {license}: {exc}"
+      ) from exc
+
+    next_slot = int(data.get("num", 1))
+    docs: list[dict[str, int]] = []
+    for m in re.finditer(
+      r"deleteDoc\((\d+)\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)",
+      data.get("body", ""),
+    ):
+      docs.append({"doc_id": int(m.group(1)), "tipo_doc": int(m.group(2))})
+    return next_slot, docs
+
   # ------------------------------------------------------------------
   # Registration wizard helpers
   # ------------------------------------------------------------------
@@ -1559,67 +1802,6 @@ class SavClient:
     return {
       int(m) for m in re.findall(r"<option value='(\d+)'", resp.text) if int(m) > 0
     }
-
-  def _load_batch_items(
-    self, batch: PlayerRegistrationBatch,
-  ) -> list[dict[str, Any]]:
-    """
-    Op=10 — render a batch's player rows and parse out (item_id, license).
-
-    The op returns JSON wrapping the batch panel HTML in `msg`. Each row's
-    delete button carries `onclick='eliJogador(item_id, batch_id, tipo)'`
-    where ``item_id`` is the per-row id we need for op=29 (it is *not* the
-    player's internal id from op=35).
-    """
-    import json as _json
-    import re
-    from bs4 import BeautifulSoup
-
-    try:
-      resp = self._http.get(
-        self._url(_REGISTRATIONS_PATH),
-        params={
-          "op": _REGISTRATIONS_BATCH_DETAIL_OP,
-          "id": batch.id,
-          "tipo": batch.type_id,
-          "perfil": self.session.get("perfil", 0),
-          "user": self.session.get("user", ""),
-          "organizacao": self.session.get("organizacao", 0),
-        },
-        timeout=self._timeout,
-      )
-      resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-      raise SavConnectionError(
-        f"Could not load batch {batch.id} detail: {exc}"
-      ) from exc
-    try:
-      data = _json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Batch detail not valid JSON: {resp.text[:200]!r}"
-      ) from exc
-
-    soup = BeautifulSoup(data.get("msg", ""), "html.parser")
-    items: list[dict[str, Any]] = []
-    for row in soup.select("table#main5 tbody tr"):
-      btn = row.find(attrs={"onclick": re.compile(r"eliJogador\(")})
-      if btn is None:
-        continue
-      m = re.search(r"eliJogador\((\d+)\s*,", btn["onclick"])
-      if not m:
-        continue
-      item_id = int(m.group(1))
-      cells = [td.get_text(strip=True) for td in row.find_all("td")]
-      # Columns: [icon, licença, nome, nasc, nacionalidade, estatuto, taxa, seguro, exame, subida]
-      if len(cells) < 3:
-        continue
-      try:
-        license = int(cells[1])
-      except ValueError:
-        continue
-      items.append({"item_id": item_id, "license": license, "name": cells[2]})
-    return items
 
   def list_concelhos(self, distrito_id: int) -> dict[int, str]:
     """Op=18 — concelhos under a given distrito (id → name), cached 7 days.

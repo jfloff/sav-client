@@ -308,15 +308,41 @@ client.add_player_to_registration_batch(                                      # 
 
 Raises `SavConfigError` for missing minor-guardian fields or non-Revalidação batches; `SavResponseError` if the commit fails. The licence must appear in the batch's server-side eligible list — passing one that doesn't raises `ValueError` with the eligible count for context.
 
+### `upload_player_registration_document(batch_id, license, file_path, *, tipo_doc=1, internal_id=None) → None`
+
+Upload a `.pdf` or `.jpg` document attached to a player's registration. Mirrors the SAV2 upload modal: op=91 fetches the existing doc list to derive the next slot index, then op=92 POSTs the file as a multipart `file0` field.
+
+```python
+client.upload_player_registration_document(batch_id, 301772, "form.pdf")              # tipo_doc defaults to 1 (Modelo 1)
+client.upload_player_registration_document(batch_id, 301772, "exame.pdf", tipo_doc=2)  # Exame Médico
+```
+
+`internal_id` is the value `add_player_to_registration_batch()` returns; pass it to skip an extra op=35 round-trip when uploading right after enrolling. Common `tipo_doc` values: `1` Modelo 1, `2` Exame Médico, `6` Modelo 4, `18` Doc. Identificação — full list in the modal's `<select id="tipo1">`.
+
+### `list_player_registration_documents(batch_id, license) → list[dict]`
+
+List currently uploaded documents for this player+batch as `[{"doc_id", "tipo_doc"}, ...]`. `doc_id` is the galeria id used by `delete_player_registration_document()`.
+
+### `delete_player_registration_document(doc_id) → None`
+
+Delete a previously uploaded document by its `galeria` id (op=94). The id is the first argument of the `deleteDoc(...)` handler in the modal — typically obtained by enumerating existing docs first (the same op=91 round `upload_player_registration_document` already does).
+
+### `replace_player_registration_document(batch_id, license, file_path, *, tipo_doc=1, internal_id=None) → None`
+
+Delete every existing document of `tipo_doc` for this player+batch, then upload `file_path`. Idempotent on the upload side — when no existing doc matches, behaves like a plain upload.
+
+```python
+client.replace_player_registration_document(batch_id, 301772, "form.pdf")              # replace Modelo 1
+client.replace_player_registration_document(batch_id, 301772, "exame.pdf", tipo_doc=2)  # replace Exame Médico
+```
+
 ### `remove_player_from_registration_batch(batch_id, license) → None`
 
-Remove a player from an open batch by licence. Internally loads the batch's rendered rows (op=10), maps `license → item_id` from each row's `eliJogador(item_id, ...)` button, then fires op=29 with that `item_id`. Raises `SavResponseError` if the licence isn't currently in the batch (with the current licence list for debugging).
+Remove a player from an open batch by licence. Fires op=29 directly with `id=license`.
 
 ```python
 client.remove_player_from_registration_batch(batch_id, 301772)
 ```
-
-> The id passed to op=29 is the per-row **batch-item id**, not the player's internal SAV2 id. (They occasionally happen to match, but the parser never relies on that.)
 
 ## Exceptions
 

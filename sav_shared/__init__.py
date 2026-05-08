@@ -116,6 +116,88 @@ def escalao_field_to_name(field_key: str) -> str:
     return suffix.replace("_", " ").title()
 
 
+def _build_club_nif_map(client: Any, club_id: int) -> dict[str, int]:
+    """Build {nif → license} for the given club's roster (all seasons).
+
+    SAV2 has no NIF-based search, so we pay one profile fetch per unique
+    license (parallelised, max 8 workers). Used internally by
+    find_player_license_by_nif and cached on the client per club.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+        roster = client.search_players(club=club_id, season=0)
+    except Exception:
+        return {}
+
+    seen: set[int] = set()
+    licenses: list[int] = []
+    for p in roster:
+        try:
+            lic = int(p.license)
+        except (ValueError, TypeError):
+            continue
+        if lic not in seen:
+            seen.add(lic)
+            licenses.append(lic)
+    if not licenses:
+        return {}
+
+    def _fetch(lic: int) -> tuple[str, int]:
+        try:
+            profile = client.load_player_profile(lic, club_id=club_id)
+        except Exception:
+            return "", 0
+        return (profile.get("nif") or "").strip(), lic
+
+    nif_map: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(licenses))) as pool:
+        for nif_val, lic in pool.map(_fetch, licenses):
+            if nif_val and lic:
+                nif_map[nif_val] = lic
+    return nif_map
+
+
+def find_player_license_by_nif(
+    parsed: dict, client: Any, *, club_id: int | None = None,
+) -> int | None:
+    """Return the license of the player with the OCR'd NIF in the login's club roster.
+
+    The full {nif → license} map for the club is built once and cached on
+    the client so repeated calls within the same enroll operation are O(1).
+
+    Used both to decide reg_type when neither tipo_inscricao box is checked
+    (hit → revalidação, miss → primeira) and to recover a missing licença
+    on the form when the player is already in the roster.
+
+    Returns None when NIF or session club is missing, or when no roster
+    profile carries a matching NIF.
+    """
+    nif_field = parsed.get("nif")
+    nif = str(nif_field.value).strip() if (nif_field and nif_field.value) else ""
+    if not nif:
+        return None
+
+    if club_id is None:
+        club_id = int(client.session.get("organizacao") or 0) if client.session else 0
+    if not club_id:
+        return None
+
+    cache: dict[int, dict[str, int]] | None = getattr(client, "_nif_license_cache", None)
+    if cache is None:
+        cache = {}
+        try:
+            object.__setattr__(client, "_nif_license_cache", cache)
+        except (AttributeError, TypeError):
+            pass
+
+    nif_map = cache.get(club_id)
+    if nif_map is None:
+        nif_map = _build_club_nif_map(client, club_id)
+        cache[club_id] = nif_map
+    return nif_map.get(nif)
+
+
 def derive_enrollment_params(
     parsed: dict, client: Any,
 ) -> tuple[int, int, int]:
@@ -126,9 +208,18 @@ def derive_enrollment_params(
     need the {id → name} map for display can re-call
     list_player_registration_tiers(gender_id=...) for free.
 
+    When neither tipo_inscricao_revalidacao nor tipo_inscricao_primeira is
+    checked on the form, the player is looked up by NIF in the login's
+    club roster — found means revalidação, miss means primeira.
+
     Raises ValueError when no tier is detected or the name doesn't match SAV.
     """
-    reg_type = 2 if parsed_bool(parsed, "tipo_inscricao_revalidacao") else 1
+    if parsed_bool(parsed, "tipo_inscricao_revalidacao"):
+        reg_type = 2
+    elif parsed_bool(parsed, "tipo_inscricao_primeira"):
+        reg_type = 1
+    else:
+        reg_type = 2 if find_player_license_by_nif(parsed, client) is not None else 1
     gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
 
     tier_field = next(
@@ -189,8 +280,9 @@ def resolve_player_candidates(
     Resolve the player for a parsed form against an eligible-licence list.
 
     Returns ``(license, candidates, ocr_name, ocr_license)``:
-      - ``license`` is set when OCR licence matches eligible OR when name search
-        yields exactly one eligible candidate.
+      - ``license`` is set when OCR licence matches eligible, when a NIF
+        lookup against the club roster yields an eligible licence, OR when
+        name search yields exactly one eligible candidate.
       - ``candidates`` is the eligible-name-search list (empty when license is
         set or when no name search ran).
       - ``ocr_name`` / ``ocr_license`` echo what was read from the form.
@@ -213,6 +305,13 @@ def resolve_player_candidates(
     # so the caller can override (already-registered players, etc.).
     if ocr_license is not None:
         return None, [], None, ocr_license
+
+    # No OCR licence: try the same NIF-based club roster lookup we use to
+    # decide reg_type. The map is cached on the client so this is free if
+    # derive_enrollment_params already ran.
+    nif_license = find_player_license_by_nif(parsed, client, club_id=club_id)
+    if nif_license is not None and nif_license in eligible_set:
+        return nif_license, [], None, None
 
     name_field = parsed.get("nome_completo")
     name_val = str(name_field.value) if name_field and name_field.value else ""

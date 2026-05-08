@@ -38,8 +38,11 @@ from sav_shared import (
   find_distrito_id,
   find_id_by_name,
   game_sort_key,
+  GUARDIAN_RELATIONS,
+  ID_TYPES,
   KWARG_TO_SAV_KEY,
   parse_missing_guardian_fields,
+  parsed_bool,
   REGISTRATION_TYPE_LABELS,
   resolve_player_candidates,
 )
@@ -1148,6 +1151,12 @@ def _format_submit_value(
       return concelhos.get(int(val), str(val))
     except (ValueError, TypeError):
       return str(val)
+  if kwarg in ("id_type", "guardian_relation") and not isinstance(val, str):
+    table = ID_TYPES if kwarg == "id_type" else GUARDIAN_RELATIONS
+    try:
+      return table.get(int(val), str(val))
+    except (ValueError, TypeError):
+      return str(val)
   return str(val)
 
 
@@ -1237,13 +1246,15 @@ def enroll_cmd(ctx, pdfs):
       continue
 
     # Step 2 — parse
+    click.echo("  Processing OCR ...", nl=False)
     try:
       parse_result = parse_fpb_mod1(pdf_path)
       parsed = parse_result["fields"]
       processing_id = parse_result["processing_id"]
     except Exception as exc:
-      click.echo(f"  parse error: {exc}", err=True)
+      click.echo(f"\n  parse error: {exc}", err=True)
       continue
+    click.echo(f" Finished ({processing_id})!")
 
     # Once parse_fpb_mod1 has created a processing session, we must close it
     # on every exit path or the dir leaks under files/processing/<id>/ until
@@ -1253,8 +1264,20 @@ def enroll_cmd(ctx, pdfs):
     try:
       # Step 4 — resolve batch (once per invocation, derived from first PDF)
       if batch is None:
+        # When the form has neither tipo_inscricao box checked, derive_enrollment_params
+        # falls back to a NIF-based club-roster scan. Surface that since reg_type
+        # otherwise looks like it came from OCR, and the scan is N profile fetches.
+        type_inferred = not (
+          parsed_bool(parsed, "tipo_inscricao_revalidacao")
+          or parsed_bool(parsed, "tipo_inscricao_primeira")
+        )
         try:
+          if type_inferred:
+            click.echo("  No tipo_inscricao on form; checking club roster by NIF ...", nl=False)
           reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+          if type_inferred:
+            label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
+            click.echo(f" {label}.")
           batch_id, batch = _resolve_enroll_batch(
             client, reg_type, tier_id, gender_id,
           )
@@ -1302,9 +1325,12 @@ def enroll_cmd(ctx, pdfs):
 
       # Step 9 — submit (retry loop for missing guardian fields)
       submitted = False
+      internal_id: int | None = None
       while not submitted:
         try:
-          client.add_player_to_registration_batch(batch_id, license, **kwargs)
+          internal_id = client.add_player_to_registration_batch(
+            batch_id, license, **kwargs,
+          )
           click.echo(f"  Added licence {license} to batch #{batch_id}.")
           submitted = True
         except SavConfigError as exc:
@@ -1315,6 +1341,19 @@ def enroll_cmd(ctx, pdfs):
               kwargs[field_name] = val
         except (SavConnectionError, SavResponseError) as exc:
           raise SavCliError(str(exc), code=_exc_code(exc))
+
+      # Step 9b — upload the source PDF as Modelo 1. Non-fatal: if it fails
+      # the player is still registered, so we just warn and continue.
+      try:
+        client.upload_player_registration_document(
+          batch_id, license, pdf_path, internal_id=internal_id,
+        )
+        click.echo(f"  Uploaded {pdf_path} (Modelo 1).")
+      except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+        click.echo(
+          f"  Warning: enrollment succeeded but document upload failed: {exc}",
+          err=True,
+        )
 
       # Step 10 — close processing session; only send corrections the user
       # explicitly answered (needs_review). Updated and kept were silent paths

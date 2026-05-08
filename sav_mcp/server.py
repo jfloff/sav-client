@@ -12,7 +12,11 @@ Enrollment workflow:
     2. find_open_batch / create_batch  → batch_id
     3. resolve_player  → license (or candidate list if ambiguous)
     4. preview_enrollment  → full reconciled profile for user review
-    5. submit_enrollment  → player_id  (or missing_guardian_fields on minor)
+    5. submit_enrollment  → player_id (auto-uploads source PDF as Modelo 1)
+
+Document tools (post-enrollment, ad-hoc):
+    list_player_documents / upload_player_document /
+    delete_player_document / replace_player_document
 """
 
 from __future__ import annotations
@@ -423,6 +427,9 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             "reg_type": reg_type,
             "tier_id": tier_id,
             "gender_id": gender_id,
+            # Retained so submit_enrollment can upload the source PDF as
+            # Modelo 1 after a successful enroll (parity with the CLI flow).
+            "pdf_bytes": pdf_bytes,
         }
 
         results.append({
@@ -612,6 +619,28 @@ def submit_enrollment(
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
         }
 
+    # Auto-upload the source PDF as Modelo 1 (parity with `sav enroll`).
+    # Non-fatal: enrollment is already committed, so we just record the
+    # outcome on the response and let the caller retry via
+    # upload_player_document if it fails.
+    upload_status: str | dict = "skipped"
+    pdf_bytes = form.get("pdf_bytes")
+    if pdf_bytes:
+        tmp_path: str | None = None
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+                f.write(pdf_bytes)
+                tmp_path = f.name
+            client.upload_player_registration_document(
+                batch_id, license, tmp_path, internal_id=player_id,
+            )
+            upload_status = "ok"
+        except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+            upload_status = {"error": str(exc)}
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+
     # Only send corrections the user explicitly answered (needs_review).
     # Updated/kept were silent paths — staging them risks dataset noise.
     # retrain_corrections are SAV-side truths for read-only fields (nif,
@@ -634,7 +663,94 @@ def submit_enrollment(
         "player_id": player_id,
         "license": license,
         "name": sav_profile.get("nome", ""),
+        "modelo1_upload": upload_status,
     }
+
+
+# ── Registration documents ────────────────────────────────────────────────────
+
+@server.tool()
+def list_player_documents(batch_id: int, license: int) -> list[dict]:
+    """
+    List documents currently uploaded for a player in a batch.
+
+    Each entry: {"doc_id": int, "tipo_doc": int}. doc_id is the galeria id
+    expected by delete_player_document; tipo_doc matches the SAV2 upload
+    modal's type select (1 Modelo 1, 2 Exame Médico, 6 Modelo 4,
+    18 Doc. Identificação, ...).
+    """
+    return _get_client().list_player_registration_documents(batch_id, license)
+
+
+def _decode_pdf_to_tempfile(pdf_base64: str, suffix: str = ".pdf") -> str:
+    """Decode a base64-encoded payload into a temp file; caller must unlink."""
+    pdf_bytes = base64.b64decode(pdf_base64)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
+        f.write(pdf_bytes)
+        return f.name
+
+
+@server.tool()
+def upload_player_document(
+    batch_id: int,
+    license: int,
+    pdf_base64: str,
+    tipo_doc: int = 1,
+    internal_id: int | None = None,
+) -> dict:
+    """
+    Upload a document (PDF, base64-encoded) attached to a player's registration.
+
+    tipo_doc: 1 Modelo 1, 2 Exame Médico, 6 Modelo 4, 18 Doc. Identificação, ...
+    internal_id: player's SAV2 internal id (returned by submit_enrollment as
+    `player_id`); when omitted, derived via op=35.
+
+    Returns {"success": True} on success.
+    """
+    tmp_path = _decode_pdf_to_tempfile(pdf_base64)
+    try:
+        _get_client().upload_player_registration_document(
+            batch_id, license, tmp_path,
+            tipo_doc=tipo_doc, internal_id=internal_id,
+        )
+        return {"success": True}
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@server.tool()
+def delete_player_document(doc_id: int) -> dict:
+    """
+    Delete a previously uploaded document by its galeria id (from list_player_documents).
+    """
+    _get_client().delete_player_registration_document(doc_id)
+    return {"success": True}
+
+
+@server.tool()
+def replace_player_document(
+    batch_id: int,
+    license: int,
+    pdf_base64: str,
+    tipo_doc: int = 1,
+    internal_id: int | None = None,
+) -> dict:
+    """
+    Replace any existing documents of `tipo_doc` for this player+batch with a
+    new PDF (base64-encoded). Idempotent on the upload side: when no existing
+    doc of `tipo_doc` is found, behaves like a plain upload.
+    """
+    tmp_path = _decode_pdf_to_tempfile(pdf_base64)
+    try:
+        _get_client().replace_player_registration_document(
+            batch_id, license, tmp_path,
+            tipo_doc=tipo_doc, internal_id=internal_id,
+        )
+        return {"success": True}
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def main() -> None:
