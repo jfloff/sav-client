@@ -74,6 +74,18 @@ class Cache:
         player_id INTEGER NOT NULL
       )
     """)
+    # license ↔ NIF is also stable (NIF is the player's tax id, set once at
+    # registration). Same rationale: no TTL — invalidate() wipes it if a
+    # NIF correction ever surfaces a stale row.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS license_nif (
+        license INTEGER PRIMARY KEY,
+        nif     TEXT    NOT NULL
+      )
+    """)
+    con.execute(
+      "CREATE INDEX IF NOT EXISTS idx_license_nif_nif ON license_nif(nif)"
+    )
     for col, typedef in [
       ("full_name", "TEXT NOT NULL DEFAULT ''"),
       ("code",      "TEXT NOT NULL DEFAULT ''"),
@@ -231,6 +243,32 @@ class Cache:
     finally:
       con.close()
 
+  def get_license_by_nif(self, nif: str) -> int | None:
+    """Return the licence whose NIF matches, or None if unknown."""
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT license FROM license_nif WHERE nif = ? LIMIT 1",
+        (nif,),
+      ).fetchone()
+      return row[0] if row else None
+    finally:
+      con.close()
+
+  def record_player_nifs(self, pairs: list[tuple[int, str]]) -> None:
+    """Bulk-upsert (license, nif) pairs. No-op when pairs is empty."""
+    if not pairs:
+      return
+    con = self._db()
+    try:
+      con.executemany(
+        "INSERT OR REPLACE INTO license_nif (license, nif) VALUES (?, ?)",
+        pairs,
+      )
+      con.commit()
+    finally:
+      con.close()
+
   def invalidate(self) -> None:
     """Clear all cached data."""
     if not self.path.exists():
@@ -242,6 +280,7 @@ class Cache:
       con.execute("DELETE FROM concelhos")
       con.execute("DELETE FROM tiers")
       con.execute("DELETE FROM license_to_id")
+      con.execute("DELETE FROM license_nif")
       con.commit()
     finally:
       con.close()

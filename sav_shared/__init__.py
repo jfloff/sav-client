@@ -163,8 +163,10 @@ def find_player_license_by_nif(
 ) -> int | None:
     """Return the license of the player with the OCR'd NIF in the login's club roster.
 
-    The full {nif → license} map for the club is built once and cached on
-    the client so repeated calls within the same enroll operation are O(1).
+    Lookup tiers (cheapest first):
+      1. SQLite license↔NIF cache — O(1), survives across processes.
+      2. Per-club roster build, persisted into the SQLite cache for
+         future runs. Done at most once per club per process.
 
     Used both to decide reg_type when neither tipo_inscricao box is checked
     (hit → revalidação, miss → primeira) and to recover a missing licença
@@ -178,23 +180,32 @@ def find_player_license_by_nif(
     if not nif:
         return None
 
+    sqlite_cache = getattr(client, "_cache", None)
+    if sqlite_cache is not None:
+        hit = sqlite_cache.get_license_by_nif(nif)
+        if hit:
+            return hit
+
     if club_id is None:
         club_id = int(client.session.get("organizacao") or 0) if client.session else 0
     if not club_id:
         return None
 
-    cache: dict[int, dict[str, int]] | None = getattr(client, "_nif_license_cache", None)
-    if cache is None:
-        cache = {}
+    built: set[int] | None = getattr(client, "_nif_clubs_built", None)
+    if built is None:
+        built = set()
         try:
-            object.__setattr__(client, "_nif_license_cache", cache)
+            object.__setattr__(client, "_nif_clubs_built", built)
         except (AttributeError, TypeError):
-            pass
+            built = set()
 
-    nif_map = cache.get(club_id)
-    if nif_map is None:
-        nif_map = _build_club_nif_map(client, club_id)
-        cache[club_id] = nif_map
+    if club_id in built:
+        return None
+
+    nif_map = _build_club_nif_map(client, club_id)
+    built.add(club_id)
+    if nif_map and sqlite_cache is not None:
+        sqlite_cache.record_player_nifs([(lic, n) for n, lic in nif_map.items()])
     return nif_map.get(nif)
 
 
