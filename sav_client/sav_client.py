@@ -549,7 +549,7 @@ class SavClient:
       "jc_findByNumber": number,
       "jc_sexo": gender,
       "jc_escalao": tier,
-      "jc_associacao": 0 if association is None else association,
+      "jc_associacao": "" if association is None else association,
       "jc_epoca": season,
       "perfil": self.session.get("perfil", 0),
       "user": self.session.get("user", ""),
@@ -1504,16 +1504,17 @@ class SavClient:
     file_path: Any,
     *,
     tipo_doc: int = _REGISTRATIONS_DOC_TIPO_MODELO_1,
-    internal_id: int | None = None,
   ) -> None:
     """
     Upload a document (PDF or JPG) attached to a player's registration.
 
-    Mirrors the SAV2 upload modal flow: op=91 fetches the existing doc list
-    (so we can pick the next ``n`` slot), then op=92 POSTs the file as a
-    multipart ``file0`` field. The ``inscricao`` query-param is the player's
-    internal id (op=35) — same value returned by
-    ``add_player_to_registration_batch()``.
+    Mirrors the SAV2 upload modal flow: op=91 fetches the modal HTML — we
+    parse the next ``n`` slot AND the per-batch ``inscricao`` id from the
+    embedded ``checkDoc(n, inscricao, licenca, guia, ...)`` onclick — then
+    op=92 POSTs the file as a multipart ``file0`` field. ``inscricao`` is
+    the registration record id created by op=36, NOT the user_id from
+    op=35; the only reliable way to obtain it is via op=91 once the player
+    has been added to the batch.
 
     Args:
         batch_id:    Target batch (guia).
@@ -1523,9 +1524,6 @@ class SavClient:
                      Common values: 1 Modelo 1, 2 Exame Médico, 6 Modelo 4,
                      18 Doc. Identificação. The full list lives in the
                      upload modal's ``<select id="tipo1">``.
-        internal_id: Player's internal SAV2 id. When omitted, looked up via
-                     op=35 — pass the value returned by
-                     ``add_player_to_registration_batch()`` to skip that hop.
 
     Raises:
         SavResponseError:   not logged in, or server signals failure.
@@ -1561,15 +1559,12 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
 
-    if internal_id is None:
-      internal_id = int(self._load_player_record(batch.id, license)["id"])
-
-    n, _ = self._fetch_registration_documents(batch, license)
+    n, inscricao, _ = self._fetch_registration_documents(batch, license)
 
     url = (
       f"{self._url(_REGISTRATIONS_PATH)}?"
       f"op={_REGISTRATIONS_DOC_UPLOAD_OP}"
-      f"&inscricao={internal_id}&n={n}&licenca={license}"
+      f"&inscricao={inscricao}&n={n}&licenca={license}"
       f"&tipo_doc={tipo_doc}&agente={_REGISTRATIONS_AGENTE_PLAYER}"
     )
 
@@ -1660,7 +1655,7 @@ class SavClient:
     )
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
-    _, docs = self._fetch_registration_documents(batch, license)
+    _, _, docs = self._fetch_registration_documents(batch, license)
     return docs
 
   def replace_player_registration_document(
@@ -1670,7 +1665,6 @@ class SavClient:
     file_path: Any,
     *,
     tipo_doc: int = _REGISTRATIONS_DOC_TIPO_MODELO_1,
-    internal_id: int | None = None,
   ) -> None:
     """
     Replace any existing documents of ``tipo_doc`` for this player+batch with
@@ -1692,28 +1686,28 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
 
-    if internal_id is None:
-      internal_id = int(self._load_player_record(batch.id, license)["id"])
-
-    _, docs = self._fetch_registration_documents(batch, license)
+    _, _, docs = self._fetch_registration_documents(batch, license)
     for doc in docs:
       if doc["tipo_doc"] == tipo_doc:
         self.delete_player_registration_document(doc["doc_id"])
 
     self.upload_player_registration_document(
-      batch_id, license, file_path,
-      tipo_doc=tipo_doc, internal_id=internal_id,
+      batch_id, license, file_path, tipo_doc=tipo_doc,
     )
 
   def _fetch_registration_documents(
     self, batch: PlayerRegistrationBatch, license: int,
-  ) -> tuple[int, list[dict[str, int]]]:
+  ) -> tuple[int, int, list[dict[str, int]]]:
     """
     Op=91 — fetch a player's existing registration documents.
 
-    Returns ``(next_slot, docs)`` where:
+    Returns ``(next_slot, inscricao, docs)`` where:
       - ``next_slot`` is the ``num`` field (1-indexed slot for the next
         upload via op=92).
+      - ``inscricao`` is the per-batch registration record id, parsed from
+        the embedded ``checkDoc(n, inscricao, licenca, guia, ...)`` onclick
+        in the HTML (this is NOT the user_id from op=35; it's created when
+        the player is added to the batch via op=36).
       - ``docs`` is a list of ``{"doc_id": int, "tipo_doc": int}`` parsed
         from each row's ``deleteDoc(doc_id, licenca, guia, tipo_doc, ...)``
         onclick handler in the embedded HTML.
@@ -1739,14 +1733,22 @@ class SavClient:
         f"Could not list registration documents for license {license}: {exc}"
       ) from exc
 
+    body = data.get("body") or ""
     next_slot = int(data.get("num", 1))
+    m_check = re.search(r"checkDoc\(\s*\d+\s*,\s*(\d+)", body)
+    if not m_check:
+      raise SavResponseError(
+        f"Could not find inscricao id in op=91 response for license "
+        f"{license}, batch {batch.id}: {body[:200]!r}"
+      )
+    inscricao = int(m_check.group(1))
     docs: list[dict[str, int]] = []
     for m in re.finditer(
       r"deleteDoc\((\d+)\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)",
-      data.get("body", ""),
+      body,
     ):
       docs.append({"doc_id": int(m.group(1)), "tipo_doc": int(m.group(2))})
-    return next_slot, docs
+    return next_slot, inscricao, docs
 
   # ------------------------------------------------------------------
   # Registration wizard helpers

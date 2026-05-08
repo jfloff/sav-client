@@ -1151,7 +1151,10 @@ def _format_submit_value(
       return concelhos.get(int(val), str(val))
     except (ValueError, TypeError):
       return str(val)
-  if kwarg in ("id_type", "guardian_relation") and not isinstance(val, str):
+  if kwarg in ("id_type", "guardian_relation"):
+    # SAV stores `tipo` as a numeric string ("1"), OCR may carry raw text
+    # ("Cartão de Cidadão"); int() succeeds on the former, raises on the
+    # latter — fall through to str(val) when the lookup doesn't apply.
     table = ID_TYPES if kwarg == "id_type" else GUARDIAN_RELATIONS
     try:
       return table.get(int(val), str(val))
@@ -1325,10 +1328,9 @@ def enroll_cmd(ctx, pdfs):
 
       # Step 9 — submit (retry loop for missing guardian fields)
       submitted = False
-      internal_id: int | None = None
       while not submitted:
         try:
-          internal_id = client.add_player_to_registration_batch(
+          client.add_player_to_registration_batch(
             batch_id, license, **kwargs,
           )
           click.echo(f"  Added licence {license} to batch #{batch_id}.")
@@ -1346,7 +1348,7 @@ def enroll_cmd(ctx, pdfs):
       # the player is still registered, so we just warn and continue.
       try:
         client.upload_player_registration_document(
-          batch_id, license, pdf_path, internal_id=internal_id,
+          batch_id, license, pdf_path,
         )
         click.echo(f"  Uploaded {pdf_path} (Modelo 1).")
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:

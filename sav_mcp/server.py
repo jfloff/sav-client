@@ -632,7 +632,7 @@ def submit_enrollment(
                 f.write(pdf_bytes)
                 tmp_path = f.name
             client.upload_player_registration_document(
-                batch_id, license, tmp_path, internal_id=player_id,
+                batch_id, license, tmp_path,
             )
             upload_status = "ok"
         except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
@@ -696,22 +696,18 @@ def upload_player_document(
     license: int,
     pdf_base64: str,
     tipo_doc: int = 1,
-    internal_id: int | None = None,
 ) -> dict:
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
 
     tipo_doc: 1 Modelo 1, 2 Exame Médico, 6 Modelo 4, 18 Doc. Identificação, ...
-    internal_id: player's SAV2 internal id (returned by submit_enrollment as
-    `player_id`); when omitted, derived via op=35.
 
     Returns {"success": True} on success.
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         _get_client().upload_player_registration_document(
-            batch_id, license, tmp_path,
-            tipo_doc=tipo_doc, internal_id=internal_id,
+            batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
         return {"success": True}
     finally:
@@ -734,7 +730,6 @@ def replace_player_document(
     license: int,
     pdf_base64: str,
     tipo_doc: int = 1,
-    internal_id: int | None = None,
 ) -> dict:
     """
     Replace any existing documents of `tipo_doc` for this player+batch with a
@@ -744,8 +739,7 @@ def replace_player_document(
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         _get_client().replace_player_registration_document(
-            batch_id, license, tmp_path,
-            tipo_doc=tipo_doc, internal_id=internal_id,
+            batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
         return {"success": True}
     finally:
