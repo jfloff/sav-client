@@ -68,6 +68,8 @@ _REGISTRATIONS_DELETE_OP = "9"
 _REGISTRATIONS_REMOVE_ITEM_OP = "29"
 _REGISTRATIONS_LIST_REVALIDABLE_OP = "139"
 _REGISTRATIONS_LOAD_PLAYER_OP = "35"
+_REGISTRATIONS_BATCH_DETAIL_OP = "10"
+_REGISTRATIONS_LOAD_EXISTING_PLAYER_OP = "30"
 _REGISTRATIONS_SAVE_STEP1_OP = "33"
 _REGISTRATIONS_SAVE_STEP2_OP = "31"
 _REGISTRATIONS_LIST_CONCELHOS_OP = "18"
@@ -1399,6 +1401,19 @@ class SavClient:
 
     eligible = self._list_revalidable_licenses(batch)
     if license not in eligible:
+      enrolled = {
+        item["license"] for item in self.list_player_registration_batch_items(batch.id)
+      }
+      if license in enrolled:
+        return self._update_existing_player_in_batch(
+          batch, license,
+          id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+          telemovel=telemovel, telefone=telefone, email=email,
+          nome_pai=nome_pai, nome_mae=nome_mae,
+          morada=morada, cod_postal=cod_postal,
+          localidade_txt=localidade_txt,
+          distrito_id=distrito_id, concelho_id=concelho_id,
+        )
       raise ValueError(
         f"Licence {license} is not eligible for revalidation in batch "
         f"{batch.id} ({batch.tier} {batch.gender}). The server's eligible "
@@ -1496,6 +1511,142 @@ class SavClient:
       license, internal_id, batch.id, result.get("resultfunction"),
     )
     return internal_id
+
+  def _update_existing_player_in_batch(
+    self,
+    batch: PlayerRegistrationBatch,
+    license: int,
+    *,
+    id_type: int | None,
+    id_number: str | None,
+    id_expiry: str | None,
+    telemovel: str | None,
+    telefone: str | None,
+    email: str | None,
+    nome_pai: str | None,
+    nome_mae: str | None,
+    morada: str | None,
+    cod_postal: str | None,
+    localidade_txt: str | None,
+    distrito_id: int | None,
+    concelho_id: int | None,
+  ) -> int:
+    """
+    Patch an already-enrolled player's personal data and (optionally)
+    address. Mirrors the wizard's edit flow: op=30 (load) → op=33 (step 1)
+    → op=31 (step 2, only when an address field is overridden). Skips the
+    insurance/taxa cascade and op=36 commit — those are creation-time and
+    the existing inscricao already carries them.
+    """
+    record = self._load_existing_registration_record(batch.id, license)
+    internal_id = int(record["id"])
+
+    step1_send = self._build_step1_send(
+      record,
+      id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+      telemovel=telemovel, telefone=telefone, email=email,
+      nome_pai=nome_pai, nome_mae=nome_mae,
+    )
+    step2_prefill = self._save_registration_step1(batch.id, internal_id, step1_send)
+
+    address_fields = (morada, cod_postal, localidade_txt, distrito_id, concelho_id)
+    if any(v is not None for v in address_fields):
+      step2_send = self._build_step2_send(
+        step2_prefill,
+        morada=morada, cod_postal=cod_postal, localidade_txt=localidade_txt,
+        distrito_id=distrito_id, concelho_id=concelho_id,
+      )
+      self._save_registration_step2(
+        batch.type_id, batch.id, internal_id, license, step2_send,
+      )
+
+    logger.info(
+      "Updated player license=%s (id=%s) in batch %s",
+      license, internal_id, batch.id,
+    )
+    return internal_id
+
+  def update_player_in_registration_batch(
+    self,
+    batch_id: int,
+    license: int,
+    *,
+    id_type: int | None = None,
+    id_number: str | None = None,
+    id_expiry: str | None = None,
+    telemovel: str | None = None,
+    telefone: str | None = None,
+    email: str | None = None,
+    nome_pai: str | None = None,
+    nome_mae: str | None = None,
+    morada: str | None = None,
+    cod_postal: str | None = None,
+    localidade_txt: str | None = None,
+    distrito_id: int | None = None,
+    concelho_id: int | None = None,
+  ) -> int:
+    """
+    Patch fields on a player already enrolled in an open Revalidação batch.
+
+    Only step-1 (personal data) and step-2 (address) fields are supported;
+    those persist via op=33/op=31 without re-firing the op=36 commit. Pass
+    only the fields you want to change — the rest are loaded from the
+    existing inscricao via op=30 and kept as-is.
+
+    Guardian, taxa, insurance, and consent fields are commit-time only
+    (op=36) and require a separate edit-flow trace before they can be
+    safely patched on an existing enrolment.
+
+    Args:
+        batch_id: Open Revalidação batch holding the enrolment.
+        license:  Licence of the already-enrolled player.
+
+    Raises:
+        ValueError:        Batch unknown, not open, wrong type, or licence
+                           not currently enrolled in this batch.
+        SavResponseError:  Server returned an error.
+        SavConnectionError: Network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before update_player_in_registration_batch()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+    if not batch.is_open:
+      raise ValueError(
+        f"Batch {batch.id} is not open (state={batch.state!r}); "
+        "only 'Em construção' batches can be edited."
+      )
+    if batch.type_id != _REGISTRATIONS_TYPE_REVALIDACAO:
+      raise NotImplementedError(
+        f"Only Revalidação batches are supported (type_id=2); "
+        f"got type_id={batch.type_id} ({batch.type!r})."
+      )
+
+    enrolled = {
+      item["license"] for item in self.list_player_registration_batch_items(batch.id)
+    }
+    if license not in enrolled:
+      raise ValueError(
+        f"Licence {license} is not enrolled in batch {batch.id}; "
+        f"use add_player_to_registration_batch() to add new players."
+      )
+
+    return self._update_existing_player_in_batch(
+      batch, license,
+      id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+      telemovel=telemovel, telefone=telefone, email=email,
+      nome_pai=nome_pai, nome_mae=nome_mae,
+      morada=morada, cod_postal=cod_postal,
+      localidade_txt=localidade_txt,
+      distrito_id=distrito_id, concelho_id=concelho_id,
+    )
 
   def upload_player_registration_document(
     self,
@@ -1804,6 +1955,130 @@ class SavClient:
     return {
       int(m) for m in re.findall(r"<option value='(\d+)'", resp.text) if int(m) > 0
     }
+
+  def list_player_registration_batch_items(
+    self, batch_id: int,
+  ) -> list[dict[str, Any]]:
+    """
+    Op=10 — list players currently enrolled in a registration batch.
+
+    The SAV2 batch detail page renders one row per item; each row carries
+    ``editJogador(license, batch, type)`` and similar onclick handlers from
+    which we recover the licence. Returns a list of
+    ``{"license": int, "name": str}`` in the order the server lists them.
+
+    Used to detect "already enrolled" players so a re-submit can patch the
+    existing item via op=30 + op=33/op=31 instead of erroring on the
+    revalidable-list gate (op=139 excludes anyone already in any open batch).
+
+    Raises:
+        SavResponseError:   not logged in, or response cannot be parsed.
+        SavConnectionError: network errors.
+        ValueError:         batch_id not found.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before list_player_registration_batch_items()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    import json as _json
+    import re
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_BATCH_DETAIL_OP,
+          "id": batch.id,
+          "tipo": batch.type_id,
+          "perfil": self.session.get("perfil", 0),
+          "user": self.session.get("user", ""),
+          "organizacao": self.session.get("organizacao", 0),
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not list items for batch {batch_id}: {exc}"
+      ) from exc
+
+    body = resp.text
+    try:
+      body = _json.loads(body).get("msg", body)
+    except ValueError:
+      pass
+
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(body, "html.parser")
+    items: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for btn in soup.find_all(attrs={"onclick": re.compile(r"editJogador\(")}):
+      m = re.search(r"editJogador\((\d+)\s*,\s*(\d+)", btn.get("onclick", ""))
+      if not m:
+        continue
+      license = int(m.group(1))
+      if license in seen:
+        continue
+      seen.add(license)
+      row = btn.find_parent("tr")
+      cells = [c.get_text(strip=True) for c in row.find_all("td")] if row else []
+      name = cells[2] if len(cells) > 2 else ""
+      items.append({"license": license, "name": name})
+    return items
+
+  def _load_existing_registration_record(
+    self, batch_id: int, license: int,
+  ) -> dict[str, Any]:
+    """Op=30 — load an already-enrolled item's record for the edit wizard.
+
+    Same response shape as op=35 (id, nome, nasc/datenasc, nif, email, …)
+    plus an ``existe: 1`` flag. Required entry point for the update path:
+    op=33/op=31 then key by (internal_id, guia) and patch the existing
+    inscricao without firing op=36 again.
+    """
+    import json as _json
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_EXISTING_PLAYER_OP,
+          "id": license,
+          "guia": batch_id,
+        },
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not load existing registration record: {exc}"
+      ) from exc
+    try:
+      data = _json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse existing record: {resp.text[:200]!r}"
+      ) from exc
+    if not data.get("id"):
+      raise SavResponseError(
+        f"Existing record for licence {license!r} in batch {batch_id} not "
+        f"found: {data!r}"
+      )
+    # op=30 uses different keys than op=35 ("datenasc" vs "nasc",
+    # "nacionalidade" vs "nacional"); normalise so the shared
+    # _build_step1_send helper can treat both records identically.
+    if "datenasc" in data and "nasc" not in data:
+      data["nasc"] = data["datenasc"]
+    if "nacionalidade" in data and "nacional" not in data:
+      data["nacional"] = data["nacionalidade"]
+    return data
 
   def list_concelhos(self, distrito_id: int) -> dict[int, str]:
     """Op=18 — concelhos under a given distrito (id → name), cached 7 days.

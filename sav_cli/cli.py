@@ -37,6 +37,7 @@ from sav_shared import (
   find_club_matches,
   find_distrito_id,
   find_id_by_name,
+  find_player_license_by_nif,
   game_sort_key,
   GUARDIAN_RELATIONS,
   ID_TYPES,
@@ -1010,8 +1011,48 @@ def _resolve_enroll_batch(
   return _create()
 
 
-def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
-  """Return the player licence from OCR / name search / manual input, or None to skip."""
+def _find_enrolled_in_matching_batches(
+  client: Any, batch: Any, license: int,
+) -> Any | None:
+  """Locate the open batch (same type/tier/gender) where ``license`` is
+  already enrolled, or None.
+
+  SAV2 only allows a player in one open batch at a time, so a parsed form
+  whose licence is missing from the current batch's eligible list usually
+  means they're sitting in a different open batch with the same params —
+  which is the batch the update path needs to point at.
+  """
+  try:
+    all_batches = client.list_player_registration_batches()
+  except (SavConnectionError, SavResponseError):
+    return None
+  candidates = [
+    b for b in all_batches
+    if b.is_open
+    and b.type_id == batch.type_id
+    and b.tier_id == batch.tier_id
+    and b.gender_id == batch.gender_id
+  ]
+  for b in candidates:
+    try:
+      items = client.list_player_registration_batch_items(b.id)
+    except (SavConnectionError, SavResponseError):
+      continue
+    if any(item["license"] == license for item in items):
+      return b
+  return None
+
+
+def _resolve_enroll_player(
+  client: Any, batch: Any, parsed: dict,
+) -> tuple[int, Any] | None:
+  """Return ``(license, target_batch)`` for the parsed form, or None to skip.
+
+  ``target_batch`` is normally the input ``batch``, but switches when the
+  player is already enrolled in a different open batch with matching
+  params — in that case the caller should add/update against the returned
+  batch instead, since SAV2 won't allow re-adding to a second one.
+  """
   try:
     eligible = client._list_revalidable_licenses(batch)
   except Exception as exc:
@@ -1021,19 +1062,42 @@ def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
     parsed, eligible, client, batch.club_id,
   )
   if license is not None:
-    return license
+    return license, batch
+
+  # Already-enrolled fallback: licence-first, then NIF, against open batches
+  # matching the same (type, tier, gender). Returning the matching batch lets
+  # the caller route the wizard's edit path (op=30 + op=33/op=31).
+  enrolled_license: int | None = None
+  if ocr_license is not None:
+    enrolled_license = ocr_license
+  else:
+    nif_license = find_player_license_by_nif(parsed, client, club_id=batch.club_id)
+    if nif_license is not None:
+      enrolled_license = nif_license
+
+  if enrolled_license is not None:
+    target = _find_enrolled_in_matching_batches(client, batch, enrolled_license)
+    if target is not None:
+      if target.id != batch.id:
+        click.echo(
+          f"  Already enrolled in batch #{target.number} (id={target.id}); "
+          f"updating there."
+        )
+      else:
+        click.echo(f"  Already enrolled in this batch — updating.")
+      return enrolled_license, target
 
   if len(candidates) > 1:
     click.echo(f"  Multiple players match {ocr_name!r}:")
     for i, p in enumerate(candidates, 1):
       click.echo(f"    {i}.  {p.name}  (licence {p.license})")
     idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
-    return int(candidates[idx - 1].license)
+    return int(candidates[idx - 1].license), batch
 
   if ocr_license is not None:
     click.echo(f"  OCR licence {ocr_license} is not in the eligible list for this batch.")
     if click.confirm("  Use it anyway?"):
-      return ocr_license
+      return ocr_license, batch
   elif ocr_name:
     click.echo(f"  Player not found for {ocr_name!r} in eligible list.")
   else:
@@ -1049,10 +1113,20 @@ def _resolve_enroll_player(client: Any, batch: Any, parsed: dict) -> int | None:
       click.echo("  Not a valid number.")
       continue
     if lic not in eligible:
+      target = _find_enrolled_in_matching_batches(client, batch, lic)
+      if target is not None:
+        if target.id != batch.id:
+          click.echo(
+            f"  Licence {lic} is enrolled in batch #{target.number} "
+            f"(id={target.id}); updating there."
+          )
+        else:
+          click.echo(f"  Licence {lic} is already in this batch — updating.")
+        return lic, target
       click.echo(f"  Licence {lic} is not in the eligible list for this batch.")
       if not click.confirm("  Use it anyway?"):
         continue
-    return lic
+    return lic, batch
 
 
 def _prompt_field(kwarg: str, hint: str = "") -> Any:
@@ -1291,14 +1365,18 @@ def enroll_cmd(ctx, pdfs):
         except (SavConnectionError, SavResponseError) as exc:
           raise SavCliError(str(exc), code=_exc_code(exc))
 
-      # Step 5 — resolve player licence
+      # Step 5 — resolve player licence (may redirect to a different open
+      # batch when the player is already enrolled there — SAV2 only permits
+      # one open enrolment per player).
       try:
-        license = _resolve_enroll_player(client, batch, parsed)
+        resolved = _resolve_enroll_player(client, batch, parsed)
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(str(exc), code=_exc_code(exc))
-      if license is None:
+      if resolved is None:
         click.echo("  Skipped.")
         continue
+      license, batch = resolved
+      batch_id = batch.id
 
       # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
       # server-side validation surfaces at real submit.
@@ -1344,10 +1422,12 @@ def enroll_cmd(ctx, pdfs):
         except (SavConnectionError, SavResponseError) as exc:
           raise SavCliError(str(exc), code=_exc_code(exc))
 
-      # Step 9b — upload the source PDF as Modelo 1. Non-fatal: if it fails
-      # the player is still registered, so we just warn and continue.
+      # Step 9b — upload the source PDF as Modelo 1. Replace semantics: any
+      # prior Modelo 1 for this player+batch is deleted first so a re-submit
+      # leaves exactly the new file in place. Non-fatal: if it fails the
+      # player is still registered, so we just warn and continue.
       try:
-        client.upload_player_registration_document(
+        client.replace_player_registration_document(
           batch_id, license, pdf_path,
         )
         click.echo(f"  Uploaded {pdf_path} (Modelo 1).")
@@ -1379,6 +1459,311 @@ def enroll_cmd(ctx, pdfs):
           close_processing(processing_id)
         except Exception:
           pass
+
+
+_TIPO_DOC_NAMES: dict[str, int] = {
+  "modelo1": 1, "modelo-1": 1, "mod1": 1, "1": 1,
+  "exame": 2, "exame-medico": 2, "2": 2,
+  "modelo4": 6, "modelo-4": 6, "mod4": 6, "6": 6,
+  "doc-id": 18, "id": 18, "identificacao": 18, "18": 18,
+}
+_TIPO_DOC_LABELS: dict[int, str] = {
+  1: "Modelo 1", 2: "Exame Médico", 6: "Modelo 4", 18: "Doc. Identificação",
+}
+
+# Field types accepted by `sav enrollment update --field`. Values are
+# ("step1"|"step2"|"resolve_distrito"|"resolve_concelho", py_type) — the
+# coercer turns each --field K=V into a kwarg on update_player_in_registration_batch.
+_UPDATE_FIELDS: dict[str, tuple[str, type]] = {
+  "id_type":        ("step1", int),
+  "id_number":      ("step1", str),
+  "id_expiry":      ("step1", str),
+  "telemovel":      ("step1", str),
+  "telefone":       ("step1", str),
+  "email":          ("step1", str),
+  "nome_pai":       ("step1", str),
+  "nome_mae":       ("step1", str),
+  "morada":         ("step2", str),
+  "cod_postal":     ("step2", str),
+  "localidade_txt": ("step2", str),
+  "distrito_id":    ("resolve_distrito", int),
+  "concelho_id":    ("resolve_concelho", int),
+}
+# Aliases so users don't have to type the `_id` suffix.
+_UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
+
+
+def _resolve_tipo_doc(value: str) -> int:
+  """Coerce a --tipo arg (name or int) to a tipo_doc integer."""
+  norm = value.lower().strip()
+  if norm in _TIPO_DOC_NAMES:
+    return _TIPO_DOC_NAMES[norm]
+  try:
+    return int(value)
+  except (ValueError, TypeError):
+    raise click.UsageError(
+      f"Unknown --tipo {value!r}. Use one of: "
+      f"{', '.join(sorted(set(_TIPO_DOC_NAMES) - set('1268')))}, or an integer."
+    )
+
+
+# sav-parsers DocType strings → SAV2 tipo_doc int (the upload modal codes).
+# Only the doc types the classifier recognises today; extend as the
+# classifier grows.
+_DOC_TYPE_TO_TIPO_DOC: dict[str, int] = {
+  "fpb-mod1": 1,
+  "fpb-mod4": 6,
+}
+
+
+def _classify_pdf_tipo_doc(pdf_path: str) -> tuple[int, str]:
+  """Classify a PDF and return ``(tipo_doc, doc_type_str)``.
+
+  Falls back to Modelo 1 when the classifier returns ``unknown`` — the
+  classifier itself is currently a TODO stub, so we keep the previous
+  default behaviour rather than refusing to upload.
+  """
+  try:
+    from sav_parsers import classify
+  except ImportError as exc:
+    raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+  try:
+    doc_type = str(classify(pdf_path))
+  except Exception as exc:
+    raise SavCliError(f"classify error: {exc}", code="parse_error")
+  return _DOC_TYPE_TO_TIPO_DOC.get(doc_type, 1), doc_type
+
+
+def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
+  """Parse --field K=V flags into the kwargs dict for update_player_in_registration_batch."""
+  out: dict[str, Any] = {}
+  for arg in field_args:
+    if "=" not in arg:
+      raise click.UsageError(f"Bad --field {arg!r}: expected KEY=VALUE.")
+    key, _, val = arg.partition("=")
+    key = _UPDATE_FIELD_ALIASES.get(key.strip(), key.strip())
+    val = val.strip()
+    if key not in _UPDATE_FIELDS:
+      supported = sorted(set(_UPDATE_FIELDS) | set(_UPDATE_FIELD_ALIASES))
+      raise click.UsageError(
+        f"Unknown field {key!r}. Supported: {', '.join(supported)}."
+      )
+    kind, _ = _UPDATE_FIELDS[key]
+    if kind == "step1" or kind == "step2":
+      coerced: Any = val
+      if _UPDATE_FIELDS[key][1] is int:
+        try:
+          coerced = int(val)
+        except ValueError:
+          raise click.UsageError(f"--field {key} expects an integer; got {val!r}.")
+      out[key] = coerced
+    elif kind == "resolve_distrito":
+      resolved = find_distrito_id(val)
+      if resolved is None:
+        try:
+          resolved = int(val)
+        except ValueError:
+          raise click.UsageError(
+            f"Unknown distrito {val!r}; pass a numeric distrito ID or the name."
+          )
+      out["distrito_id"] = resolved
+    elif kind == "resolve_concelho":
+      try:
+        out["concelho_id"] = int(val)
+      except ValueError:
+        raise click.UsageError(
+          f"--field concelho_id expects a numeric ID (name resolution needs the "
+          f"distrito context which isn't available from a single --field)."
+        )
+  return out
+
+
+@cli.group("enrollment")
+def enrollment_grp():
+  """Manage individual player enrolments in open Revalidação batches."""
+  pass
+
+
+@enrollment_grp.command("update")
+@click.argument("batch_id", type=int)
+@click.argument("license", type=int)
+@click.argument("pdf", type=click.Path(exists=True), required=False)
+@click.option(
+  "--field", "fields", multiple=True, metavar="KEY=VAL",
+  help=(
+    "Patch a single field (repeatable). Mutually exclusive with PDF. "
+    "Supported: " + ", ".join(sorted(_UPDATE_FIELDS)) + "."
+  ),
+)
+@click.option(
+  "--file-only", is_flag=True, default=False,
+  help="With PDF: only replace the document; do not touch fields.",
+)
+@click.option(
+  "--tipo", default=None,
+  help=(
+    "Document type (modelo1|exame|modelo4|doc-id|<int>). When omitted with a "
+    "PDF, sav-parsers classifies it; falls back to modelo1 when unknown."
+  ),
+)
+@click.pass_context
+def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
+  """Update an existing player enrolment.
+
+  Three modes:
+
+  \b
+    sav enrollment update BATCH LICENSE FILE
+        OCR-reconcile FILE against SAV, patch fields, replace doc.
+    sav enrollment update BATCH LICENSE FILE --file-only
+        Replace the document; leave fields untouched.
+    sav enrollment update BATCH LICENSE --field KEY=VAL [--field ...]
+        Patch fields; no document.
+  """
+  if not pdf and not fields:
+    raise click.UsageError(
+      "Pass a PDF (positional) or --field K=V (repeatable). "
+      "Run `sav enrollment update --help` for examples."
+    )
+  if file_only and not pdf:
+    raise click.UsageError("--file-only requires a PDF argument.")
+  if fields and pdf:
+    raise click.UsageError(
+      "--field cannot be combined with a PDF. Use one or the other."
+    )
+
+  client = _make_client()
+
+  # Resolve tipo_doc lazily (modes A/B only). When --tipo is omitted we
+  # classify the PDF; in mode A the classified type also gates the reconcile
+  # path (only fpb-mod1 is reconcilable today).
+  classified_doc_type: str | None = None
+  tipo_doc = 0
+  if pdf:
+    if tipo is not None:
+      tipo_doc = _resolve_tipo_doc(tipo)
+    else:
+      tipo_doc, classified_doc_type = _classify_pdf_tipo_doc(pdf)
+  tipo_label = _TIPO_DOC_LABELS.get(tipo_doc, f"tipo {tipo_doc}")
+
+  # Mode B — doc-only replace.
+  if pdf and file_only:
+    try:
+      client.replace_player_registration_document(
+        batch_id, license, pdf, tipo_doc=tipo_doc,
+      )
+    except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    click.echo(
+      f"Replaced {tipo_label} for licence {license} in batch #{batch_id}."
+    )
+    return
+
+  # Mode A — PDF-driven (parse → reconcile → patch fields → replace doc).
+  if pdf:
+    try:
+      from sav_parsers import close_processing, parse_fpb_mod1
+      from sav_shared import reconcile_fpb_mod1
+    except ImportError as exc:
+      raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+
+    # Classify only when --tipo was given (we skipped it above); we need it
+    # to gate the reconcile path even when the user pinned an upload tipo.
+    if classified_doc_type is None:
+      _, classified_doc_type = _classify_pdf_tipo_doc(pdf)
+    if classified_doc_type != "fpb-mod1":
+      raise SavCliError(
+        f"Unsupported document type {classified_doc_type!r}; "
+        f"only fpb-mod1 forms are reconciled. Use --file-only to upload as-is.",
+        code="parse_error",
+      )
+
+    click.echo("Processing OCR ...", nl=False)
+    try:
+      parse_result = parse_fpb_mod1(pdf)
+    except Exception as exc:
+      click.echo()
+      raise SavCliError(f"parse error: {exc}", code="parse_error")
+    parsed = parse_result["fields"]
+    processing_id = parse_result["processing_id"]
+    click.echo(" done.")
+
+    close_called = False
+    try:
+      try:
+        sav_profile = client.load_player_profile(license)
+      except (SavConnectionError, SavResponseError) as exc:
+        raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
+
+      try:
+        result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
+      except (SavConnectionError, SavResponseError) as exc:
+        raise SavCliError(f"Reconcile failed: {exc}", code=_exc_code(exc))
+
+      kwargs = _confirm_enroll(result, sav_profile, license)
+      if kwargs is None:
+        click.echo("Skipped.")
+        return
+
+      # Drop fields that update_player_in_registration_batch doesn't accept.
+      ignored = {k: v for k, v in kwargs.items() if k not in _UPDATE_FIELDS}
+      patch_kwargs = {k: v for k, v in kwargs.items() if k in _UPDATE_FIELDS}
+      if ignored:
+        click.echo(
+          f"  Ignored (not patchable on existing enrolments): "
+          f"{', '.join(sorted(ignored))}."
+        )
+
+      try:
+        client.update_player_in_registration_batch(
+          batch_id, license, **patch_kwargs,
+        )
+      except (SavConnectionError, SavResponseError, ValueError) as exc:
+        raise SavCliError(str(exc), code=_exc_code(exc))
+      click.echo(f"Updated licence {license} in batch #{batch_id}.")
+
+      try:
+        client.replace_player_registration_document(
+          batch_id, license, pdf, tipo_doc=tipo_doc,
+        )
+        click.echo(f"  Uploaded {pdf} ({tipo_label}).")
+      except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+        click.echo(
+          f"  Warning: field update succeeded but document upload failed: {exc}",
+          err=True,
+        )
+
+      from sav_shared import KWARG_TO_ENTITY
+      corrections: dict[str, str] = {}
+      for kwarg in result.needs_review:
+        entity = KWARG_TO_ENTITY.get(kwarg)
+        val = kwargs.get(kwarg)
+        if entity and val is not None:
+          corrections[entity] = str(val)
+      corrections.update(result.retrain_corrections)
+      close_called = True
+      try:
+        close_processing(processing_id, corrections=corrections or None)
+      except Exception as exc:
+        click.echo(f"  Warning: could not close processing {processing_id}: {exc}", err=True)
+    finally:
+      if not close_called:
+        try:
+          close_processing(processing_id)
+        except Exception:
+          pass
+    return
+
+  # Mode C — fields-only.
+  patch_kwargs = _parse_update_fields(fields)
+  try:
+    client.update_player_in_registration_batch(
+      batch_id, license, **patch_kwargs,
+    )
+  except (SavConnectionError, SavResponseError, ValueError) as exc:
+    raise SavCliError(str(exc), code=_exc_code(exc))
+  applied = ", ".join(sorted(patch_kwargs))
+  click.echo(f"Updated licence {license} in batch #{batch_id}: {applied}.")
 
 
 def main():

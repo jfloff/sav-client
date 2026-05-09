@@ -631,7 +631,7 @@ def submit_enrollment(
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
                 f.write(pdf_bytes)
                 tmp_path = f.name
-            client.upload_player_registration_document(
+            client.replace_player_registration_document(
                 batch_id, license, tmp_path,
             )
             upload_status = "ok"
@@ -665,6 +665,63 @@ def submit_enrollment(
         "name": sav_profile.get("nome", ""),
         "modelo1_upload": upload_status,
     }
+
+
+@server.tool()
+def update_enrollment(
+    batch_id: int,
+    license: int,
+    fields: dict[str, Any],
+) -> dict:
+    """
+    Patch personal-data and/or address fields on an already-enrolled player.
+
+    The player must be in batch_id (open Revalidação). Only the keys present
+    in `fields` are changed; everything else is preserved from the existing
+    inscricao. No document is touched — pair with `replace_player_document`
+    if you also want to swap the PDF.
+
+    Supported keys (any subset, ints where applicable):
+      Step 1 (personal): id_type (int), id_number, id_expiry, telemovel,
+        telefone, email, nome_pai, nome_mae.
+      Step 2 (address): morada, cod_postal, localidade_txt,
+        distrito_id (int), concelho_id (int).
+
+    Guardian/taxa/exam/consent fields are commit-time only on creation and
+    are not (yet) patchable on existing enrolments — pass them via
+    submit_enrollment when adding a new player.
+
+    Returns: {"success": True, "player_id": int} on success.
+    """
+    allowed = {
+        "id_type", "id_number", "id_expiry", "telemovel", "telefone",
+        "email", "nome_pai", "nome_mae",
+        "morada", "cod_postal", "localidade_txt",
+        "distrito_id", "concelho_id",
+    }
+    unknown = sorted(set(fields) - allowed)
+    if unknown:
+        raise ValueError(
+            f"Unsupported field(s) for update_enrollment: {unknown}. "
+            f"Allowed: {sorted(allowed)}."
+        )
+    int_keys = {"id_type", "distrito_id", "concelho_id"}
+    coerced: dict[str, Any] = {}
+    for k, v in fields.items():
+        if v is None:
+            continue
+        if k in int_keys and not isinstance(v, int):
+            try:
+                coerced[k] = int(v)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"Field {k!r} expects an integer; got {v!r}.") from exc
+        else:
+            coerced[k] = v
+
+    player_id = _get_client().update_player_in_registration_batch(
+        batch_id, license, **coerced,
+    )
+    return {"success": True, "player_id": player_id}
 
 
 # ── Registration documents ────────────────────────────────────────────────────
