@@ -20,6 +20,9 @@ from dataclasses import asdict
 from typing import Any
 
 import click
+from rich import box
+from rich.console import Console
+from rich.table import Table
 
 from sav_client import SavClient, Player
 from sav_client.exceptions import (
@@ -52,11 +55,17 @@ from sav_shared import (
 # Tracks the root --output flag so SavCliError.show() can format errors
 # appropriately even after Click has unwound the context stack.
 _OUTPUT_MODE: str = "table"
+_VERBOSE: bool = False
 
 # Cap on how many clubs a single --club fragment may resolve to before we
 # refuse to fan out the search. Short/ambiguous queries can otherwise silently
 # trigger parallel searches against dozens of clubs.
 _CLUB_MATCH_LIMIT = 5
+
+
+def _console(*, err: bool = False) -> Console:
+  stream_name = "stderr" if err else "stdout"
+  return Console(file=click.get_text_stream(stream_name))
 
 
 class SavCliError(click.ClickException):
@@ -261,17 +270,24 @@ def _make_client() -> SavClient:
   help="Output format.",
 )
 @click.option(
+  "--verbose",
+  is_flag=True,
+  help="Show verbose human output.",
+)
+@click.option(
   "--fields",
   default=None,
   help="Comma-separated field projection for JSON/CSV output (e.g. 'name,license,active'). Ignored for table output.",
 )
 @click.pass_context
-def cli(ctx, output, fields):
+def cli(ctx, output, verbose, fields):
   """SAV2 API client."""
-  global _OUTPUT_MODE
+  global _OUTPUT_MODE, _VERBOSE
   _OUTPUT_MODE = output
+  _VERBOSE = verbose
   ctx.ensure_object(dict)
   ctx.obj["output"] = output
+  ctx.obj["verbose"] = verbose
   ctx.obj["fields"] = [f.strip() for f in fields.split(",") if f.strip()] if fields else None
 
 
@@ -969,26 +985,29 @@ def _resolve_enroll_batch(
   gender_id: int,
 ) -> tuple[int, Any]:
   """Interactively find an open batch or create one. Returns (batch_id, batch)."""
+  console = _console()
   type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
   gender_label = "Feminino" if gender_id == 2 else "Masculino"
-  tiers = client.list_player_registration_tiers(gender_id=gender_id)
-  tier_name = tiers.get(tier_id, str(tier_id))
 
   def _create() -> tuple[int, Any]:
     try:
-      return create_and_fetch_batch(
-        client, type=reg_type, tier_id=tier_id, gender_id=gender_id,
-      )
+      with console.status("[bold cyan]:hammer_and_wrench: Creating registration batch...[/]"):
+        return create_and_fetch_batch(
+          client, type=reg_type, tier_id=tier_id, gender_id=gender_id,
+        )
     except RuntimeError as exc:
       raise SavCliError(str(exc), code="batch_error")
 
-  existing = client.find_open_player_registration_batch(
-    type=reg_type, tier_id=tier_id, gender_id=gender_id,
-  )
+  with console.status("[bold cyan]:open_file_folder: Looking up open registration batches...[/]"):
+    tiers = client.list_player_registration_tiers(gender_id=gender_id)
+    tier_name = tiers.get(tier_id, str(tier_id))
+    existing = client.find_open_player_registration_batch(
+      type=reg_type, tier_id=tier_id, gender_id=gender_id,
+    )
 
   if existing:
-    click.echo(
-      f"\nOpen batch found: #{existing.number} "
+    console.print(
+      f"[cyan]:open_file_folder: Open batch found:[/] #{existing.number} "
       f"({type_label} · {existing.tier} · {gender_label} · "
       f"{existing.item_count} player(s) already added)"
     )
@@ -1005,7 +1024,9 @@ def _resolve_enroll_batch(
       return _create()
     return existing.id, existing
 
-  click.echo(f"\nNo open batch for {type_label} · {tier_name} · {gender_label}.")
+  console.print(
+    f"[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
+  )
   if not click.confirm("Create new batch?"):
     raise click.Abort()
   return _create()
@@ -1053,14 +1074,16 @@ def _resolve_enroll_player(
   params — in that case the caller should add/update against the returned
   batch instead, since SAV2 won't allow re-adding to a second one.
   """
+  console = _console()
   try:
-    eligible = client._list_revalidable_licenses(batch)
+    with console.status("[bold cyan]:busts_in_silhouette: Matching the form to eligible players...[/]"):
+      eligible = client._list_revalidable_licenses(batch)
+      license, candidates, ocr_name, ocr_license = resolve_player_candidates(
+        parsed, eligible, client, batch.club_id,
+      )
   except Exception as exc:
     raise SavCliError(f"Could not fetch eligible players: {exc}", code="fetch_failed")
 
-  license, candidates, ocr_name, ocr_license = resolve_player_candidates(
-    parsed, eligible, client, batch.club_id,
-  )
   if license is not None:
     return license, batch
 
@@ -1076,32 +1099,35 @@ def _resolve_enroll_player(
       enrolled_license = nif_license
 
   if enrolled_license is not None:
-    target = _find_enrolled_in_matching_batches(client, batch, enrolled_license)
+    with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
+      target = _find_enrolled_in_matching_batches(client, batch, enrolled_license)
     if target is not None:
       if target.id != batch.id:
-        click.echo(
-          f"  Already enrolled in batch #{target.number} (id={target.id}); "
+        console.print(
+          f"[cyan]:repeat: Already enrolled in batch #{target.number} (id={target.id}); "
           f"updating there."
         )
       else:
-        click.echo(f"  Already enrolled in this batch — updating.")
+        console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
       return enrolled_license, target
 
   if len(candidates) > 1:
-    click.echo(f"  Multiple players match {ocr_name!r}:")
+    console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
     for i, p in enumerate(candidates, 1):
-      click.echo(f"    {i}.  {p.name}  (licence {p.license})")
+      console.print(f"  {i}.  {p.name}  (licence {p.license})")
     idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
     return int(candidates[idx - 1].license), batch
 
   if ocr_license is not None:
-    click.echo(f"  OCR licence {ocr_license} is not in the eligible list for this batch.")
+    console.print(
+      f"[yellow]:warning: OCR licence {ocr_license} is not in the eligible list for this batch.[/]"
+    )
     if click.confirm("  Use it anyway?"):
       return ocr_license, batch
   elif ocr_name:
-    click.echo(f"  Player not found for {ocr_name!r} in eligible list.")
+    console.print(f"[yellow]:warning: Player not found for {ocr_name!r} in eligible list.[/]")
   else:
-    click.echo("  Could not determine player from OCR.")
+    console.print("[yellow]:warning: Could not determine player from OCR.[/]")
 
   while True:
     raw = click.prompt("  Licence number (blank to skip)", default="")
@@ -1110,20 +1136,23 @@ def _resolve_enroll_player(
     try:
       lic = int(raw)
     except ValueError:
-      click.echo("  Not a valid number.")
+      console.print("[yellow]:warning: Not a valid number.[/]")
       continue
     if lic not in eligible:
-      target = _find_enrolled_in_matching_batches(client, batch, lic)
+      with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
+        target = _find_enrolled_in_matching_batches(client, batch, lic)
       if target is not None:
         if target.id != batch.id:
-          click.echo(
-            f"  Licence {lic} is enrolled in batch #{target.number} "
+          console.print(
+            f"[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number} "
             f"(id={target.id}); updating there."
           )
         else:
-          click.echo(f"  Licence {lic} is already in this batch — updating.")
+          console.print(f"[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
         return lic, target
-      click.echo(f"  Licence {lic} is not in the eligible list for this batch.")
+      console.print(
+        f"[yellow]:warning: Licence {lic} is not in the eligible list for this batch.[/]"
+      )
       if not click.confirm("  Use it anyway?"):
         continue
     return lic, batch
@@ -1131,10 +1160,11 @@ def _resolve_enroll_player(
 
 def _prompt_field(kwarg: str, hint: str = "") -> Any:
   """Prompt the user for one field value, returning the entered value or None."""
+  console = _console()
   label = f"    {kwarg}" + (f"  ({hint})" if hint else "")
   if kwarg == "guardian_relation":
-    click.echo(f"{label}")
-    click.echo("      1=Pai  2=Mãe  3=Tutor")
+    console.print(label)
+    console.print("[dim]      1=Pai  2=Mãe  3=Tutor[/]")
     return int(click.prompt("      Relation", type=click.Choice(["1", "2", "3"])))
   entered = click.prompt(label, default="")
   return entered if entered else None
@@ -1145,21 +1175,17 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
   Show reconciliation summary and prompt for needs_review fields.
   Returns final kwargs dict (license already popped out) or None to skip.
   """
+  console = _console()
   kwargs = dict(result.kwargs)
   any_changes = bool(result.updated or result.kept or result.needs_review)
 
   if result.updated:
-    click.echo("  Updated (OCR overrides SAV):")
+    console.print("[green]:white_check_mark: Updated (OCR overrides SAV):[/]")
     for kwarg, (sav_val, ocr_val) in result.updated.items():
-      click.echo(f"    {kwarg}:  {sav_val!r}  →  {ocr_val!r}")
-
-  if result.kept:
-    click.echo("  Kept from SAV (close enough):")
-    for kwarg, (sav_val, ocr_val, sim) in result.kept.items():
-      click.echo(f"    {kwarg}:  {sav_val!r}  (OCR: {ocr_val!r}, {sim:.0%} match)")
+      console.print(f"    {kwarg}:  {sav_val!r}  ->  {ocr_val!r}")
 
   if result.needs_review:
-    click.echo("  Needs review (low OCR confidence):")
+    console.print("[yellow]:warning: Needs review (low OCR confidence):[/]")
     for kwarg in result.needs_review:
       sav_key = KWARG_TO_SAV_KEY.get(kwarg, "")
       sav_val = str(sav_profile.get(sav_key) or "") if sav_key else ""
@@ -1176,15 +1202,15 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
       if kwarg == "distrito_id":
         resolved = find_distrito_id(val) if isinstance(val, str) else None
         if resolved is None:
-          click.echo(f"    {val!r} is not a known distrito — keeping SAV value.")
+          console.print(f"[yellow]:warning: {val!r} is not a known distrito; keeping SAV value.[/]")
           continue
         kwargs[kwarg] = resolved
       elif kwarg == "concelho_id":
         resolved = find_id_by_name(val, result.concelhos) if isinstance(val, str) else None
         if resolved is None:
           known = ", ".join(sorted(result.concelhos.values())) or "(none — distrito unknown)"
-          click.echo(f"    {val!r} is not a known concelho for this distrito.")
-          click.echo(f"    Known: {known}")
+          console.print(f"[yellow]:warning: {val!r} is not a known concelho for this distrito.[/]")
+          console.print(f"[dim]    Known: {known}[/]")
           continue
         kwargs[kwarg] = resolved
       else:
@@ -1194,7 +1220,7 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
   player_label = f"{name_str} (licence {license})" if name_str else f"licence {license}"
 
   if not any_changes:
-    click.echo(f"  No changes — {player_label}.")
+    console.print(f"[cyan]:information_source: No changes for {player_label}.[/]")
 
   _print_submission_summary(kwargs, result, sav_profile)
 
@@ -1238,12 +1264,13 @@ def _format_submit_value(
 
 
 def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> None:
-  """Render the final pre-submit table: SAV vs OCR side-by-side, plus the chosen value.
+  """Render the final pre-submit summary.
 
-  Final column shows what SAV will see (kept SAV value, OCR override, or user-typed)
-  with a source tag in parens. Empty SAV/OCR cells render as em-dash.
+  Default mode shows a compact field/value/source view. Verbose mode expands
+  that into the full SAV vs OCR side-by-side table with the chosen final value.
+  Empty SAV/OCR cells render as em-dash.
   """
-  rows: list[tuple[str, str, str, str]] = []
+  rows: list[tuple[str, str, str, str, str]] = []
   for kwarg, (label, sav_key) in ENROLLMENT_FIELD_META.items():
     sav_raw = sav_profile.get(sav_key) if sav_key else None
     ocr_raw = result.ocr.get(kwarg)
@@ -1254,43 +1281,56 @@ def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> N
       final_raw = kwargs[kwarg]
       if final_raw in (None, ""):
         continue
-      if kwarg in result.updated:
-        source = "OCR over SAV"
-      elif kwarg in result.needs_review:
+      if kwarg in result.needs_review:
         source = "user"
       else:
         source = "OCR"
     elif has_sav:
       final_raw = sav_raw
-      if kwarg in result.retrain_corrections:
-        source = "SAV (OCR mismatch — will retrain)"
-      elif kwarg in result.kept:
-        source = "SAV kept (close to OCR)"
-      elif kwarg in result.needs_review:
-        source = "SAV kept (review skipped)"
-      else:
-        source = "SAV"
+      source = "SAV"
     else:
       continue
 
     sav_str   = _format_submit_value(sav_raw, kwarg, concelhos=result.concelhos) if has_sav else "—"
     ocr_str   = _format_submit_value(ocr_raw, kwarg, concelhos=result.concelhos) if has_ocr else "—"
-    final_str = f"{_format_submit_value(final_raw, kwarg, concelhos=result.concelhos)}  [{source}]"
-    rows.append((label, sav_str, ocr_str, final_str))
+    ocr_confidence = getattr(result, "ocr_confidence", {}).get(kwarg)
+    if ocr_confidence is not None and has_ocr:
+      ocr_str = f"{ocr_str} ({ocr_confidence:.0%})"
+    final_str = _format_submit_value(final_raw, kwarg, concelhos=result.concelhos)
+    rows.append((label, sav_str, ocr_str, final_str, source))
 
   if not rows:
     return
 
-  click.echo("\n  Submission summary:")
-  label_w = max(len("Field"), max(len(r[0]) for r in rows))
-  sav_w   = max(len("SAV"),   max(len(r[1]) for r in rows))
-  ocr_w   = max(len("OCR"),   max(len(r[2]) for r in rows))
-
-  click.echo(f"    {'Field'.ljust(label_w)}  {'SAV'.ljust(sav_w)}  {'OCR'.ljust(ocr_w)}  Final")
-  click.echo(f"    {'-'*label_w}  {'-'*sav_w}  {'-'*ocr_w}  -----")
-  for label, sav, ocr, final in rows:
-    click.echo(f"    {label.ljust(label_w)}  {sav.ljust(sav_w)}  {ocr.ljust(ocr_w)}  {final}")
-  click.echo("")
+  console = _console()
+  if _VERBOSE:
+    table = Table(
+      box=box.SIMPLE_HEAVY,
+      header_style="bold cyan",
+      title="Submission Summary",
+      title_style="bold cyan",
+    )
+    table.add_column("Field", style="bold")
+    table.add_column("SAV")
+    table.add_column("OCR")
+    table.add_column("Final", style="green")
+    for label, sav, ocr, final, source in rows:
+      table.add_row(label, sav, ocr, f"{final}  [{source}]")
+  else:
+    table = Table(
+      box=box.SIMPLE_HEAVY,
+      header_style="bold cyan",
+      title="Submission Summary",
+      title_style="bold cyan",
+    )
+    table.add_column("Field", style="bold")
+    table.add_column("Value", style="green")
+    table.add_column("Source", style="cyan")
+    for label, _, _, final, source in rows:
+      table.add_row(label, final, source)
+  console.print()
+  console.print(table)
+  console.print()
 
 
 @cli.command("enroll")
@@ -1308,30 +1348,36 @@ def enroll_cmd(ctx, pdfs):
 
   batch_id: int | None = None
   batch: Any = None
+  console = _console()
+  err_console = _console(err=True)
 
   for pdf_path in pdfs:
-    click.echo(f"\n── {pdf_path} ──")
-
     # Step 1 — classify
     try:
-      doc_type = classify(pdf_path)
+      with console.status("[bold cyan]:mag: Classifying document...[/]"):
+        doc_type = classify(pdf_path)
     except Exception as exc:
-      click.echo(f"  classify error: {exc}", err=True)
+      err_console.print(f"[red]:x: Classify error:[/] {exc} [dim]({pdf_path})[/]")
       continue
     if doc_type != "fpb-mod1":
-      click.echo(f"  Unsupported document type {doc_type!r} — skipped.")
+      console.print(
+        f"[yellow]:warning: Unsupported document type {doc_type!r}; skipped.[/] "
+        f"[dim]({pdf_path})[/]"
+      )
       continue
 
     # Step 2 — parse
-    click.echo("  Processing OCR ...", nl=False)
     try:
-      parse_result = parse_fpb_mod1(pdf_path)
-      parsed = parse_result["fields"]
-      processing_id = parse_result["processing_id"]
+      with console.status("[bold cyan]:robot: Running OCR and parsing form...[/]"):
+        parse_result = parse_fpb_mod1(pdf_path)
+        parsed = parse_result["fields"]
+        processing_id = parse_result["processing_id"]
     except Exception as exc:
-      click.echo(f"\n  parse error: {exc}", err=True)
+      err_console.print(f"[red]:x: Parse error:[/] {exc} [dim]({pdf_path})[/]")
       continue
-    click.echo(f" Finished ({processing_id})!")
+    console.print(
+      f"[green]:white_check_mark: OCR ready[/] [dim]{pdf_path} ({processing_id})[/]"
+    )
 
     # Once parse_fpb_mod1 has created a processing session, we must close it
     # on every exit path or the dir leaks under files/processing/<id>/ until
@@ -1349,12 +1395,16 @@ def enroll_cmd(ctx, pdfs):
           or parsed_bool(parsed, "tipo_inscricao_primeira")
         )
         try:
-          if type_inferred:
-            click.echo("  No tipo_inscricao on form; checking club roster by NIF ...", nl=False)
-          reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+          status_message = (
+            "[bold cyan]:mag_right: No tipo_inscricao on form; checking club roster by NIF...[/]"
+            if type_inferred
+            else "[bold cyan]:card_index_dividers: Resolving enrollment parameters...[/]"
+          )
+          with console.status(status_message):
+            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
           if type_inferred:
             label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
-            click.echo(f" {label}.")
+            console.print(f"[cyan]:information_source: Inferred registration type:[/] {label}")
           batch_id, batch = _resolve_enroll_batch(
             client, reg_type, tier_id, gender_id,
           )
@@ -1373,7 +1423,7 @@ def enroll_cmd(ctx, pdfs):
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(str(exc), code=_exc_code(exc))
       if resolved is None:
-        click.echo("  Skipped.")
+        console.print("[yellow]:fast_forward: Skipped.[/]")
         continue
       license, batch = resolved
       batch_id = batch.id
@@ -1381,40 +1431,43 @@ def enroll_cmd(ctx, pdfs):
       # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
       # server-side validation surfaces at real submit.
       try:
-        sav_profile = client.load_player_profile(license, club_id=batch.club_id)
+        with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
+          sav_profile = client.load_player_profile(license, club_id=batch.club_id)
       except (SavConnectionError, SavResponseError) as exc:
-        click.echo(f"  Could not load player profile: {exc}", err=True)
+        err_console.print(f"[red]:x: Could not load player profile:[/] {exc}")
         continue
 
       # Step 7 — reconcile OCR vs SAV. reconcile_fpb_mod1 fetches the
       # distrito-scoped concelho list itself (cached client-side); without it
       # concelho silently falls to needs_review.
       try:
-        result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
+        with console.status("[bold cyan]:balance_scale: Reconciling OCR with SAV...[/]"):
+          result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
       except (SavConnectionError, SavResponseError) as exc:
-        click.echo(f"  Could not load concelhos: {exc}", err=True)
+        err_console.print(f"[red]:x: Could not load concelhos:[/] {exc}")
         continue
       except Exception as exc:
-        click.echo(f"  reconcile error: {exc}", err=True)
+        err_console.print(f"[red]:x: Reconcile error:[/] {exc}")
         continue
 
       # Step 8 — confirm with user
       kwargs = _confirm_enroll(result, sav_profile, license)
       if kwargs is None:
-        click.echo("  Skipped.")
+        console.print("[yellow]:fast_forward: Skipped.[/]")
         continue
 
       # Step 9 — submit (retry loop for missing guardian fields)
       submitted = False
       while not submitted:
         try:
-          client.add_player_to_registration_batch(
-            batch_id, license, **kwargs,
-          )
-          click.echo(f"  Added licence {license} to batch #{batch_id}.")
+          with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
+            client.add_player_to_registration_batch(
+              batch_id, license, **kwargs,
+            )
+          console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch_id}.[/]")
           submitted = True
         except SavConfigError as exc:
-          click.echo(f"  Guardian info required for minor:")
+          console.print("[yellow]:warning: Guardian info required for minor.[/]")
           for field_name in parse_missing_guardian_fields(exc):
             val = _prompt_field(field_name)
             if val is not None:
@@ -1427,14 +1480,14 @@ def enroll_cmd(ctx, pdfs):
       # leaves exactly the new file in place. Non-fatal: if it fails the
       # player is still registered, so we just warn and continue.
       try:
-        client.replace_player_registration_document(
-          batch_id, license, pdf_path,
-        )
-        click.echo(f"  Uploaded {pdf_path} (Modelo 1).")
+        with console.status("[bold cyan]:page_facing_up: Uploading Modelo 1...[/]"):
+          client.replace_player_registration_document(
+            batch_id, license, pdf_path,
+          )
+        console.print(f"[green]:white_check_mark: Uploaded {pdf_path} (Modelo 1).[/]")
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-        click.echo(
-          f"  Warning: enrollment succeeded but document upload failed: {exc}",
-          err=True,
+        err_console.print(
+          f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {exc}"
         )
 
       # Step 10 — close processing session; only send corrections the user
@@ -1450,9 +1503,12 @@ def enroll_cmd(ctx, pdfs):
       corrections.update(result.retrain_corrections)
       close_called = True
       try:
-        close_processing(processing_id, corrections=corrections or None)
+        with console.status("[bold cyan]:sparkles: Finalizing OCR processing...[/]"):
+          close_processing(processing_id, corrections=corrections or None)
       except Exception as exc:
-        click.echo(f"  Warning: could not close processing {processing_id}: {exc}", err=True)
+        err_console.print(
+          f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}"
+        )
     finally:
       if not close_called:
         try:
