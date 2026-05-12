@@ -12,11 +12,12 @@ Enrollment workflow:
     2. find_open_batch / create_batch  → batch_id
     3. resolve_player  → license (or candidate list if ambiguous)
     4. preview_enrollment  → full reconciled profile for user review
-    5. submit_enrollment  → player_id (auto-uploads source PDF as Modelo 1)
+    5. submit_enrollment  → player_id (auto-uploads source PDF as fpb_modelo_1)
 
 Document tools (post-enrollment, ad-hoc):
     list_player_documents / upload_player_document /
     delete_player_document / replace_player_document
+    use sav-parsers doc_type strings and translate to SAV2 tipo_doc internally.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from mcp.server.fastmcp import FastMCP
 from sav_client import SavClient
 from sav_client.exceptions import SavConfigError, SavConnectionError, SavResponseError
 from sav_shared import (
+    doc_type_to_tipo_doc,
     batch_to_dict,
     club_to_dict,
     create_and_fetch_batch,
@@ -43,7 +45,9 @@ from sav_shared import (
     player_to_dict,
     REGISTRATION_TYPE_LABELS,
     resolve_player_candidates,
+    tipo_doc_to_doc_type,
 )
+from sav_parsers.types import DocType
 
 server = FastMCP("FPB SAV")
 
@@ -380,8 +384,9 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
     Classifies each document, extracts fields via OCR, and derives the batch
     parameters (registration type, tier, gender) from the form checkboxes.
 
-    Returns one entry per PDF with a form_id to reference in subsequent tools.
-    On error for a given PDF the entry contains an "error" key instead.
+    Returns one entry per PDF with a form_id and canonical doc_type to
+    reference in subsequent tools. On error for a given PDF the entry
+    contains an "error" key instead.
     """
     from sav_parsers import classify, parse_fpb_mod1
 
@@ -402,8 +407,8 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
                 tmp_path = f.name
 
             doc_type = classify(tmp_path)
-            if doc_type != "fpb-mod1":
-                results.append({"index": i, "error": f"Unsupported document type: {doc_type!r}"})
+            if doc_type != DocType.FPB_MOD1:
+                results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
 
             parse_result = parse_fpb_mod1(tmp_path)
@@ -428,13 +433,14 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             "tier_id": tier_id,
             "gender_id": gender_id,
             # Retained so submit_enrollment can upload the source PDF as
-            # Modelo 1 after a successful enroll (parity with the CLI flow).
+            # fpb_modelo_1 after a successful enroll (parity with the CLI flow).
             "pdf_bytes": pdf_bytes,
         }
 
         results.append({
             "index": i,
             "form_id": form_id,
+            "doc_type": doc_type.value,
             "reg_type": reg_type,
             "reg_type_label": REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type)),
             "tier_id": tier_id,
@@ -592,6 +598,7 @@ def submit_enrollment(
       success=false + missing_guardian_fields  when the player is a minor and
         guardian info is absent — call submit_enrollment again with those fields
         added to field_overrides.
+      success=true also includes source_document_upload with {doc_type, status, error}.
     """
     from sav_parsers import close_processing
     from sav_shared import KWARG_TO_ENTITY
@@ -619,11 +626,15 @@ def submit_enrollment(
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
         }
 
-    # Auto-upload the source PDF as Modelo 1 (parity with `sav enroll`).
+    # Auto-upload the source PDF as fpb_modelo_1 (parity with `sav enroll`).
     # Non-fatal: enrollment is already committed, so we just record the
     # outcome on the response and let the caller retry via
     # upload_player_document if it fails.
-    upload_status: str | dict = "skipped"
+    upload_status = {
+        "doc_type": str(form["doc_type"]),
+        "status": "skipped",
+        "error": None,
+    }
     pdf_bytes = form.get("pdf_bytes")
     if pdf_bytes:
         tmp_path: str | None = None
@@ -632,11 +643,15 @@ def submit_enrollment(
                 f.write(pdf_bytes)
                 tmp_path = f.name
             client.replace_player_registration_document(
-                batch_id, license, tmp_path,
+                batch_id,
+                license,
+                tmp_path,
+                tipo_doc=doc_type_to_tipo_doc(form["doc_type"]),
             )
-            upload_status = "ok"
+            upload_status["status"] = "ok"
         except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-            upload_status = {"error": str(exc)}
+            upload_status["status"] = "error"
+            upload_status["error"] = str(exc)
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
@@ -663,7 +678,7 @@ def submit_enrollment(
         "player_id": player_id,
         "license": license,
         "name": sav_profile.get("nome", ""),
-        "modelo1_upload": upload_status,
+        "source_document_upload": upload_status,
     }
 
 
@@ -731,12 +746,21 @@ def list_player_documents(batch_id: int, license: int) -> list[dict]:
     """
     List documents currently uploaded for a player in a batch.
 
-    Each entry: {"doc_id": int, "tipo_doc": int}. doc_id is the galeria id
-    expected by delete_player_document; tipo_doc matches the SAV2 upload
-    modal's type select (1 Modelo 1, 2 Exame Médico, 6 Modelo 4,
-    18 Doc. Identificação, ...).
+    Each entry: {"doc_id": int, "doc_type": str | null}. doc_id is the
+    galeria id expected by delete_player_document. SAV2-only document types
+    with no sav-parsers equivalent are returned with doc_type=null.
     """
-    return _get_client().list_player_registration_documents(batch_id, license)
+    docs = _get_client().list_player_registration_documents(batch_id, license)
+    return [
+        {
+            "doc_id": doc["doc_id"],
+            "doc_type": (
+                mapped.value if (mapped := tipo_doc_to_doc_type(doc["tipo_doc"])) is not None
+                else None
+            ),
+        }
+        for doc in docs
+    ]
 
 
 def _decode_pdf_to_tempfile(pdf_base64: str, suffix: str = ".pdf") -> str:
@@ -752,15 +776,17 @@ def upload_player_document(
     batch_id: int,
     license: int,
     pdf_base64: str,
-    tipo_doc: int = 1,
+    doc_type: str = DocType.FPB_MOD1.value,
 ) -> dict:
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
 
-    tipo_doc: 1 Modelo 1, 2 Exame Médico, 6 Modelo 4, 18 Doc. Identificação, ...
+    doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4, outros.
+    Recognized but unmapped types such as outros fail before the SAV2 call.
 
     Returns {"success": True} on success.
     """
+    tipo_doc = doc_type_to_tipo_doc(doc_type)
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         _get_client().upload_player_registration_document(
@@ -786,13 +812,14 @@ def replace_player_document(
     batch_id: int,
     license: int,
     pdf_base64: str,
-    tipo_doc: int = 1,
+    doc_type: str = DocType.FPB_MOD1.value,
 ) -> dict:
     """
-    Replace any existing documents of `tipo_doc` for this player+batch with a
+    Replace any existing documents of `doc_type` for this player+batch with a
     new PDF (base64-encoded). Idempotent on the upload side: when no existing
-    doc of `tipo_doc` is found, behaves like a plain upload.
+    doc of the translated SAV2 tipo_doc is found, behaves like a plain upload.
     """
+    tipo_doc = doc_type_to_tipo_doc(doc_type)
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         _get_client().replace_player_registration_document(

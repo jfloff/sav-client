@@ -23,6 +23,7 @@ import click
 from rich import box
 from rich.console import Console
 from rich.table import Table
+from sav_parsers.types import DocType
 
 from sav_client import SavClient, Player
 from sav_client.exceptions import (
@@ -32,8 +33,10 @@ from sav_client.exceptions import (
   SavResponseError,
 )
 from sav_shared import (
+  DOC_TYPE_CHOICES,
   create_and_fetch_batch,
   derive_enrollment_params,
+  doc_type_to_tipo_doc,
   distrito_name,
   ENROLLMENT_FIELD_META,
   filter_games,
@@ -45,6 +48,7 @@ from sav_shared import (
   GUARDIAN_RELATIONS,
   ID_TYPES,
   KWARG_TO_SAV_KEY,
+  normalize_doc_type,
   parse_missing_guardian_fields,
   parsed_bool,
   REGISTRATION_TYPE_LABELS,
@@ -93,6 +97,10 @@ def _exc_code(exc: Exception) -> str:
   if isinstance(exc, SavResponseError):   return "response_error"
   if isinstance(exc, SavConfigError):     return "config_error"
   return "error"
+
+
+def _doc_type_text(doc_type: DocType | str) -> str:
+  return doc_type.value if isinstance(doc_type, DocType) else str(doc_type)
 
 _COL_SEP = "  "
 _ELLIPSIS = "…"
@@ -1359,9 +1367,9 @@ def enroll_cmd(ctx, pdfs):
     except Exception as exc:
       err_console.print(f"[red]:x: Classify error:[/] {exc} [dim]({pdf_path})[/]")
       continue
-    if doc_type != "fpb-mod1":
+    if doc_type != DocType.FPB_MOD1:
       console.print(
-        f"[yellow]:warning: Unsupported document type {doc_type!r}; skipped.[/] "
+        f"[yellow]:warning: Unsupported document type {_doc_type_text(doc_type)!r}; skipped.[/] "
         f"[dim]({pdf_path})[/]"
       )
       continue
@@ -1475,16 +1483,20 @@ def enroll_cmd(ctx, pdfs):
         except (SavConnectionError, SavResponseError) as exc:
           raise SavCliError(str(exc), code=_exc_code(exc))
 
-      # Step 9b — upload the source PDF as Modelo 1. Replace semantics: any
-      # prior Modelo 1 for this player+batch is deleted first so a re-submit
-      # leaves exactly the new file in place. Non-fatal: if it fails the
-      # player is still registered, so we just warn and continue.
+      # Step 9b — upload the source PDF as fpb_modelo_1. Replace semantics:
+      # any prior fpb_modelo_1 for this player+batch is deleted first so a
+      # re-submit leaves exactly the new file in place. Non-fatal: if it
+      # fails the player is still registered, so we just warn and continue.
       try:
-        with console.status("[bold cyan]:page_facing_up: Uploading Modelo 1...[/]"):
+        with console.status(
+          "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
+        ):
           client.replace_player_registration_document(
-            batch_id, license, pdf_path,
+            batch_id, license, pdf_path, tipo_doc=doc_type_to_tipo_doc(doc_type),
           )
-        console.print(f"[green]:white_check_mark: Uploaded {pdf_path} (Modelo 1).[/]")
+        console.print(
+          f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
+        )
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
         err_console.print(
           f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {exc}"
@@ -1516,17 +1528,6 @@ def enroll_cmd(ctx, pdfs):
         except Exception:
           pass
 
-
-_TIPO_DOC_NAMES: dict[str, int] = {
-  "modelo1": 1, "modelo-1": 1, "mod1": 1, "1": 1,
-  "exame": 2, "exame-medico": 2, "2": 2,
-  "modelo4": 6, "modelo-4": 6, "mod4": 6, "6": 6,
-  "doc-id": 18, "id": 18, "identificacao": 18, "18": 18,
-}
-_TIPO_DOC_LABELS: dict[int, str] = {
-  1: "Modelo 1", 2: "Exame Médico", 6: "Modelo 4", 18: "Doc. Identificação",
-}
-
 # Field types accepted by `sav enrollment update --field`. Values are
 # ("step1"|"step2"|"resolve_distrito"|"resolve_concelho", py_type) — the
 # coercer turns each --field K=V into a kwarg on update_player_in_registration_batch.
@@ -1549,45 +1550,32 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
-def _resolve_tipo_doc(value: str) -> int:
-  """Coerce a --tipo arg (name or int) to a tipo_doc integer."""
-  norm = value.lower().strip()
-  if norm in _TIPO_DOC_NAMES:
-    return _TIPO_DOC_NAMES[norm]
+def _resolve_doc_type(value: str) -> DocType:
+  """Coerce a --tipo arg to a canonical sav-parsers DocType."""
   try:
-    return int(value)
-  except (ValueError, TypeError):
-    raise click.UsageError(
-      f"Unknown --tipo {value!r}. Use one of: "
-      f"{', '.join(sorted(set(_TIPO_DOC_NAMES) - set('1268')))}, or an integer."
-    )
+    return normalize_doc_type(value)
+  except ValueError as exc:
+    raise click.UsageError(str(exc))
 
 
-# sav-parsers DocType strings → SAV2 tipo_doc int (the upload modal codes).
-# Only the doc types the classifier recognises today; extend as the
-# classifier grows.
-_DOC_TYPE_TO_TIPO_DOC: dict[str, int] = {
-  "fpb-mod1": 1,
-  "fpb-mod4": 6,
-}
-
-
-def _classify_pdf_tipo_doc(pdf_path: str) -> tuple[int, str]:
-  """Classify a PDF and return ``(tipo_doc, doc_type_str)``.
-
-  Falls back to Modelo 1 when the classifier returns ``unknown`` — the
-  classifier itself is currently a TODO stub, so we keep the previous
-  default behaviour rather than refusing to upload.
-  """
+def _classify_pdf_doc_type(pdf_path: str) -> DocType:
+  """Classify a PDF and return the canonical sav-parsers DocType."""
   try:
     from sav_parsers import classify
   except ImportError as exc:
     raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
   try:
-    doc_type = str(classify(pdf_path))
+    return classify(pdf_path)
   except Exception as exc:
     raise SavCliError(f"classify error: {exc}", code="parse_error")
-  return _DOC_TYPE_TO_TIPO_DOC.get(doc_type, 1), doc_type
+
+
+def _tipo_doc_for_upload(doc_type: DocType | str) -> int:
+  """Translate a public doc type to the SAV2 upload tipo_doc integer."""
+  try:
+    return doc_type_to_tipo_doc(doc_type)
+  except ValueError as exc:
+    raise SavCliError(str(exc), code="parse_error")
 
 
 def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
@@ -1658,8 +1646,9 @@ def enrollment_grp():
 @click.option(
   "--tipo", default=None,
   help=(
-    "Document type (modelo1|exame|modelo4|doc-id|<int>). When omitted with a "
-    "PDF, sav-parsers classifies it; falls back to modelo1 when unknown."
+    "Document type "
+    f"({ '|'.join(DOC_TYPE_CHOICES) }). "
+    "When omitted with a PDF, sav-parsers classifies it automatically."
   ),
 )
 @click.pass_context
@@ -1688,22 +1677,14 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
       "--field cannot be combined with a PDF. Use one or the other."
     )
 
-  client = _make_client()
-
-  # Resolve tipo_doc lazily (modes A/B only). When --tipo is omitted we
-  # classify the PDF; in mode A the classified type also gates the reconcile
-  # path (only fpb-mod1 is reconcilable today).
-  classified_doc_type: str | None = None
-  tipo_doc = 0
-  if pdf:
-    if tipo is not None:
-      tipo_doc = _resolve_tipo_doc(tipo)
-    else:
-      tipo_doc, classified_doc_type = _classify_pdf_tipo_doc(pdf)
-  tipo_label = _TIPO_DOC_LABELS.get(tipo_doc, f"tipo {tipo_doc}")
+  doc_type: DocType | None = _resolve_doc_type(tipo) if tipo is not None else None
 
   # Mode B — doc-only replace.
   if pdf and file_only:
+    if doc_type is None:
+      doc_type = _classify_pdf_doc_type(pdf)
+    tipo_doc = _tipo_doc_for_upload(doc_type)
+    client = _make_client()
     try:
       client.replace_player_registration_document(
         batch_id, license, pdf, tipo_doc=tipo_doc,
@@ -1711,28 +1692,29 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
     except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     click.echo(
-      f"Replaced {tipo_label} for licence {license} in batch #{batch_id}."
+      f"Replaced {_doc_type_text(doc_type)} for licence {license} in batch #{batch_id}."
     )
     return
 
   # Mode A — PDF-driven (parse → reconcile → patch fields → replace doc).
   if pdf:
+    if doc_type is None:
+      doc_type = _classify_pdf_doc_type(pdf)
+    if doc_type != DocType.FPB_MOD1:
+      raise SavCliError(
+        f"Unsupported document type {_doc_type_text(doc_type)!r}; "
+        "only fpb_modelo_1 forms are reconciled. Use --file-only to upload as-is.",
+        code="parse_error",
+      )
+    tipo_doc = _tipo_doc_for_upload(doc_type)
+
     try:
       from sav_parsers import close_processing, parse_fpb_mod1
       from sav_shared import reconcile_fpb_mod1
     except ImportError as exc:
       raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
 
-    # Classify only when --tipo was given (we skipped it above); we need it
-    # to gate the reconcile path even when the user pinned an upload tipo.
-    if classified_doc_type is None:
-      _, classified_doc_type = _classify_pdf_tipo_doc(pdf)
-    if classified_doc_type != "fpb-mod1":
-      raise SavCliError(
-        f"Unsupported document type {classified_doc_type!r}; "
-        f"only fpb-mod1 forms are reconciled. Use --file-only to upload as-is.",
-        code="parse_error",
-      )
+    client = _make_client()
 
     click.echo("Processing OCR ...", nl=False)
     try:
@@ -1782,7 +1764,7 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
         client.replace_player_registration_document(
           batch_id, license, pdf, tipo_doc=tipo_doc,
         )
-        click.echo(f"  Uploaded {pdf} ({tipo_label}).")
+        click.echo(f"  Uploaded {pdf} ({_doc_type_text(doc_type)}).")
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
         click.echo(
           f"  Warning: field update succeeded but document upload failed: {exc}",
@@ -1811,6 +1793,7 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
     return
 
   # Mode C — fields-only.
+  client = _make_client()
   patch_kwargs = _parse_update_fields(fields)
   try:
     client.update_player_in_registration_batch(
