@@ -13,6 +13,8 @@ When you add a new lookup here:
 """
 from __future__ import annotations
 
+from sav_parsers.types import DocType
+
 
 # ── Generic ────────────────────────────────────────────────────────────────────
 
@@ -122,3 +124,52 @@ GENERO: dict[int, str] = {
   1: "Masculino",
   2: "Feminino",
 }
+
+
+# ── Document types ─────────────────────────────────────────────────────────────
+
+DOC_TYPE_CHOICES: tuple[str, ...] = tuple(doc_type.value for doc_type in DocType)
+
+_DOC_TYPE_TO_TIPO_DOC: dict[DocType, int] = {
+  DocType.FPB_MOD1: 1,
+  DocType.EM: 2,
+  DocType.FPB_MOD4: 6,
+}
+_TIPO_DOC_TO_DOC_TYPE: dict[int, DocType] = {
+  tipo_doc: doc_type
+  for doc_type, tipo_doc in _DOC_TYPE_TO_TIPO_DOC.items()
+}
+
+
+def normalize_doc_type(value: DocType | str) -> DocType:
+  """Normalize a CLI/MCP doc-type input to the canonical sav-parsers enum."""
+  if isinstance(value, DocType):
+    return value
+  if not isinstance(value, str):
+    raise ValueError(
+      f"Unknown doc_type {value!r}. Use one of: {', '.join(DOC_TYPE_CHOICES)}."
+    )
+
+  normalized = value.strip().lower()
+  try:
+    return DocType(normalized)
+  except ValueError as exc:
+    raise ValueError(
+      f"Unknown doc_type {value!r}. Use one of: {', '.join(DOC_TYPE_CHOICES)}."
+    ) from exc
+
+
+def doc_type_to_tipo_doc(doc_type: DocType | str) -> int:
+  """Translate a sav-parsers doc type to the SAV2 upload modal integer."""
+  normalized = normalize_doc_type(doc_type)
+  if normalized not in _DOC_TYPE_TO_TIPO_DOC:
+    raise ValueError(
+      f"Document type {normalized.value!r} is recognized by sav-parsers "
+      "but has no SAV2 tipo_doc mapping yet."
+    )
+  return _DOC_TYPE_TO_TIPO_DOC[normalized]
+
+
+def tipo_doc_to_doc_type(tipo_doc: int) -> DocType | None:
+  """Reverse-map a SAV2 tipo_doc integer back to a sav-parsers doc type."""
+  return _TIPO_DOC_TO_DOC_TYPE.get(tipo_doc)

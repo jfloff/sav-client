@@ -13,14 +13,18 @@ from typing import Any
 
 from .fields import ENROLLMENT_FIELD_META, FIELDS, FieldDef, KWARG_TO_ENTITY
 from .lookups import (
+    DOC_TYPE_CHOICES,
     DISTRITOS,
     GENERO,
     GUARDIAN_RELATIONS,
     ID_TYPES,
     REGISTRATION_TYPE_LABELS,
+    doc_type_to_tipo_doc,
     distrito_name,
     find_distrito_id,
     find_id_by_name,
+    normalize_doc_type,
+    tipo_doc_to_doc_type,
 )
 from .fpb_mod1 import (
     ReconcileResult,
