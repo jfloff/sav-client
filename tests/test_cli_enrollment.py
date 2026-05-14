@@ -152,11 +152,7 @@ def test_enrollment_update_reconcile_accepts_only_fpb_modelo_1(monkeypatch, tmp_
   assert "only fpb_modelo_1 forms are reconciled" in result.output
 
 
-def test_enroll_rejects_medical_exam_with_multiple_pdfs(tmp_path):
-  first_pdf = tmp_path / "first.pdf"
-  first_pdf.write_bytes(b"%PDF-1.4\n")
-  second_pdf = tmp_path / "second.pdf"
-  second_pdf.write_bytes(b"%PDF-1.4\n")
+def test_enrollment_create_rejects_medical_exam_without_pdf(tmp_path):
   exam_path = tmp_path / "exam.pdf"
   exam_path.write_bytes(b"%PDF-1.4\n")
 
@@ -164,13 +160,14 @@ def test_enroll_rejects_medical_exam_with_multiple_pdfs(tmp_path):
   result = runner.invoke(
     cli_module.cli,
     [
-      "enroll", str(first_pdf), str(second_pdf),
+      "enrollment", "create",
+      "--batch", "12", "--license", "301772",
       "--medical-exam", str(exam_path),
     ],
   )
 
   assert result.exit_code != 0
-  assert "only be used when enrolling a single PDF" in result.output
+  assert "--medical-exam requires a PDF or --mod1" in result.output
 
 
 def test_enroll_uses_medical_exam_date_and_uploads_exam(monkeypatch, tmp_path, batch_stub, reconcile_result_stub):
@@ -225,7 +222,7 @@ def test_enroll_uses_medical_exam_date_and_uploads_exam(monkeypatch, tmp_path, b
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enroll", str(form_path), "--medical-exam", str(exam_path)],
+    ["enrollment", "create", str(form_path), "--medical-exam", str(exam_path)],
   )
 
   assert result.exit_code == 0
@@ -290,7 +287,7 @@ def test_enroll_prompts_for_manual_medical_exam_date(monkeypatch, tmp_path, batc
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enroll", str(form_path), "--medical-exam", str(exam_path)],
+    ["enrollment", "create", str(form_path), "--medical-exam", str(exam_path)],
     input="2026-05-03\n",
   )
 
@@ -340,7 +337,7 @@ def test_enroll_prompts_for_exam_date_without_medical_exam(monkeypatch, tmp_path
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enroll", str(form_path)],
+    ["enrollment", "create", str(form_path)],
     input="2026-05-03\n",
   )
 
@@ -397,7 +394,7 @@ def test_enroll_skips_when_parse_em_raises(monkeypatch, tmp_path, batch_stub, re
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enroll", str(form_path), "--medical-exam", str(exam_path)],
+    ["enrollment", "create", str(form_path), "--medical-exam", str(exam_path)],
   )
 
   assert result.exit_code == 0
@@ -455,7 +452,7 @@ def test_enroll_skips_when_exam_date_not_entered(monkeypatch, tmp_path, batch_st
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enroll", str(form_path), "--medical-exam", str(exam_path)],
+    ["enrollment", "create", str(form_path), "--medical-exam", str(exam_path)],
     input="\n",
   )
 
@@ -504,3 +501,159 @@ def test_prompt_field_retries_date_type(monkeypatch):
 
   assert cli_module._prompt_field("exam_date", field_type="date") == "2026-05-03"
   assert any("YYYY-MM-DD" in line for line in printed)
+
+
+def test_enrollment_create_rejects_no_input(tmp_path):
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "create"])
+  assert result.exit_code != 0
+  assert "Pass one or more PDFs" in result.output
+
+
+def test_enrollment_create_mod1_skips_classify(monkeypatch, tmp_path, batch_stub, reconcile_result_stub):
+  """--mod1 skips classify() and calls train_classifier instead."""
+  mod1_path = tmp_path / "form.pdf"
+  mod1_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"classify_called": False, "trained": [], "add_called": False}
+
+  def fake_classify(path):
+    captured["classify_called"] = True
+    return DocType.FPB_MOD1
+
+  monkeypatch.setattr("sav_parsers.classify", fake_classify)
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: captured["trained"].append(dt))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda path: {"fields": {}, "processing_id": "proc-mod1"},
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "load_player_profile": lambda self, lic, club_id=None: {},
+    "add_player_to_registration_batch": lambda self, *a, **kw: captured.__setitem__("add_called", True),
+    "replace_player_registration_document": lambda self, *a, **kw: None,
+  })())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch_stub))
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {"exam_date": "2026-01-01"})
+  monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "create", "--mod1", str(mod1_path)])
+
+  assert not captured["classify_called"], "classify() should be skipped for --mod1"
+  assert DocType.FPB_MOD1 in captured["trained"]
+
+
+def test_enrollment_create_manual_mode(monkeypatch, tmp_path):
+  """--batch + --license + --field enrolls player without a PDF."""
+  captured: dict = {"add_kwargs": None}
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "load_player_profile": lambda self, lic: {"nome": "Test Player"},
+    "add_player_to_registration_batch": lambda self, batch_id, lic, **kw: captured.__setitem__("add_kwargs", kw),
+  })())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "create", "--batch", "42", "--license", "301772", "--field", "email=foo@bar.com"],
+    input="y\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["add_kwargs"] == {"email": "foo@bar.com"}
+
+
+def test_enrollment_create_pdf_mode_applies_field_overrides(monkeypatch, tmp_path, batch_stub, reconcile_result_stub):
+  """--field values are merged into kwargs after reconcile in PDF mode."""
+  form_path = tmp_path / "form.pdf"
+  form_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"add_kwargs": None}
+
+  monkeypatch.setattr("sav_parsers.classify", lambda path: DocType.FPB_MOD1)
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda path: {"fields": {}, "processing_id": "proc-form"},
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "load_player_profile": lambda self, lic, club_id=None: {},
+    "add_player_to_registration_batch": lambda self, batch_id, lic, **kw: captured.__setitem__("add_kwargs", kw),
+    "replace_player_registration_document": lambda self, *a, **kw: None,
+  })())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch_stub))
+  # reconcile returns email from OCR; --field should override it
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {"exam_date": "2026-01-01", "email": "ocr@example.com"})
+  monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "create", str(form_path), "--field", "email=manual@example.com"],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["add_kwargs"]["email"] == "manual@example.com"
+
+
+def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
+  """--mod1 in update skips classify() and calls train_classifier."""
+  mod1_path = tmp_path / "form.pdf"
+  mod1_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"classify_called": False, "trained": []}
+
+  def fake_classify(path):
+    captured["classify_called"] = True
+    return DocType.FPB_MOD1
+
+  monkeypatch.setattr("sav_parsers.classify", fake_classify)
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: captured["trained"].append(dt))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda path: {"fields": {}, "processing_id": "proc-mod1"},
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "load_player_profile": lambda self, lic: {},
+    "update_player_in_registration_batch": lambda self, *a, **kw: None,
+    "replace_player_registration_document": lambda self, *a, **kw: None,
+  })())
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: type("R", (), {
+    "needs_review": [], "retrain_corrections": {},
+  })())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "update", "12", "301772", "--mod1", str(mod1_path)],
+  )
+
+  assert not captured["classify_called"], "classify() should be skipped for --mod1"
+  assert DocType.FPB_MOD1 in captured["trained"]
+
+
+def test_enrollment_update_medical_exam_uploads_exam(monkeypatch, tmp_path):
+  """--medical-exam in update uploads the exam document."""
+  exam_path = tmp_path / "exam.pdf"
+  exam_path.write_bytes(b"%PDF-1.4\n")
+
+  uploaded: list = []
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: None)
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "replace_player_registration_document": lambda self, batch_id, lic, path, tipo_doc: uploaded.append(path),
+  })())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "update", "12", "301772", "--medical-exam", str(exam_path)],
+  )
+
+  assert str(exam_path) in uploaded

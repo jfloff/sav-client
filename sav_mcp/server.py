@@ -434,7 +434,10 @@ def _replace_player_document_from_bytes(
 
 
 @server.tool()
-def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
+def parse_enrollment_forms(
+    pdfs: list[str],
+    doc_types: list[str | None] | None = None,
+) -> list[dict]:
     """
     Parse one or more enrollment-related PDFs provided as base64-encoded bytes.
 
@@ -442,6 +445,11 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
     the batch parameters (registration type, tier, gender). exame_medico
     documents are parsed for step-3 metadata and return a medical_exam_id that
     can be passed to preview_enrollment / submit_enrollment.
+
+    doc_types: optional per-PDF type hint list (same length as pdfs). When an
+    entry is "fpb_modelo_1" or "exame_medico", classification is skipped and
+    the classifier is trained with the known label. Use None or omit the list
+    to auto-classify every PDF.
 
     Returns one entry per PDF with an artifact_id and canonical doc_type to
     reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
@@ -460,13 +468,28 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             results.append({"index": i, "error": f"Invalid base64: {exc}"})
             continue
 
+        hint: str | None = (doc_types[i] if doc_types and i < len(doc_types) else None)
+
         tmp_path: str | None = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
                 f.write(pdf_bytes)
                 tmp_path = f.name
 
-            doc_type = classify(tmp_path)
+            if hint is not None:
+                # Type is already known — skip classify and train the classifier.
+                _hint_map = {"fpb_modelo_1": DocType.FPB_MOD1, "exame_medico": DocType.EM}
+                if hint not in _hint_map:
+                    results.append({"index": i, "error": f"Unknown doc_type hint: {hint!r}"})
+                    continue
+                doc_type = _hint_map[hint]
+                try:
+                    train_classifier(tmp_path, doc_type)
+                except Exception:
+                    pass
+            else:
+                doc_type = classify(tmp_path)
+
             if doc_type == DocType.FPB_MOD1:
                 parse_result = parse_fpb_mod1(tmp_path)
                 parsed = parse_result["fields"]
@@ -865,6 +888,162 @@ def update_enrollment(
         batch_id, license, **coerced,
     )
     return {"success": True, "player_id": player_id}
+
+
+@server.tool()
+def create_enrollment_manual(
+    batch_id: int,
+    license: int,
+    fields: dict[str, Any] | None = None,
+) -> dict:
+    """
+    Enroll a player in a batch using their existing SAV profile, with optional
+    field overrides — no PDF required.
+
+    Equivalent of `sav enrollment create --batch BATCH --license LICENSE [--field ...]`.
+
+    fields: optional subset of the same keys accepted by update_enrollment (id_type,
+    id_number, id_expiry, telemovel, telefone, email, nome_pai, nome_mae, morada,
+    cod_postal, localidade_txt, distrito_id, concelho_id) plus create-time fields
+    (exam_date, guardian_name, guardian_relation, guardian_phone, guardian_email,
+    consent_data, consent_communications, consent_marketing).
+
+    Returns: {"success": True, "player_id": int} on success.
+    """
+    player_id = _get_client().add_player_to_registration_batch(
+        batch_id, license, **(fields or {}),
+    )
+    return {"success": True, "player_id": player_id}
+
+
+@server.tool()
+def update_enrollment_with_document(
+    batch_id: int,
+    license: int,
+    pdf: str,
+    doc_type: str | None = None,
+    field_overrides: dict[str, Any] | None = None,
+    file_only: bool = False,
+) -> dict:
+    """
+    Reconcile a new PDF against an existing enrolment and patch fields / replace document.
+
+    Equivalent of `sav enrollment update BATCH LICENSE FILE [--mod1] [--field ...] [--file-only]`.
+
+    pdf: base64-encoded PDF.
+    doc_type: optional type hint — "fpb_modelo_1" or "exame_medico". When given,
+    classification is skipped and the classifier is trained with the known label.
+    field_overrides: optional field values applied on top of reconcile result before
+    submitting (same keys as update_enrollment). Only valid when file_only=False.
+    file_only: when True, replace the document without touching fields.
+
+    Returns: {"success": True, "fields_updated": bool, "document_uploaded": bool}.
+    """
+    from sav_parsers import classify, close_processing, parse_fpb_mod1, train_classifier
+
+    try:
+        pdf_bytes = base64.b64decode(pdf)
+    except Exception as exc:
+        raise ValueError(f"Invalid base64 for pdf: {exc}") from exc
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
+
+        _hint_map = {"fpb_modelo_1": DocType.FPB_MOD1, "exame_medico": DocType.EM}
+        if doc_type is not None:
+            if doc_type not in _hint_map:
+                raise ValueError(f"Unknown doc_type: {doc_type!r}. Use 'fpb_modelo_1' or 'exame_medico'.")
+            active_doc_type = _hint_map[doc_type]
+            try:
+                train_classifier(tmp_path, active_doc_type)
+            except Exception:
+                pass
+        else:
+            active_doc_type = classify(tmp_path)
+
+        tipo_doc = doc_type_to_tipo_doc(active_doc_type)
+        client = _get_client()
+
+        if file_only:
+            client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
+            return {"success": True, "fields_updated": False, "document_uploaded": True}
+
+        if active_doc_type != DocType.FPB_MOD1:
+            raise ValueError(
+                f"Document type {active_doc_type.value!r} cannot be reconciled; "
+                "only fpb_modelo_1 forms are supported. Use file_only=True to upload as-is."
+            )
+
+        parse_result = parse_fpb_mod1(tmp_path)
+        parsed = parse_result["fields"]
+        processing_id = parse_result["processing_id"]
+
+        close_called = False
+        try:
+            sav_profile = client.load_player_profile(license)
+            result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
+            kwargs = {k: v for k, v in {**result.updated, **result.kept}.items()}
+            if field_overrides:
+                kwargs.update(field_overrides)
+
+            allowed = {
+                "id_type", "id_number", "id_expiry", "telemovel", "telefone",
+                "email", "nome_pai", "nome_mae", "morada", "cod_postal",
+                "localidade_txt", "distrito_id", "concelho_id",
+            }
+            patch_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
+            client.update_player_in_registration_batch(batch_id, license, **patch_kwargs)
+            client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
+
+            corrections: dict[str, str] = {}
+            for kwarg in result.needs_review:
+                entity = KWARG_TO_ENTITY.get(kwarg)
+                val = kwargs.get(kwarg)
+                if entity and val is not None:
+                    corrections[entity] = str(val)
+            corrections.update(result.retrain_corrections)
+            close_called = True
+            try:
+                close_processing(processing_id, corrections=corrections or None)
+            except Exception:
+                pass
+        finally:
+            if not close_called:
+                try:
+                    close_processing(processing_id)
+                except Exception:
+                    pass
+
+        return {"success": True, "fields_updated": True, "document_uploaded": True}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@server.tool()
+def read_enrollment(batch_id: int, license: int | None = None) -> dict:
+    """
+    List players in a batch or show one player's enrolment detail.
+    (Not yet implemented.)
+
+    list form:   read_enrollment(batch_id)
+    detail form: read_enrollment(batch_id, license)
+    """
+    # TODO: _get_client().list_player_registration_batch_items(batch_id) for list
+    #       _get_client()._load_existing_registration_record(batch_id, license) for detail
+    raise NotImplementedError("read_enrollment is not yet implemented.")
+
+
+@server.tool()
+def delete_enrollment(batch_id: int, license: int) -> dict:
+    """
+    Remove a player from a registration batch. (Not yet implemented.)
+    """
+    # TODO: _get_client().remove_player_from_registration_batch(batch_id, license)
+    raise NotImplementedError("delete_enrollment is not yet implemented.")
 
 
 # ── Registration documents ────────────────────────────────────────────────────

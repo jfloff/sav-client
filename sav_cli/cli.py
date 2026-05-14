@@ -1368,21 +1368,116 @@ def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> N
   console.print()
 
 
-@cli.command("enroll")
-@click.argument("pdfs", nargs=-1, required=True, type=click.Path(exists=True))
+# Field types accepted by enrollment create/update --field. Defined here (before the
+# enrollment group) so the --field decorator can reference _UPDATE_FIELDS at import time.
+_UPDATE_FIELDS: dict[str, tuple[str, type]] = {
+  "id_type":        ("step1", int),
+  "id_number":      ("step1", str),
+  "id_expiry":      ("step1", str),
+  "telemovel":      ("step1", str),
+  "telefone":       ("step1", str),
+  "email":          ("step1", str),
+  "nome_pai":       ("step1", str),
+  "nome_mae":       ("step1", str),
+  "morada":         ("step2", str),
+  "cod_postal":     ("step2", str),
+  "localidade_txt": ("step2", str),
+  "distrito_id":    ("resolve_distrito", int),
+  "concelho_id":    ("resolve_concelho", int),
+}
+# Aliases so users don't have to type the `_id` suffix.
+_UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
+
+
+@cli.group("enrollment")
+def enrollment_grp():
+  """Create, read, update, and delete player enrolments in Revalidação batches."""
+
+
+@enrollment_grp.command("create")
+@click.argument("pdfs", nargs=-1, required=False, type=click.Path(exists=True))
+@click.option(
+  "--mod1", "mod1_path", type=click.Path(exists=True), default=None,
+  help="Explicit fpb_modelo_1 form (skips auto-classify; trains the classifier).",
+)
 @click.option(
   "--medical-exam", type=click.Path(exists=True),
   help="Parse and upload the matching exame_medico PDF.",
 )
+@click.option(
+  "--batch", "batch_id_opt", type=int, default=None,
+  help="Batch ID for manual enrolment (no PDF).",
+)
+@click.option(
+  "--license", "license_opt", type=int, default=None,
+  help="Player licence for manual enrolment (no PDF).",
+)
+@click.option(
+  "--field", "fields", multiple=True, metavar="KEY=VAL",
+  help=(
+    "Override a field value (repeatable). Applied on top of OCR in PDF mode or "
+    "as the full field set in manual mode. "
+    "Supported: " + ", ".join(sorted(_UPDATE_FIELDS)) + "."
+  ),
+)
 @click.pass_context
-def enroll_cmd(ctx, pdfs, medical_exam):
-  """Enroll players from FPB registration PDFs into SAV."""
+def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, license_opt, fields):
+  """Enroll players from FPB registration PDFs into SAV.
+
+  \b
+    sav enrollment create player.pdf
+        Auto-classify, OCR-reconcile, and enroll.
+    sav enrollment create --mod1 player.pdf --medical-exam exam.pdf
+        Explicit form types (skip classify); trains the classifier.
+    sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
+        Manual enrolment from SAV profile, no PDF.
+  """
   from sav_parsers import classify, close_processing, parse_em, parse_fpb_mod1, train_classifier
   from sav_shared.fields import KWARG_TO_ENTITY
-  if medical_exam and len(pdfs) != 1:
+
+  pdf_mode = bool(pdfs or mod1_path)
+  manual_mode = bool(batch_id_opt is not None and license_opt is not None)
+
+  if not pdf_mode and not manual_mode:
     raise click.UsageError(
-      "--medical-exam can only be used when enrolling a single PDF."
+      "Pass one or more PDFs (or --mod1), or --batch + --license for manual enrolment."
     )
+  if medical_exam and not pdf_mode:
+    raise click.UsageError("--medical-exam requires a PDF or --mod1.")
+
+  # Manual mode: no PDF, enroll directly from SAV profile + optional field overrides.
+  if manual_mode and not pdf_mode:
+    client = _make_client()
+    field_overrides = _parse_update_fields(fields)
+    console = _console()
+    try:
+      with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
+        sav_profile = client.load_player_profile(license_opt)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
+    console.print(
+      f"[bold]Enrolling:[/] {sav_profile.get('nome', '?')} "
+      f"(licence {license_opt}) in batch #{batch_id_opt}"
+    )
+    if field_overrides:
+      console.print(
+        "[cyan]:information_source: Field overrides:[/] "
+        + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+      )
+    if not click.confirm("Proceed?"):
+      console.print("[yellow]:fast_forward: Aborted.[/]")
+      return
+    try:
+      with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
+        client.add_player_to_registration_batch(
+          batch_id_opt, license_opt, **field_overrides,
+        )
+    except (SavConnectionError, SavResponseError, ValueError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    console.print(
+      f"[green]:white_check_mark: Enrolled licence {license_opt} in batch #{batch_id_opt}.[/]"
+    )
+    return
 
   client = _make_client()
 
@@ -1391,21 +1486,39 @@ def enroll_cmd(ctx, pdfs, medical_exam):
   console = _console()
   err_console = _console(err=True)
 
-  for pdf_path in pdfs:
+  # Build list of (pdf_path, explicit_doc_type) pairs.
+  # Positional PDFs are auto-classified; --mod1 path skips classify.
+  paths_to_process: list[tuple[str, DocType | None]] = [(p, None) for p in pdfs]
+  if mod1_path:
+    paths_to_process.append((mod1_path, DocType.FPB_MOD1))
+
+  for pdf_path, explicit_doc_type in paths_to_process:
     medical_exam_path = medical_exam
-    # Step 1 — classify
-    try:
-      with console.status("[bold cyan]:mag: Classifying document...[/]"):
-        doc_type = classify(pdf_path)
-    except Exception as exc:
-      err_console.print(f"[red]:x: Classify error:[/] {exc} [dim]({pdf_path})[/]")
-      continue
-    if doc_type != DocType.FPB_MOD1:
-      console.print(
-        f"[yellow]:warning: Unsupported document type {_doc_type_text(doc_type)!r}; skipped.[/] "
-        f"[dim]({pdf_path})[/]"
-      )
-      continue
+    if explicit_doc_type is None:
+      # Step 1 — classify
+      try:
+        with console.status("[bold cyan]:mag: Classifying document...[/]"):
+          doc_type = classify(pdf_path)
+      except Exception as exc:
+        err_console.print(f"[red]:x: Classify error:[/] {exc} [dim]({pdf_path})[/]")
+        continue
+      if doc_type != DocType.FPB_MOD1:
+        console.print(
+          f"[yellow]:warning: Unsupported document type {_doc_type_text(doc_type)!r}; skipped.[/] "
+          f"[dim]({pdf_path})[/]"
+        )
+        continue
+    else:
+      # Explicit type: skip classify, train classifier with known label.
+      doc_type = explicit_doc_type
+      try:
+        with console.status("[bold cyan]:bookmark_tabs: Labeling mod1 form for classifier training...[/]"):
+          train_classifier(pdf_path, doc_type)
+      except Exception as exc:
+        err_console.print(
+          f"[yellow]:warning: Could not submit classifier training for mod1:[/] "
+          f"{exc} [dim]({pdf_path})[/]"
+        )
 
     # Step 2 — parse
     try:
@@ -1537,6 +1650,14 @@ def enroll_cmd(ctx, pdfs, medical_exam):
         continue
       if medical_exam_info is not None and medical_exam_info.exam_date:
         kwargs["exam_date"] = medical_exam_info.exam_date
+
+      # Apply --field overrides on top of reconciled values (user wins over OCR).
+      if fields:
+        field_overrides = _parse_update_fields(fields)
+        if field_overrides:
+          applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+          console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
+        kwargs.update(field_overrides)
       if not kwargs.get("exam_date"):
         entered = _prompt_field(
           "exam_date",
@@ -1663,26 +1784,6 @@ def enroll_cmd(ctx, pdfs, medical_exam):
         except Exception:
           pass
 
-# Field types accepted by `sav enrollment update --field`. Values are
-# ("step1"|"step2"|"resolve_distrito"|"resolve_concelho", py_type) — the
-# coercer turns each --field K=V into a kwarg on update_player_in_registration_batch.
-_UPDATE_FIELDS: dict[str, tuple[str, type]] = {
-  "id_type":        ("step1", int),
-  "id_number":      ("step1", str),
-  "id_expiry":      ("step1", str),
-  "telemovel":      ("step1", str),
-  "telefone":       ("step1", str),
-  "email":          ("step1", str),
-  "nome_pai":       ("step1", str),
-  "nome_mae":       ("step1", str),
-  "morada":         ("step2", str),
-  "cod_postal":     ("step2", str),
-  "localidade_txt": ("step2", str),
-  "distrito_id":    ("resolve_distrito", int),
-  "concelho_id":    ("resolve_concelho", int),
-}
-# Aliases so users don't have to type the `_id` suffix.
-_UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
 def _resolve_doc_type(value: str) -> DocType:
@@ -1754,10 +1855,20 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
   return out
 
 
-@cli.group("enrollment")
-def enrollment_grp():
-  """Manage individual player enrolments in open Revalidação batches."""
-  pass
+@enrollment_grp.command("read")
+@click.argument("batch_id", type=int)
+@click.argument("license", type=int, required=False)
+@click.pass_context
+def enrollment_read_cmd(ctx, batch_id, license):
+  """Show player enrolments in a batch. (Not yet implemented.)
+
+  \b
+    sav enrollment read BATCH_ID              List all players in the batch.
+    sav enrollment read BATCH_ID LICENSE      Show one player's enrolment detail.
+  """
+  # TODO: list_player_registration_batch_items(batch_id) for list view
+  #       client._load_existing_registration_record(batch_id, license) for detail
+  raise click.UsageError("enrollment read is not yet implemented.")
 
 
 @enrollment_grp.command("update")
@@ -1765,9 +1876,17 @@ def enrollment_grp():
 @click.argument("license", type=int)
 @click.argument("pdf", type=click.Path(exists=True), required=False)
 @click.option(
+  "--mod1", "mod1_path", type=click.Path(exists=True), default=None,
+  help="Explicit fpb_modelo_1 form (alternative to positional pdf; skips classify).",
+)
+@click.option(
+  "--medical-exam", "medical_exam_path", type=click.Path(exists=True), default=None,
+  help="Upload a medical exam PDF for this player.",
+)
+@click.option(
   "--field", "fields", multiple=True, metavar="KEY=VAL",
   help=(
-    "Patch a single field (repeatable). Mutually exclusive with PDF. "
+    "Override a field value (repeatable). May be combined with a PDF. "
     "Supported: " + ", ".join(sorted(_UPDATE_FIELDS)) + "."
   ),
 )
@@ -1784,69 +1903,99 @@ def enrollment_grp():
   ),
 )
 @click.pass_context
-def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
+def enrollment_update_cmd(
+  ctx, batch_id, license, pdf, mod1_path, medical_exam_path, fields, file_only, tipo,
+):
   """Update an existing player enrolment.
-
-  Three modes:
 
   \b
     sav enrollment update BATCH LICENSE FILE
         OCR-reconcile FILE against SAV, patch fields, replace doc.
+    sav enrollment update BATCH LICENSE --mod1 FILE
+        Same with explicit doc type (skips classify; trains classifier).
+    sav enrollment update BATCH LICENSE FILE --field KEY=VAL [...]
+        OCR-reconcile FILE, apply manual field overrides, patch, replace doc.
     sav enrollment update BATCH LICENSE FILE --file-only
-        Replace the document; leave fields untouched.
+        Replace document only; leave fields untouched.
     sav enrollment update BATCH LICENSE --field KEY=VAL [--field ...]
         Patch fields; no document.
+    sav enrollment update BATCH LICENSE --medical-exam FILE
+        Upload medical exam document only.
   """
-  if not pdf and not fields:
+  if pdf and (mod1_path or medical_exam_path):
+    raise click.UsageError("Positional pdf and --mod1/--medical-exam are mutually exclusive.")
+  has_pdf = bool(pdf or mod1_path)
+  if not has_pdf and not fields and not medical_exam_path:
     raise click.UsageError(
-      "Pass a PDF (positional) or --field K=V (repeatable). "
+      "Pass a PDF (positional or --mod1), --medical-exam, or --field K=V. "
       "Run `sav enrollment update --help` for examples."
     )
-  if file_only and not pdf:
-    raise click.UsageError("--file-only requires a PDF argument.")
-  if fields and pdf:
-    raise click.UsageError(
-      "--field cannot be combined with a PDF. Use one or the other."
-    )
+  if file_only and not has_pdf:
+    raise click.UsageError("--file-only requires a PDF argument (positional or --mod1).")
 
   doc_type: DocType | None = _resolve_doc_type(tipo) if tipo is not None else None
 
-  # Mode B — doc-only replace.
-  if pdf and file_only:
-    if doc_type is None:
-      doc_type = _classify_pdf_doc_type(pdf)
-    tipo_doc = _tipo_doc_for_upload(doc_type)
+  # Mode B — doc-only replace (pdf/--mod1 + --file-only).
+  if has_pdf and file_only:
+    active_pdf = mod1_path or pdf
+    if mod1_path:
+      active_doc_type: DocType = DocType.FPB_MOD1
+      from sav_parsers import train_classifier
+      try:
+        train_classifier(mod1_path, active_doc_type)
+      except Exception as exc:
+        click.echo(f"  Warning: could not submit classifier training: {exc}", err=True)
+    else:
+      if doc_type is None:
+        doc_type = _classify_pdf_doc_type(active_pdf)
+      active_doc_type = doc_type
+    tipo_doc = _tipo_doc_for_upload(active_doc_type)
     client = _make_client()
     try:
       client.replace_player_registration_document(
-        batch_id, license, pdf, tipo_doc=tipo_doc,
+        batch_id, license, active_pdf, tipo_doc=tipo_doc,
       )
     except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     click.echo(
-      f"Replaced {_doc_type_text(doc_type)} for licence {license} in batch #{batch_id}."
+      f"Replaced {_doc_type_text(active_doc_type)} for licence {license} in batch #{batch_id}."
     )
+    if medical_exam_path:
+      _upload_medical_exam_update(batch_id, license, medical_exam_path)
     return
 
-  # Mode A — PDF-driven (parse → reconcile → patch fields → replace doc).
-  if pdf:
-    if doc_type is None:
-      doc_type = _classify_pdf_doc_type(pdf)
-    if doc_type != DocType.FPB_MOD1:
-      raise SavCliError(
-        f"Unsupported document type {_doc_type_text(doc_type)!r}; "
-        "only fpb_modelo_1 forms are reconciled. Use --file-only to upload as-is.",
-        code="parse_error",
-      )
-    tipo_doc = _tipo_doc_for_upload(doc_type)
+  # Mode A / D — PDF-driven (parse → reconcile → patch fields → replace doc).
+  # Mode A: PDF only. Mode D: PDF + --field overrides.
+  if has_pdf and not file_only:
+    active_pdf = mod1_path or pdf
+    from sav_parsers import close_processing, parse_fpb_mod1, train_classifier
 
-    from sav_parsers import close_processing, parse_fpb_mod1
+    if mod1_path:
+      # Explicit type: skip classify, train classifier.
+      active_doc_type: DocType = DocType.FPB_MOD1
+      try:
+        train_classifier(mod1_path, active_doc_type)
+      except Exception as exc:
+        click.echo(
+          f"  Warning: could not submit classifier training for mod1: {exc}", err=True,
+        )
+    else:
+      if doc_type is None:
+        doc_type = _classify_pdf_doc_type(pdf)
+      if doc_type != DocType.FPB_MOD1:
+        raise SavCliError(
+          f"Unsupported document type {_doc_type_text(doc_type)!r}; "
+          "only fpb_modelo_1 forms are reconciled. Use --file-only to upload as-is.",
+          code="parse_error",
+        )
+      active_doc_type = doc_type
+    tipo_doc = _tipo_doc_for_upload(active_doc_type)
 
     client = _make_client()
 
     click.echo("Processing OCR ...", nl=False)
     try:
-      parse_result = parse_fpb_mod1(pdf)
+      parse_result = parse_fpb_mod1(active_pdf)
     except Exception as exc:
       click.echo()
       raise SavCliError(f"parse error: {exc}", code="parse_error")
@@ -1871,6 +2020,16 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
         click.echo("Skipped.")
         return
 
+      # Apply --field overrides on top of reconciled values (user wins over OCR).
+      if fields:
+        field_overrides = _parse_update_fields(fields)
+        if field_overrides:
+          click.echo(
+            "  Field overrides: "
+            + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+          )
+        kwargs.update(field_overrides)
+
       # Drop fields that update_player_in_registration_batch doesn't accept.
       ignored = {k: v for k, v in kwargs.items() if k not in _UPDATE_FIELDS}
       patch_kwargs = {k: v for k, v in kwargs.items() if k in _UPDATE_FIELDS}
@@ -1890,14 +2049,17 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
 
       try:
         client.replace_player_registration_document(
-          batch_id, license, pdf, tipo_doc=tipo_doc,
+          batch_id, license, active_pdf, tipo_doc=tipo_doc,
         )
-        click.echo(f"  Uploaded {pdf} ({_doc_type_text(doc_type)}).")
+        click.echo(f"  Uploaded {active_pdf} ({_doc_type_text(active_doc_type)}).")
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
         click.echo(
           f"  Warning: field update succeeded but document upload failed: {exc}",
           err=True,
         )
+
+      if medical_exam_path:
+        _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client)
 
       corrections: dict[str, str] = {}
       for kwarg in result.needs_review:
@@ -1919,17 +2081,49 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
           pass
     return
 
-  # Mode C — fields-only.
+  # Mode C — fields-only (and optional medical exam upload).
   client = _make_client()
-  patch_kwargs = _parse_update_fields(fields)
+  if fields:
+    patch_kwargs = _parse_update_fields(fields)
+    try:
+      client.update_player_in_registration_batch(
+        batch_id, license, **patch_kwargs,
+      )
+    except (SavConnectionError, SavResponseError, ValueError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    applied = ", ".join(sorted(patch_kwargs))
+    click.echo(f"Updated licence {license} in batch #{batch_id}: {applied}.")
+  if medical_exam_path:
+    _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client)
+
+
+def _upload_medical_exam_update(
+  batch_id: int, license: int, path: str, *, client: Any = None,
+) -> None:
+  """Upload or replace a medical exam document for an existing enrolment."""
+  from sav_parsers import train_classifier
+  if client is None:
+    client = _make_client()
   try:
-    client.update_player_in_registration_batch(
-      batch_id, license, **patch_kwargs,
-    )
-  except (SavConnectionError, SavResponseError, ValueError) as exc:
-    raise SavCliError(str(exc), code=_exc_code(exc))
-  applied = ", ".join(sorted(patch_kwargs))
-  click.echo(f"Updated licence {license} in batch #{batch_id}: {applied}.")
+    train_classifier(path, DocType.EM)
+  except Exception as exc:
+    click.echo(f"  Warning: could not submit classifier training for exam: {exc}", err=True)
+  tipo_doc = _tipo_doc_for_upload(DocType.EM)
+  try:
+    client.replace_player_registration_document(batch_id, license, path, tipo_doc=tipo_doc)
+    click.echo(f"  Uploaded {path} (exame_medico).")
+  except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+    click.echo(f"  Warning: medical exam upload failed: {exc}", err=True)
+
+
+@enrollment_grp.command("delete")
+@click.argument("batch_id", type=int)
+@click.argument("license", type=int)
+@click.pass_context
+def enrollment_delete_cmd(ctx, batch_id, license):
+  """Remove a player from a registration batch. (Not yet implemented.)"""
+  # TODO: click.confirm prompt + client.remove_player_from_registration_batch(batch_id, license)
+  raise click.UsageError("enrollment delete is not yet implemented.")
 
 
 def main():
