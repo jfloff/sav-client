@@ -277,7 +277,12 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
     },
   )
 
-  result = server_module.submit_enrollment(batch_id=12, license=301772, mod1_id="form-1")
+  result = server_module.submit_enrollment(
+    batch_id=12,
+    license=301772,
+    mod1_id="form-1",
+    field_overrides={"exam_date": "2026-05-01"},
+  )
 
   assert result["success"] is True
   assert replace_calls == [1]
@@ -287,6 +292,38 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
     "error": None,
   }
   assert result["medical_exam_upload"] is None
+
+
+def test_submit_enrollment_raises_when_exam_date_missing_without_medical_exam(monkeypatch):
+  import pytest
+
+  result_obj = type(
+    "ResultStub",
+    (),
+    {
+      "kwargs": {"license": 301772, "nome": "A"},
+      "needs_review": [],
+      "retrain_corrections": {},
+    },
+  )()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr(
+    server_module,
+    "_forms",
+    {
+      "form-1": {
+        "reconcile_result": result_obj,
+        "processing_id": "proc-1",
+        "pdf_bytes": b"%PDF-1.4\n",
+        "doc_type": DocType.FPB_MOD1,
+        "sav_profile": {"nome": "Player A"},
+      }
+    },
+  )
+
+  with pytest.raises(ValueError, match="Enrollment requires exam_date"):
+    server_module.submit_enrollment(batch_id=12, license=301772, mod1_id="form-1")
 
 
 def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
@@ -409,3 +446,83 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
 
   assert captured["kwargs"]["exam_date"] == "2026-05-02"
   assert captured["close"][-1] == ("proc-em", {"exam_date": "2026-05-02"})
+
+
+def test_submit_enrollment_raises_when_exam_date_missing(monkeypatch):
+  import pytest
+
+  result_obj = type(
+    "ResultStub",
+    (),
+    {
+      "kwargs": {"license": 301772},
+      "needs_review": [],
+      "retrain_corrections": {},
+    },
+  )()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr(
+    server_module,
+    "_forms",
+    {
+      "form-1": {
+        "reconcile_result": result_obj,
+        "processing_id": "proc-form",
+        "pdf_bytes": b"%PDF-1.4\n",
+        "doc_type": DocType.FPB_MOD1,
+        "sav_profile": {"nome": "Player A"},
+      },
+      "exam-1": {
+        "parsed": {"exam_date": ParsedField(value="13/05/2026", confidence=0.30)},
+        "processing_id": "proc-em",
+        "pdf_bytes": b"%PDF-1.4\n",
+        "doc_type": DocType.EM,
+      },
+    },
+  )
+
+  with pytest.raises(ValueError, match="exam_date"):
+    server_module.submit_enrollment(
+      batch_id=12, license=301772, mod1_id="form-1", medical_exam_id="exam-1",
+    )
+
+
+def test_resolve_player_rejects_non_fpb_mod1_artifact(monkeypatch):
+  import pytest
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr(
+    server_module,
+    "_forms",
+    {
+      "exam-1": {
+        "parsed": {},
+        "processing_id": "proc-em",
+        "doc_type": DocType.EM,
+      },
+    },
+  )
+
+  with pytest.raises(ValueError, match="not an fpb_modelo_1"):
+    server_module.resolve_player(batch_id=12, mod1_id="exam-1")
+
+
+def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
+  import pytest
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr(
+    server_module,
+    "_forms",
+    {
+      "exam-1": {
+        "parsed": {},
+        "processing_id": "proc-em",
+        "doc_type": DocType.EM,
+      },
+    },
+  )
+
+  with pytest.raises(ValueError, match="not an fpb_modelo_1"):
+    server_module.preview_enrollment(batch_id=12, license=301772, mod1_id="exam-1")

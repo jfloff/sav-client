@@ -6,6 +6,8 @@ Import concrete submodules directly, for example:
   - sav_shared.serializers
   - sav_shared.games
   - sav_shared.clubs
+  - sav_shared.lookups
+  - sav_shared.text
 """
 
 from __future__ import annotations

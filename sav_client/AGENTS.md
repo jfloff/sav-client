@@ -281,10 +281,10 @@ Delete a batch by ID. Only `Em construção` batches can be deleted; the server 
 Walk the SAV2 multi-step enrolment wizard (load player → save step 1 → save step 2 → insurance/taxa cascades → pre-commit → commit). Returns the player's internal SAV2 id.
 
 ```python
-client.add_player_to_registration_batch(batch_id, 301772)                     # all auto-derived
 client.add_player_to_registration_batch(batch_id, 301772, exam_date="2026-04-20")
 client.add_player_to_registration_batch(                                      # minor — guardian required
     batch_id, 285943,
+    exam_date="2026-04-20",
     guardian_name="...", guardian_relation=1,
     guardian_phone="91...", guardian_email="...",
 )
@@ -300,7 +300,7 @@ client.add_player_to_registration_batch(                                      # 
 | `morada`, `cod_postal`, `localidade_txt` | `str` | `None` | Step 2 address overrides |
 | `distrito_id`, `concelho_id` | `int` | `None` | Step 2 address overrides |
 | `taxa_id` | `int` | auto | Auto-picked when only one option exists; required when ambiguous |
-| `exam_date` | `str` | today | `YYYY-MM-DD`. Medical exam is always assumed done (`exame=1`) |
+| `exam_date` | `str` | required | `YYYY-MM-DD`. Medical exam is always assumed done (`exame=1`) |
 | `promote_to_tier_id` | `int` | `None` | Subida only; usually unset |
 | `guardian_name`, `guardian_relation`, `guardian_phone`, `guardian_email` | mixed | `None` | **Required when player is a minor** |
 | `consent_data`, `consent_communications` | `bool` | `True` | GDPR consents |
@@ -382,7 +382,7 @@ batch = client.find_open_player_registration_batch(type=2, tier_id=5, gender_id=
 batch_id = batch.id if batch else client.create_player_registration_batch(
     type=2, tier=5, gender_id=1,
 )
-client.add_player_to_registration_batch(batch_id, 301772)
+client.add_player_to_registration_batch(batch_id, 301772, exam_date="2026-04-20")
 
 # Pull a player back out of a batch
 client.remove_player_from_registration_batch(batch_id, 301772)

@@ -115,7 +115,9 @@ def fpb_mod1_to_sav_kwargs(
   Returns a dict that includes 'license' (pop it out before **-spreading):
     kwargs = fpb_mod1_to_sav_kwargs(fields)
     license = kwargs.pop("license")
-    client.add_player_to_registration_batch(batch_id, license, **kwargs)
+    client.add_player_to_registration_batch(
+      batch_id, license, exam_date="YYYY-MM-DD", **kwargs,
+    )
   """
   def val(key: str):
     f = fields.get(key)

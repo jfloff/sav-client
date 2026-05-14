@@ -41,7 +41,7 @@ from sav_shared.enrollment import (
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import reconcile_fpb_mod1
 from sav_shared.games import filter_games
-from sav_shared.lookups import REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
+from sav_shared.lookups import GENERO, REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
 from sav_shared.medical_exam import extract_medical_exam_info
 from sav_shared.serializers import (
     batch_to_dict,
@@ -448,7 +448,7 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
     exame_medico entries also include medical_exam_id. On error for a given
     PDF the entry contains an "error" key instead.
     """
-    from sav_parsers import classify, parse_em, parse_fpb_mod1
+    from sav_parsers import classify, parse_em, parse_fpb_mod1, train_classifier
 
     client = _get_client()
     results: list[dict] = []
@@ -478,6 +478,10 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
                 parse_result = parse_em(tmp_path)
                 parsed = parse_result["fields"]
                 processing_id = parse_result["processing_id"]
+                try:
+                    train_classifier(tmp_path, DocType.EM)
+                except Exception:
+                    pass
             else:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
@@ -493,7 +497,6 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             "parsed": parsed,
             "processing_id": processing_id,
             "doc_type": doc_type,
-            "kind": "medical_exam" if doc_type == DocType.EM else "enrollment_form",
             "pdf_bytes": pdf_bytes,
         }
         if doc_type == DocType.FPB_MOD1:
@@ -515,7 +518,7 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
                 "tier_id": tier_id,
                 "tier_name": tier_name,
                 "gender_id": gender_id,
-                "gender_label": "Feminino" if gender_id == 2 else "Masculino",
+                "gender_label": GENERO.get(gender_id, str(gender_id)),
             })
         else:
             payload = _build_medical_exam_payload(artifact_id, artifact)
@@ -555,7 +558,7 @@ def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
     """
     client = _get_client()
     _, batch = create_and_fetch_batch(
-        client, type=reg_type, tier_id=tier_id, gender_id=gender_id,
+        client, batch_type=reg_type, tier_id=tier_id, gender_id=gender_id,
     )
     return {
         "batch_id": batch.id,
@@ -683,8 +686,9 @@ def submit_enrollment(
     field_overrides should supply values for every field listed in
     needs_review plus any guardian fields required for minors
     (guardian_name, guardian_relation, guardian_phone, guardian_email).
-    It may also include exam_date (YYYY-MM-DD), which overrides any parsed
-    exame_medico date when medical_exam_id is supplied.
+    It must include exam_date (YYYY-MM-DD) when no usable medical exam date
+    is available. It may also override any parsed exame_medico date when
+    medical_exam_id is supplied.
 
     Returns:
       success=true + player_id  on success.
@@ -729,6 +733,11 @@ def submit_enrollment(
     if medical_exam is not None and not kwargs.get("exam_date"):
         raise ValueError(
             "Medical exam OCR did not yield a usable exam_date; pass "
+            "field_overrides={'exam_date': 'YYYY-MM-DD'}."
+        )
+    if not kwargs.get("exam_date"):
+        raise ValueError(
+            "Enrollment requires exam_date; pass "
             "field_overrides={'exam_date': 'YYYY-MM-DD'}."
         )
 

@@ -1006,7 +1006,7 @@ def _resolve_enroll_batch(
     try:
       with console.status("[bold cyan]:hammer_and_wrench: Creating registration batch...[/]"):
         return create_and_fetch_batch(
-          client, type=reg_type, tier_id=tier_id, gender_id=gender_id,
+          client, batch_type=reg_type, tier_id=tier_id, gender_id=gender_id,
         )
     except RuntimeError as exc:
       raise SavCliError(str(exc), code="batch_error")
@@ -1426,7 +1426,7 @@ def enroll_cmd(ctx, pdfs, medical_exam):
     # the finally falls back to a no-corrections close for any earlier exit.
     close_called = False
     medical_processing_id: str | None = None
-    medical_close_called = True
+    medical_close_pending = False
     manual_exam_date = False
     try:
       # Step 4 — resolve batch (once per invocation, derived from first PDF)
@@ -1500,7 +1500,7 @@ def enroll_cmd(ctx, pdfs, medical_exam):
           with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
             medical_parse_result = parse_em(medical_exam_path)
           medical_processing_id = medical_parse_result["processing_id"]
-          medical_close_called = False
+          medical_close_pending = True
           medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
         except SavCliError:
           raise
@@ -1535,24 +1535,24 @@ def enroll_cmd(ctx, pdfs, medical_exam):
       if kwargs is None:
         console.print("[yellow]:fast_forward: Skipped.[/]")
         continue
-      if medical_exam_info is not None:
-        if medical_exam_info.exam_date:
-          kwargs["exam_date"] = medical_exam_info.exam_date
-        else:
-          entered = _prompt_field(
-            "exam_date",
-            (
-              f"OCR: {medical_exam_info.raw_exam_date!r}"
-              if medical_exam_info.raw_exam_date
-              else "no value found"
-            ),
-            field_type="date",
-          )
-          if entered is None:
-            console.print("[yellow]:warning: Medical exam date required; skipped.[/]")
-            continue
-          kwargs["exam_date"] = entered
-          manual_exam_date = True
+      if medical_exam_info is not None and medical_exam_info.exam_date:
+        kwargs["exam_date"] = medical_exam_info.exam_date
+      if not kwargs.get("exam_date"):
+        entered = _prompt_field(
+          "exam_date",
+          (
+            f"OCR: {medical_exam_info.raw_exam_date!r}"
+            if medical_exam_info is not None and medical_exam_info.raw_exam_date
+            else "required"
+          ),
+          field_type="date",
+        )
+        if entered is None:
+          console.print("[yellow]:warning: Medical exam date required; skipped.[/]")
+          continue
+        kwargs["exam_date"] = entered
+        manual_exam_date = medical_exam_info is not None
+      if kwargs.get("exam_date"):
         console.print(
           f"[cyan]:information_source: Step 3 exam_date:[/] {kwargs['exam_date']}"
         )
@@ -1637,7 +1637,7 @@ def enroll_cmd(ctx, pdfs, medical_exam):
           f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}"
         )
       if medical_processing_id is not None:
-        medical_close_called = True
+        medical_close_pending = False
         medical_corrections = {}
         if manual_exam_date and kwargs.get("exam_date") is not None:
           medical_corrections["exam_date"] = str(kwargs["exam_date"])
@@ -1657,7 +1657,7 @@ def enroll_cmd(ctx, pdfs, medical_exam):
           close_processing(processing_id)
         except Exception:
           pass
-      if medical_processing_id is not None and not medical_close_called:
+      if medical_processing_id is not None and medical_close_pending:
         try:
           close_processing(medical_processing_id)
         except Exception:

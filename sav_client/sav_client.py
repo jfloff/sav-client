@@ -108,9 +108,9 @@ _DEFAULT_TIMEOUT = 30
 
 
 def _coerce_exam_date(value: str | None) -> str:
-  """Return a strict ISO exam date, defaulting to today when omitted."""
+  """Return a strict ISO exam date, rejecting missing values."""
   if value is None:
-    return date.today().isoformat()
+    raise ValueError("exam_date must be YYYY-MM-DD; got None.")
   try:
     return date.fromisoformat(str(value)).isoformat()
   except ValueError as exc:
@@ -1372,7 +1372,7 @@ class SavClient:
           morada, cod_postal, localidade_txt, distrito_id, concelho_id.
 
         Step 3:
-          exam_date:           YYYY-MM-DD; defaults to today when omitted.
+          exam_date:           Required YYYY-MM-DD date.
                                (The medical exam itself is always assumed done.)
           promote_to_tier_id:  Numeric escalão ID for Subida; usually unset.
           guardian_*:          Required when the player is a minor; raises
@@ -1383,6 +1383,8 @@ class SavClient:
         Internal SAV2 user id of the added player.
 
     Raises:
+        ValueError:        Missing/invalid exam_date, unknown batch, or
+                           player not eligible for revalidation.
         SavConfigError:    Missing guardian fields for a minor; or batch is
                            not a Revalidação.
         SavResponseError:  Server signals failure on commit.

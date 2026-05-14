@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
+from datetime import date as _date
 from typing import Any
 
 
@@ -16,13 +16,20 @@ class MedicalExamInfo:
 
 
 def _strict_iso_date(value: Any) -> str | None:
-  """Return value only when it is a strict YYYY-MM-DD string."""
+  """Return value only when it is a valid, strictly YYYY-MM-DD date string.
+
+  Uses fromisoformat for calendar validation (rejects impossible dates like
+  2026-99-99) then round-trips through isoformat() to reject non-YYYY-MM-DD
+  forms that Python 3.11+ fromisoformat accepts (e.g. "20260513").
+  """
   if value in (None, ""):
     return None
   text = str(value).strip()
-  if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+  try:
+    canonical = _date.fromisoformat(text).isoformat()
+  except ValueError:
     return None
-  return text
+  return canonical if canonical == text else None
 
 
 def extract_medical_exam_info(parsed: dict[str, Any]) -> MedicalExamInfo:

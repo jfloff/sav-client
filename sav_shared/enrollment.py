@@ -242,11 +242,11 @@ def resolve_player_candidates(
 
 
 def create_and_fetch_batch(
-  client: Any, *, type: int, tier_id: int, gender_id: int,
+  client: Any, *, batch_type: int, tier_id: int, gender_id: int,
 ) -> tuple[int, Any]:
   """Create a registration batch and return ``(batch_id, batch)`` from the listing."""
   new_id = client.create_player_registration_batch(
-    type=type, tier=tier_id, gender_id=gender_id,
+    type=batch_type, tier=tier_id, gender_id=gender_id,
   )
   batches = client.list_player_registration_batches()
   batch = next((b for b in batches if b.id == new_id), None)
