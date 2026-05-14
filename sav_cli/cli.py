@@ -14,9 +14,11 @@ Usage
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 import shutil
 from dataclasses import asdict
+from datetime import date
 from typing import Any
 
 import click
@@ -32,28 +34,31 @@ from sav_client.exceptions import (
   SavConnectionError,
   SavResponseError,
 )
-from sav_shared import (
-  DOC_TYPE_CHOICES,
+from sav_shared.clubs import find_club_matches
+from sav_shared.enrollment import (
+  KWARG_TO_SAV_KEY,
   create_and_fetch_batch,
   derive_enrollment_params,
-  doc_type_to_tipo_doc,
-  distrito_name,
-  ENROLLMENT_FIELD_META,
-  filter_games,
-  find_club_matches,
-  find_distrito_id,
-  find_id_by_name,
   find_player_license_by_nif,
-  game_sort_key,
-  GUARDIAN_RELATIONS,
-  ID_TYPES,
-  KWARG_TO_SAV_KEY,
-  normalize_doc_type,
   parse_missing_guardian_fields,
   parsed_bool,
-  REGISTRATION_TYPE_LABELS,
   resolve_player_candidates,
 )
+from sav_shared.fields import ENROLLMENT_FIELD_META
+from sav_shared.fpb_mod1 import reconcile_fpb_mod1
+from sav_shared.games import filter_games, game_sort_key
+from sav_shared.lookups import (
+  DOC_TYPE_CHOICES,
+  GUARDIAN_RELATIONS,
+  ID_TYPES,
+  REGISTRATION_TYPE_LABELS,
+  distrito_name,
+  doc_type_to_tipo_doc,
+  find_distrito_id,
+  find_id_by_name,
+  normalize_doc_type,
+)
+from sav_shared.medical_exam import extract_medical_exam_info
 
 
 # Tracks the root --output flag so SavCliError.show() can format errors
@@ -1166,14 +1171,36 @@ def _resolve_enroll_player(
     return lic, batch
 
 
-def _prompt_field(kwarg: str, hint: str = "") -> Any:
+def _prompt_field(
+  kwarg: str,
+  hint: str = "",
+  *,
+  field_type: str | Mapping[Any, str] = "text",
+  prompt_text: str | None = None,
+) -> Any:
   """Prompt the user for one field value, returning the entered value or None."""
   console = _console()
   label = f"    {kwarg}" + (f"  ({hint})" if hint else "")
-  if kwarg == "guardian_relation":
+  if isinstance(field_type, Mapping):
+    if not field_type:
+      raise ValueError("Choice field_type must not be empty.")
     console.print(label)
-    console.print("[dim]      1=Pai  2=Mãe  3=Tutor[/]")
-    return int(click.prompt("      Relation", type=click.Choice(["1", "2", "3"])))
+    options_text = "  ".join(f"{key}={value}" for key, value in field_type.items())
+    console.print(f"[dim]      {options_text}[/]")
+    choices = {str(key): key for key in field_type}
+    entered = click.prompt(prompt_text or label, type=click.Choice(tuple(choices)))
+    return choices[entered]
+  if field_type == "date":
+    while True:
+      entered = click.prompt(prompt_text or label, default="")
+      if not entered:
+        return None
+      try:
+        return date.fromisoformat(entered).isoformat()
+      except ValueError:
+        console.print("[yellow]:warning: Enter the date as YYYY-MM-DD.[/]")
+  if field_type != "text":
+    raise ValueError(f"Unknown prompt field_type {field_type!r}.")
   entered = click.prompt(label, default="")
   return entered if entered else None
 
@@ -1343,14 +1370,19 @@ def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> N
 
 @cli.command("enroll")
 @click.argument("pdfs", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option(
+  "--medical-exam", type=click.Path(exists=True),
+  help="Parse and upload the matching exame_medico PDF.",
+)
 @click.pass_context
-def enroll_cmd(ctx, pdfs):
+def enroll_cmd(ctx, pdfs, medical_exam):
   """Enroll players from FPB registration PDFs into SAV."""
-  try:
-    from sav_parsers import classify, close_processing, parse_fpb_mod1
-    from sav_shared import KWARG_TO_ENTITY, reconcile_fpb_mod1
-  except ImportError as exc:
-    raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+  from sav_parsers import classify, close_processing, parse_em, parse_fpb_mod1, train_classifier
+  from sav_shared.fields import KWARG_TO_ENTITY
+  if medical_exam and len(pdfs) != 1:
+    raise click.UsageError(
+      "--medical-exam can only be used when enrolling a single PDF."
+    )
 
   client = _make_client()
 
@@ -1360,6 +1392,7 @@ def enroll_cmd(ctx, pdfs):
   err_console = _console(err=True)
 
   for pdf_path in pdfs:
+    medical_exam_path = medical_exam
     # Step 1 — classify
     try:
       with console.status("[bold cyan]:mag: Classifying document...[/]"):
@@ -1392,6 +1425,9 @@ def enroll_cmd(ctx, pdfs):
     # gc sweeps it. close_called flips to True at step 10 (success path);
     # the finally falls back to a no-corrections close for any earlier exit.
     close_called = False
+    medical_processing_id: str | None = None
+    medical_close_called = True
+    manual_exam_date = False
     try:
       # Step 4 — resolve batch (once per invocation, derived from first PDF)
       if batch is None:
@@ -1458,11 +1494,68 @@ def enroll_cmd(ctx, pdfs):
         err_console.print(f"[red]:x: Reconcile error:[/] {exc}")
         continue
 
+      medical_exam_info = None
+      if medical_exam_path:
+        try:
+          with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
+            medical_parse_result = parse_em(medical_exam_path)
+          medical_processing_id = medical_parse_result["processing_id"]
+          medical_close_called = False
+          medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
+        except SavCliError:
+          raise
+        except Exception as exc:
+          err_console.print(
+            f"[red]:x: Medical exam parse error:[/] {exc} [dim]({medical_exam_path})[/]"
+          )
+          continue
+        try:
+          with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
+            train_classifier(medical_exam_path, DocType.EM)
+        except Exception as exc:
+          err_console.print(
+            f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
+            f"{exc} [dim]({medical_exam_path})[/]"
+          )
+
+        if medical_exam_info.exam_date:
+          console.print(
+            f"[cyan]:information_source: Medical exam date:[/] "
+            f"{medical_exam_info.exam_date} [dim]({medical_exam_path})[/]"
+          )
+        else:
+          raw_text = medical_exam_info.raw_exam_date or "not found"
+          console.print(
+            f"[yellow]:warning: Medical exam date needs review:[/] "
+            f"{raw_text!r} [dim]({medical_exam_path})[/]"
+          )
+
       # Step 8 — confirm with user
       kwargs = _confirm_enroll(result, sav_profile, license)
       if kwargs is None:
         console.print("[yellow]:fast_forward: Skipped.[/]")
         continue
+      if medical_exam_info is not None:
+        if medical_exam_info.exam_date:
+          kwargs["exam_date"] = medical_exam_info.exam_date
+        else:
+          entered = _prompt_field(
+            "exam_date",
+            (
+              f"OCR: {medical_exam_info.raw_exam_date!r}"
+              if medical_exam_info.raw_exam_date
+              else "no value found"
+            ),
+            field_type="date",
+          )
+          if entered is None:
+            console.print("[yellow]:warning: Medical exam date required; skipped.[/]")
+            continue
+          kwargs["exam_date"] = entered
+          manual_exam_date = True
+        console.print(
+          f"[cyan]:information_source: Step 3 exam_date:[/] {kwargs['exam_date']}"
+        )
 
       # Step 9 — submit (retry loop for missing guardian fields)
       submitted = False
@@ -1477,7 +1570,14 @@ def enroll_cmd(ctx, pdfs):
         except SavConfigError as exc:
           console.print("[yellow]:warning: Guardian info required for minor.[/]")
           for field_name in parse_missing_guardian_fields(exc):
-            val = _prompt_field(field_name)
+            if field_name == "guardian_relation":
+              val = _prompt_field(
+                field_name,
+                field_type=GUARDIAN_RELATIONS,
+                prompt_text="      Relation",
+              )
+            else:
+              val = _prompt_field(field_name)
             if val is not None:
               kwargs[field_name] = val
         except (SavConnectionError, SavResponseError) as exc:
@@ -1501,6 +1601,21 @@ def enroll_cmd(ctx, pdfs):
         err_console.print(
           f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {exc}"
         )
+      if medical_exam_path:
+        try:
+          with console.status(
+            "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
+          ):
+            client.replace_player_registration_document(
+              batch_id, license, medical_exam_path, tipo_doc=doc_type_to_tipo_doc(DocType.EM),
+            )
+          console.print(
+            f"[green]:white_check_mark: Uploaded {medical_exam_path} (exame_medico).[/]"
+          )
+        except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+          err_console.print(
+            f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {exc}"
+          )
 
       # Step 10 — close processing session; only send corrections the user
       # explicitly answered (needs_review). Updated and kept were silent paths
@@ -1521,10 +1636,30 @@ def enroll_cmd(ctx, pdfs):
         err_console.print(
           f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}"
         )
+      if medical_processing_id is not None:
+        medical_close_called = True
+        medical_corrections = {}
+        if manual_exam_date and kwargs.get("exam_date") is not None:
+          medical_corrections["exam_date"] = str(kwargs["exam_date"])
+        try:
+          with console.status("[bold cyan]:sparkles: Finalizing medical exam OCR...[/]"):
+            close_processing(
+              medical_processing_id,
+              corrections=medical_corrections or None,
+            )
+        except Exception as exc:
+          err_console.print(
+            f"[yellow]:warning: Could not close processing {medical_processing_id}:[/] {exc}"
+          )
     finally:
       if not close_called:
         try:
           close_processing(processing_id)
+        except Exception:
+          pass
+      if medical_processing_id is not None and not medical_close_called:
+        try:
+          close_processing(medical_processing_id)
         except Exception:
           pass
 
@@ -1560,10 +1695,7 @@ def _resolve_doc_type(value: str) -> DocType:
 
 def _classify_pdf_doc_type(pdf_path: str) -> DocType:
   """Classify a PDF and return the canonical sav-parsers DocType."""
-  try:
-    from sav_parsers import classify
-  except ImportError as exc:
-    raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+  from sav_parsers import classify
   try:
     return classify(pdf_path)
   except Exception as exc:
@@ -1708,11 +1840,7 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
       )
     tipo_doc = _tipo_doc_for_upload(doc_type)
 
-    try:
-      from sav_parsers import close_processing, parse_fpb_mod1
-      from sav_shared import reconcile_fpb_mod1
-    except ImportError as exc:
-      raise SavCliError(f"sav-parsers not installed: {exc}", code="import_error")
+    from sav_parsers import close_processing, parse_fpb_mod1
 
     client = _make_client()
 
@@ -1771,7 +1899,6 @@ def enrollment_update_cmd(ctx, batch_id, license, pdf, fields, file_only, tipo):
           err=True,
         )
 
-      from sav_shared import KWARG_TO_ENTITY
       corrections: dict[str, str] = {}
       for kwarg in result.needs_review:
         entity = KWARG_TO_ENTITY.get(kwarg)

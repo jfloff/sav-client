@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import os
+from datetime import date
 from typing import Any
 from urllib.parse import urljoin
 
@@ -104,6 +105,16 @@ _GUARDIAN_RELATION_PAI = 1         # Pai
 _GUARDIAN_RELATION_MAE = 2         # Mãe
 _GUARDIAN_RELATION_TUTOR = 3       # Tutor
 _DEFAULT_TIMEOUT = 30
+
+
+def _coerce_exam_date(value: str | None) -> str:
+  """Return a strict ISO exam date, defaulting to today when omitted."""
+  if value is None:
+    return date.today().isoformat()
+  try:
+    return date.fromisoformat(str(value)).isoformat()
+  except ValueError as exc:
+    raise ValueError(f"exam_date must be YYYY-MM-DD; got {value!r}.") from exc
 
 
 class SavClient:
@@ -1476,9 +1487,7 @@ class SavClient:
     # ── Pre-commit hook + final commit ────────────────────────────────────────
     self._registration_precommit(batch.id, internal_id)
 
-    if exam_date is None:
-      from datetime import date
-      exam_date = date.today().isoformat()
+    exam_date = _coerce_exam_date(exam_date)
 
     commit_body = {
       "guiaid": batch.id,

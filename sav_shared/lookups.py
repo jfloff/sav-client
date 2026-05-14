@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from sav_parsers.types import DocType
 
+from .text import normalise_text
+
 
 # ── Generic ────────────────────────────────────────────────────────────────────
 
@@ -27,9 +29,6 @@ def find_id_by_name(name: str | None, mapping: dict[int, str]) -> int | None:
   """
   if not name or not mapping:
     return None
-  # Lazy import to avoid circular dep — sav_shared/__init__.py imports from
-  # this module while it's still being constructed.
-  from . import normalise_text
   needle = normalise_text(name)
   if not needle:
     return None

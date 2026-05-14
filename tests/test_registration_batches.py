@@ -89,6 +89,50 @@ class TestPreHttpGuards:
     with pytest.raises(TypeError):
       client.add_player_to_registration_batch(1, 1, exam_done=False)
 
+  def test_add_rejects_invalid_exam_date_before_commit(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    batch = type(
+      "BatchStub",
+      (),
+      {
+        "id": 1,
+        "is_open": True,
+        "type_id": 2,
+        "state": "Em construção",
+        "tier": "Sub 14",
+        "gender": "Masculino",
+        "tier_id": 7,
+      },
+    )()
+
+    monkeypatch.setattr(client, "list_player_registration_batches", lambda season=None: [batch])
+    monkeypatch.setattr(client, "_list_revalidable_licenses", lambda batch_obj: {301772})
+    monkeypatch.setattr(client, "_load_player_record", lambda batch_id, license: {"id": 88})
+    monkeypatch.setattr(client, "_build_step1_send", lambda *args, **kwargs: "step1")
+    monkeypatch.setattr(client, "_save_registration_step1", lambda batch_id, internal_id, send: {})
+    monkeypatch.setattr(client, "_build_step2_send", lambda *args, **kwargs: "step2")
+    monkeypatch.setattr(
+      client,
+      "_save_registration_step2",
+      lambda batch_type, batch_id, internal_id, license, send: {
+        "menor_idade": 0,
+        "escalao": 7,
+        "estatuto": "A",
+      },
+    )
+    monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
+
+    def fail_commit(*args, **kwargs):
+      raise AssertionError("_registration_commit should not run for invalid exam_date")
+
+    monkeypatch.setattr(client, "_registration_commit", fail_commit)
+
+    with pytest.raises(ValueError, match="exam_date must be YYYY-MM-DD"):
+      client.add_player_to_registration_batch(1, 301772, exam_date="13/05/2026")
+
 
 # ─── live read-only ─────────────────────────────────────────────────────────
 

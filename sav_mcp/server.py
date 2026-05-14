@@ -8,11 +8,11 @@ agent can drive them without an interactive UI — the chat is the confirmation
 loop.
 
 Enrollment workflow:
-    1. parse_enrollment_forms  → form_id(s) + batch params per PDF
+    1. parse_enrollment_forms  → mod1_id(s) / medical_exam_id(s) + parsed metadata
     2. find_open_batch / create_batch  → batch_id
     3. resolve_player  → license (or candidate list if ambiguous)
-    4. preview_enrollment  → full reconciled profile for user review
-    5. submit_enrollment  → player_id (auto-uploads source PDF as fpb_modelo_1)
+    4. preview_enrollment  → full reconciled profile (+ optional medical exam sidecar)
+    5. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
 
 Document tools (post-enrollment, ad-hoc):
     list_player_documents / upload_player_document /
@@ -32,20 +32,22 @@ from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
 from sav_client.exceptions import SavConfigError, SavConnectionError, SavResponseError
-from sav_shared import (
-    doc_type_to_tipo_doc,
-    batch_to_dict,
-    club_to_dict,
+from sav_shared.enrollment import (
     create_and_fetch_batch,
     derive_enrollment_params,
-    ENROLLMENT_FIELD_META,
-    filter_games,
-    game_to_dict,
     parse_missing_guardian_fields,
-    player_to_dict,
-    REGISTRATION_TYPE_LABELS,
     resolve_player_candidates,
-    tipo_doc_to_doc_type,
+)
+from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
+from sav_shared.fpb_mod1 import reconcile_fpb_mod1
+from sav_shared.games import filter_games
+from sav_shared.lookups import REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
+from sav_shared.medical_exam import extract_medical_exam_info
+from sav_shared.serializers import (
+    batch_to_dict,
+    club_to_dict,
+    game_to_dict,
+    player_to_dict,
 )
 from sav_parsers.types import DocType
 
@@ -313,9 +315,11 @@ def list_batches(season: int | None = None) -> list[dict]:
 
 
 # ── Enrollment workflow ───────────────────────────────────────────────────────
-# In-memory form cache, keyed by form_id (UUID string). Populated by
-# parse_enrollment_forms, extended by preview_enrollment (adds reconcile_result
-# + sav_profile).
+# In-memory OCR artifact cache. Historically this held only enrollment forms,
+# so the variable name remains `_forms` for compatibility with older tests and
+# callers. Keys are artifact ids (UUID strings); fpb_modelo_1 results also
+# expose that id as `mod1_id`, and exame_medico results expose it as
+# `medical_exam_id`.
 
 _forms: dict[str, dict[str, Any]] = {}
 
@@ -376,19 +380,75 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
     return fields
 
 
+def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> dict:
+    """Serialize a cached EM OCR artifact for MCP callers."""
+    info = extract_medical_exam_info(artifact["parsed"])
+    return {
+        "artifact_id": artifact_id,
+        "medical_exam_id": artifact_id,
+        "doc_type": artifact["doc_type"].value,
+        "exam_date": info.exam_date,
+        "raw_exam_date": info.raw_exam_date,
+        "exam_date_confidence": info.exam_date_confidence,
+        "doctor_validation_present": info.doctor_validation_present,
+        "needs_review": info.exam_date is None,
+    }
+
+
+def _replace_player_document_from_bytes(
+    client: SavClient,
+    batch_id: int,
+    license: int,
+    pdf_bytes: bytes | None,
+    *,
+    doc_type: DocType,
+) -> dict[str, Any]:
+    """Upload cached PDF bytes as a replacement registration document."""
+    status = {
+        "doc_type": doc_type.value,
+        "status": "skipped",
+        "error": None,
+    }
+    if not pdf_bytes:
+        return status
+
+    tmp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+            f.write(pdf_bytes)
+            tmp_path = f.name
+        client.replace_player_registration_document(
+            batch_id,
+            license,
+            tmp_path,
+            tipo_doc=doc_type_to_tipo_doc(doc_type),
+        )
+        status["status"] = "ok"
+    except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+        status["status"] = "error"
+        status["error"] = str(exc)
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    return status
+
+
 @server.tool()
 def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
     """
-    Parse one or more FPB registration PDFs provided as base64-encoded bytes.
+    Parse one or more enrollment-related PDFs provided as base64-encoded bytes.
 
-    Classifies each document, extracts fields via OCR, and derives the batch
-    parameters (registration type, tier, gender) from the form checkboxes.
+    fpb_modelo_1 forms are parsed for the main enrollment workflow and return
+    the batch parameters (registration type, tier, gender). exame_medico
+    documents are parsed for step-3 metadata and return a medical_exam_id that
+    can be passed to preview_enrollment / submit_enrollment.
 
-    Returns one entry per PDF with a form_id and canonical doc_type to
-    reference in subsequent tools. On error for a given PDF the entry
-    contains an "error" key instead.
+    Returns one entry per PDF with an artifact_id and canonical doc_type to
+    reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
+    exame_medico entries also include medical_exam_id. On error for a given
+    PDF the entry contains an "error" key instead.
     """
-    from sav_parsers import classify, parse_fpb_mod1
+    from sav_parsers import classify, parse_em, parse_fpb_mod1
 
     client = _get_client()
     results: list[dict] = []
@@ -407,16 +467,20 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
                 tmp_path = f.name
 
             doc_type = classify(tmp_path)
-            if doc_type != DocType.FPB_MOD1:
+            if doc_type == DocType.FPB_MOD1:
+                parse_result = parse_fpb_mod1(tmp_path)
+                parsed = parse_result["fields"]
+                processing_id = parse_result["processing_id"]
+                reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+                tiers = client.list_player_registration_tiers(gender_id=gender_id)
+                tier_name = tiers.get(tier_id, str(tier_id))
+            elif doc_type == DocType.EM:
+                parse_result = parse_em(tmp_path)
+                parsed = parse_result["fields"]
+                processing_id = parse_result["processing_id"]
+            else:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
-
-            parse_result = parse_fpb_mod1(tmp_path)
-            parsed = parse_result["fields"]
-            processing_id = parse_result["processing_id"]
-            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
-            tiers = client.list_player_registration_tiers(gender_id=gender_id)
-            tier_name = tiers.get(tier_id, str(tier_id))
         except Exception as exc:
             results.append({"index": i, "error": str(exc)})
             continue
@@ -424,30 +488,39 @@ def parse_enrollment_forms(pdfs: list[str]) -> list[dict]:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
-        form_id = str(uuid.uuid4())
-        _forms[form_id] = {
+        artifact_id = str(uuid.uuid4())
+        artifact = {
             "parsed": parsed,
             "processing_id": processing_id,
             "doc_type": doc_type,
-            "reg_type": reg_type,
-            "tier_id": tier_id,
-            "gender_id": gender_id,
-            # Retained so submit_enrollment can upload the source PDF as
-            # fpb_modelo_1 after a successful enroll (parity with the CLI flow).
+            "kind": "medical_exam" if doc_type == DocType.EM else "enrollment_form",
             "pdf_bytes": pdf_bytes,
         }
+        if doc_type == DocType.FPB_MOD1:
+            artifact.update({
+                "reg_type": reg_type,
+                "tier_id": tier_id,
+                "gender_id": gender_id,
+            })
+        _forms[artifact_id] = artifact
 
-        results.append({
-            "index": i,
-            "form_id": form_id,
-            "doc_type": doc_type.value,
-            "reg_type": reg_type,
-            "reg_type_label": REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type)),
-            "tier_id": tier_id,
-            "tier_name": tier_name,
-            "gender_id": gender_id,
-            "gender_label": "Feminino" if gender_id == 2 else "Masculino",
-        })
+        if doc_type == DocType.FPB_MOD1:
+            results.append({
+                "index": i,
+                "artifact_id": artifact_id,
+                "mod1_id": artifact_id,
+                "doc_type": doc_type.value,
+                "reg_type": reg_type,
+                "reg_type_label": REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type)),
+                "tier_id": tier_id,
+                "tier_name": tier_name,
+                "gender_id": gender_id,
+                "gender_label": "Feminino" if gender_id == 2 else "Masculino",
+            })
+        else:
+            payload = _build_medical_exam_payload(artifact_id, artifact)
+            payload.update({"index": i})
+            results.append(payload)
 
     return results
 
@@ -495,7 +568,7 @@ def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
 
 
 @server.tool()
-def resolve_player(batch_id: int, form_id: str) -> dict:
+def resolve_player(batch_id: int, mod1_id: str) -> dict:
     """
     Resolve the player for a parsed form against the batch's eligible list.
 
@@ -507,9 +580,11 @@ def resolve_player(batch_id: int, form_id: str) -> dict:
       resolved=false + candidates  when multiple players match (user must pick).
       resolved=false + empty candidates  when no match found (user must supply licence).
     """
-    form = _forms.get(form_id)
+    form = _forms.get(mod1_id)
     if form is None:
-        raise ValueError(f"Unknown form_id: {form_id!r}")
+        raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
+    if form.get("doc_type") != DocType.FPB_MOD1:
+        raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
     batches = client.list_player_registration_batches()
@@ -538,7 +613,12 @@ def resolve_player(batch_id: int, form_id: str) -> dict:
 
 
 @server.tool()
-def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
+def preview_enrollment(
+    batch_id: int,
+    license: int,
+    mod1_id: str,
+    medical_exam_id: str | None = None,
+) -> dict:
     """
     Preview the enrollment for a player.
 
@@ -551,13 +631,15 @@ def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
       - Fields with no SAV equivalent (status: ocr) — id_type, guardian_*, consent_*
 
     The reconciliation result is cached internally so submit_enrollment can
-    use it without repeating the network call.
+    use it without repeating the network call. When medical_exam_id is
+    supplied, the response also includes a `medical_exam` sidecar with the
+    parsed step-3 exam metadata.
     """
-    from sav_shared import reconcile_fpb_mod1
-
-    form = _forms.get(form_id)
+    form = _forms.get(mod1_id)
     if form is None:
-        raise ValueError(f"Unknown form_id: {form_id!r}")
+        raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
+    if form.get("doc_type") != DocType.FPB_MOD1:
+        raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
     # resolve_player runs first in this workflow → search_players already
@@ -568,7 +650,7 @@ def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
     form["reconcile_result"] = result
     form["sav_profile"] = sav_profile
 
-    return {
+    preview = {
         "player": {
             "name": sav_profile.get("nome", ""),
             "license": license,
@@ -577,14 +659,23 @@ def preview_enrollment(batch_id: int, license: int, form_id: str) -> dict:
         "fields": _build_preview_fields(result, sav_profile),
         "needs_review": result.needs_review,
     }
+    if medical_exam_id is not None:
+        artifact = _forms.get(medical_exam_id)
+        if artifact is None:
+            raise ValueError(f"Unknown medical_exam_id: {medical_exam_id!r}")
+        if artifact.get("doc_type") != DocType.EM:
+            raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
+        preview["medical_exam"] = _build_medical_exam_payload(medical_exam_id, artifact)
+    return preview
 
 
 @server.tool()
 def submit_enrollment(
     batch_id: int,
     license: int,
-    form_id: str,
+    mod1_id: str,
     field_overrides: dict[str, Any] | None = None,
+    medical_exam_id: str | None = None,
 ) -> dict:
     """
     Submit the player enrollment using the reconciled data from preview_enrollment.
@@ -592,31 +683,54 @@ def submit_enrollment(
     field_overrides should supply values for every field listed in
     needs_review plus any guardian fields required for minors
     (guardian_name, guardian_relation, guardian_phone, guardian_email).
+    It may also include exam_date (YYYY-MM-DD), which overrides any parsed
+    exame_medico date when medical_exam_id is supplied.
 
     Returns:
       success=true + player_id  on success.
       success=false + missing_guardian_fields  when the player is a minor and
         guardian info is absent — call submit_enrollment again with those fields
         added to field_overrides.
-      success=true also includes source_document_upload with {doc_type, status, error}.
+      success=true also includes source_document_upload and
+      medical_exam_upload with {doc_type, status, error}.
     """
     from sav_parsers import close_processing
-    from sav_shared import KWARG_TO_ENTITY
 
-    form = _forms.get(form_id)
+    form = _forms.get(mod1_id)
     if form is None:
-        raise ValueError(f"Unknown form_id: {form_id!r}")
+        raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
+    if form.get("doc_type") != DocType.FPB_MOD1:
+        raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     result = form.get("reconcile_result")
     if result is None:
         raise ValueError("Call preview_enrollment before submit_enrollment")
 
     client = _get_client()
+    medical_exam: dict[str, Any] | None = None
+    medical_exam_info = None
+    if medical_exam_id is not None:
+        medical_exam = _forms.get(medical_exam_id)
+        if medical_exam is None:
+            raise ValueError(f"Unknown medical_exam_id: {medical_exam_id!r}")
+        if medical_exam.get("doc_type") != DocType.EM:
+            raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
+        medical_exam_info = extract_medical_exam_info(medical_exam["parsed"])
 
     kwargs = dict(result.kwargs)
     kwargs.pop("license", None)
+    if medical_exam_info and medical_exam_info.exam_date:
+        kwargs["exam_date"] = medical_exam_info.exam_date
     if field_overrides:
         kwargs.update(field_overrides)
+    manual_exam_override = bool(
+        field_overrides and field_overrides.get("exam_date") not in (None, "")
+    )
+    if medical_exam is not None and not kwargs.get("exam_date"):
+        raise ValueError(
+            "Medical exam OCR did not yield a usable exam_date; pass "
+            "field_overrides={'exam_date': 'YYYY-MM-DD'}."
+        )
 
     try:
         player_id = client.add_player_to_registration_batch(batch_id, license, **kwargs)
@@ -630,31 +744,24 @@ def submit_enrollment(
     # Non-fatal: enrollment is already committed, so we just record the
     # outcome on the response and let the caller retry via
     # upload_player_document if it fails.
-    upload_status = {
-        "doc_type": str(form["doc_type"]),
-        "status": "skipped",
-        "error": None,
-    }
-    pdf_bytes = form.get("pdf_bytes")
-    if pdf_bytes:
-        tmp_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                f.write(pdf_bytes)
-                tmp_path = f.name
-            client.replace_player_registration_document(
-                batch_id,
-                license,
-                tmp_path,
-                tipo_doc=doc_type_to_tipo_doc(form["doc_type"]),
-            )
-            upload_status["status"] = "ok"
-        except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-            upload_status["status"] = "error"
-            upload_status["error"] = str(exc)
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+    upload_status = _replace_player_document_from_bytes(
+        client,
+        batch_id,
+        license,
+        form.get("pdf_bytes"),
+        doc_type=form["doc_type"],
+    )
+    medical_exam_upload = (
+        _replace_player_document_from_bytes(
+            client,
+            batch_id,
+            license,
+            medical_exam.get("pdf_bytes"),
+            doc_type=medical_exam["doc_type"],
+        )
+        if medical_exam is not None
+        else None
+    )
 
     # Only send corrections the user explicitly answered (needs_review).
     # Updated/kept were silent paths — staging them risks dataset noise.
@@ -671,6 +778,17 @@ def submit_enrollment(
         close_processing(form["processing_id"], corrections=corrections or None)
     except Exception:
         pass
+    if medical_exam is not None:
+        exam_corrections = {}
+        if manual_exam_override and kwargs.get("exam_date") is not None:
+            exam_corrections["exam_date"] = str(kwargs["exam_date"])
+        try:
+            close_processing(
+                medical_exam["processing_id"],
+                corrections=exam_corrections or None,
+            )
+        except Exception:
+            pass
 
     sav_profile = form.get("sav_profile", {})
     return {
@@ -679,6 +797,7 @@ def submit_enrollment(
         "license": license,
         "name": sav_profile.get("nome", ""),
         "source_document_upload": upload_status,
+        "medical_exam_upload": medical_exam_upload,
     }
 
 
@@ -771,24 +890,34 @@ def _decode_pdf_to_tempfile(pdf_base64: str, suffix: str = ".pdf") -> str:
         return f.name
 
 
+def _resolve_document_upload_type(tmp_path: str, doc_type: str | None) -> str:
+    """Return explicit doc_type or classify tmp_path when omitted."""
+    if doc_type is not None:
+        return doc_type
+    from sav_parsers import classify
+    return classify(tmp_path).value
+
+
 @server.tool()
 def upload_player_document(
     batch_id: int,
     license: int,
     pdf_base64: str,
-    doc_type: str = DocType.FPB_MOD1.value,
+    doc_type: str | None = None,
 ) -> dict:
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
 
     doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4, outros.
+    When omitted, sav-parsers classifies the PDF first.
     Recognized but unmapped types such as outros fail before the SAV2 call.
 
     Returns {"success": True} on success.
     """
-    tipo_doc = doc_type_to_tipo_doc(doc_type)
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
+        resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
+        tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
         _get_client().upload_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
@@ -812,16 +941,17 @@ def replace_player_document(
     batch_id: int,
     license: int,
     pdf_base64: str,
-    doc_type: str = DocType.FPB_MOD1.value,
+    doc_type: str | None = None,
 ) -> dict:
     """
     Replace any existing documents of `doc_type` for this player+batch with a
     new PDF (base64-encoded). Idempotent on the upload side: when no existing
     doc of the translated SAV2 tipo_doc is found, behaves like a plain upload.
     """
-    tipo_doc = doc_type_to_tipo_doc(doc_type)
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
+        resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
+        tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
         _get_client().replace_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
