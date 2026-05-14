@@ -1860,15 +1860,56 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
 @click.argument("license", type=int, required=False)
 @click.pass_context
 def enrollment_read_cmd(ctx, batch_id, license):
-  """Show player enrolments in a batch. (Not yet implemented.)
+  """Show player enrolments in a batch.
 
   \b
     sav enrollment read BATCH_ID              List all players in the batch.
     sav enrollment read BATCH_ID LICENSE      Show one player's enrolment detail.
   """
-  # TODO: list_player_registration_batch_items(batch_id) for list view
-  #       client._load_existing_registration_record(batch_id, license) for detail
-  raise click.UsageError("enrollment read is not yet implemented.")
+  output = ctx.obj["output"]
+  client = _make_client()
+
+  if license is None:
+    try:
+      items = client.list_player_registration_batch_items(batch_id)
+    except (SavConnectionError, SavResponseError, ValueError) as e:
+      raise SavCliError(str(e), code=_exc_code(e))
+
+    if output == "json":
+      click.echo(json.dumps(items, ensure_ascii=False, indent=2))
+      return
+
+    if output == "csv":
+      click.echo("license,name")
+      for item in items:
+        click.echo(f"{item['license']},{item['name']}")
+      return
+
+    if not items:
+      click.echo("No players enrolled in this batch.")
+      return
+
+    _render_table(["License", "Name"], [[str(i["license"]), i["name"]] for i in items])
+    click.echo(f"\n{len(items)} player(s) enrolled.")
+  else:
+    try:
+      record = client._load_existing_registration_record(batch_id, license)
+    except (SavConnectionError, SavResponseError, ValueError) as e:
+      raise SavCliError(str(e), code=_exc_code(e))
+
+    if output == "json":
+      click.echo(json.dumps(record, ensure_ascii=False, indent=2))
+      return
+
+    rows = [[k, str(v)] for k, v in record.items() if v not in (None, "")]
+
+    if output == "csv":
+      click.echo("field,value")
+      for k, v in rows:
+        click.echo(f"{k},{v}")
+      return
+
+    _render_table(["Field", "Value"], rows, max_widths=[24, None])
 
 
 @enrollment_grp.command("update")
@@ -2121,9 +2162,20 @@ def _upload_medical_exam_update(
 @click.argument("license", type=int)
 @click.pass_context
 def enrollment_delete_cmd(ctx, batch_id, license):
-  """Remove a player from a registration batch. (Not yet implemented.)"""
-  # TODO: click.confirm prompt + client.remove_player_from_registration_batch(batch_id, license)
-  raise click.UsageError("enrollment delete is not yet implemented.")
+  """Remove a player from a registration batch."""
+  client = _make_client()
+
+  if not click.confirm(
+    f"Remove licence {license} from batch {batch_id}?", default=False
+  ):
+    raise click.Abort()
+
+  try:
+    client.remove_player_from_registration_batch(batch_id, license)
+  except (SavConnectionError, SavResponseError, ValueError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  click.echo(f"Licence {license} removed from batch {batch_id}.")
 
 
 def main():

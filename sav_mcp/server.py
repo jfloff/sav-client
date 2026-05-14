@@ -1024,26 +1024,26 @@ def update_enrollment_with_document(
 
 
 @server.tool()
-def read_enrollment(batch_id: int, license: int | None = None) -> dict:
+def read_enrollment(batch_id: int, license: int | None = None) -> dict | list:
     """
     List players in a batch or show one player's enrolment detail.
-    (Not yet implemented.)
 
-    list form:   read_enrollment(batch_id)
-    detail form: read_enrollment(batch_id, license)
+    list form:   read_enrollment(batch_id)           -> list of {"license", "name"}
+    detail form: read_enrollment(batch_id, license)  -> enrollment record dict
     """
-    # TODO: _get_client().list_player_registration_batch_items(batch_id) for list
-    #       _get_client()._load_existing_registration_record(batch_id, license) for detail
-    raise NotImplementedError("read_enrollment is not yet implemented.")
+    client = _get_client()
+    if license is None:
+        return client.list_player_registration_batch_items(batch_id)
+    return client._load_existing_registration_record(batch_id, license)
 
 
 @server.tool()
 def delete_enrollment(batch_id: int, license: int) -> dict:
     """
-    Remove a player from a registration batch. (Not yet implemented.)
+    Remove a player from a registration batch.
     """
-    # TODO: _get_client().remove_player_from_registration_batch(batch_id, license)
-    raise NotImplementedError("delete_enrollment is not yet implemented.")
+    _get_client().remove_player_from_registration_batch(batch_id, license)
+    return {"removed": True, "batch_id": batch_id, "license": license}
 
 
 # ── Registration documents ────────────────────────────────────────────────────
