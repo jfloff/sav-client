@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 import json
+import os
 import shutil
 from dataclasses import asdict
 from datetime import date
@@ -1206,10 +1207,21 @@ def _prompt_field(
   return entered if entered else None
 
 
-def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None:
+def _confirm_enroll(
+  result: Any, sav_profile: dict, license: int,
+  *,
+  ocr_source: str = "OCR",
+  extras: list[tuple[str, str, str, str, str]] | None = None,
+) -> dict | None:
   """
   Show reconciliation summary and prompt for needs_review fields.
   Returns final kwargs dict (license already popped out) or None to skip.
+
+  `ocr_source` is the label used in the Source column for OCR-derived FPB
+  rows (e.g. "OCR (form.pdf)"). `extras` are extra rows for the summary
+  table — same (label, sav, ocr, final, source) shape as the internal rows,
+  for fields outside the OCR/SAV reconcile model (e.g. medical exam date,
+  subida de escalão).
   """
   console = _console()
   kwargs = dict(result.kwargs)
@@ -1258,7 +1270,10 @@ def _confirm_enroll(result: Any, sav_profile: dict, license: int) -> dict | None
   if not any_changes:
     console.print(f"[cyan]:information_source: No changes for {player_label}.[/]")
 
-  _print_submission_summary(kwargs, result, sav_profile)
+  _print_submission_summary(
+    kwargs, result, sav_profile,
+    ocr_source=ocr_source, extras=extras,
+  )
 
   if not click.confirm(f"  Submit {player_label}?", default=True):
     return None
@@ -1299,12 +1314,22 @@ def _format_submit_value(
   return str(val)
 
 
-def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> None:
+def _print_submission_summary(
+  kwargs: dict, result: Any, sav_profile: dict,
+  *,
+  ocr_source: str = "OCR",
+  extras: list[tuple[str, str, str, str, str]] | None = None,
+) -> None:
   """Render the final pre-submit summary.
 
   Default mode shows a compact field/value/source view. Verbose mode expands
   that into the full SAV vs OCR side-by-side table with the chosen final value.
   Empty SAV/OCR cells render as em-dash.
+
+  `ocr_source` overrides the Source-column label for OCR-derived FPB rows so
+  callers can include the originating filename, e.g. "OCR (form.pdf)".
+  `extras` appends pre-rendered (label, sav, ocr, final, source) rows for
+  fields outside the OCR/SAV reconcile model.
   """
   rows: list[tuple[str, str, str, str, str]] = []
   for kwarg, (label, sav_key) in ENROLLMENT_FIELD_META.items():
@@ -1320,7 +1345,7 @@ def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> N
       if kwarg in result.needs_review:
         source = "user"
       else:
-        source = "OCR"
+        source = ocr_source
     elif has_sav:
       final_raw = sav_raw
       source = "SAV"
@@ -1334,6 +1359,9 @@ def _print_submission_summary(kwargs: dict, result: Any, sav_profile: dict) -> N
       ocr_str = f"{ocr_str} ({ocr_confidence:.0%})"
     final_str = _format_submit_value(final_raw, kwarg, concelhos=result.concelhos)
     rows.append((label, sav_str, ocr_str, final_str, source))
+
+  if extras:
+    rows.extend(extras)
 
   if not rows:
     return
@@ -1440,7 +1468,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
         Manual enrolment from SAV profile, no PDF.
   """
-  from sav_parsers import classify, close_processing, parse_em, parse_fpb_mod1, train_classifier
+  from sav_parsers import close_processing, parse_em, parse_fpb_mod1, train_classifier
   from sav_shared.fields import KWARG_TO_ENTITY
 
   pdf_mode = bool(pdfs or mod1_path)
@@ -1499,12 +1527,20 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
   for path in pdfs:
     try:
       with console.status(f"[bold cyan]:mag: Classifying {path}...[/]"):
-        dt = classify(path)
+        dt = _classify_pdf_doc_type(path)
     except Exception as exc:
       raise SavCliError(f"Classify error for {path}: {exc}", code="parse_error")
     if dt == DocType.FPB_MOD1:
+      console.print(
+        f"[green]:white_check_mark: Classified as {_doc_type_text(dt)}[/] [dim]({path})[/]",
+        soft_wrap=True,
+      )
       positional_mod1.append(path)
     elif dt == DocType.EM:
+      console.print(
+        f"[green]:white_check_mark: Classified as {_doc_type_text(dt)}[/] [dim]({path})[/]",
+        soft_wrap=True,
+      )
       positional_em.append(path)
     else:
       console.print(
@@ -1666,22 +1702,28 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
           f"{raw_text!r} [dim]({medical_exam_path})[/]"
         )
 
-    # Step 8 — confirm with user
-    kwargs = _confirm_enroll(result, sav_profile, license)
-    if kwargs is None:
-      console.print("[yellow]:fast_forward: Skipped.[/]")
-      return
-    if medical_exam_info is not None and medical_exam_info.exam_date:
-      kwargs["exam_date"] = medical_exam_info.exam_date
-
-    # Apply --field overrides on top of reconciled values (user wins over OCR).
-    if fields:
-      field_overrides = _parse_update_fields(fields)
-      if field_overrides:
-        applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
-        console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
-      kwargs.update(field_overrides)
-    if not kwargs.get("exam_date"):
+    # Resolve exam_date before the summary so the value confirmed is the value
+    # submitted — otherwise the user would confirm a "needs input" row and only
+    # then be prompted for the actual date.
+    exam_date_ocr_cell = "—"
+    exam_date_final: str | None = None
+    exam_date_source = "user"
+    exam_ocr_source = (
+      f"OCR ({os.path.basename(medical_exam_path)})" if medical_exam_path else "OCR"
+    )
+    if medical_exam_info is not None:
+      conf_suffix = (
+        f" ({medical_exam_info.exam_date_confidence:.0%})"
+        if medical_exam_info.exam_date_confidence is not None
+        else ""
+      )
+      if medical_exam_info.exam_date:
+        exam_date_final = medical_exam_info.exam_date
+        exam_date_source = exam_ocr_source
+        exam_date_ocr_cell = f"{medical_exam_info.exam_date}{conf_suffix}"
+      elif medical_exam_info.raw_exam_date:
+        exam_date_ocr_cell = f"{medical_exam_info.raw_exam_date!r}{conf_suffix}"
+    if exam_date_final is None:
       entered = _prompt_field(
         "exam_date",
         (
@@ -1698,12 +1740,33 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
           "the prompt.",
           code="missing_input",
         )
-      kwargs["exam_date"] = entered
+      exam_date_final = entered
       manual_exam_date = medical_exam_info is not None
-    if kwargs.get("exam_date"):
-      console.print(
-        f"[cyan]:information_source: Step 3 exam_date:[/] {kwargs['exam_date']}"
-      )
+
+    # Step 8 — confirm with user. Pre-render extras as full row tuples so the
+    # medical exam date follows the same OCR/confidence pattern as other rows.
+    summary_extras: list[tuple[str, str, str, str, str]] = [
+      ("Data Exame Médico", "—", exam_date_ocr_cell, exam_date_final, exam_date_source),
+      ("Subida de Escalão", "—", "—", "no", "default"),
+    ]
+
+    kwargs = _confirm_enroll(
+      result, sav_profile, license,
+      ocr_source=f"OCR ({os.path.basename(pdf_path)})",
+      extras=summary_extras,
+    )
+    if kwargs is None:
+      console.print("[yellow]:fast_forward: Skipped.[/]")
+      return
+    kwargs["exam_date"] = exam_date_final
+
+    # Apply --field overrides on top of reconciled values (user wins over OCR).
+    if fields:
+      field_overrides = _parse_update_fields(fields)
+      if field_overrides:
+        applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+        console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
+      kwargs.update(field_overrides)
 
     # Step 9 — submit (retry loop for missing guardian fields)
     submitted = False
@@ -2018,6 +2081,7 @@ def enrollment_update_cmd(
     else:
       if doc_type is None:
         doc_type = _classify_pdf_doc_type(active_pdf)
+        click.echo(f"Classified {active_pdf} as {_doc_type_text(doc_type)}.")
       active_doc_type = doc_type
     tipo_doc = _tipo_doc_for_upload(active_doc_type)
     client = _make_client()
@@ -2052,6 +2116,7 @@ def enrollment_update_cmd(
     else:
       if doc_type is None:
         doc_type = _classify_pdf_doc_type(pdf)
+        click.echo(f"Classified {active_pdf} as {_doc_type_text(doc_type)}.")
       if doc_type != DocType.FPB_MOD1:
         raise SavCliError(
           f"Unsupported document type {_doc_type_text(doc_type)!r}; "
@@ -2085,7 +2150,10 @@ def enrollment_update_cmd(
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(f"Reconcile failed: {exc}", code=_exc_code(exc))
 
-      kwargs = _confirm_enroll(result, sav_profile, license)
+      kwargs = _confirm_enroll(
+        result, sav_profile, license,
+        ocr_source=f"OCR ({os.path.basename(active_pdf)})",
+      )
       if kwargs is None:
         click.echo("Skipped.")
         return

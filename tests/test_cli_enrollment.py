@@ -112,6 +112,8 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
 
   assert result.exit_code == 0
   assert captured == [2]
+  assert f"Classified {pdf_path}" in result.output
+  assert "as exame_medico" in result.output
   assert "Replaced exame_medico" in result.output
 
 
@@ -192,7 +194,7 @@ def test_enroll_uses_medical_exam_date_and_uploads_exam(monkeypatch, tmp_path, b
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch_obj, parsed: (301772, batch_obj))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr(
     "sav_parsers.classify",
     lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
@@ -257,7 +259,7 @@ def test_enroll_prompts_for_manual_medical_exam_date(monkeypatch, tmp_path, batc
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch_obj, parsed: (301772, batch_obj))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr(
     "sav_parsers.classify",
     lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
@@ -320,7 +322,7 @@ def test_enroll_prompts_for_exam_date_without_medical_exam(monkeypatch, tmp_path
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch_obj, parsed: (301772, batch_obj))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MOD1)
   monkeypatch.setattr(
     "sav_parsers.parse_fpb_mod1",
@@ -373,7 +375,7 @@ def test_enroll_skips_when_parse_em_raises(monkeypatch, tmp_path, batch_stub, re
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch_obj, parsed: (301772, batch_obj))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr(
     "sav_parsers.classify",
     lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
@@ -425,7 +427,7 @@ def test_enroll_skips_when_exam_date_not_entered(monkeypatch, tmp_path, batch_st
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch_obj, parsed: (301772, batch_obj))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr(
     "sav_parsers.classify",
     lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
@@ -535,7 +537,7 @@ def test_enrollment_create_mod1_skips_classify(monkeypatch, tmp_path, batch_stub
   })())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch_stub))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {"exam_date": "2026-01-01"})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {"exam_date": "2026-01-01"})
   monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
   monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
 
@@ -587,7 +589,7 @@ def test_enrollment_create_pdf_mode_applies_field_overrides(monkeypatch, tmp_pat
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch_stub))
   # reconcile returns email from OCR; --field should override it
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {"exam_date": "2026-01-01", "email": "ocr@example.com"})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {"exam_date": "2026-01-01", "email": "ocr@example.com"})
   monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
   monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
 
@@ -595,6 +597,7 @@ def test_enrollment_create_pdf_mode_applies_field_overrides(monkeypatch, tmp_pat
   result = runner.invoke(
     cli_module.cli,
     ["enrollment", "create", str(form_path), "--field", "email=manual@example.com"],
+    input="2026-01-01\n",
   )
 
   assert result.exit_code == 0, result.output
@@ -624,7 +627,7 @@ def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
     "update_player_in_registration_batch": lambda self, *a, **kw: None,
     "replace_player_registration_document": lambda self, *a, **kw: None,
   })())
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: type("R", (), {
     "needs_review": [], "retrain_corrections": {},
   })())
@@ -803,7 +806,7 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
   monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
   monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch))
-  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license, *, ocr_source="OCR", extras=None: {})
   monkeypatch.setattr(
     "sav_parsers.classify",
     lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
@@ -842,6 +845,10 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   # (only --mod1 explicit pinning does); exam IS trained either way.
   assert (str(exam_path), DocType.EM) in captured["trained"]
   assert not any(p == str(form_path) for p, _ in captured["trained"])
+  assert "Classified as fpb_modelo_1" in result.output
+  assert "Classified as exame_medico" in result.output
+  assert str(form_path) in result.output
+  assert str(exam_path) in result.output
 
 
 def test_enrollment_create_rejects_two_mod1_pdfs(monkeypatch, tmp_path):
