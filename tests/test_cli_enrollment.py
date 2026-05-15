@@ -397,7 +397,7 @@ def test_enroll_skips_when_parse_em_raises(monkeypatch, tmp_path, batch_stub, re
     ["enrollment", "create", str(form_path), "--medical-exam", str(exam_path)],
   )
 
-  assert result.exit_code == 0
+  assert result.exit_code != 0
   assert not captured["add_called"]
   assert "Medical exam parse error" in result.output
   assert ("proc-form", None) in captured["closed"]
@@ -456,7 +456,7 @@ def test_enroll_skips_when_exam_date_not_entered(monkeypatch, tmp_path, batch_st
     input="\n",
   )
 
-  assert result.exit_code == 0
+  assert result.exit_code != 0
   assert not captured["add_called"]
   assert "Medical exam date required" in result.output
   assert ("proc-form", None) in captured["closed"]
@@ -775,3 +775,128 @@ def test_enrollment_delete_aborts_on_no(monkeypatch):
 
   assert result.exit_code != 0
   assert "removed from batch" not in result.output
+
+
+def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
+  monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
+):
+  """Two positional PDFs auto-classify into one mod1 + one exam for ONE player."""
+  form_path = tmp_path / "form.pdf"
+  form_path.write_bytes(b"%PDF-1.4\n")
+  exam_path = tmp_path / "exam.pdf"
+  exam_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"add_calls": 0, "uploads": [], "trained": []}
+
+  class StubClient:
+    def load_player_profile(self, license, club_id=None):
+      return {"nome": "Player A"}
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["add_calls"] += 1
+      captured["kwargs"] = kwargs
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+      captured["uploads"].append((str(pdf), tipo_doc))
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id: (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed: (301772, batch))
+  monkeypatch.setattr(cli_module, "_confirm_enroll", lambda result, sav_profile, license: {})
+  monkeypatch.setattr(
+    "sav_parsers.classify",
+    lambda pdf: DocType.EM if str(pdf).endswith("exam.pdf") else DocType.FPB_MOD1,
+  )
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda pdf: {"fields": {}, "processing_id": "proc-form"},
+  )
+  monkeypatch.setattr(
+    "sav_parsers.parse_em",
+    lambda pdf: {
+      "fields": {"exam_date": ParsedField(value="2026-05-01", confidence=0.92)},
+      "processing_id": "proc-em",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr(
+    "sav_parsers.train_classifier",
+    lambda pdf, dt: captured["trained"].append((str(pdf), dt)),
+  )
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+  monkeypatch.setattr("sav_shared.fpb_mod1.reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "create", str(form_path), str(exam_path)],
+  )
+
+  assert result.exit_code == 0, result.output
+  # Exactly one enrollment, not one per PDF.
+  assert captured["add_calls"] == 1
+  # Both documents uploaded, each with the correct tipo_doc.
+  assert (str(form_path), 1) in captured["uploads"]
+  assert (str(exam_path), 2) in captured["uploads"]
+  # Auto-classified positional mod1 should NOT trigger classifier training
+  # (only --mod1 explicit pinning does); exam IS trained either way.
+  assert (str(exam_path), DocType.EM) in captured["trained"]
+  assert not any(p == str(form_path) for p, _ in captured["trained"])
+
+
+def test_enrollment_create_rejects_two_mod1_pdfs(monkeypatch, tmp_path):
+  """Two positional PDFs both classifying as mod1 is rejected as ambiguous."""
+  a = tmp_path / "a.pdf"
+  a.write_bytes(b"%PDF-1.4\n")
+  b = tmp_path / "b.pdf"
+  b.write_bytes(b"%PDF-1.4\n")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MOD1)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "create", str(a), str(b)])
+
+  assert result.exit_code != 0
+  assert "one enrollment per invocation" in result.output
+  assert "2 fpb_modelo_1 forms" in result.output
+
+
+def test_enrollment_create_rejects_two_exam_pdfs(monkeypatch, tmp_path):
+  """A form plus two exams (one positional + one --medical-exam) is rejected."""
+  form = tmp_path / "form.pdf"
+  form.write_bytes(b"%PDF-1.4\n")
+  e1 = tmp_path / "e1.pdf"
+  e1.write_bytes(b"%PDF-1.4\n")
+  e2 = tmp_path / "e2.pdf"
+  e2.write_bytes(b"%PDF-1.4\n")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+  monkeypatch.setattr(
+    "sav_parsers.classify",
+    lambda pdf: DocType.FPB_MOD1 if str(pdf).endswith("form.pdf") else DocType.EM,
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "create", str(form), str(e1), "--medical-exam", str(e2)],
+  )
+
+  assert result.exit_code != 0
+  assert "at most one exame_medico" in result.output
+
+
+def test_enrollment_create_rejects_pdf_input_without_mod1(monkeypatch, tmp_path):
+  """If a positional PDF doesn't classify as mod1 or em, the command fails."""
+  random_pdf = tmp_path / "random.pdf"
+  random_pdf.write_bytes(b"%PDF-1.4\n")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.OUTROS)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "create", str(random_pdf)])
+
+  assert result.exit_code != 0
+  assert "No fpb_modelo_1 form provided" in result.output

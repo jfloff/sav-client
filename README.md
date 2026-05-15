@@ -40,8 +40,9 @@ cd sav-client
 pip install -e .
 ```
 
-If you plan to use `sav enroll` or the MCP enrollment tools, also configure the
-Document AI environment described in the `sav-parsers` README.
+If you plan to use the `sav enrollment` commands or the MCP enrollment tools,
+also configure the Document AI environment described in the `sav-parsers`
+README.
 
 ---
 
@@ -87,6 +88,16 @@ sav game-sheet 841 --home --out sheet.pdf --player 301772 --coach-pri 44321
 sav clubs --association 7
 sav clubs "Rio Maior" --all-associations
 sav associations
+
+# Enrollment (one player per invocation; PDFs are supporting documents)
+sav enrollment create form.pdf                          # auto-classified mod1
+sav enrollment create form.pdf exam.pdf                 # mod1 + exame_medico
+sav enrollment create --mod1 form.pdf --medical-exam exam.pdf
+sav enrollment create --batch 42 --license 301772 --field email=foo@bar.com
+sav enrollment read 42                                  # list players in batch
+sav enrollment read 42 301772                           # one player's record
+sav enrollment update 42 301772 form.pdf --file-only    # replace document only
+sav enrollment delete 42 301772
 ```
 
 Run `sav --help` or `sav <command> --help` for full option reference.

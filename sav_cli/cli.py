@@ -1403,7 +1403,7 @@ def enrollment_grp():
 )
 @click.option(
   "--medical-exam", type=click.Path(exists=True),
-  help="Parse and upload the matching exame_medico PDF.",
+  help="Explicit exame_medico PDF (skips auto-classify for this file).",
 )
 @click.option(
   "--batch", "batch_id_opt", type=int, default=None,
@@ -1423,13 +1423,20 @@ def enrollment_grp():
 )
 @click.pass_context
 def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, license_opt, fields):
-  """Enroll players from FPB registration PDFs into SAV.
+  """Enroll one player into SAV from one or more supporting PDFs.
+
+  A single invocation creates a single enrollment. Pass one fpb_modelo_1 form
+  (required in PDF mode) plus any number of supporting documents — currently
+  zero or one exame_medico. Positional PDFs are auto-classified; --mod1 and
+  --medical-exam pin the type explicitly (and skip classify for that file).
 
   \b
-    sav enrollment create player.pdf
-        Auto-classify, OCR-reconcile, and enroll.
-    sav enrollment create --mod1 player.pdf --medical-exam exam.pdf
-        Explicit form types (skip classify); trains the classifier.
+    sav enrollment create form.pdf
+        Auto-classify the form; enroll without a medical exam.
+    sav enrollment create form.pdf exam.pdf
+        Auto-classify both PDFs into mod1 + exame_medico; enroll one player.
+    sav enrollment create --mod1 form.pdf --medical-exam exam.pdf
+        Skip classify for both; trains the classifier.
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
         Manual enrolment from SAV profile, no PDF.
   """
@@ -1482,310 +1489,329 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
 
   client = _make_client()
 
-  batch_id: int | None = None
-  batch: Any = None
   console = _console()
   err_console = _console(err=True)
 
-  # Build list of (pdf_path, explicit_doc_type) pairs.
-  # Positional PDFs are auto-classified; --mod1 path skips classify.
-  paths_to_process: list[tuple[str, DocType | None]] = [(p, None) for p in pdfs]
-  if mod1_path:
-    paths_to_process.append((mod1_path, DocType.FPB_MOD1))
-
-  for pdf_path, explicit_doc_type in paths_to_process:
-    medical_exam_path = medical_exam
-    if explicit_doc_type is None:
-      # Step 1 — classify
-      try:
-        with console.status("[bold cyan]:mag: Classifying document...[/]"):
-          doc_type = classify(pdf_path)
-      except Exception as exc:
-        err_console.print(f"[red]:x: Classify error:[/] {exc} [dim]({pdf_path})[/]")
-        continue
-      if doc_type != DocType.FPB_MOD1:
-        console.print(
-          f"[yellow]:warning: Unsupported document type {_doc_type_text(doc_type)!r}; skipped.[/] "
-          f"[dim]({pdf_path})[/]"
-        )
-        continue
-    else:
-      # Explicit type: skip classify, train classifier with known label.
-      doc_type = explicit_doc_type
-      try:
-        with console.status("[bold cyan]:bookmark_tabs: Labeling mod1 form for classifier training...[/]"):
-          train_classifier(pdf_path, doc_type)
-      except Exception as exc:
-        err_console.print(
-          f"[yellow]:warning: Could not submit classifier training for mod1:[/] "
-          f"{exc} [dim]({pdf_path})[/]"
-        )
-
-    # Step 2 — parse
+  # Pre-classify each positional PDF and bucket by doc type. Explicit
+  # --mod1 / --medical-exam paths are appended directly (no classify call).
+  positional_mod1: list[str] = []
+  positional_em: list[str] = []
+  for path in pdfs:
     try:
-      with console.status("[bold cyan]:robot: Running OCR and parsing form...[/]"):
-        parse_result = parse_fpb_mod1(pdf_path)
-        parsed = parse_result["fields"]
-        processing_id = parse_result["processing_id"]
+      with console.status(f"[bold cyan]:mag: Classifying {path}...[/]"):
+        dt = classify(path)
     except Exception as exc:
-      err_console.print(f"[red]:x: Parse error:[/] {exc} [dim]({pdf_path})[/]")
-      continue
-    console.print(
-      f"[green]:white_check_mark: OCR ready[/] [dim]{pdf_path} ({processing_id})[/]"
+      raise SavCliError(f"Classify error for {path}: {exc}", code="parse_error")
+    if dt == DocType.FPB_MOD1:
+      positional_mod1.append(path)
+    elif dt == DocType.EM:
+      positional_em.append(path)
+    else:
+      console.print(
+        f"[yellow]:warning: Unsupported document type {_doc_type_text(dt)!r}; ignored.[/] "
+        f"[dim]({path})[/]"
+      )
+
+  mod1_candidates = positional_mod1 + ([mod1_path] if mod1_path else [])
+  em_candidates = positional_em + ([medical_exam] if medical_exam else [])
+
+  if not mod1_candidates:
+    raise click.UsageError(
+      "No fpb_modelo_1 form provided. Pass one as a positional PDF or via --mod1."
+    )
+  if len(mod1_candidates) > 1:
+    raise click.UsageError(
+      f"enrollment create now produces one enrollment per invocation, but got "
+      f"{len(mod1_candidates)} fpb_modelo_1 forms: {', '.join(mod1_candidates)}. "
+      f"To enroll multiple players, run this command once per form "
+      f"(e.g. `for f in *.pdf; do sav enrollment create \"$f\"; done`)."
+    )
+  if len(em_candidates) > 1:
+    raise click.UsageError(
+      f"enrollment create accepts at most one exame_medico per invocation, but "
+      f"got {len(em_candidates)}: {', '.join(em_candidates)}. A medical exam is "
+      f"per-player, so attach exactly one alongside the fpb_modelo_1 form."
     )
 
-    # Once parse_fpb_mod1 has created a processing session, we must close it
-    # on every exit path or the dir leaks under files/processing/<id>/ until
-    # gc sweeps it. close_called flips to True at step 10 (success path);
-    # the finally falls back to a no-corrections close for any earlier exit.
-    close_called = False
-    medical_processing_id: str | None = None
-    medical_close_pending = False
-    manual_exam_date = False
+  pdf_path = mod1_candidates[0]
+  doc_type = DocType.FPB_MOD1
+  medical_exam_path: str | None = em_candidates[0] if em_candidates else None
+  # Train the classifier on the mod1 only when the user pinned it with --mod1;
+  # an auto-classified positional already represents a confident classify call.
+  if mod1_path is not None:
     try:
-      # Step 4 — resolve batch (once per invocation, derived from first PDF)
-      if batch is None:
-        # When the form has neither tipo_inscricao box checked, derive_enrollment_params
-        # falls back to a NIF-based club-roster scan. Surface that since reg_type
-        # otherwise looks like it came from OCR, and the scan is N profile fetches.
-        type_inferred = not (
-          parsed_bool(parsed, "tipo_inscricao_revalidacao")
-          or parsed_bool(parsed, "tipo_inscricao_primeira")
-        )
-        try:
-          status_message = (
-            "[bold cyan]:mag_right: No tipo_inscricao on form; checking club roster by NIF...[/]"
-            if type_inferred
-            else "[bold cyan]:card_index_dividers: Resolving enrollment parameters...[/]"
-          )
-          with console.status(status_message):
-            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
-          if type_inferred:
-            label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
-            console.print(f"[cyan]:information_source: Inferred registration type:[/] {label}")
-          batch_id, batch = _resolve_enroll_batch(
-            client, reg_type, tier_id, gender_id,
-          )
-        except ValueError as exc:
-          raise SavCliError(str(exc), code="parse_error")
-        except click.Abort:
-          return
-        except (SavConnectionError, SavResponseError) as exc:
-          raise SavCliError(str(exc), code=_exc_code(exc))
+      with console.status("[bold cyan]:bookmark_tabs: Labeling mod1 form for classifier training...[/]"):
+        train_classifier(pdf_path, doc_type)
+    except Exception as exc:
+      err_console.print(
+        f"[yellow]:warning: Could not submit classifier training for mod1:[/] "
+        f"{exc} [dim]({pdf_path})[/]"
+      )
 
-      # Step 5 — resolve player licence (may redirect to a different open
-      # batch when the player is already enrolled there — SAV2 only permits
-      # one open enrolment per player).
+  # Step 2 — parse
+  try:
+    with console.status("[bold cyan]:robot: Running OCR and parsing form...[/]"):
+      parse_result = parse_fpb_mod1(pdf_path)
+      parsed = parse_result["fields"]
+      processing_id = parse_result["processing_id"]
+  except Exception as exc:
+    raise SavCliError(f"Parse error for {pdf_path}: {exc}", code="parse_error")
+  console.print(
+    f"[green]:white_check_mark: OCR ready[/] [dim]{pdf_path} ({processing_id})[/]"
+  )
+
+  # Once parse_fpb_mod1 has created a processing session, we must close it
+  # on every exit path or the dir leaks under files/processing/<id>/ until
+  # gc sweeps it. close_called flips to True at step 10 (success path);
+  # the finally falls back to a no-corrections close for any earlier exit.
+  close_called = False
+  medical_processing_id: str | None = None
+  medical_close_pending = False
+  manual_exam_date = False
+  try:
+    # Step 4 — resolve batch
+    # When the form has neither tipo_inscricao box checked, derive_enrollment_params
+    # falls back to a NIF-based club-roster scan. Surface that since reg_type
+    # otherwise looks like it came from OCR, and the scan is N profile fetches.
+    type_inferred = not (
+      parsed_bool(parsed, "tipo_inscricao_revalidacao")
+      or parsed_bool(parsed, "tipo_inscricao_primeira")
+    )
+    try:
+      status_message = (
+        "[bold cyan]:mag_right: No tipo_inscricao on form; checking club roster by NIF...[/]"
+        if type_inferred
+        else "[bold cyan]:card_index_dividers: Resolving enrollment parameters...[/]"
+      )
+      with console.status(status_message):
+        reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+      if type_inferred:
+        label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
+        console.print(f"[cyan]:information_source: Inferred registration type:[/] {label}")
+      batch_id, batch = _resolve_enroll_batch(
+        client, reg_type, tier_id, gender_id,
+      )
+    except ValueError as exc:
+      raise SavCliError(str(exc), code="parse_error")
+    except click.Abort:
+      return
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+
+    # Step 5 — resolve player licence (may redirect to a different open
+    # batch when the player is already enrolled there — SAV2 only permits
+    # one open enrolment per player).
+    try:
+      resolved = _resolve_enroll_player(client, batch, parsed)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    if resolved is None:
+      console.print("[yellow]:fast_forward: Skipped.[/]")
+      return
+    license, batch = resolved
+    batch_id = batch.id
+
+    # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
+    # server-side validation surfaces at real submit.
+    try:
+      with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
+        sav_profile = client.load_player_profile(license, club_id=batch.club_id)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
+
+    # Step 7 — reconcile OCR vs SAV. reconcile_fpb_mod1 fetches the
+    # distrito-scoped concelho list itself (cached client-side); without it
+    # concelho silently falls to needs_review.
+    try:
+      with console.status("[bold cyan]:balance_scale: Reconciling OCR with SAV...[/]"):
+        result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(f"Could not load concelhos: {exc}", code=_exc_code(exc))
+    except Exception as exc:
+      raise SavCliError(f"Reconcile error: {exc}", code="reconcile_error")
+
+    medical_exam_info = None
+    if medical_exam_path:
       try:
-        resolved = _resolve_enroll_player(client, batch, parsed)
+        with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
+          medical_parse_result = parse_em(medical_exam_path)
+        medical_processing_id = medical_parse_result["processing_id"]
+        medical_close_pending = True
+        medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
+      except SavCliError:
+        raise
+      except Exception as exc:
+        raise SavCliError(
+          f"Medical exam parse error: {exc} ({medical_exam_path})",
+          code="parse_error",
+        )
+      try:
+        with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
+          train_classifier(medical_exam_path, DocType.EM)
+      except Exception as exc:
+        err_console.print(
+          f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
+          f"{exc} [dim]({medical_exam_path})[/]"
+        )
+
+      if medical_exam_info.exam_date:
+        console.print(
+          f"[cyan]:information_source: Medical exam date:[/] "
+          f"{medical_exam_info.exam_date} [dim]({medical_exam_path})[/]"
+        )
+      else:
+        raw_text = medical_exam_info.raw_exam_date or "not found"
+        console.print(
+          f"[yellow]:warning: Medical exam date needs review:[/] "
+          f"{raw_text!r} [dim]({medical_exam_path})[/]"
+        )
+
+    # Step 8 — confirm with user
+    kwargs = _confirm_enroll(result, sav_profile, license)
+    if kwargs is None:
+      console.print("[yellow]:fast_forward: Skipped.[/]")
+      return
+    if medical_exam_info is not None and medical_exam_info.exam_date:
+      kwargs["exam_date"] = medical_exam_info.exam_date
+
+    # Apply --field overrides on top of reconciled values (user wins over OCR).
+    if fields:
+      field_overrides = _parse_update_fields(fields)
+      if field_overrides:
+        applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+        console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
+      kwargs.update(field_overrides)
+    if not kwargs.get("exam_date"):
+      entered = _prompt_field(
+        "exam_date",
+        (
+          f"OCR: {medical_exam_info.raw_exam_date!r}"
+          if medical_exam_info is not None and medical_exam_info.raw_exam_date
+          else "required"
+        ),
+        field_type="date",
+      )
+      if entered is None:
+        raise SavCliError(
+          "Medical exam date required. Supply a parseable exame_medico PDF "
+          "(positional or --medical-exam), or run interactively and answer "
+          "the prompt.",
+          code="missing_input",
+        )
+      kwargs["exam_date"] = entered
+      manual_exam_date = medical_exam_info is not None
+    if kwargs.get("exam_date"):
+      console.print(
+        f"[cyan]:information_source: Step 3 exam_date:[/] {kwargs['exam_date']}"
+      )
+
+    # Step 9 — submit (retry loop for missing guardian fields)
+    submitted = False
+    while not submitted:
+      try:
+        with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
+          client.add_player_to_registration_batch(
+            batch_id, license, **kwargs,
+          )
+        console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch_id}.[/]")
+        submitted = True
+      except SavConfigError as exc:
+        console.print("[yellow]:warning: Guardian info required for minor.[/]")
+        for field_name in parse_missing_guardian_fields(exc):
+          if field_name == "guardian_relation":
+            val = _prompt_field(
+              field_name,
+              field_type=GUARDIAN_RELATIONS,
+              prompt_text="      Relation",
+            )
+          else:
+            val = _prompt_field(field_name)
+          if val is not None:
+            kwargs[field_name] = val
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(str(exc), code=_exc_code(exc))
-      if resolved is None:
-        console.print("[yellow]:fast_forward: Skipped.[/]")
-        continue
-      license, batch = resolved
-      batch_id = batch.id
 
-      # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
-      # server-side validation surfaces at real submit.
-      try:
-        with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
-          sav_profile = client.load_player_profile(license, club_id=batch.club_id)
-      except (SavConnectionError, SavResponseError) as exc:
-        err_console.print(f"[red]:x: Could not load player profile:[/] {exc}")
-        continue
-
-      # Step 7 — reconcile OCR vs SAV. reconcile_fpb_mod1 fetches the
-      # distrito-scoped concelho list itself (cached client-side); without it
-      # concelho silently falls to needs_review.
-      try:
-        with console.status("[bold cyan]:balance_scale: Reconciling OCR with SAV...[/]"):
-          result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
-      except (SavConnectionError, SavResponseError) as exc:
-        err_console.print(f"[red]:x: Could not load concelhos:[/] {exc}")
-        continue
-      except Exception as exc:
-        err_console.print(f"[red]:x: Reconcile error:[/] {exc}")
-        continue
-
-      medical_exam_info = None
-      if medical_exam_path:
-        try:
-          with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
-            medical_parse_result = parse_em(medical_exam_path)
-          medical_processing_id = medical_parse_result["processing_id"]
-          medical_close_pending = True
-          medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
-        except SavCliError:
-          raise
-        except Exception as exc:
-          err_console.print(
-            f"[red]:x: Medical exam parse error:[/] {exc} [dim]({medical_exam_path})[/]"
-          )
-          continue
-        try:
-          with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
-            train_classifier(medical_exam_path, DocType.EM)
-        except Exception as exc:
-          err_console.print(
-            f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
-            f"{exc} [dim]({medical_exam_path})[/]"
-          )
-
-        if medical_exam_info.exam_date:
-          console.print(
-            f"[cyan]:information_source: Medical exam date:[/] "
-            f"{medical_exam_info.exam_date} [dim]({medical_exam_path})[/]"
-          )
-        else:
-          raw_text = medical_exam_info.raw_exam_date or "not found"
-          console.print(
-            f"[yellow]:warning: Medical exam date needs review:[/] "
-            f"{raw_text!r} [dim]({medical_exam_path})[/]"
-          )
-
-      # Step 8 — confirm with user
-      kwargs = _confirm_enroll(result, sav_profile, license)
-      if kwargs is None:
-        console.print("[yellow]:fast_forward: Skipped.[/]")
-        continue
-      if medical_exam_info is not None and medical_exam_info.exam_date:
-        kwargs["exam_date"] = medical_exam_info.exam_date
-
-      # Apply --field overrides on top of reconciled values (user wins over OCR).
-      if fields:
-        field_overrides = _parse_update_fields(fields)
-        if field_overrides:
-          applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
-          console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
-        kwargs.update(field_overrides)
-      if not kwargs.get("exam_date"):
-        entered = _prompt_field(
-          "exam_date",
-          (
-            f"OCR: {medical_exam_info.raw_exam_date!r}"
-            if medical_exam_info is not None and medical_exam_info.raw_exam_date
-            else "required"
-          ),
-          field_type="date",
-        )
-        if entered is None:
-          console.print("[yellow]:warning: Medical exam date required; skipped.[/]")
-          continue
-        kwargs["exam_date"] = entered
-        manual_exam_date = medical_exam_info is not None
-      if kwargs.get("exam_date"):
-        console.print(
-          f"[cyan]:information_source: Step 3 exam_date:[/] {kwargs['exam_date']}"
-        )
-
-      # Step 9 — submit (retry loop for missing guardian fields)
-      submitted = False
-      while not submitted:
-        try:
-          with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
-            client.add_player_to_registration_batch(
-              batch_id, license, **kwargs,
-            )
-          console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch_id}.[/]")
-          submitted = True
-        except SavConfigError as exc:
-          console.print("[yellow]:warning: Guardian info required for minor.[/]")
-          for field_name in parse_missing_guardian_fields(exc):
-            if field_name == "guardian_relation":
-              val = _prompt_field(
-                field_name,
-                field_type=GUARDIAN_RELATIONS,
-                prompt_text="      Relation",
-              )
-            else:
-              val = _prompt_field(field_name)
-            if val is not None:
-              kwargs[field_name] = val
-        except (SavConnectionError, SavResponseError) as exc:
-          raise SavCliError(str(exc), code=_exc_code(exc))
-
-      # Step 9b — upload the source PDF as fpb_modelo_1. Replace semantics:
-      # any prior fpb_modelo_1 for this player+batch is deleted first so a
-      # re-submit leaves exactly the new file in place. Non-fatal: if it
-      # fails the player is still registered, so we just warn and continue.
+    # Step 9b — upload the source PDF as fpb_modelo_1. Replace semantics:
+    # any prior fpb_modelo_1 for this player+batch is deleted first so a
+    # re-submit leaves exactly the new file in place. Non-fatal: if it
+    # fails the player is still registered, so we just warn and continue.
+    with console.status(
+      "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
+    ):
+      ok, err = try_replace_document(
+        client, batch_id, license, pdf_path,
+        tipo_doc=doc_type_to_tipo_doc(doc_type),
+      )
+    if ok:
+      console.print(
+        f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
+      )
+    else:
+      err_console.print(
+        f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
+      )
+    if medical_exam_path:
       with console.status(
-        "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
+        "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
       ):
         ok, err = try_replace_document(
-          client, batch_id, license, pdf_path,
-          tipo_doc=doc_type_to_tipo_doc(doc_type),
+          client, batch_id, license, medical_exam_path,
+          tipo_doc=doc_type_to_tipo_doc(DocType.EM),
         )
       if ok:
         console.print(
-          f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
+          f"[green]:white_check_mark: Uploaded {medical_exam_path} (exame_medico).[/]"
         )
       else:
         err_console.print(
-          f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
+          f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {err}"
         )
-      if medical_exam_path:
-        with console.status(
-          "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
-        ):
-          ok, err = try_replace_document(
-            client, batch_id, license, medical_exam_path,
-            tipo_doc=doc_type_to_tipo_doc(DocType.EM),
-          )
-        if ok:
-          console.print(
-            f"[green]:white_check_mark: Uploaded {medical_exam_path} (exame_medico).[/]"
-          )
-        else:
-          err_console.print(
-            f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {err}"
-          )
 
-      # Step 10 — close processing session; only send corrections the user
-      # explicitly answered (needs_review). Updated and kept were silent paths
-      # from the user's perspective, so we don't stage them as labeled training
-      # data — that would risk noise in the dataset.
-      corrections: dict[str, str] = {}
-      for kwarg in result.needs_review:
-        entity = KWARG_TO_ENTITY.get(kwarg)
-        val = kwargs.get(kwarg)
-        if entity and val is not None:
-          corrections[entity] = str(val)
-      corrections.update(result.retrain_corrections)
-      close_called = True
+    # Step 10 — close processing session; only send corrections the user
+    # explicitly answered (needs_review). Updated and kept were silent paths
+    # from the user's perspective, so we don't stage them as labeled training
+    # data — that would risk noise in the dataset.
+    corrections: dict[str, str] = {}
+    for kwarg in result.needs_review:
+      entity = KWARG_TO_ENTITY.get(kwarg)
+      val = kwargs.get(kwarg)
+      if entity and val is not None:
+        corrections[entity] = str(val)
+    corrections.update(result.retrain_corrections)
+    close_called = True
+    try:
+      with console.status("[bold cyan]:sparkles: Finalizing OCR processing...[/]"):
+        close_processing(processing_id, corrections=corrections or None)
+    except Exception as exc:
+      err_console.print(
+        f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}"
+      )
+    if medical_processing_id is not None:
+      medical_close_pending = False
+      medical_corrections = {}
+      if manual_exam_date and kwargs.get("exam_date") is not None:
+        medical_corrections["exam_date"] = str(kwargs["exam_date"])
       try:
-        with console.status("[bold cyan]:sparkles: Finalizing OCR processing...[/]"):
-          close_processing(processing_id, corrections=corrections or None)
+        with console.status("[bold cyan]:sparkles: Finalizing medical exam OCR...[/]"):
+          close_processing(
+            medical_processing_id,
+            corrections=medical_corrections or None,
+          )
       except Exception as exc:
         err_console.print(
-          f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}"
+          f"[yellow]:warning: Could not close processing {medical_processing_id}:[/] {exc}"
         )
-      if medical_processing_id is not None:
-        medical_close_pending = False
-        medical_corrections = {}
-        if manual_exam_date and kwargs.get("exam_date") is not None:
-          medical_corrections["exam_date"] = str(kwargs["exam_date"])
-        try:
-          with console.status("[bold cyan]:sparkles: Finalizing medical exam OCR...[/]"):
-            close_processing(
-              medical_processing_id,
-              corrections=medical_corrections or None,
-            )
-        except Exception as exc:
-          err_console.print(
-            f"[yellow]:warning: Could not close processing {medical_processing_id}:[/] {exc}"
-          )
-    finally:
-      if not close_called:
-        try:
-          close_processing(processing_id)
-        except Exception:
-          pass
-      if medical_processing_id is not None and medical_close_pending:
-        try:
-          close_processing(medical_processing_id)
-        except Exception:
-          pass
+  finally:
+    if not close_called:
+      try:
+        close_processing(processing_id)
+      except Exception:
+        pass
+    if medical_processing_id is not None and medical_close_pending:
+      try:
+        close_processing(medical_processing_id)
+      except Exception:
+        pass
 
 
 
