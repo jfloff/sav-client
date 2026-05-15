@@ -43,6 +43,7 @@ from sav_shared.enrollment import (
   parse_missing_guardian_fields,
   parsed_bool,
   resolve_player_candidates,
+  try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
 from sav_shared.fpb_mod1 import reconcile_fpb_mod1
@@ -1708,34 +1709,36 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
       # any prior fpb_modelo_1 for this player+batch is deleted first so a
       # re-submit leaves exactly the new file in place. Non-fatal: if it
       # fails the player is still registered, so we just warn and continue.
-      try:
-        with console.status(
-          "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
-        ):
-          client.replace_player_registration_document(
-            batch_id, license, pdf_path, tipo_doc=doc_type_to_tipo_doc(doc_type),
-          )
+      with console.status(
+        "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
+      ):
+        ok, err = try_replace_document(
+          client, batch_id, license, pdf_path,
+          tipo_doc=doc_type_to_tipo_doc(doc_type),
+        )
+      if ok:
         console.print(
           f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
         )
-      except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+      else:
         err_console.print(
-          f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {exc}"
+          f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
         )
       if medical_exam_path:
-        try:
-          with console.status(
-            "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
-          ):
-            client.replace_player_registration_document(
-              batch_id, license, medical_exam_path, tipo_doc=doc_type_to_tipo_doc(DocType.EM),
-            )
+        with console.status(
+          "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
+        ):
+          ok, err = try_replace_document(
+            client, batch_id, license, medical_exam_path,
+            tipo_doc=doc_type_to_tipo_doc(DocType.EM),
+          )
+        if ok:
           console.print(
             f"[green]:white_check_mark: Uploaded {medical_exam_path} (exame_medico).[/]"
           )
-        except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+        else:
           err_console.print(
-            f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {exc}"
+            f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {err}"
           )
 
       # Step 10 — close processing session; only send corrections the user
@@ -1893,7 +1896,7 @@ def enrollment_read_cmd(ctx, batch_id, license):
     click.echo(f"\n{len(items)} player(s) enrolled.")
   else:
     try:
-      record = client._load_existing_registration_record(batch_id, license)
+      record = client.load_existing_registration_record(batch_id, license)
     except (SavConnectionError, SavResponseError, ValueError) as e:
       raise SavCliError(str(e), code=_exc_code(e))
 

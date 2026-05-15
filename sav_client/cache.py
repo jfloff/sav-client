@@ -115,7 +115,7 @@ class Cache:
         (assoc_key,),
       ).fetchall()
 
-      if rows and (now - rows[0][4]) < ttl:
+      if rows and (now - min(r[4] for r in rows)) < ttl:
         return [Club(id=r[0], name=r[1], full_name=r[2], code=r[3]) for r in rows]
 
       clubs = fetcher(association)
@@ -145,7 +145,7 @@ class Cache:
         "SELECT id, name, cached_at FROM associations ORDER BY name"
       ).fetchall()
 
-      if rows and (now - rows[0][2]) < ttl:
+      if rows and (now - min(r[2] for r in rows)) < ttl:
         return [Club(id=r[0], name=r[1]) for r in rows]
 
       associations = fetcher()
@@ -174,7 +174,7 @@ class Cache:
         (distrito_id,),
       ).fetchall()
 
-      if rows and (now - rows[0][2]) < ttl:
+      if rows and (now - min(r[2] for r in rows)) < ttl:
         return {r[0]: r[1] for r in rows}
 
       concelhos = fetcher(distrito_id)
@@ -203,7 +203,7 @@ class Cache:
         (gender_id,),
       ).fetchall()
 
-      if rows and (now - rows[0][2]) < ttl:
+      if rows and (now - min(r[2] for r in rows)) < ttl:
         return {r[0]: r[1] for r in rows}
 
       tiers = fetcher(gender_id)

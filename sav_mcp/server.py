@@ -23,6 +23,8 @@ Document tools (post-enrollment, ad-hoc):
 from __future__ import annotations
 
 import base64
+import binascii
+import logging
 import os
 import tempfile
 import uuid
@@ -31,12 +33,20 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
-from sav_client.exceptions import SavConfigError, SavConnectionError, SavResponseError
+from sav_client.exceptions import (
+    SavConfigError,
+    SavConnectionError,
+    SavError,
+    SavResponseError,
+)
+
+logger = logging.getLogger(__name__)
 from sav_shared.enrollment import (
     create_and_fetch_batch,
     derive_enrollment_params,
     parse_missing_guardian_fields,
     resolve_player_candidates,
+    try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import reconcile_fpb_mod1
@@ -417,16 +427,12 @@ def _replace_player_document_from_bytes(
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
             f.write(pdf_bytes)
             tmp_path = f.name
-        client.replace_player_registration_document(
-            batch_id,
-            license,
-            tmp_path,
+        ok, error = try_replace_document(
+            client, batch_id, license, tmp_path,
             tipo_doc=doc_type_to_tipo_doc(doc_type),
         )
-        status["status"] = "ok"
-    except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-        status["status"] = "error"
-        status["error"] = str(exc)
+        status["status"] = "ok" if ok else "error"
+        status["error"] = error
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -464,7 +470,7 @@ def parse_enrollment_forms(
     for i, pdf_b64 in enumerate(pdfs):
         try:
             pdf_bytes = base64.b64decode(pdf_b64)
-        except Exception as exc:
+        except (binascii.Error, ValueError) as exc:
             results.append({"index": i, "error": f"Invalid base64: {exc}"})
             continue
 
@@ -486,7 +492,7 @@ def parse_enrollment_forms(
                 try:
                     train_classifier(tmp_path, doc_type)
                 except Exception:
-                    pass
+                    logger.debug("train_classifier failed for hint=%r", hint, exc_info=True)
             else:
                 doc_type = classify(tmp_path)
 
@@ -504,11 +510,11 @@ def parse_enrollment_forms(
                 try:
                     train_classifier(tmp_path, DocType.EM)
                 except Exception:
-                    pass
+                    logger.debug("train_classifier failed for EM", exc_info=True)
             else:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
-        except Exception as exc:
+        except (SavError, ValueError, KeyError, OSError) as exc:
             results.append({"index": i, "error": str(exc)})
             continue
         finally:
@@ -809,7 +815,7 @@ def submit_enrollment(
     try:
         close_processing(form["processing_id"], corrections=corrections or None)
     except Exception:
-        pass
+        logger.debug("close_processing failed for form", exc_info=True)
     if medical_exam is not None:
         exam_corrections = {}
         if manual_exam_override and kwargs.get("exam_date") is not None:
@@ -820,7 +826,7 @@ def submit_enrollment(
                 corrections=exam_corrections or None,
             )
         except Exception:
-            pass
+            logger.debug("close_processing failed for medical exam", exc_info=True)
 
     sav_profile = form.get("sav_profile", {})
     return {
@@ -943,7 +949,7 @@ def update_enrollment_with_document(
 
     try:
         pdf_bytes = base64.b64decode(pdf)
-    except Exception as exc:
+    except (binascii.Error, ValueError) as exc:
         raise ValueError(f"Invalid base64 for pdf: {exc}") from exc
 
     tmp_path: str | None = None
@@ -960,7 +966,7 @@ def update_enrollment_with_document(
             try:
                 train_classifier(tmp_path, active_doc_type)
             except Exception:
-                pass
+                logger.debug("train_classifier failed for doc_type=%r", doc_type, exc_info=True)
         else:
             active_doc_type = classify(tmp_path)
 
@@ -1009,13 +1015,13 @@ def update_enrollment_with_document(
             try:
                 close_processing(processing_id, corrections=corrections or None)
             except Exception:
-                pass
+                logger.debug("close_processing failed", exc_info=True)
         finally:
             if not close_called:
                 try:
                     close_processing(processing_id)
                 except Exception:
-                    pass
+                    logger.debug("close_processing fallback failed", exc_info=True)
 
         return {"success": True, "fields_updated": True, "document_uploaded": True}
     finally:
@@ -1034,7 +1040,7 @@ def read_enrollment(batch_id: int, license: int | None = None) -> dict | list:
     client = _get_client()
     if license is None:
         return client.list_player_registration_batch_items(batch_id)
-    return client._load_existing_registration_record(batch_id, license)
+    return client.load_existing_registration_record(batch_id, license)
 
 
 @server.tool()

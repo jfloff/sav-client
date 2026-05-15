@@ -657,3 +657,121 @@ def test_enrollment_update_medical_exam_uploads_exam(monkeypatch, tmp_path):
   )
 
   assert str(exam_path) in uploaded
+
+
+def test_enrollment_read_lists_batch_items(monkeypatch):
+  """`enrollment read BATCH` lists all players in the batch."""
+
+  class StubClient:
+    def list_player_registration_batch_items(self, batch_id):
+      assert batch_id == 42
+      return [
+        {"license": 301772, "name": "Player A"},
+        {"license": 301773, "name": "Player B"},
+      ]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42"])
+
+  assert result.exit_code == 0, result.output
+  assert "301772" in result.output
+  assert "Player A" in result.output
+  assert "2 player(s) enrolled" in result.output
+
+
+def test_enrollment_read_empty_batch(monkeypatch):
+  """`enrollment read BATCH` prints a friendly message when the batch is empty."""
+
+  class StubClient:
+    def list_player_registration_batch_items(self, batch_id):
+      return []
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42"])
+
+  assert result.exit_code == 0, result.output
+  assert "No players enrolled" in result.output
+
+
+def test_enrollment_read_detail(monkeypatch):
+  """`enrollment read BATCH LICENSE` shows one player's enrollment detail."""
+  captured: dict = {}
+
+  class StubClient:
+    def load_existing_registration_record(self, batch_id, license):
+      captured["args"] = (batch_id, license)
+      return {"id": 77, "nome": "Player A", "nif": "123456789", "email": ""}
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42", "301772"])
+
+  assert result.exit_code == 0, result.output
+  assert captured["args"] == (42, 301772)
+  assert "Player A" in result.output
+  assert "123456789" in result.output
+  # Empty values must be filtered out of the table.
+  assert "email" not in result.output
+
+
+def test_enrollment_read_detail_json(monkeypatch):
+  """`--output json enrollment read BATCH LICENSE` emits valid JSON."""
+  import json as _json
+
+  class StubClient:
+    def load_existing_registration_record(self, batch_id, license):
+      return {"id": 77, "nome": "Player A"}
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["--output", "json", "enrollment", "read", "42", "301772"]
+  )
+
+  assert result.exit_code == 0, result.output
+  payload = _json.loads(result.output)
+  assert payload == {"id": 77, "nome": "Player A"}
+
+
+def test_enrollment_delete_confirms_and_removes(monkeypatch):
+  """`enrollment delete` prompts for confirmation before deleting."""
+  captured: dict = {"removed": None}
+
+  class StubClient:
+    def remove_player_from_registration_batch(self, batch_id, license):
+      captured["removed"] = (batch_id, license)
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "delete", "42", "301772"], input="y\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["removed"] == (42, 301772)
+  assert "removed from batch 42" in result.output
+
+
+def test_enrollment_delete_aborts_on_no(monkeypatch):
+  """Answering 'n' to the confirmation prompt aborts without deletion."""
+
+  class StubClient:
+    def remove_player_from_registration_batch(self, batch_id, license):
+      raise AssertionError("remove should not be called when user declines")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "delete", "42", "301772"], input="n\n",
+  )
+
+  assert result.exit_code != 0
+  assert "removed from batch" not in result.output

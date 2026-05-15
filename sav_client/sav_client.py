@@ -20,6 +20,7 @@ Configuration (.env keys)
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import date
@@ -33,6 +34,7 @@ from .exceptions import (
   SavAuthError,
   SavConfigError,
   SavConnectionError,
+  SavError,
   SavResponseError,
 )
 from .cache import Cache
@@ -161,6 +163,9 @@ class SavClient:
     self.session: Session | None = None
 
     self._cache = Cache()
+    # Tracks which club rosters we've already scanned to build the
+    # license↔NIF map in sav_shared.enrollment.find_player_license_by_nif.
+    self._nif_clubs_built: set[int] = set()
 
     # Reuse a single requests.Session for connection pooling and automatic
     # cookie handling (the server may set cookies in addition to returning
@@ -440,6 +445,7 @@ class SavClient:
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     seen: dict[int, Player] = {}
+    failures = 0
     with ThreadPoolExecutor(max_workers=min(max_workers, len(tiers))) as pool:
       futures = {pool.submit(self.search_players, tier=t, **kwargs): t for t in tiers}
       for future in as_completed(futures):
@@ -447,12 +453,19 @@ class SavClient:
           for p in future.result():
             if p.id not in seen:
               seen[p.id] = p
-        except Exception:
+        except (SavError, ValueError):
+          failures += 1
           logger.debug("Skipping tier=%r", futures[future], exc_info=True)
         if limit is not None and len(seen) >= limit:
           for f in futures:
             f.cancel()
           break
+    if failures and failures == len(futures):
+      raise SavConnectionError(
+        f"All {failures} parallel tier searches failed; see DEBUG logs for details"
+      )
+    if failures:
+      logger.warning("%d of %d parallel tier searches failed", failures, len(futures))
     ordered = sorted(seen.values(), key=lambda p: p.id)
     return ordered[:limit] if limit is not None else ordered
 
@@ -467,6 +480,7 @@ class SavClient:
       return self._search_players_single(club=club_id, page=1, **filters)
 
     seen: dict[int, Player] = {}
+    failures = 0
     with ThreadPoolExecutor(max_workers=min(max_workers, len(club_ids))) as pool:
       futures = {pool.submit(_fetch, cid): cid for cid in club_ids}
       for future in as_completed(futures):
@@ -474,12 +488,19 @@ class SavClient:
           for p in future.result():
             if p.id not in seen:
               seen[p.id] = p
-        except Exception:
+        except (SavError, ValueError):
+          failures += 1
           logger.debug("Skipping club id=%s", futures[future], exc_info=True)
         if limit is not None and len(seen) >= limit:
           for f in futures:
             f.cancel()
           break
+    if failures and failures == len(futures):
+      raise SavConnectionError(
+        f"All {failures} parallel club searches failed; see DEBUG logs for details"
+      )
+    if failures:
+      logger.warning("%d of %d parallel club searches failed", failures, len(futures))
     ordered = sorted(seen.values(), key=lambda p: p.id)
     return ordered[:limit] if limit is not None else ordered
 
@@ -511,10 +532,10 @@ class SavClient:
           try:
             for c in self.list_clubs(association=assoc.id):
               clubs_by_id[c.id] = c
-          except Exception:
-            logger.debug("Skipping association id=%s", assoc.id, exc_info=True)
-      except Exception:
-        logger.debug("Could not fetch associations; falling back to own", exc_info=True)
+          except (SavError, ValueError):
+            logger.warning("Could not list clubs for association id=%s", assoc.id, exc_info=True)
+      except SavError:
+        logger.warning("Could not fetch associations; falling back to own club", exc_info=True)
 
       if not clubs_by_id:
         org = int(self.session.get("organizacao") or 0)
@@ -525,6 +546,7 @@ class SavClient:
       return self._search_players_single(club=club_id, page=1, **filters)
 
     seen: dict[int, Player] = {}
+    failures = 0
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
       futures = {pool.submit(_fetch, c.id): c.id for c in clubs_by_id.values()}
       for future in as_completed(futures):
@@ -533,12 +555,19 @@ class SavClient:
           for p in future.result():
             if p.id not in seen:
               seen[p.id] = p
-        except Exception:
+        except (SavError, ValueError):
+          failures += 1
           logger.debug("Skipping club id=%s during all-clubs search", club_id, exc_info=True)
         if limit is not None and len(seen) >= limit:
           for f in futures:
             f.cancel()
           break
+    if failures and failures == len(futures):
+      raise SavConnectionError(
+        f"All {failures} parallel club searches failed during all-clubs sweep; see DEBUG logs"
+      )
+    if failures:
+      logger.warning("%d of %d clubs failed during all-clubs search", failures, len(futures))
     ordered = sorted(seen.values(), key=lambda p: p.id)
     return ordered[:limit] if limit is not None else ordered
 
@@ -622,8 +651,7 @@ class SavClient:
     logger.info("Fetching photo for athlete id=%s", player_id)
     text = self._post_form(_ATHLETE_DETAIL_PATH, payload, params={"op": _ATHLETE_DETAIL_OP})
     try:
-      import json as _json
-      raw = _json.loads(text)
+      raw = json.loads(text)
     except ValueError as exc:
       raise SavResponseError(
         f"Player detail response was not valid JSON: {text[:200]!r}"
@@ -703,8 +731,7 @@ class SavClient:
     logger.info("Searching games with filters: %s", payload)
     text = self._post_form(_GAMES_PATH, payload, params={"op": _GAMES_OP})
     try:
-      import json as _json
-      raw = _json.loads(text)
+      raw = json.loads(text)
     except ValueError as exc:
       raise SavResponseError(
         f"Games response was not valid JSON: {text[:200]!r}"
@@ -737,12 +764,11 @@ class SavClient:
         timeout=self._timeout,
       )
       resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch game sheet info: {exc}") from exc
 
     try:
-      import json as _json
-      raw = _json.loads(resp.text)
+      raw = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Game sheet response was not valid JSON: {resp.text[:200]!r}"
@@ -759,7 +785,7 @@ class SavClient:
     try:
       pdf_resp = self._http.get(pdf_url, timeout=self._timeout)
       pdf_resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not download game sheet PDF: {exc}") from exc
 
     return pdf_resp.content
@@ -791,12 +817,11 @@ class SavClient:
         timeout=self._timeout,
       )
       resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch eligible players page: {exc}") from exc
 
     try:
-      import json as _json
-      raw = _json.loads(resp.text)
+      raw = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Eligible players response was not valid JSON: {resp.text[:200]!r}"
@@ -880,12 +905,11 @@ class SavClient:
         timeout=self._timeout,
       )
       resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch eligible players page: {exc}") from exc
 
     try:
-      import json as _json
-      raw = _json.loads(resp.text)
+      raw = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Eligible players response was not valid JSON: {resp.text[:200]!r}"
@@ -928,12 +952,12 @@ class SavClient:
       "jogo": game_id,
       "equipa": equipa_id,
       "numJogadores": len(licences),
-      "arrayJogadores": _json.dumps(licences),
-      "arrayNumCamisola": _json.dumps(num_camisola),
-      "arrayTreinadoresPRI": _json.dumps(pri),
-      "arrayTreinadoresADJ": _json.dumps(adj),
-      "arrayTreinadoresOutros": _json.dumps(outros),
-      "arrayEnq": _json.dumps(enq),
+      "arrayJogadores": json.dumps(licences),
+      "arrayNumCamisola": json.dumps(num_camisola),
+      "arrayTreinadoresPRI": json.dumps(pri),
+      "arrayTreinadoresADJ": json.dumps(adj),
+      "arrayTreinadoresOutros": json.dumps(outros),
+      "arrayEnq": json.dumps(enq),
     }
 
     logger.info(
@@ -948,7 +972,7 @@ class SavClient:
         headers={"Content-Type": "application/x-www-form-urlencoded"},
       )
       pdf_resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not generate PDF: {exc}") from exc
 
     if not pdf_resp.content.startswith(b"%PDF"):
@@ -992,8 +1016,6 @@ class SavClient:
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
 
-    import json as _json
-
     info = {
       "epoca": str(season),
       "perfil": self.session.get("perfil", 0),
@@ -1001,7 +1023,7 @@ class SavClient:
       "organizacao": self.session.get("organizacao", 0),
       "agente": _REGISTRATIONS_AGENTE_PLAYER,
     }
-    payload = {"info": _json.dumps(info)}
+    payload = {"info": json.dumps(info)}
 
     raw = self._post_form(
       _REGISTRATIONS_PATH,
@@ -1010,7 +1032,7 @@ class SavClient:
     )
 
     try:
-      data = _json.loads(raw)
+      data = json.loads(raw)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse registration batches response: {raw[:200]!r}"
@@ -1078,7 +1100,8 @@ class SavClient:
     for assoc in self.list_associations():
       try:
         clubs = self.list_clubs(association=assoc.id)
-      except Exception:
+      except (SavError, ValueError):
+        logger.debug("Could not list clubs for association id=%s", assoc.id, exc_info=True)
         continue
       if any(c.id == club_id for c in clubs):
         cache[club_id] = assoc.id
@@ -1173,13 +1196,11 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not create batch: {exc}") from exc
-
-    import json as _json
     text = resp.text
     logger.info("Create batch response: %s", text[:500])
 
     try:
-      data = _json.loads(text)
+      data = json.loads(text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse create-batch response: {text[:200]!r}"
@@ -1549,7 +1570,7 @@ class SavClient:
     insurance/taxa cascade and op=36 commit — those are creation-time and
     the existing inscricao already carries them.
     """
-    record = self._load_existing_registration_record(batch.id, license)
+    record = self.load_existing_registration_record(batch.id, license)
     internal_id = int(record["id"])
 
     step1_send = self._build_step1_send(
@@ -1729,8 +1750,6 @@ class SavClient:
       f"&inscricao={inscricao}&n={n}&licenca={license}"
       f"&tipo_doc={tipo_doc}&agente={_REGISTRATIONS_AGENTE_PLAYER}"
     )
-
-    import json as _json
     with path.open("rb") as fh:
       files = {"file0": (path.name, fh, content_type)}
       try:
@@ -1741,7 +1760,7 @@ class SavClient:
       except requests.exceptions.RequestException as exc:
         raise SavConnectionError(f"Could not upload document: {exc}") from exc
     try:
-      data = _json.loads(resp.text)
+      data = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse upload response: {resp.text[:200]!r}"
@@ -1874,7 +1893,6 @@ class SavClient:
         from each row's ``deleteDoc(doc_id, licenca, guia, tipo_doc, ...)``
         onclick handler in the embedded HTML.
     """
-    import json as _json
     import re
     try:
       resp = self._http.get(
@@ -1889,7 +1907,7 @@ class SavClient:
         timeout=self._timeout,
       )
       resp.raise_for_status()
-      data = _json.loads(resp.text)
+      data = json.loads(resp.text)
     except (requests.exceptions.RequestException, ValueError) as exc:
       raise SavConnectionError(
         f"Could not list registration documents for license {license}: {exc}"
@@ -1998,8 +2016,6 @@ class SavClient:
     )
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
-
-    import json as _json
     import re
 
     try:
@@ -2023,7 +2039,7 @@ class SavClient:
 
     body = resp.text
     try:
-      body = _json.loads(body).get("msg", body)
+      body = json.loads(body).get("msg", body)
     except ValueError:
       pass
 
@@ -2045,7 +2061,7 @@ class SavClient:
       items.append({"license": license, "name": name})
     return items
 
-  def _load_existing_registration_record(
+  def load_existing_registration_record(
     self, batch_id: int, license: int,
   ) -> dict[str, Any]:
     """Op=30 — load an already-enrolled item's record for the edit wizard.
@@ -2055,7 +2071,6 @@ class SavClient:
     op=33/op=31 then key by (internal_id, guia) and patch the existing
     inscricao without firing op=36 again.
     """
-    import json as _json
     try:
       resp = self._http.get(
         self._url(_REGISTRATIONS_PATH),
@@ -2072,7 +2087,7 @@ class SavClient:
         f"Could not load existing registration record: {exc}"
       ) from exc
     try:
-      data = _json.loads(resp.text)
+      data = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse existing record: {resp.text[:200]!r}"
@@ -2167,8 +2182,7 @@ class SavClient:
     }
     text = self._post_form(_ATHLETE_DETAIL_PATH, payload, params={"op": _ATHLETE_DETAIL_OP})
     try:
-      import json as _json
-      raw = _json.loads(text)
+      raw = json.loads(text)
     except ValueError as exc:
       raise SavResponseError(
         f"Athlete profile response was not valid JSON: {text[:200]!r}"
@@ -2215,7 +2229,6 @@ class SavClient:
 
   def _load_player_record(self, batch_id: int, license: int) -> dict[str, Any]:
     """Op=35 — fetch a player's stored demographics for prefill."""
-    import json as _json
     try:
       resp = self._http.get(
         self._url(_REGISTRATIONS_PATH),
@@ -2230,7 +2243,7 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not load player record: {exc}") from exc
     try:
-      data = _json.loads(resp.text)
+      data = json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse player record: {resp.text[:200]!r}"
@@ -2282,7 +2295,6 @@ class SavClient:
     self, batch_id: int, internal_id: int, send: str,
   ) -> dict[str, Any]:
     """Op=33 — save personal data; response carries step 2's address prefill."""
-    import json as _json
     import urllib.parse
 
     # The `send` value embeds raw `=` and `,` chars; preserve them through
@@ -2300,7 +2312,7 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 1: {exc}") from exc
     try:
-      return _json.loads(resp.text)
+      return json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse step 1 response: {resp.text[:200]!r}"
@@ -2339,7 +2351,6 @@ class SavClient:
     send: str,
   ) -> dict[str, Any]:
     """Op=31 — multipart POST that saves address + returns step 3 prefill."""
-    import json as _json
     files = {
       "tipo":    (None, str(batch_type)),
       "guiaid":  (None, str(batch_id)),
@@ -2362,7 +2373,7 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 2: {exc}") from exc
     try:
-      return _json.loads(resp.text)
+      return json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse step 2 response: {resp.text[:200]!r}"
@@ -2382,7 +2393,6 @@ class SavClient:
     actually carries the *seguro* id, while in op=175 it carries the
     insurer (seguradora) id. They are distinct entities despite the name.
     """
-    import json as _json
 
     season_param = f"'{batch.season}'"  # The literal `'2025/2026'` form
 
@@ -2401,7 +2411,7 @@ class SavClient:
         timeout=self._timeout,
       )
       r.raise_for_status()
-      seguro_id = int(_json.loads(r.text)["companhia"])
+      seguro_id = int(json.loads(r.text)["companhia"])
     except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
       raise SavConnectionError(f"Insurance cascade op=87 failed: {exc}") from exc
 
@@ -2420,7 +2430,7 @@ class SavClient:
         timeout=self._timeout,
       )
       r.raise_for_status()
-      companhia_id = int(_json.loads(r.text)["companhia"])
+      companhia_id = int(json.loads(r.text)["companhia"])
     except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
       raise SavConnectionError(f"Insurance cascade op=175 failed: {exc}") from exc
 
@@ -2482,10 +2492,8 @@ class SavClient:
       r.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not load taxa options: {exc}") from exc
-
-    import json as _json
     try:
-      msg = _json.loads(r.text).get("msg", "")
+      msg = json.loads(r.text).get("msg", "")
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse taxa response: {r.text[:200]!r}"
@@ -2527,12 +2535,11 @@ class SavClient:
 
   def _registration_commit(self, body: dict[str, Any]) -> dict[str, Any]:
     """Op=36 — final commit. Body is JSON sent with text/plain Content-Type."""
-    import json as _json
     try:
       resp = self._http.post(
         self._url(_REGISTRATIONS_PATH),
         params={"op": _REGISTRATIONS_COMMIT_OP},
-        data=_json.dumps(body, ensure_ascii=False),
+        data=json.dumps(body, ensure_ascii=False),
         headers={"Content-Type": "text/plain;charset=UTF-8"},
         timeout=self._timeout,
       )
@@ -2540,7 +2547,7 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not commit registration: {exc}") from exc
     try:
-      return _json.loads(resp.text)
+      return json.loads(resp.text)
     except ValueError as exc:
       raise SavResponseError(
         f"Could not parse commit response: {resp.text[:200]!r}"
@@ -2640,7 +2647,7 @@ class SavClient:
     try:
       resp = self._http.get(self._url("jogadores.php"), timeout=self._timeout)
       resp.raise_for_status()
-    except Exception as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch associations: {exc}") from exc
 
     options = re.findall(r"value='ass,(\d+)'[^>]*>([^<]+)<", resp.text)
@@ -2975,13 +2982,12 @@ class SavClient:
     callers can gracefully fall back to storing only the display name.
     """
     try:
-      import json as _json
       from bs4 import BeautifulSoup
 
       text = self._post_form(
         _CLUB_DETAIL_PATH, {"id": club_id}, params={"op": _CLUB_DETAIL_OP}
       )
-      raw = _json.loads(text)
+      raw = json.loads(text)
       soup = BeautifulSoup(raw.get("msg", ""), "html.parser")
       fields: dict[str, str] = {}
       for label in soup.find_all("label"):
@@ -2997,7 +3003,7 @@ class SavClient:
         if key:
           fields[key] = val
       return fields.get("Nome do Clube", "").strip(), fields.get("Código", "").strip()
-    except Exception:
+    except (SavError, ValueError, AttributeError):
       logger.debug("Could not fetch club detail for id=%s", club_id, exc_info=True)
       return "", ""
 

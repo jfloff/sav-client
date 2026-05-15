@@ -2,11 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any
 
+from sav_client.exceptions import SavError
+
 from .fields import ENROLLMENT_FIELD_META
 from .text import normalise_text
+
+logger = logging.getLogger(__name__)
 
 
 _DEFAULT_GUARDIAN_FIELDS = [
@@ -48,7 +53,8 @@ def _build_club_nif_map(client: Any, club_id: int) -> dict[str, int]:
 
   try:
     roster = client.search_players(club=club_id, season=0)
-  except Exception:
+  except (SavError, ValueError):
+    logger.debug("Could not list roster for club_id=%s", club_id, exc_info=True)
     return {}
 
   seen: set[int] = set()
@@ -67,7 +73,8 @@ def _build_club_nif_map(client: Any, club_id: int) -> dict[str, int]:
   def _fetch(lic: int) -> tuple[str, int]:
     try:
       profile = client.load_player_profile(lic, club_id=club_id)
-    except Exception:
+    except (SavError, ValueError):
+      logger.debug("Could not load profile for license=%s", lic, exc_info=True)
       return "", 0
     return (profile.get("nif") or "").strip(), lic
 
@@ -112,14 +119,17 @@ def find_player_license_by_nif(
   if not club_id:
     return None
 
-  built: set[int] | None = getattr(client, "_nif_clubs_built", None)
+  built = getattr(client, "_nif_clubs_built", None)
   if built is None:
     built = set()
+    # Real SavClient initialises this attribute in __init__, so this path is
+    # only taken by test stubs / unusual client shapes. Frozen dataclasses
+    # and slot-only classes reject assignment — fall back to a throwaway set
+    # so callers don't crash; the per-process roster cache just won't persist.
     try:
-      object.__setattr__(client, "_nif_clubs_built", built)
+      client._nif_clubs_built = built
     except (AttributeError, TypeError):
-      built = set()
-
+      pass
   if club_id in built:
     return None
 
@@ -232,7 +242,8 @@ def resolve_player_candidates(
     try:
       found = client.search_players(name=name_val, club=club_id)
       candidates = [p for p in found if int(p.license) in eligible_set]
-    except Exception:
+    except (SavError, ValueError):
+      logger.debug("Name-search fallback failed for club_id=%s", club_id, exc_info=True)
       candidates = []
 
   if len(candidates) == 1:
@@ -253,3 +264,21 @@ def create_and_fetch_batch(
   if batch is None:
     raise RuntimeError(f"Newly created batch {new_id} not found in listing")
   return new_id, batch
+
+
+def try_replace_document(
+  client: Any, batch_id: int, license: int, source: str, *, tipo_doc: int,
+) -> tuple[bool, str | None]:
+  """Replace a player document, swallowing transport/validation errors.
+
+  Returns ``(ok, error_message)`` — both CLI and MCP need this shape because
+  enrollment is already committed by the time a document upload runs, and the
+  caller wants to surface the failure without rolling back the registration.
+  """
+  try:
+    client.replace_player_registration_document(
+      batch_id, license, source, tipo_doc=tipo_doc,
+    )
+    return True, None
+  except (SavError, FileNotFoundError, ValueError) as exc:
+    return False, str(exc)
