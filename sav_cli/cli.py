@@ -1543,13 +1543,13 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       raise SavCliError(f"Classify error for {path}: {exc}", code="parse_error")
     if dt == DocType.FPB_MOD1:
       console.print(
-        f"[green]:white_check_mark: Classified as {filename} as {_doc_type_text(dt)}[/]",
+        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
         soft_wrap=True,
       )
       positional_mod1.append(path)
     elif dt == DocType.EM:
       console.print(
-        f"[green]:white_check_mark: Classified as {filename} as {_doc_type_text(dt)}[/]",
+        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
         soft_wrap=True,
       )
       positional_em.append(path)
@@ -1682,6 +1682,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       try:
         with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
           medical_parse_result = parse_em(medical_exam_path)
+        print(medical_parse_result)
         medical_processing_id = medical_parse_result["processing_id"]
         medical_close_pending = True
         medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
@@ -2125,7 +2126,7 @@ def enrollment_update_cmd(
         doc_type = _classify_pdf_doc_type(active_pdf)
         active_filename = os.path.basename(active_pdf)
         console.print(
-          f"[green]:white_check_mark: Classified as {active_filename} as {_doc_type_text(doc_type)}[/]",
+          f"[green]:white_check_mark: Classified {active_filename} as {_doc_type_text(doc_type)}[/]",
           soft_wrap=True,
         )
       active_doc_type = doc_type
@@ -2164,7 +2165,7 @@ def enrollment_update_cmd(
         doc_type = _classify_pdf_doc_type(pdf)
         active_filename = os.path.basename(active_pdf)
         console.print(
-          f"[green]:white_check_mark: Classified as {active_filename} as {_doc_type_text(doc_type)}[/]",
+          f"[green]:white_check_mark: Classified {active_filename} as {_doc_type_text(doc_type)}[/]",
           soft_wrap=True,
         )
       if doc_type != DocType.FPB_MOD1:

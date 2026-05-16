@@ -310,7 +310,7 @@ Raises `SavConfigError` for missing minor-guardian fields or non-Revalidação b
 
 ### `upload_player_registration_document(batch_id, license, file_path, *, tipo_doc=1) → None`
 
-Upload a `.pdf` or `.jpg` document attached to a player's registration. Mirrors the SAV2 upload modal: op=91 fetches the modal HTML — we parse the next slot **and** the per-batch `inscricao` id from the embedded `checkDoc(n, inscricao, licenca, guia, ...)` onclick — then op=92 POSTs the file as a multipart `file0` field.
+Upload a `.pdf` or `.jpg` document attached to a player's registration. Mirrors the SAV2 upload modal: op=91 fetches the modal HTML — we parse the per-batch `inscricao` id from the embedded `checkDoc(n, inscricao, licenca, guia, ...)` onclick — then op=92 POSTs the file with hardcoded `n=1` and multipart key `file0` (op=92 takes exactly one file per request; the PHP handler reads `$_FILES["file" . ($n - 1)]`, so any other values cause `Undefined array key` errors).
 
 ```python
 client.upload_player_registration_document(batch_id, 301772, "form.pdf")              # tipo_doc defaults to 1 (Modelo 1)

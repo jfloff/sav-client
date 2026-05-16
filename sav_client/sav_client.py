@@ -1712,12 +1712,15 @@ class SavClient:
     Upload a document (PDF or JPG) attached to a player's registration.
 
     Mirrors the SAV2 upload modal flow: op=91 fetches the modal HTML — we
-    parse the next ``n`` slot AND the per-batch ``inscricao`` id from the
-    embedded ``checkDoc(n, inscricao, licenca, guia, ...)`` onclick — then
-    op=92 POSTs the file as a multipart ``file0`` field. ``inscricao`` is
-    the registration record id created by op=36, NOT the user_id from
-    op=35; the only reliable way to obtain it is via op=91 once the player
-    has been added to the batch.
+    parse the per-batch ``inscricao`` id from the embedded
+    ``checkDoc(n, inscricao, licenca, guia, ...)`` onclick — then op=92
+    POSTs the file with hardcoded ``n=1`` and multipart key ``file0``. The
+    SAV2 web UI always uses those constants (op=92 takes exactly one file
+    per request); the PHP handler reads ``$_FILES["file" . ($n - 1)]``, so
+    any other combination causes ``Undefined array key`` errors.
+    ``inscricao`` is the registration record id created by op=36, NOT the
+    user_id from op=35; the only reliable way to obtain it is via op=91
+    once the player has been added to the batch.
 
     Args:
         batch_id:    Target batch (guia).
@@ -1762,16 +1765,24 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
 
-    n, inscricao, _ = self._fetch_registration_documents(batch, license)
+    # `inscricao` (the per-batch registration record id) is the only value
+    # we still need from op=91. We deliberately ignore the modal's `num`
+    # field: the SAV2 web UI hardcodes `n=1` and multipart key `file0` for
+    # every upload (op=92 accepts exactly one file per request — captured
+    # from a live browser session). Passing `num` here causes the PHP
+    # handler to look up `$_FILES["file" . ($n - 1)]` against the wrong
+    # slot, which manifests as `Undefined array key "fileN"` on the second
+    # and subsequent uploads to the same player.
+    _, inscricao, _ = self._fetch_registration_documents(batch, license)
 
     url = (
       f"{self._url(_REGISTRATIONS_PATH)}?"
       f"op={_REGISTRATIONS_DOC_UPLOAD_OP}"
-      f"&inscricao={inscricao}&n={n}&licenca={license}"
+      f"&inscricao={inscricao}&n=1&licenca={license}"
       f"&tipo_doc={tipo_doc}&agente={_REGISTRATIONS_AGENTE_PLAYER}"
     )
     with path.open("rb") as fh:
-      files = {f"file{n}": (path.name, fh, content_type)}
+      files = {"file0": (path.name, fh, content_type)}
       try:
         resp = self._http.post(
           url, files=files, timeout=self._timeout, headers={"Accept": "*/*"},
@@ -1790,8 +1801,8 @@ class SavClient:
         f"Document upload failed: {data!r}"
       )
     logger.info(
-      "Uploaded %s (tipo_doc=%s, n=%s) for license=%s in batch %s",
-      path.name, tipo_doc, n, license, batch.id,
+      "Uploaded %s (tipo_doc=%s) for license=%s in batch %s",
+      path.name, tipo_doc, license, batch.id,
     )
 
   def delete_player_registration_document(self, doc_id: int) -> None:
