@@ -32,7 +32,7 @@ def club_to_dict(c: Any) -> dict:
 
 def batch_to_dict(b: Any) -> dict:
   return {
-    "batch_id": b.id, "number": b.number,
+    "number": b.number,
     "type": b.type, "tier": b.tier, "gender": b.gender,
     "state": b.state, "state_date": b.state_date,
     "item_count": b.item_count, "season": b.season,

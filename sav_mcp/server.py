@@ -9,7 +9,7 @@ loop.
 
 Enrollment workflow:
     1. parse_enrollment_forms  → mod1_id(s) / medical_exam_id(s) + parsed metadata
-    2. find_open_batch / create_batch  → batch_id
+    2. find_open_batch / create_batch  → batch_number
     3. resolve_player  → license (or candidate list if ambiguous)
     4. preview_enrollment  → full reconciled profile (+ optional medical exam sidecar)
     5. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
@@ -570,7 +570,6 @@ def find_open_batch(reg_type: int, tier_id: int, gender_id: int) -> dict | None:
     if batch is None:
         return None
     return {
-        "batch_id": batch.id,
         "number": batch.number,
         "type": batch.type,
         "tier": batch.tier,
@@ -583,14 +582,13 @@ def find_open_batch(reg_type: int, tier_id: int, gender_id: int) -> dict | None:
 def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
     """
     Create a new registration batch for the given type, tier, and gender.
-    Returns the new batch details including its batch_id.
+    Returns the new batch details including its human-visible batch number.
     """
     client = _get_client()
     _, batch = create_and_fetch_batch(
         client, batch_type=reg_type, tier_id=tier_id, gender_id=gender_id,
     )
     return {
-        "batch_id": batch.id,
         "number": batch.number,
         "type": batch.type,
         "tier": batch.tier,
@@ -600,9 +598,11 @@ def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
 
 
 @server.tool()
-def resolve_player(batch_id: int, mod1_id: str) -> dict:
+def resolve_player(batch_number: str, mod1_id: str) -> dict:
     """
     Resolve the player for a parsed form against the batch's eligible list.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     Tries the OCR licence number first, then falls back to a name search
     scoped to the batch's club.
@@ -620,9 +620,9 @@ def resolve_player(batch_id: int, mod1_id: str) -> dict:
 
     client = _get_client()
     batches = client.list_player_registration_batches()
-    batch = next((b for b in batches if b.id == batch_id), None)
+    batch = next((b for b in batches if b.number == batch_number), None)
     if batch is None:
-        raise ValueError(f"Batch {batch_id} not found")
+        raise ValueError(f"Batch {batch_number!r} not found")
 
     eligible = client._list_revalidable_licenses(batch)
     license, candidates, ocr_name, ocr_license = resolve_player_candidates(
@@ -646,13 +646,15 @@ def resolve_player(batch_id: int, mod1_id: str) -> dict:
 
 @server.tool()
 def preview_enrollment(
-    batch_id: int,
+    batch_number: str,
     license: int,
     mod1_id: str,
     medical_exam_id: str | None = None,
 ) -> dict:
     """
     Preview the enrollment for a player.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     Fetches the player's current SAV profile, runs OCR reconciliation, and
     returns the full field-by-field picture:
@@ -666,7 +668,11 @@ def preview_enrollment(
     use it without repeating the network call. When medical_exam_id is
     supplied, the response also includes a `medical_exam` sidecar with the
     parsed step-3 exam metadata.
+
+    batch_number is accepted for workflow symmetry; only the form/license are
+    needed at this stage. It is validated when submit_enrollment is called.
     """
+    del batch_number
     form = _forms.get(mod1_id)
     if form is None:
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
@@ -703,7 +709,7 @@ def preview_enrollment(
 
 @server.tool()
 def submit_enrollment(
-    batch_id: int,
+    batch_number: str,
     license: int,
     mod1_id: str,
     field_overrides: dict[str, Any] | None = None,
@@ -711,6 +717,8 @@ def submit_enrollment(
 ) -> dict:
     """
     Submit the player enrollment using the reconciled data from preview_enrollment.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     field_overrides should supply values for every field listed in
     needs_review plus any guardian fields required for minors
@@ -739,7 +747,6 @@ def submit_enrollment(
     if result is None:
         raise ValueError("Call preview_enrollment before submit_enrollment")
 
-    client = _get_client()
     medical_exam: dict[str, Any] | None = None
     medical_exam_info = None
     if medical_exam_id is not None:
@@ -770,6 +777,8 @@ def submit_enrollment(
             "field_overrides={'exam_date': 'YYYY-MM-DD'}."
         )
 
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
     try:
         player_id = client.add_player_to_registration_batch(batch_id, license, **kwargs)
     except SavConfigError as exc:
@@ -841,14 +850,16 @@ def submit_enrollment(
 
 @server.tool()
 def update_enrollment(
-    batch_id: int,
+    batch_number: str,
     license: int,
     fields: dict[str, Any],
 ) -> dict:
     """
     Patch personal-data and/or address fields on an already-enrolled player.
 
-    The player must be in batch_id (open Revalidação). Only the keys present
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+
+    The player must be in this batch (open Revalidação). Only the keys present
     in `fields` are changed; everything else is preserved from the existing
     inscricao. No document is touched — pair with `replace_player_document`
     if you also want to swap the PDF.
@@ -890,7 +901,9 @@ def update_enrollment(
         else:
             coerced[k] = v
 
-    player_id = _get_client().update_player_in_registration_batch(
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    player_id = client.update_player_in_registration_batch(
         batch_id, license, **coerced,
     )
     return {"success": True, "player_id": player_id}
@@ -898,7 +911,7 @@ def update_enrollment(
 
 @server.tool()
 def create_enrollment_manual(
-    batch_id: int,
+    batch_number: str,
     license: int,
     fields: dict[str, Any] | None = None,
 ) -> dict:
@@ -906,7 +919,9 @@ def create_enrollment_manual(
     Enroll a player in a batch using their existing SAV profile, with optional
     field overrides — no PDF required.
 
-    Equivalent of `sav enrollment create --batch BATCH --license LICENSE [--field ...]`.
+    Equivalent of `sav enrollment create --batch BATCH_NUMBER --license LICENSE [--field ...]`.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     fields: optional subset of the same keys accepted by update_enrollment (id_type,
     id_number, id_expiry, telemovel, telefone, email, nome_pai, nome_mae, morada,
@@ -916,7 +931,9 @@ def create_enrollment_manual(
 
     Returns: {"success": True, "player_id": int} on success.
     """
-    player_id = _get_client().add_player_to_registration_batch(
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    player_id = client.add_player_to_registration_batch(
         batch_id, license, **(fields or {}),
     )
     return {"success": True, "player_id": player_id}
@@ -924,7 +941,7 @@ def create_enrollment_manual(
 
 @server.tool()
 def update_enrollment_with_document(
-    batch_id: int,
+    batch_number: str,
     license: int,
     pdf: str,
     doc_type: str | None = None,
@@ -934,7 +951,9 @@ def update_enrollment_with_document(
     """
     Reconcile a new PDF against an existing enrolment and patch fields / replace document.
 
-    Equivalent of `sav enrollment update BATCH LICENSE FILE [--mod1] [--field ...] [--file-only]`.
+    Equivalent of `sav enrollment update BATCH_NUMBER LICENSE FILE [--mod1] [--field ...] [--file-only]`.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     pdf: base64-encoded PDF.
     doc_type: optional type hint — "fpb_modelo_1" or "exame_medico". When given,
@@ -972,6 +991,7 @@ def update_enrollment_with_document(
 
         tipo_doc = doc_type_to_tipo_doc(active_doc_type)
         client = _get_client()
+        batch_id = client.resolve_batch_id(batch_number)
 
         if file_only:
             client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
@@ -1030,40 +1050,51 @@ def update_enrollment_with_document(
 
 
 @server.tool()
-def read_enrollment(batch_id: int, license: int | None = None) -> dict | list:
+def read_enrollment(batch_number: str, license: int | None = None) -> dict | list:
     """
     List players in a batch or show one player's enrolment detail.
 
-    list form:   read_enrollment(batch_id)           -> list of {"license", "name"}
-    detail form: read_enrollment(batch_id, license)  -> enrollment record dict
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+
+    list form:   read_enrollment(batch_number)           -> list of {"license", "name"}
+    detail form: read_enrollment(batch_number, license)  -> enrollment record dict
     """
     client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
     if license is None:
         return client.list_player_registration_batch_items(batch_id)
     return client.load_existing_registration_record(batch_id, license)
 
 
 @server.tool()
-def delete_enrollment(batch_id: int, license: int) -> dict:
+def delete_enrollment(batch_number: str, license: int) -> dict:
     """
     Remove a player from a registration batch.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
     """
-    _get_client().remove_player_from_registration_batch(batch_id, license)
-    return {"removed": True, "batch_id": batch_id, "license": license}
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    client.remove_player_from_registration_batch(batch_id, license)
+    return {"removed": True, "batch_number": batch_number, "license": license}
 
 
 # ── Registration documents ────────────────────────────────────────────────────
 
 @server.tool()
-def list_player_documents(batch_id: int, license: int) -> list[dict]:
+def list_player_documents(batch_number: str, license: int) -> list[dict]:
     """
     List documents currently uploaded for a player in a batch.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     Each entry: {"doc_id": int, "doc_type": str | null}. doc_id is the
     galeria id expected by delete_player_document. SAV2-only document types
     with no sav-parsers equivalent are returned with doc_type=null.
     """
-    docs = _get_client().list_player_registration_documents(batch_id, license)
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    docs = client.list_player_registration_documents(batch_id, license)
     return [
         {
             "doc_id": doc["doc_id"],
@@ -1094,13 +1125,15 @@ def _resolve_document_upload_type(tmp_path: str, doc_type: str | None) -> str:
 
 @server.tool()
 def upload_player_document(
-    batch_id: int,
+    batch_number: str,
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
 ) -> dict:
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
     doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4, outros.
     When omitted, sav-parsers classifies the PDF first.
@@ -1112,7 +1145,9 @@ def upload_player_document(
     try:
         resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
         tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
-        _get_client().upload_player_registration_document(
+        client = _get_client()
+        batch_id = client.resolve_batch_id(batch_number)
+        client.upload_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
         return {"success": True}
@@ -1132,7 +1167,7 @@ def delete_player_document(doc_id: int) -> dict:
 
 @server.tool()
 def replace_player_document(
-    batch_id: int,
+    batch_number: str,
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
@@ -1141,12 +1176,16 @@ def replace_player_document(
     Replace any existing documents of `doc_type` for this player+batch with a
     new PDF (base64-encoded). Idempotent on the upload side: when no existing
     doc of the translated SAV2 tipo_doc is found, behaves like a plain upload.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
         tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
-        _get_client().replace_player_registration_document(
+        client = _get_client()
+        batch_id = client.resolve_batch_id(batch_number)
+        client.replace_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
         return {"success": True}

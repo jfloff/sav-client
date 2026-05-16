@@ -13,7 +13,7 @@ def _write_pdf(tmp_path):
 
 @pytest.fixture
 def batch_stub():
-  return type("BatchStub", (), {"id": 12, "club_id": 99})()
+  return type("BatchStub", (), {"id": 12, "number": "2025/12", "club_id": 99})()
 
 
 @pytest.fixture
@@ -74,6 +74,9 @@ def test_enrollment_update_maps_parser_tipo_names_for_file_replace(monkeypatch, 
   captured: list[int] = []
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
       captured.append(tipo_doc)
 
@@ -98,6 +101,9 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
   captured: list[int] = []
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
       captured.append(tipo_doc)
 
@@ -112,8 +118,8 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
 
   assert result.exit_code == 0
   assert captured == [2]
-  assert f"Classified {pdf_path}" in result.output
-  assert "as exame_medico" in result.output
+  assert "Classified as exame_medico" in result.output
+  assert str(pdf_path) in result.output
   assert "Replaced exame_medico" in result.output
 
 
@@ -553,6 +559,7 @@ def test_enrollment_create_manual_mode(monkeypatch, tmp_path):
   captured: dict = {"add_kwargs": None}
 
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "resolve_batch_id": lambda self, number: int(number),
     "load_player_profile": lambda self, lic: {"nome": "Test Player"},
     "add_player_to_registration_batch": lambda self, batch_id, lic, **kw: captured.__setitem__("add_kwargs", kw),
   })())
@@ -623,6 +630,7 @@ def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
   )
   monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "resolve_batch_id": lambda self, number: int(number),
     "load_player_profile": lambda self, lic: {},
     "update_player_in_registration_batch": lambda self, *a, **kw: None,
     "replace_player_registration_document": lambda self, *a, **kw: None,
@@ -650,6 +658,7 @@ def test_enrollment_update_medical_exam_uploads_exam(monkeypatch, tmp_path):
   uploaded: list = []
   monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
+    "resolve_batch_id": lambda self, number: int(number),
     "replace_player_registration_document": lambda self, batch_id, lic, path, tipo_doc: uploaded.append(path),
   })())
 
@@ -666,6 +675,9 @@ def test_enrollment_read_lists_batch_items(monkeypatch):
   """`enrollment read BATCH` lists all players in the batch."""
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def list_player_registration_batch_items(self, batch_id):
       assert batch_id == 42
       return [
@@ -688,6 +700,9 @@ def test_enrollment_read_empty_batch(monkeypatch):
   """`enrollment read BATCH` prints a friendly message when the batch is empty."""
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def list_player_registration_batch_items(self, batch_id):
       return []
 
@@ -705,6 +720,9 @@ def test_enrollment_read_detail(monkeypatch):
   captured: dict = {}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def load_existing_registration_record(self, batch_id, license):
       captured["args"] = (batch_id, license)
       return {"id": 77, "nome": "Player A", "nif": "123456789", "email": ""}
@@ -727,6 +745,9 @@ def test_enrollment_read_detail_json(monkeypatch):
   import json as _json
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def load_existing_registration_record(self, batch_id, license):
       return {"id": 77, "nome": "Player A"}
 
@@ -747,6 +768,9 @@ def test_enrollment_delete_confirms_and_removes(monkeypatch):
   captured: dict = {"removed": None}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def remove_player_from_registration_batch(self, batch_id, license):
       captured["removed"] = (batch_id, license)
 
@@ -759,13 +783,16 @@ def test_enrollment_delete_confirms_and_removes(monkeypatch):
 
   assert result.exit_code == 0, result.output
   assert captured["removed"] == (42, 301772)
-  assert "removed from batch 42" in result.output
+  assert "removed from batch #42" in result.output
 
 
 def test_enrollment_delete_aborts_on_no(monkeypatch):
   """Answering 'n' to the confirmation prompt aborts without deletion."""
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def remove_player_from_registration_batch(self, batch_id, license):
       raise AssertionError("remove should not be called when user declines")
 
@@ -841,10 +868,10 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   # Both documents uploaded, each with the correct tipo_doc.
   assert (str(form_path), 1) in captured["uploads"]
   assert (str(exam_path), 2) in captured["uploads"]
-  # Auto-classified positional mod1 should NOT trigger classifier training
-  # (only --mod1 explicit pinning does); exam IS trained either way.
-  assert (str(exam_path), DocType.EM) in captured["trained"]
-  assert not any(p == str(form_path) for p, _ in captured["trained"])
+  # Auto-classified positionals should NOT trigger classifier training —
+  # only explicit --mod1 / --medical-exam pinning does. Both PDFs here were
+  # auto-classified, so no training calls should fire.
+  assert captured["trained"] == []
   assert "Classified as fpb_modelo_1" in result.output
   assert "Classified as exame_medico" in result.output
   assert str(form_path) in result.output

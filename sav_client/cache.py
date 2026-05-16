@@ -86,6 +86,18 @@ class Cache:
     con.execute(
       "CREATE INDEX IF NOT EXISTS idx_license_nif_nif ON license_nif(nif)"
     )
+    # batch_number (numero_guia) ↔ batch_id (guia_id) is permanent: SAV2
+    # assigns the number once and never reassigns it. Same rationale as
+    # license_to_id — no TTL, invalidate() wipes it.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS batch_number_to_id (
+        number   TEXT PRIMARY KEY,
+        batch_id INTEGER NOT NULL
+      )
+    """)
+    con.execute(
+      "CREATE INDEX IF NOT EXISTS idx_batch_number_to_id_id ON batch_number_to_id(batch_id)"
+    )
     for col, typedef in [
       ("full_name", "TEXT NOT NULL DEFAULT ''"),
       ("code",      "TEXT NOT NULL DEFAULT ''"),
@@ -269,6 +281,44 @@ class Cache:
     finally:
       con.close()
 
+  def get_batch_id(self, number: str) -> int | None:
+    """Return the internal batch_id for a human-visible batch number, or None."""
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT batch_id FROM batch_number_to_id WHERE number = ?",
+        (number,),
+      ).fetchone()
+      return row[0] if row else None
+    finally:
+      con.close()
+
+  def get_batch_number(self, batch_id: int) -> str | None:
+    """Return the human-visible batch number for an internal batch_id, or None."""
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT number FROM batch_number_to_id WHERE batch_id = ? LIMIT 1",
+        (batch_id,),
+      ).fetchone()
+      return row[0] if row else None
+    finally:
+      con.close()
+
+  def record_batches(self, pairs: list[tuple[str, int]]) -> None:
+    """Bulk-upsert (number, batch_id) pairs. No-op when pairs is empty."""
+    if not pairs:
+      return
+    con = self._db()
+    try:
+      con.executemany(
+        "INSERT OR REPLACE INTO batch_number_to_id (number, batch_id) VALUES (?, ?)",
+        pairs,
+      )
+      con.commit()
+    finally:
+      con.close()
+
   def invalidate(self) -> None:
     """Clear all cached data."""
     if not self.path.exists():
@@ -281,6 +331,7 @@ class Cache:
       con.execute("DELETE FROM tiers")
       con.execute("DELETE FROM license_to_id")
       con.execute("DELETE FROM license_nif")
+      con.execute("DELETE FROM batch_number_to_id")
       con.commit()
     finally:
       con.close()

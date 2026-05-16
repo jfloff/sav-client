@@ -276,6 +276,16 @@ def _make_client() -> SavClient:
   return client
 
 
+def _resolve_batch_id_or_raise(client: SavClient, batch_number: str) -> int:
+  """Translate a human-visible batch number to the internal batch_id, or raise SavCliError."""
+  try:
+    return client.resolve_batch_id(batch_number)
+  except ValueError as e:
+    raise SavCliError(str(e), code="batch_not_found")
+  except (SavConnectionError, SavResponseError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+
+
 @click.group()
 @click.option(
   "--output", "-o",
@@ -1027,13 +1037,13 @@ def _resolve_enroll_batch(
       f"{existing.item_count} player(s) already added)"
     )
     choice = click.prompt(
-      "Append to existing or create new?",
-      type=click.Choice(["append", "new"]),
-      default="append",
+      click.style("  Use existing or create new?", fg="cyan"),
+      type=click.Choice(["existing", "new"]),
+      default="existing",
     )
     if choice == "new":
       if not click.confirm(
-        f"Create new {type_label} batch ({tier_name} · {gender_label})?"
+        click.style(f"  Create new {type_label} batch ({tier_name} · {gender_label})?", fg="cyan")
       ):
         raise click.Abort()
       return _create()
@@ -1042,7 +1052,7 @@ def _resolve_enroll_batch(
   console.print(
     f"[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
   )
-  if not click.confirm("Create new batch?"):
+  if not click.confirm(click.style("  Create new batch?", fg="cyan")):
     raise click.Abort()
   return _create()
 
@@ -1119,8 +1129,7 @@ def _resolve_enroll_player(
     if target is not None:
       if target.id != batch.id:
         console.print(
-          f"[cyan]:repeat: Already enrolled in batch #{target.number} (id={target.id}); "
-          f"updating there."
+          f"[cyan]:repeat: Already enrolled in batch #{target.number}; updating there."
         )
       else:
         console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
@@ -1159,8 +1168,7 @@ def _resolve_enroll_player(
       if target is not None:
         if target.id != batch.id:
           console.print(
-            f"[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number} "
-            f"(id={target.id}); updating there."
+            f"[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number}; updating there."
           )
         else:
           console.print(f"[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
@@ -1434,8 +1442,8 @@ def enrollment_grp():
   help="Explicit exame_medico PDF (skips auto-classify for this file).",
 )
 @click.option(
-  "--batch", "batch_id_opt", type=int, default=None,
-  help="Batch ID for manual enrolment (no PDF).",
+  "--batch", "batch_number_opt", type=str, default=None,
+  help="Batch number (as shown in the SAV2 UI) for manual enrolment (no PDF).",
 )
 @click.option(
   "--license", "license_opt", type=int, default=None,
@@ -1450,7 +1458,7 @@ def enrollment_grp():
   ),
 )
 @click.pass_context
-def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, license_opt, fields):
+def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, license_opt, fields):
   """Enroll one player into SAV from one or more supporting PDFs.
 
   A single invocation creates a single enrollment. Pass one fpb_modelo_1 form
@@ -1472,7 +1480,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
   from sav_shared.fields import KWARG_TO_ENTITY
 
   pdf_mode = bool(pdfs or mod1_path)
-  manual_mode = bool(batch_id_opt is not None and license_opt is not None)
+  manual_mode = bool(batch_number_opt is not None and license_opt is not None)
 
   if not pdf_mode and not manual_mode:
     raise click.UsageError(
@@ -1486,6 +1494,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
     client = _make_client()
     field_overrides = _parse_update_fields(fields)
     console = _console()
+    with console.status("[bold cyan]:open_file_folder: Resolving batch...[/]"):
+      batch_id = _resolve_batch_id_or_raise(client, batch_number_opt)
     try:
       with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
         sav_profile = client.load_player_profile(license_opt)
@@ -1493,7 +1503,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
       raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
     console.print(
       f"[bold]Enrolling:[/] {sav_profile.get('nome', '?')} "
-      f"(licence {license_opt}) in batch #{batch_id_opt}"
+      f"(licence {license_opt}) in batch #{batch_number_opt}"
     )
     if field_overrides:
       console.print(
@@ -1506,12 +1516,12 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
     try:
       with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
         client.add_player_to_registration_batch(
-          batch_id_opt, license_opt, **field_overrides,
+          batch_id, license_opt, **field_overrides,
         )
     except (SavConnectionError, SavResponseError, ValueError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     console.print(
-      f"[green]:white_check_mark: Enrolled licence {license_opt} in batch #{batch_id_opt}.[/]"
+      f"[green]:white_check_mark: Enrolled licence {license_opt} in batch #{batch_number_opt}.[/]"
     )
     return
 
@@ -1681,14 +1691,17 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
           f"Medical exam parse error: {exc} ({medical_exam_path})",
           code="parse_error",
         )
-      try:
-        with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
-          train_classifier(medical_exam_path, DocType.EM)
-      except Exception as exc:
-        err_console.print(
-          f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
-          f"{exc} [dim]({medical_exam_path})[/]"
-        )
+      # Train the classifier on the medical exam only when the user pinned it
+      # with --medical-exam; a positional was already auto-classified.
+      if medical_exam is not None:
+        try:
+          with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
+            train_classifier(medical_exam_path, DocType.EM)
+        except Exception as exc:
+          err_console.print(
+            f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
+            f"{exc} [dim]({medical_exam_path})[/]"
+          )
 
       if medical_exam_info.exam_date:
         console.print(
@@ -1701,6 +1714,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
           f"[yellow]:warning: Medical exam date needs review:[/] "
           f"{raw_text!r} [dim]({medical_exam_path})[/]"
         )
+        _dump_parsed_fields(console, medical_parse_result["fields"])
 
     # Resolve exam_date before the summary so the value confirmed is the value
     # submitted — otherwise the user would confirm a "needs input" row and only
@@ -1776,7 +1790,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_id_opt, lice
           client.add_player_to_registration_batch(
             batch_id, license, **kwargs,
           )
-        console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch_id}.[/]")
+        console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch.number}.[/]")
         submitted = True
       except SavConfigError as exc:
         console.print("[yellow]:warning: Guardian info required for minor.[/]")
@@ -1895,6 +1909,29 @@ def _classify_pdf_doc_type(pdf_path: str) -> DocType:
     raise SavCliError(f"classify error: {exc}", code="parse_error")
 
 
+def _dump_parsed_fields(console: Console, fields: dict[str, Any]) -> None:
+  """Pretty-print parser output (entity → value + confidence) for debugging."""
+  if not fields:
+    return
+  table = Table(
+    box=box.SIMPLE,
+    header_style="bold cyan",
+    title="OCR debug",
+    title_style="bold cyan",
+  )
+  table.add_column("Field", style="bold")
+  table.add_column("Value")
+  table.add_column("Confidence", justify="right")
+  for name in sorted(fields):
+    pf = fields[name]
+    value = getattr(pf, "value", pf)
+    confidence = getattr(pf, "confidence", None)
+    value_str = "—" if value in (None, "") else repr(value)
+    conf_str = f"{confidence:.0%}" if isinstance(confidence, (int, float)) else "—"
+    table.add_row(name, value_str, conf_str)
+  console.print(table)
+
+
 def _tipo_doc_for_upload(doc_type: DocType | str) -> int:
   """Translate a public doc type to the SAV2 upload tipo_doc integer."""
   try:
@@ -1948,18 +1985,19 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
 
 
 @enrollment_grp.command("read")
-@click.argument("batch_id", type=int)
+@click.argument("batch_number", type=str)
 @click.argument("license", type=int, required=False)
 @click.pass_context
-def enrollment_read_cmd(ctx, batch_id, license):
+def enrollment_read_cmd(ctx, batch_number, license):
   """Show player enrolments in a batch.
 
   \b
-    sav enrollment read BATCH_ID              List all players in the batch.
-    sav enrollment read BATCH_ID LICENSE      Show one player's enrolment detail.
+    sav enrollment read BATCH_NUMBER              List all players in the batch.
+    sav enrollment read BATCH_NUMBER LICENSE      Show one player's enrolment detail.
   """
   output = ctx.obj["output"]
   client = _make_client()
+  batch_id = _resolve_batch_id_or_raise(client, batch_number)
 
   if license is None:
     try:
@@ -1978,11 +2016,11 @@ def enrollment_read_cmd(ctx, batch_id, license):
       return
 
     if not items:
-      click.echo("No players enrolled in this batch.")
+      _console().print("[cyan]:information_source: No players enrolled in this batch.[/]")
       return
 
     _render_table(["License", "Name"], [[str(i["license"]), i["name"]] for i in items])
-    click.echo(f"\n{len(items)} player(s) enrolled.")
+    _console().print(f"\n[cyan]:information_source: {len(items)} player(s) enrolled.[/]")
   else:
     try:
       record = client.load_existing_registration_record(batch_id, license)
@@ -2005,7 +2043,7 @@ def enrollment_read_cmd(ctx, batch_id, license):
 
 
 @enrollment_grp.command("update")
-@click.argument("batch_id", type=int)
+@click.argument("batch_number", type=str)
 @click.argument("license", type=int)
 @click.argument("pdf", type=click.Path(exists=True), required=False)
 @click.option(
@@ -2037,22 +2075,22 @@ def enrollment_read_cmd(ctx, batch_id, license):
 )
 @click.pass_context
 def enrollment_update_cmd(
-  ctx, batch_id, license, pdf, mod1_path, medical_exam_path, fields, file_only, tipo,
+  ctx, batch_number, license, pdf, mod1_path, medical_exam_path, fields, file_only, tipo,
 ):
   """Update an existing player enrolment.
 
   \b
-    sav enrollment update BATCH LICENSE FILE
+    sav enrollment update BATCH_NUMBER LICENSE FILE
         OCR-reconcile FILE against SAV, patch fields, replace doc.
-    sav enrollment update BATCH LICENSE --mod1 FILE
+    sav enrollment update BATCH_NUMBER LICENSE --mod1 FILE
         Same with explicit doc type (skips classify; trains classifier).
-    sav enrollment update BATCH LICENSE FILE --field KEY=VAL [...]
+    sav enrollment update BATCH_NUMBER LICENSE FILE --field KEY=VAL [...]
         OCR-reconcile FILE, apply manual field overrides, patch, replace doc.
-    sav enrollment update BATCH LICENSE FILE --file-only
+    sav enrollment update BATCH_NUMBER LICENSE FILE --file-only
         Replace document only; leave fields untouched.
-    sav enrollment update BATCH LICENSE --field KEY=VAL [--field ...]
+    sav enrollment update BATCH_NUMBER LICENSE --field KEY=VAL [--field ...]
         Patch fields; no document.
-    sav enrollment update BATCH LICENSE --medical-exam FILE
+    sav enrollment update BATCH_NUMBER LICENSE --medical-exam FILE
         Upload medical exam document only.
   """
   if pdf and (mod1_path or medical_exam_path):
@@ -2068,6 +2106,9 @@ def enrollment_update_cmd(
 
   doc_type: DocType | None = _resolve_doc_type(tipo) if tipo is not None else None
 
+  console = _console()
+  err_console = _console(err=True)
+
   # Mode B — doc-only replace (pdf/--mod1 + --file-only).
   if has_pdf and file_only:
     active_pdf = mod1_path or pdf
@@ -2077,25 +2118,31 @@ def enrollment_update_cmd(
       try:
         train_classifier(mod1_path, active_doc_type)
       except Exception as exc:
-        click.echo(f"  Warning: could not submit classifier training: {exc}", err=True)
+        err_console.print(f"[yellow]:warning: Could not submit classifier training:[/] {exc}")
     else:
       if doc_type is None:
         doc_type = _classify_pdf_doc_type(active_pdf)
-        click.echo(f"Classified {active_pdf} as {_doc_type_text(doc_type)}.")
+        console.print(
+          f"[green]:white_check_mark: Classified as {_doc_type_text(doc_type)}[/]"
+          f" [dim]({active_pdf})[/]",
+          soft_wrap=True,
+        )
       active_doc_type = doc_type
     tipo_doc = _tipo_doc_for_upload(active_doc_type)
     client = _make_client()
+    batch_id = _resolve_batch_id_or_raise(client, batch_number)
     try:
       client.replace_player_registration_document(
         batch_id, license, active_pdf, tipo_doc=tipo_doc,
       )
     except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
-    click.echo(
-      f"Replaced {_doc_type_text(active_doc_type)} for licence {license} in batch #{batch_id}."
+    console.print(
+      f"[green]:white_check_mark: Replaced {_doc_type_text(active_doc_type)}"
+      f" for licence {license} in batch #{batch_number}.[/]"
     )
     if medical_exam_path:
-      _upload_medical_exam_update(batch_id, license, medical_exam_path)
+      _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client, console=console, err_console=err_console)
     return
 
   # Mode A / D — PDF-driven (parse → reconcile → patch fields → replace doc).
@@ -2110,13 +2157,15 @@ def enrollment_update_cmd(
       try:
         train_classifier(mod1_path, active_doc_type)
       except Exception as exc:
-        click.echo(
-          f"  Warning: could not submit classifier training for mod1: {exc}", err=True,
-        )
+        err_console.print(f"[yellow]:warning: Could not submit classifier training:[/] {exc}")
     else:
       if doc_type is None:
         doc_type = _classify_pdf_doc_type(pdf)
-        click.echo(f"Classified {active_pdf} as {_doc_type_text(doc_type)}.")
+        console.print(
+          f"[green]:white_check_mark: Classified as {_doc_type_text(doc_type)}[/]"
+          f" [dim]({active_pdf})[/]",
+          soft_wrap=True,
+        )
       if doc_type != DocType.FPB_MOD1:
         raise SavCliError(
           f"Unsupported document type {_doc_type_text(doc_type)!r}; "
@@ -2127,16 +2176,19 @@ def enrollment_update_cmd(
     tipo_doc = _tipo_doc_for_upload(active_doc_type)
 
     client = _make_client()
+    batch_id = _resolve_batch_id_or_raise(client, batch_number)
 
-    click.echo("Processing OCR ...", nl=False)
     try:
-      parse_result = parse_fpb_mod1(active_pdf)
+      with console.status("[bold cyan]:mag: Processing OCR...[/]"):
+        parse_result = parse_fpb_mod1(active_pdf)
     except Exception as exc:
-      click.echo()
       raise SavCliError(f"parse error: {exc}", code="parse_error")
     parsed = parse_result["fields"]
     processing_id = parse_result["processing_id"]
-    click.echo(" done.")
+    console.print(
+      f"[green]:white_check_mark: OCR ready[/] [dim]{active_pdf} ({processing_id})[/]",
+      soft_wrap=True,
+    )
 
     close_called = False
     try:
@@ -2155,25 +2207,23 @@ def enrollment_update_cmd(
         ocr_source=f"OCR ({os.path.basename(active_pdf)})",
       )
       if kwargs is None:
-        click.echo("Skipped.")
+        console.print("[yellow]:fast_forward: Skipped.[/]")
         return
 
       # Apply --field overrides on top of reconciled values (user wins over OCR).
       if fields:
         field_overrides = _parse_update_fields(fields)
         if field_overrides:
-          click.echo(
-            "  Field overrides: "
-            + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
-          )
+          applied = ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+          console.print(f"[cyan]:information_source: Applying manual field overrides:[/] {applied}")
         kwargs.update(field_overrides)
 
       # Drop fields that update_player_in_registration_batch doesn't accept.
       ignored = {k: v for k, v in kwargs.items() if k not in _UPDATE_FIELDS}
       patch_kwargs = {k: v for k, v in kwargs.items() if k in _UPDATE_FIELDS}
       if ignored:
-        click.echo(
-          f"  Ignored (not patchable on existing enrolments): "
+        console.print(
+          f"[yellow]:warning: Ignored (not patchable on existing enrolments):[/] "
           f"{', '.join(sorted(ignored))}."
         )
 
@@ -2183,21 +2233,24 @@ def enrollment_update_cmd(
         )
       except (SavConnectionError, SavResponseError, ValueError) as exc:
         raise SavCliError(str(exc), code=_exc_code(exc))
-      click.echo(f"Updated licence {license} in batch #{batch_id}.")
+      console.print(f"[green]:white_check_mark: Updated licence {license} in batch #{batch_number}.[/]")
 
       try:
         client.replace_player_registration_document(
           batch_id, license, active_pdf, tipo_doc=tipo_doc,
         )
-        click.echo(f"  Uploaded {active_pdf} ({_doc_type_text(active_doc_type)}).")
+        console.print(
+          f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/]"
+          f" [dim]({active_pdf})[/]",
+          soft_wrap=True,
+        )
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-        click.echo(
-          f"  Warning: field update succeeded but document upload failed: {exc}",
-          err=True,
+        err_console.print(
+          f"[yellow]:warning: Field update succeeded but document upload failed:[/] {exc}"
         )
 
       if medical_exam_path:
-        _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client)
+        _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client, console=console, err_console=err_console)
 
       corrections: dict[str, str] = {}
       for kwarg in result.needs_review:
@@ -2210,7 +2263,7 @@ def enrollment_update_cmd(
       try:
         close_processing(processing_id, corrections=corrections or None)
       except Exception as exc:
-        click.echo(f"  Warning: could not close processing {processing_id}: {exc}", err=True)
+        err_console.print(f"[yellow]:warning: Could not close processing {processing_id}:[/] {exc}")
     finally:
       if not close_called:
         try:
@@ -2221,6 +2274,7 @@ def enrollment_update_cmd(
 
   # Mode C — fields-only (and optional medical exam upload).
   client = _make_client()
+  batch_id = _resolve_batch_id_or_raise(client, batch_number)
   if fields:
     patch_kwargs = _parse_update_fields(fields)
     try:
@@ -2230,40 +2284,51 @@ def enrollment_update_cmd(
     except (SavConnectionError, SavResponseError, ValueError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     applied = ", ".join(sorted(patch_kwargs))
-    click.echo(f"Updated licence {license} in batch #{batch_id}: {applied}.")
+    console.print(
+      f"[green]:white_check_mark: Updated licence {license} in batch #{batch_number}:[/] {applied}."
+    )
   if medical_exam_path:
-    _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client)
+    _upload_medical_exam_update(batch_id, license, medical_exam_path, client=client, console=console, err_console=err_console)
 
 
 def _upload_medical_exam_update(
-  batch_id: int, license: int, path: str, *, client: Any = None,
+  batch_id: int, license: int, path: str,
+  *, client: Any = None, console: Any = None, err_console: Any = None,
 ) -> None:
   """Upload or replace a medical exam document for an existing enrolment."""
   from sav_parsers import train_classifier
   if client is None:
     client = _make_client()
+  if console is None:
+    console = _console()
+  if err_console is None:
+    err_console = _console(err=True)
   try:
     train_classifier(path, DocType.EM)
   except Exception as exc:
-    click.echo(f"  Warning: could not submit classifier training for exam: {exc}", err=True)
+    err_console.print(f"[yellow]:warning: Could not submit classifier training for exam:[/] {exc}")
   tipo_doc = _tipo_doc_for_upload(DocType.EM)
   try:
     client.replace_player_registration_document(batch_id, license, path, tipo_doc=tipo_doc)
-    click.echo(f"  Uploaded {path} (exame_medico).")
+    console.print(
+      f"[green]:white_check_mark: Uploaded exame_medico[/] [dim]({path})[/]",
+      soft_wrap=True,
+    )
   except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-    click.echo(f"  Warning: medical exam upload failed: {exc}", err=True)
+    err_console.print(f"[yellow]:warning: Medical exam upload failed:[/] {exc}")
 
 
 @enrollment_grp.command("delete")
-@click.argument("batch_id", type=int)
+@click.argument("batch_number", type=str)
 @click.argument("license", type=int)
 @click.pass_context
-def enrollment_delete_cmd(ctx, batch_id, license):
+def enrollment_delete_cmd(ctx, batch_number, license):
   """Remove a player from a registration batch."""
   client = _make_client()
+  batch_id = _resolve_batch_id_or_raise(client, batch_number)
 
   if not click.confirm(
-    f"Remove licence {license} from batch {batch_id}?", default=False
+    f"Remove licence {license} from batch {batch_number}?", default=False
   ):
     raise click.Abort()
 
@@ -2272,7 +2337,7 @@ def enrollment_delete_cmd(ctx, batch_id, license):
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 
-  click.echo(f"Licence {license} removed from batch {batch_id}.")
+  _console().print(f"[green]:white_check_mark: Licence {license} removed from batch #{batch_number}.[/]")
 
 
 def main():

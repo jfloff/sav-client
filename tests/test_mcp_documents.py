@@ -13,13 +13,16 @@ def test_upload_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.upload_player_document(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
     doc_type=DocType.EM.value,
@@ -33,6 +36,9 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
 
@@ -40,7 +46,7 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
 
   result = server_module.upload_player_document(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
   )
@@ -53,13 +59,16 @@ def test_replace_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.replace_player_document(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
     doc_type=DocType.FPB_MOD4.value,
@@ -73,6 +82,9 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
 
@@ -80,7 +92,7 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
 
   result = server_module.replace_player_document(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
   )
@@ -91,6 +103,9 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
 
 def test_list_player_documents_returns_parser_doc_types(monkeypatch):
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def list_player_registration_documents(self, batch_id, license):
       return [
         {"doc_id": 1, "tipo_doc": 1},
@@ -101,7 +116,7 @@ def test_list_player_documents_returns_parser_doc_types(monkeypatch):
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
-  result = server_module.list_player_documents(batch_id=12, license=301772)
+  result = server_module.list_player_documents(batch_number="12", license=301772)
 
   assert result == [
     {"doc_id": 1, "doc_type": DocType.FPB_MOD1.value},
@@ -200,6 +215,9 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
   )()
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def load_player_profile(self, license):
       return {"nome": "Player A", "nasc": "2000-01-01"}
 
@@ -226,7 +244,7 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
   )
 
   result = server_module.preview_enrollment(
-    batch_id=12, license=301772, mod1_id="form-1", medical_exam_id="exam-1",
+    batch_number="12", license=301772, mod1_id="form-1", medical_exam_id="exam-1",
   )
 
   assert result["medical_exam"] == {
@@ -245,6 +263,9 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
   replace_calls: list[int] = []
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def add_player_to_registration_batch(self, batch_id, license, **kwargs):
       return 77
 
@@ -278,7 +299,7 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
   )
 
   result = server_module.submit_enrollment(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     mod1_id="form-1",
     field_overrides={"exam_date": "2026-05-01"},
@@ -323,7 +344,7 @@ def test_submit_enrollment_raises_when_exam_date_missing_without_medical_exam(mo
   )
 
   with pytest.raises(ValueError, match="Enrollment requires exam_date"):
-    server_module.submit_enrollment(batch_id=12, license=301772, mod1_id="form-1")
+    server_module.submit_enrollment(batch_number="12", license=301772, mod1_id="form-1")
 
 
 def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
@@ -331,6 +352,9 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
   replace_calls: list[int] = []
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def add_player_to_registration_batch(self, batch_id, license, **kwargs):
       captured["kwargs"] = kwargs
       return 77
@@ -374,7 +398,7 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
   )
 
   result = server_module.submit_enrollment(
-    batch_id=12, license=301772, mod1_id="form-1", medical_exam_id="exam-1",
+    batch_number="12", license=301772, mod1_id="form-1", medical_exam_id="exam-1",
   )
 
   assert captured["kwargs"]["exam_date"] == "2026-05-01"
@@ -394,6 +418,9 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
   captured = {"kwargs": None, "close": []}
 
   class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
     def add_player_to_registration_batch(self, batch_id, license, **kwargs):
       captured["kwargs"] = kwargs
       return 77
@@ -437,7 +464,7 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
   )
 
   server_module.submit_enrollment(
-    batch_id=12,
+    batch_number="12",
     license=301772,
     mod1_id="form-1",
     medical_exam_id="exam-1",
@@ -484,7 +511,7 @@ def test_submit_enrollment_raises_when_exam_date_missing(monkeypatch):
 
   with pytest.raises(ValueError, match="exam_date"):
     server_module.submit_enrollment(
-      batch_id=12, license=301772, mod1_id="form-1", medical_exam_id="exam-1",
+      batch_number="12", license=301772, mod1_id="form-1", medical_exam_id="exam-1",
     )
 
 
@@ -505,7 +532,7 @@ def test_resolve_player_rejects_non_fpb_mod1_artifact(monkeypatch):
   )
 
   with pytest.raises(ValueError, match="not an fpb_modelo_1"):
-    server_module.resolve_player(batch_id=12, mod1_id="exam-1")
+    server_module.resolve_player(batch_number="12", mod1_id="exam-1")
 
 
 def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
@@ -525,4 +552,4 @@ def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
   )
 
   with pytest.raises(ValueError, match="not an fpb_modelo_1"):
-    server_module.preview_enrollment(batch_id=12, license=301772, mod1_id="exam-1")
+    server_module.preview_enrollment(batch_number="12", license=301772, mod1_id="exam-1")

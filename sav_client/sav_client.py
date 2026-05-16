@@ -1039,7 +1039,27 @@ class SavClient:
       ) from exc
 
     rows = data.get("data") or []
-    return [self._parse_registration_batch(row) for row in rows]
+    batches = [self._parse_registration_batch(row) for row in rows]
+    self._cache.record_batches([(b.number, b.id) for b in batches if b.number])
+    return batches
+
+  def resolve_batch_id(self, number: str) -> int:
+    """Translate a human-visible batch number (`numero_guia`) to internal batch_id.
+
+    Hits the local cache first; on miss refreshes via
+    ``list_player_registration_batches()`` (which repopulates the cache).
+    Raises ``ValueError`` if no batch with that number exists.
+    """
+    if not number:
+      raise ValueError("batch number must not be empty")
+    cached = self._cache.get_batch_id(number)
+    if cached is not None:
+      return cached
+    self.list_player_registration_batches()
+    cached = self._cache.get_batch_id(number)
+    if cached is not None:
+      return cached
+    raise ValueError(f"Batch {number!r} not found")
 
   def list_player_registration_tiers(
     self, *, gender_id: int,
@@ -1751,7 +1771,7 @@ class SavClient:
       f"&tipo_doc={tipo_doc}&agente={_REGISTRATIONS_AGENTE_PLAYER}"
     )
     with path.open("rb") as fh:
-      files = {"file0": (path.name, fh, content_type)}
+      files = {f"file{n}": (path.name, fh, content_type)}
       try:
         resp = self._http.post(
           url, files=files, timeout=self._timeout, headers={"Accept": "*/*"},
