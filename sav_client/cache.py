@@ -98,6 +98,19 @@ class Cache:
     con.execute(
       "CREATE INDEX IF NOT EXISTS idx_batch_number_to_id_id ON batch_number_to_id(batch_id)"
     )
+    # license → batch_id maps a player to the open batch they are currently
+    # enrolled in. SAV enforces that a player belongs to at most one open
+    # batch at a time, so the mapping is single-valued. Validated on read
+    # via load_existing_registration_record — stale entries are wiped on miss.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS license_to_batch_id (
+        license  INTEGER PRIMARY KEY,
+        batch_id INTEGER NOT NULL
+      )
+    """)
+    con.execute(
+      "CREATE INDEX IF NOT EXISTS idx_license_to_batch_id_bid ON license_to_batch_id(batch_id)"
+    )
     for col, typedef in [
       ("full_name", "TEXT NOT NULL DEFAULT ''"),
       ("code",      "TEXT NOT NULL DEFAULT ''"),
@@ -319,6 +332,48 @@ class Cache:
     finally:
       con.close()
 
+  def get_batch_id_by_license(self, license: int) -> int | None:
+    """Return the cached batch_id for a license's current enrollment, or None."""
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT batch_id FROM license_to_batch_id WHERE license = ?",
+        (license,),
+      ).fetchone()
+      return row[0] if row else None
+    finally:
+      con.close()
+
+  def record_license_batch(self, license: int, batch_id: int) -> None:
+    """Upsert a (license, batch_id) entry."""
+    con = self._db()
+    try:
+      con.execute(
+        "INSERT OR REPLACE INTO license_to_batch_id (license, batch_id) VALUES (?, ?)",
+        (license, batch_id),
+      )
+      con.commit()
+    finally:
+      con.close()
+
+  def forget_license_batch(self, license: int) -> None:
+    """Remove the cached batch entry for a license."""
+    con = self._db()
+    try:
+      con.execute("DELETE FROM license_to_batch_id WHERE license = ?", (license,))
+      con.commit()
+    finally:
+      con.close()
+
+  def forget_licenses_in_batch(self, batch_id: int) -> None:
+    """Remove every cached license entry that points at this batch_id."""
+    con = self._db()
+    try:
+      con.execute("DELETE FROM license_to_batch_id WHERE batch_id = ?", (batch_id,))
+      con.commit()
+    finally:
+      con.close()
+
   def invalidate(self) -> None:
     """Clear all cached data."""
     if not self.path.exists():
@@ -332,6 +387,7 @@ class Cache:
       con.execute("DELETE FROM license_to_id")
       con.execute("DELETE FROM license_nif")
       con.execute("DELETE FROM batch_number_to_id")
+      con.execute("DELETE FROM license_to_batch_id")
       con.commit()
     finally:
       con.close()

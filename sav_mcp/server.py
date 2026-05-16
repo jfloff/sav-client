@@ -34,6 +34,7 @@ from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
 from sav_client.exceptions import (
+    LicenseNotEnrolledError,
     SavConfigError,
     SavConnectionError,
     SavError,
@@ -74,6 +75,24 @@ def _get_client() -> SavClient:
         _client = SavClient.from_env()
         _client.login()
     return _client
+
+
+def _resolve_license_batch(client: SavClient, license: int) -> int | dict:
+    """Resolve the open batch for a license.
+
+    Returns the batch_id on success, or a structured error dict shaped as
+    ``{"error": "license_not_enrolled", "license": int, "open_batches": [...]}``
+    when the license is not enrolled in any open batch. Tools should return
+    that dict directly so the LLM client can act on it.
+    """
+    try:
+        return client.resolve_batch_id_by_license(license)
+    except LicenseNotEnrolledError as exc:
+        return {
+            "error": "license_not_enrolled",
+            "license": exc.license,
+            "open_batches": exc.open_batches,
+        }
 
 
 # ── Players ───────────────────────────────────────────────────────────────────
@@ -850,19 +869,16 @@ def submit_enrollment(
 
 @server.tool()
 def update_enrollment(
-    batch_number: str,
     license: int,
     fields: dict[str, Any],
 ) -> dict:
     """
     Patch personal-data and/or address fields on an already-enrolled player.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
-
-    The player must be in this batch (open Revalidação). Only the keys present
-    in `fields` are changed; everything else is preserved from the existing
-    inscricao. No document is touched — pair with `replace_player_document`
-    if you also want to swap the PDF.
+    The batch is resolved automatically from the license. Only the keys
+    present in `fields` are changed; everything else is preserved from the
+    existing inscricao. No document is touched — pair with
+    `replace_player_document` if you also want to swap the PDF.
 
     Supported keys (any subset, ints where applicable):
       Step 1 (personal): id_type (int), id_number, id_expiry, telemovel,
@@ -874,7 +890,9 @@ def update_enrollment(
     are not (yet) patchable on existing enrolments — pass them via
     submit_enrollment when adding a new player.
 
-    Returns: {"success": True, "player_id": int} on success.
+    Returns: {"success": True, "player_id": int} on success, or
+    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
     """
     allowed = {
         "id_type", "id_number", "id_expiry", "telemovel", "telefone",
@@ -902,7 +920,9 @@ def update_enrollment(
             coerced[k] = v
 
     client = _get_client()
-    batch_id = client.resolve_batch_id(batch_number)
+    batch_id = _resolve_license_batch(client, license)
+    if isinstance(batch_id, dict):
+        return batch_id
     player_id = client.update_player_in_registration_batch(
         batch_id, license, **coerced,
     )
@@ -941,7 +961,6 @@ def create_enrollment_manual(
 
 @server.tool()
 def update_enrollment_with_document(
-    batch_number: str,
     license: int,
     pdf: str,
     doc_type: str | None = None,
@@ -951,9 +970,9 @@ def update_enrollment_with_document(
     """
     Reconcile a new PDF against an existing enrolment and patch fields / replace document.
 
-    Equivalent of `sav enrollment update BATCH_NUMBER LICENSE FILE [--mod1] [--field ...] [--file-only]`.
+    Equivalent of `sav enrollment update --license LICENSE FILE [--mod1] [--field ...] [--file-only]`.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    The batch is resolved automatically from the license.
 
     pdf: base64-encoded PDF.
     doc_type: optional type hint — "fpb_modelo_1" or "exame_medico". When given,
@@ -962,7 +981,9 @@ def update_enrollment_with_document(
     submitting (same keys as update_enrollment). Only valid when file_only=False.
     file_only: when True, replace the document without touching fields.
 
-    Returns: {"success": True, "fields_updated": bool, "document_uploaded": bool}.
+    Returns: {"success": True, "fields_updated": bool, "document_uploaded": bool} on
+    success, or {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
     """
     from sav_parsers import classify, close_processing, parse_fpb_mod1, train_classifier
 
@@ -991,7 +1012,9 @@ def update_enrollment_with_document(
 
         tipo_doc = doc_type_to_tipo_doc(active_doc_type)
         client = _get_client()
-        batch_id = client.resolve_batch_id(batch_number)
+        batch_id = _resolve_license_batch(client, license)
+        if isinstance(batch_id, dict):
+            return batch_id
 
         if file_only:
             client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
@@ -1050,50 +1073,105 @@ def update_enrollment_with_document(
 
 
 @server.tool()
-def read_enrollment(batch_number: str, license: int | None = None) -> dict | list:
+def read_enrollment(license: int) -> dict:
     """
-    List players in a batch or show one player's enrolment detail.
+    Show one player's enrolment detail by licence.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    The batch is resolved automatically from the license.
 
-    list form:   read_enrollment(batch_number)           -> list of {"license", "name"}
-    detail form: read_enrollment(batch_number, license)  -> enrollment record dict
+    Returns the enrollment record dict on success, or
+    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
+
+    To list every player in a batch, use list_batch_enrollments(batch_number).
     """
     client = _get_client()
-    batch_id = client.resolve_batch_id(batch_number)
-    if license is None:
-        return client.list_player_registration_batch_items(batch_id)
+    batch_id = _resolve_license_batch(client, license)
+    if isinstance(batch_id, dict):
+        return batch_id
     return client.load_existing_registration_record(batch_id, license)
 
 
 @server.tool()
-def delete_enrollment(batch_number: str, license: int) -> dict:
+def list_batch_enrollments(batch_number: str) -> list[dict]:
     """
-    Remove a player from a registration batch.
+    List every player enrolled in a batch.
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
+
+    Returns: list of {"license": int, "name": str}.
+
+    To inspect a single player by licence, use read_enrollment(license).
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
+    return client.list_player_registration_batch_items(batch_id)
+
+
+@server.tool()
+def delete_enrollment(license: int) -> dict:
+    """
+    Remove one player's enrolment by licence.
+
+    The batch is resolved automatically from the license.
+
+    Returns {"removed": True, "license": int, "batch_number": str} on success,
+    or {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
+
+    To delete a whole batch (all enrollments in it), use delete_batch(batch_number).
+    """
+    client = _get_client()
+    batch_id = _resolve_license_batch(client, license)
+    if isinstance(batch_id, dict):
+        return batch_id
     client.remove_player_from_registration_batch(batch_id, license)
-    return {"removed": True, "batch_number": batch_number, "license": license}
+    return {
+        "removed": True,
+        "license": license,
+        "batch_number": client._cache.get_batch_number(batch_id) or f"#{batch_id}",
+    }
+
+
+@server.tool()
+def delete_batch(batch_number: str) -> dict:
+    """
+    Delete an entire registration batch and every enrolment in it.
+
+    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    Only open ("Em construção") batches can be deleted; submitted batches
+    will raise an error from SAV2.
+
+    Returns {"deleted": True, "batch_number": str} on success.
+
+    To remove a single player from a batch, use delete_enrollment(license).
+    """
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    client.delete_player_registration_batch(batch_id)
+    return {"deleted": True, "batch_number": batch_number}
 
 
 # ── Registration documents ────────────────────────────────────────────────────
 
 @server.tool()
-def list_player_documents(batch_number: str, license: int) -> list[dict]:
+def list_player_documents(license: int) -> list[dict] | dict:
     """
-    List documents currently uploaded for a player in a batch.
+    List documents currently uploaded for a player.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    The batch is resolved automatically from the license.
 
     Each entry: {"doc_id": int, "doc_type": str | null}. doc_id is the
     galeria id expected by delete_player_document. SAV2-only document types
     with no sav-parsers equivalent are returned with doc_type=null.
+
+    Returns {"error": "license_not_enrolled", ...} if the licence is not
+    enrolled in any open batch.
     """
     client = _get_client()
-    batch_id = client.resolve_batch_id(batch_number)
+    batch_id = _resolve_license_batch(client, license)
+    if isinstance(batch_id, dict):
+        return batch_id
     docs = client.list_player_registration_documents(batch_id, license)
     return [
         {
@@ -1125,7 +1203,6 @@ def _resolve_document_upload_type(tmp_path: str, doc_type: str | None) -> str:
 
 @server.tool()
 def upload_player_document(
-    batch_number: str,
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
@@ -1133,20 +1210,24 @@ def upload_player_document(
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    The batch is resolved automatically from the license.
 
     doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4, outros.
     When omitted, sav-parsers classifies the PDF first.
     Recognized but unmapped types such as outros fail before the SAV2 call.
 
-    Returns {"success": True} on success.
+    Returns {"success": True} on success, or
+    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
         tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
         client = _get_client()
-        batch_id = client.resolve_batch_id(batch_number)
+        batch_id = _resolve_license_batch(client, license)
+        if isinstance(batch_id, dict):
+            return batch_id
         client.upload_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
@@ -1167,24 +1248,29 @@ def delete_player_document(doc_id: int) -> dict:
 
 @server.tool()
 def replace_player_document(
-    batch_number: str,
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
 ) -> dict:
     """
-    Replace any existing documents of `doc_type` for this player+batch with a
+    Replace any existing documents of `doc_type` for this player with a
     new PDF (base64-encoded). Idempotent on the upload side: when no existing
     doc of the translated SAV2 tipo_doc is found, behaves like a plain upload.
 
-    batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    The batch is resolved automatically from the license.
+
+    Returns {"success": True} on success, or
+    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch.
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
         resolved_doc_type = _resolve_document_upload_type(tmp_path, doc_type)
         tipo_doc = doc_type_to_tipo_doc(resolved_doc_type)
         client = _get_client()
-        batch_id = client.resolve_batch_id(batch_number)
+        batch_id = _resolve_license_batch(client, license)
+        if isinstance(batch_id, dict):
+            return batch_id
         client.replace_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )

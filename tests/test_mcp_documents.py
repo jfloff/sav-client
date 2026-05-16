@@ -13,8 +13,8 @@ def test_upload_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
@@ -22,7 +22,6 @@ def test_upload_player_document_translates_doc_type(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.upload_player_document(
-    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
     doc_type=DocType.EM.value,
@@ -36,8 +35,8 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
@@ -46,7 +45,6 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
 
   result = server_module.upload_player_document(
-    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
   )
@@ -59,8 +57,8 @@ def test_replace_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
@@ -68,7 +66,6 @@ def test_replace_player_document_translates_doc_type(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.replace_player_document(
-    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
     doc_type=DocType.FPB_MOD4.value,
@@ -82,8 +79,8 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured["call"] = (batch_id, license, tipo_doc)
@@ -92,7 +89,6 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
 
   result = server_module.replace_player_document(
-    batch_number="12",
     license=301772,
     pdf_base64=_pdf_b64(),
   )
@@ -103,8 +99,8 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
 
 def test_list_player_documents_returns_parser_doc_types(monkeypatch):
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def list_player_registration_documents(self, batch_id, license):
       return [
@@ -116,7 +112,7 @@ def test_list_player_documents_returns_parser_doc_types(monkeypatch):
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
-  result = server_module.list_player_documents(batch_number="12", license=301772)
+  result = server_module.list_player_documents(license=301772)
 
   assert result == [
     {"doc_id": 1, "doc_type": DocType.FPB_MOD1.value},

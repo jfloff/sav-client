@@ -44,7 +44,7 @@ def test_enrollment_update_rejects_legacy_tipo_alias(monkeypatch, tmp_path):
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", str(pdf_path), "--file-only", "--tipo", "modelo1"],
+    ["enrollment", "update", "--license", "301772", str(pdf_path), "--file-only", "--tipo", "modelo1"],
   )
 
   assert result.exit_code != 0
@@ -62,7 +62,7 @@ def test_enrollment_update_rejects_raw_tipo_integer(monkeypatch, tmp_path):
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", str(pdf_path), "--file-only", "--tipo", "1"],
+    ["enrollment", "update", "--license", "301772", str(pdf_path), "--file-only", "--tipo", "1"],
   )
 
   assert result.exit_code != 0
@@ -74,8 +74,8 @@ def test_enrollment_update_maps_parser_tipo_names_for_file_replace(monkeypatch, 
   captured: list[int] = []
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
       captured.append(tipo_doc)
@@ -86,7 +86,7 @@ def test_enrollment_update_maps_parser_tipo_names_for_file_replace(monkeypatch, 
   result = runner.invoke(
     cli_module.cli,
     [
-      "enrollment", "update", "12", "301772", str(pdf_path), "--file-only",
+      "enrollment", "update", "--license", "301772", str(pdf_path), "--file-only",
       "--tipo", "exame_medico",
     ],
   )
@@ -101,8 +101,8 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
   captured: list[int] = []
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
       captured.append(tipo_doc)
@@ -113,7 +113,7 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", str(pdf_path), "--file-only"],
+    ["enrollment", "update", "--license", "301772", str(pdf_path), "--file-only"],
   )
 
   assert result.exit_code == 0
@@ -134,7 +134,7 @@ def test_enrollment_update_rejects_unmapped_classified_doc_type(monkeypatch, tmp
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", str(pdf_path), "--file-only"],
+    ["enrollment", "update", "--license", "301772", str(pdf_path), "--file-only"],
   )
 
   assert result.exit_code != 0
@@ -152,7 +152,7 @@ def test_enrollment_update_reconcile_accepts_only_fpb_modelo_1(monkeypatch, tmp_
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", str(pdf_path), "--tipo", "exame_medico"],
+    ["enrollment", "update", "--license", "301772", str(pdf_path), "--tipo", "exame_medico"],
   )
 
   assert result.exit_code != 0
@@ -629,7 +629,7 @@ def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
   )
   monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
-    "resolve_batch_id": lambda self, number: int(number),
+    "resolve_batch_id_by_license": lambda self, license: 12,
     "load_player_profile": lambda self, lic: {},
     "update_player_in_registration_batch": lambda self, *a, **kw: None,
     "replace_player_registration_document": lambda self, *a, **kw: None,
@@ -642,7 +642,7 @@ def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", "--mod1", str(mod1_path)],
+    ["enrollment", "update", "--license", "301772", "--mod1", str(mod1_path)],
   )
 
   assert not captured["classify_called"], "classify() should be skipped for --mod1"
@@ -657,21 +657,39 @@ def test_enrollment_update_medical_exam_uploads_exam(monkeypatch, tmp_path):
   uploaded: list = []
   monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
-    "resolve_batch_id": lambda self, number: int(number),
+    "resolve_batch_id_by_license": lambda self, license: 12,
     "replace_player_registration_document": lambda self, batch_id, lic, path, tipo_doc: uploaded.append(path),
   })())
 
   runner = CliRunner()
   result = runner.invoke(
     cli_module.cli,
-    ["enrollment", "update", "12", "301772", "--medical-exam", str(exam_path)],
+    ["enrollment", "update", "--license", "301772", "--medical-exam", str(exam_path)],
   )
 
   assert str(exam_path) in uploaded
 
 
+def test_enrollment_update_rejects_unknown_batch_flag(monkeypatch, tmp_path):
+  """The new `update` interface drops --batch entirely — click rejects it."""
+  pdf_path = _write_pdf(tmp_path)
+
+  def fail_make_client():
+    raise AssertionError("_make_client should not run for unknown flags")
+
+  monkeypatch.setattr(cli_module, "_make_client", fail_make_client)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "update", "--batch", "12", "--license", "301772", str(pdf_path), "--file-only"],
+  )
+
+  assert result.exit_code != 0
+
+
 def test_enrollment_read_lists_batch_items(monkeypatch):
-  """`enrollment read BATCH` lists all players in the batch."""
+  """`enrollment read --batch BATCH` lists all players in the batch."""
 
   class StubClient:
     def resolve_batch_id(self, number):
@@ -687,7 +705,7 @@ def test_enrollment_read_lists_batch_items(monkeypatch):
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
 
   runner = CliRunner()
-  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42"])
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "--batch", "42"])
 
   assert result.exit_code == 0, result.output
   assert "301772" in result.output
@@ -696,7 +714,7 @@ def test_enrollment_read_lists_batch_items(monkeypatch):
 
 
 def test_enrollment_read_empty_batch(monkeypatch):
-  """`enrollment read BATCH` prints a friendly message when the batch is empty."""
+  """`enrollment read --batch BATCH` prints a friendly message when empty."""
 
   class StubClient:
     def resolve_batch_id(self, number):
@@ -708,19 +726,20 @@ def test_enrollment_read_empty_batch(monkeypatch):
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
 
   runner = CliRunner()
-  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42"])
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "--batch", "42"])
 
   assert result.exit_code == 0, result.output
   assert "No players enrolled" in result.output
 
 
 def test_enrollment_read_detail(monkeypatch):
-  """`enrollment read BATCH LICENSE` shows one player's enrollment detail."""
+  """`enrollment read --license LICENSE` resolves the batch and shows detail."""
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      captured["resolver_arg"] = license
+      return 42
 
     def load_existing_registration_record(self, batch_id, license):
       captured["args"] = (batch_id, license)
@@ -729,9 +748,10 @@ def test_enrollment_read_detail(monkeypatch):
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
 
   runner = CliRunner()
-  result = runner.invoke(cli_module.cli, ["enrollment", "read", "42", "301772"])
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "--license", "301772"])
 
   assert result.exit_code == 0, result.output
+  assert captured["resolver_arg"] == 301772
   assert captured["args"] == (42, 301772)
   assert "Player A" in result.output
   assert "123456789" in result.output
@@ -740,12 +760,12 @@ def test_enrollment_read_detail(monkeypatch):
 
 
 def test_enrollment_read_detail_json(monkeypatch):
-  """`--output json enrollment read BATCH LICENSE` emits valid JSON."""
+  """`--output json enrollment read --license LICENSE` emits valid JSON."""
   import json as _json
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 42
 
     def load_existing_registration_record(self, batch_id, license):
       return {"id": 77, "nome": "Player A"}
@@ -754,7 +774,7 @@ def test_enrollment_read_detail_json(monkeypatch):
 
   runner = CliRunner()
   result = runner.invoke(
-    cli_module.cli, ["--output", "json", "enrollment", "read", "42", "301772"]
+    cli_module.cli, ["--output", "json", "enrollment", "read", "--license", "301772"]
   )
 
   assert result.exit_code == 0, result.output
@@ -762,13 +782,50 @@ def test_enrollment_read_detail_json(monkeypatch):
   assert payload == {"id": 77, "nome": "Player A"}
 
 
-def test_enrollment_delete_confirms_and_removes(monkeypatch):
-  """`enrollment delete` prompts for confirmation before deleting."""
+def test_enrollment_read_requires_exactly_one_flag(monkeypatch):
+  """`enrollment read` with neither / both flags fails with a usage error."""
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+
+  runner = CliRunner()
+  no_flags = runner.invoke(cli_module.cli, ["enrollment", "read"])
+  assert no_flags.exit_code != 0
+  assert "exactly one" in no_flags.output.lower()
+
+  both = runner.invoke(
+    cli_module.cli, ["enrollment", "read", "--license", "301772", "--batch", "42"]
+  )
+  assert both.exit_code != 0
+  assert "exactly one" in both.output.lower()
+
+
+def test_enrollment_read_license_not_enrolled_lists_open_batches(monkeypatch):
+  """A `read --license` miss surfaces the structured error from the client."""
+  from sav_client.exceptions import LicenseNotEnrolledError
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      raise LicenseNotEnrolledError(
+        license=license,
+        open_batches=[{"number": "2025/123", "tier": "Sub 14", "gender": "M"}],
+      )
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "read", "--license", "301772"])
+
+  assert result.exit_code != 0
+  assert "not enrolled" in result.output.lower()
+  assert "2025/123" in result.output
+
+
+def test_enrollment_delete_license_confirms_and_removes(monkeypatch):
+  """`enrollment delete --license` prompts before removing one player."""
   captured: dict = {"removed": None}
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 42
 
     def remove_player_from_registration_batch(self, batch_id, license):
       captured["removed"] = (batch_id, license)
@@ -777,20 +834,20 @@ def test_enrollment_delete_confirms_and_removes(monkeypatch):
 
   runner = CliRunner()
   result = runner.invoke(
-    cli_module.cli, ["enrollment", "delete", "42", "301772"], input="y\n",
+    cli_module.cli, ["enrollment", "delete", "--license", "301772"], input="y\n",
   )
 
   assert result.exit_code == 0, result.output
   assert captured["removed"] == (42, 301772)
-  assert "removed from batch #42" in result.output
+  assert "removed from batch" in result.output
 
 
-def test_enrollment_delete_aborts_on_no(monkeypatch):
-  """Answering 'n' to the confirmation prompt aborts without deletion."""
+def test_enrollment_delete_license_aborts_on_no(monkeypatch):
+  """Answering 'n' to the player-delete prompt aborts without removal."""
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return int(number)
+    def resolve_batch_id_by_license(self, license):
+      return 42
 
     def remove_player_from_registration_batch(self, batch_id, license):
       raise AssertionError("remove should not be called when user declines")
@@ -799,11 +856,50 @@ def test_enrollment_delete_aborts_on_no(monkeypatch):
 
   runner = CliRunner()
   result = runner.invoke(
-    cli_module.cli, ["enrollment", "delete", "42", "301772"], input="n\n",
+    cli_module.cli, ["enrollment", "delete", "--license", "301772"], input="n\n",
   )
 
   assert result.exit_code != 0
   assert "removed from batch" not in result.output
+
+
+def test_enrollment_delete_batch_deletes_whole_batch(monkeypatch):
+  """`enrollment delete --batch BATCH` confirms and removes the entire batch."""
+  captured: dict = {"deleted_id": None}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
+    def delete_player_registration_batch(self, batch_id):
+      captured["deleted_id"] = batch_id
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "delete", "--batch", "42"], input="y\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["deleted_id"] == 42
+  assert "deleted" in result.output.lower()
+
+
+def test_enrollment_delete_requires_exactly_one_flag(monkeypatch):
+  """`enrollment delete` with neither / both flags fails with a usage error."""
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+
+  runner = CliRunner()
+  no_flags = runner.invoke(cli_module.cli, ["enrollment", "delete"])
+  assert no_flags.exit_code != 0
+  assert "exactly one" in no_flags.output.lower()
+
+  both = runner.invoke(
+    cli_module.cli, ["enrollment", "delete", "--license", "301772", "--batch", "42"]
+  )
+  assert both.exit_code != 0
+  assert "exactly one" in both.output.lower()
 
 
 def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(

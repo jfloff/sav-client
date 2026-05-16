@@ -245,6 +245,21 @@ batches = client.list_player_registration_batches()
 open_revalidations = [b for b in batches if b.is_open and b.type_id == 2]
 ```
 
+### `resolve_batch_id(number) → int`
+
+Translates a human-visible batch number (e.g. `"2025/00123"`) to the internal `batch_id`. Hits the SQLite cache first (`batch_number_to_id`, no TTL — batch numbers are permanent) and on miss refreshes via `list_player_registration_batches()`. Raises `ValueError` if no batch with that number exists.
+
+### `resolve_batch_id_by_license(license) → int`
+
+Finds the open batch a license is currently enrolled in. SAV enforces at most one open enrollment per player, so the answer is single-valued.
+
+Strategy:
+1. Check the local `license_to_batch_id` cache. On hit, validate by calling `load_existing_registration_record(batch_id, license)` — on success return the cached id; on any error forget the entry and fall through.
+2. Scan open batches (`is_open=True`) via `list_player_registration_batch_items(batch_id)` looking for the licence. First hit caches and returns.
+3. Raise `LicenseNotEnrolledError` (subclass of `ValueError`) carrying `license` and an `open_batches: list[{number, tier, gender}]` for the caller to render.
+
+Cache hygiene is automatic — `add_player_to_registration_batch` records the mapping, `remove_player_from_registration_batch` forgets it, and `delete_player_registration_batch` wipes every entry pointing at the deleted batch.
+
 ### `list_player_registration_tiers(*, gender_id) → dict[int, str]`
 
 Tier ID → display name (e.g. `{5: "Sub 14", ...}`). The tier set differs by gender — `gender_id` (1 or 2) is required. Used internally by `create_player_registration_batch()` to resolve a tier name string.

@@ -31,10 +31,12 @@ import requests
 from dotenv import load_dotenv
 
 from .exceptions import (
+  LicenseNotEnrolledError,
   SavAuthError,
   SavConfigError,
   SavConnectionError,
   SavError,
+  SavRecordNotFoundError,
   SavResponseError,
 )
 from .cache import Cache
@@ -1061,6 +1063,66 @@ class SavClient:
       return cached
     raise ValueError(f"Batch {number!r} not found")
 
+  def resolve_batch_id_by_license(self, license: int) -> int:
+    """Find the batch_id for a license's current enrollment in an open batch.
+
+    SAV constrains a player to at most one open batch at a time, so the
+    answer is single-valued.
+
+    Strategy:
+      1. Fetch the current batch list (single HTTP call) so we know which
+         batches are open *right now* — server-side state transitions
+         (admin submits a batch) can invalidate a cached entry without any
+         client-side write.
+      2. If the cache points at a still-open batch, validate it cheaply
+         with ``load_existing_registration_record``. A successful probe
+         returns; a "not in this batch" response (``SavResponseError``)
+         forgets and falls through. Transport errors propagate so the
+         caller sees a real failure instead of a misleading "not enrolled".
+      3. Otherwise scan open batches' items in order. Transport / parse
+         errors propagate — silently skipping a batch that actually holds
+         the player would surface as a false ``LicenseNotEnrolledError``.
+      4. If no open batch contains the licence, raise
+         ``LicenseNotEnrolledError`` with the open-batch list.
+    """
+    if license is None:
+      raise ValueError("license must not be None")
+
+    batches = self.list_player_registration_batches()
+    open_batches = [b for b in batches if b.is_open]
+    open_ids = {b.id for b in open_batches}
+
+    cached = self._cache.get_batch_id_by_license(license)
+    if cached is not None:
+      if cached in open_ids:
+        try:
+          self.load_existing_registration_record(cached, license)
+          return cached
+        except SavRecordNotFoundError:
+          # Probe came back well-formed but the player is no longer in
+          # this batch — cache is stale. Fall through to a full scan.
+          # SavConnectionError and parse-shape SavResponseError are NOT
+          # caught here on purpose: a transport blip or a broken response
+          # must surface, not get papered over as a stale entry.
+          self._cache.forget_license_batch(license)
+      else:
+        # The cached batch is closed or no longer visible — forget it.
+        self._cache.forget_license_batch(license)
+
+    for batch in open_batches:
+      items = self.list_player_registration_batch_items(batch.id)
+      if any(int(item.get("license", 0)) == int(license) for item in items):
+        self._cache.record_license_batch(license, batch.id)
+        return batch.id
+
+    raise LicenseNotEnrolledError(
+      license=license,
+      open_batches=[
+        {"number": b.number, "tier": b.tier, "gender": b.gender}
+        for b in open_batches
+      ],
+    )
+
   def list_player_registration_tiers(
     self, *, gender_id: int,
   ) -> dict[int, str]:
@@ -1265,6 +1327,7 @@ class SavClient:
       raise SavConnectionError(f"Could not delete batch: {exc}") from exc
 
     logger.info("Delete batch response: %s", resp.text[:200])
+    self._cache.forget_licenses_in_batch(batch_id)
 
   def remove_player_from_registration_batch(
     self,
@@ -1314,6 +1377,7 @@ class SavClient:
       "Removed player license=%s from batch %s — response: %s",
       license, batch.id, resp.text[:200],
     )
+    self._cache.forget_license_batch(license)
 
   def find_open_player_registration_batch(
     self,
@@ -1562,6 +1626,7 @@ class SavClient:
       "Added player license=%s (id=%s) to batch %s — validity: %s",
       license, internal_id, batch.id, result.get("resultfunction"),
     )
+    self._cache.record_license_batch(license, batch.id)
     return internal_id
 
   def _update_existing_player_in_batch(
@@ -2123,10 +2188,33 @@ class SavClient:
       raise SavResponseError(
         f"Could not parse existing record: {resp.text[:200]!r}"
       ) from exc
-    if not data.get("id"):
+    if not isinstance(data, dict):
+      # Valid JSON but the wrong top-level shape (e.g. `null`, `[]`, a bare
+      # string or number). Raising plainly here keeps callers from
+      # crashing with `AttributeError` on `.get(...)` further down.
       raise SavResponseError(
-        f"Existing record for licence {license!r} in batch {batch_id} not "
-        f"found: {data!r}"
+        f"Unexpected existing-record payload type ({type(data).__name__}) "
+        f"for licence {license!r} in batch {batch_id}: {data!r}"
+      )
+    if not data.get("id"):
+      # No id field — could be a clean "not found" or a server-side error
+      # payload. We need a *positive* not-found signal to tell them apart;
+      # otherwise a 500-ish payload like {"error": "..."} would silently
+      # look identical to "this player isn't in this batch".
+      #
+      #   - Empty body (``{}``)                  → clean "not found"
+      #   - ``existe`` explicitly falsy (0/"0")  → clean "not found"
+      #   - Anything else                        → unexpected shape, raise
+      #     the broader SavResponseError so callers don't mask it.
+      not_found = not data or str(data.get("existe", "")).strip() in ("0", "false", "False")
+      if not_found:
+        raise SavRecordNotFoundError(
+          f"Existing record for licence {license!r} in batch {batch_id} not "
+          f"found: {data!r}"
+        )
+      raise SavResponseError(
+        f"Unexpected existing-record response for licence {license!r} in "
+        f"batch {batch_id}: {data!r}"
       )
     # op=30 uses different keys than op=35 ("datenasc" vs "nasc",
     # "nacionalidade" vs "nacional"); normalise so the shared

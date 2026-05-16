@@ -3,10 +3,12 @@ sav_client — automation client for the FPB SA2.0 (SAV2) player registration sy
 """
 
 from .exceptions import (
+    LicenseNotEnrolledError,
     SavAuthError,
     SavConfigError,
     SavConnectionError,
     SavError,
+    SavRecordNotFoundError,
     SavResponseError,
 )
 from .models import Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
@@ -27,4 +29,6 @@ __all__ = [
     "SavConnectionError",
     "SavAuthError",
     "SavResponseError",
+    "SavRecordNotFoundError",
+    "LicenseNotEnrolledError",
 ]
