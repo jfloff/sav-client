@@ -118,8 +118,7 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
 
   assert result.exit_code == 0
   assert captured == [2]
-  assert "Classified as exame_medico" in result.output
-  assert str(pdf_path) in result.output
+  assert f"Classified as {pdf_path.name} as exame_medico" in result.output
   assert "Replaced exame_medico" in result.output
 
 
@@ -872,10 +871,8 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   # only explicit --mod1 / --medical-exam pinning does. Both PDFs here were
   # auto-classified, so no training calls should fire.
   assert captured["trained"] == []
-  assert "Classified as fpb_modelo_1" in result.output
-  assert "Classified as exame_medico" in result.output
-  assert str(form_path) in result.output
-  assert str(exam_path) in result.output
+  assert f"Classified as {form_path.name} as fpb_modelo_1" in result.output
+  assert f"Classified as {exam_path.name} as exame_medico" in result.output
 
 
 def test_enrollment_create_rejects_two_mod1_pdfs(monkeypatch, tmp_path):
