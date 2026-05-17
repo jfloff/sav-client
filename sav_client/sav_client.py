@@ -1152,7 +1152,10 @@ class SavClient:
     if gender_id not in (1, 2):
       raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)")
 
-    return self._cache.get_tiers(self._fetch_tiers, gender_id=gender_id)
+    season_id = int(self.session.get("epoca_id") or 0)
+    return self._cache.get_tiers(
+      self._fetch_tiers, gender_id=gender_id, season_id=season_id,
+    )
 
   def _fetch_tiers(self, gender_id: int) -> dict[int, str]:
     import re

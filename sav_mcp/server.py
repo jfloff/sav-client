@@ -95,6 +95,33 @@ def _resolve_license_batch(client: SavClient, license: int) -> int | dict:
         }
 
 
+# ── Session ───────────────────────────────────────────────────────────────────
+
+@server.tool()
+def get_session_info() -> dict:
+    """
+    Return the authenticated session's context.
+
+    Useful for the LLM to know what "the session's club" resolves to before
+    calling tools that default to it (search_players, list_games, list_batches,
+    etc.).
+
+    Returns ``{user, profile, club_id, season_id}``. season_id is the current
+    epoch — pass it (or omit / pass 0 for all-seasons) to tools that accept a
+    season parameter.
+    """
+    client = _get_client()
+    session = client.session
+    if session is None:
+        raise ValueError("Session not initialized")
+    return {
+        "user": session.get("user"),
+        "profile": session.get("perfil"),
+        "club_id": int(session.get("organizacao") or 0),
+        "season_id": int(session.get("epoca_id") or 0),
+    }
+
+
 # ── Players ───────────────────────────────────────────────────────────────────
 
 @server.tool()
@@ -331,6 +358,23 @@ def generate_game_sheet_pdf(
 # ── Registration batches ──────────────────────────────────────────────────────
 
 @server.tool()
+def list_tiers(gender_id: int) -> list[dict]:
+    """
+    List the registration tiers (escalões) available for a given gender.
+
+    The tier set differs by gender (some categories are male- or female-only),
+    so the gender_id (1=Masculino, 2=Feminino) is required.
+
+    Use this when the LLM needs a valid tier_id for create_batch /
+    find_open_batch without first parsing an enrollment PDF. Cached 7 days
+    server-side.
+    """
+    client = _get_client()
+    tiers = client.list_player_registration_tiers(gender_id=gender_id)
+    return [{"tier_id": tid, "tier_name": name} for tid, name in tiers.items()]
+
+
+@server.tool()
 def list_batches(season: int | None = None) -> list[dict]:
     """
     List player registration batches visible to the session's club.
@@ -341,6 +385,23 @@ def list_batches(season: int | None = None) -> list[dict]:
     client = _get_client()
     batches = client.list_player_registration_batches(season=season)
     return [batch_to_dict(b) for b in batches]
+
+
+@server.tool()
+def get_batch(batch_number: str, season: int | None = None) -> dict | None:
+    """
+    Fetch a single registration batch by its human-visible number.
+
+    season defaults to the current season; pass 0 to search across all seasons.
+    Returns the batch details (same shape as list_batches entries) or null if
+    no batch matches.
+    """
+    client = _get_client()
+    batches = client.list_player_registration_batches(season=season)
+    batch = next((b for b in batches if b.number == batch_number), None)
+    if batch is None:
+        return None
+    return batch_to_dict(batch)
 
 
 # ── Enrollment workflow ───────────────────────────────────────────────────────

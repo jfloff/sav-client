@@ -56,6 +56,9 @@ class Cache:
         PRIMARY KEY (distrito_id, concelho_id)
       )
     """)
+    # Legacy unscoped tiers table — pre-0.35. Kept created (empty on fresh
+    # installs) so a downgrade to <0.35 can still write/read without errors.
+    # 0.35+ uses tiers_seasoned below instead.
     con.execute("""
       CREATE TABLE IF NOT EXISTS tiers (
         gender_id INTEGER NOT NULL,
@@ -63,6 +66,19 @@ class Cache:
         name      TEXT    NOT NULL,
         cached_at REAL    NOT NULL,
         PRIMARY KEY (gender_id, tier_id)
+      )
+    """)
+    # Tiers are season-scoped: SAV2 returns the set based on the session's
+    # epoch. The cache key includes season_id so a process running in a new
+    # season doesn't surface stale rows from a prior season's cache file.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS tiers_seasoned (
+        gender_id INTEGER NOT NULL,
+        season_id INTEGER NOT NULL,
+        tier_id   INTEGER NOT NULL,
+        name      TEXT    NOT NULL,
+        cached_at REAL    NOT NULL,
+        PRIMARY KEY (gender_id, season_id, tier_id)
       )
     """)
     # license → internal player id is essentially immutable (FPB licences
@@ -217,25 +233,31 @@ class Cache:
     self,
     fetcher: Callable[[int], dict[int, str]],
     gender_id: int,
+    season_id: int,
     ttl: int = _DEFAULT_TTL,
   ) -> dict[int, str]:
-    """Return {tier_id → name} for a gender, refreshing on miss/expiry."""
+    """Return {tier_id → name} for a (gender, season), refreshing on miss/expiry."""
     now = time.time()
     con = self._db()
     try:
       rows = con.execute(
-        "SELECT tier_id, name, cached_at FROM tiers WHERE gender_id = ? ORDER BY name",
-        (gender_id,),
+        "SELECT tier_id, name, cached_at FROM tiers_seasoned "
+        "WHERE gender_id = ? AND season_id = ? ORDER BY name",
+        (gender_id, season_id),
       ).fetchall()
 
       if rows and (now - min(r[2] for r in rows)) < ttl:
         return {r[0]: r[1] for r in rows}
 
       tiers = fetcher(gender_id)
-      con.execute("DELETE FROM tiers WHERE gender_id = ?", (gender_id,))
+      con.execute(
+        "DELETE FROM tiers_seasoned WHERE gender_id = ? AND season_id = ?",
+        (gender_id, season_id),
+      )
       con.executemany(
-        "INSERT INTO tiers (gender_id, tier_id, name, cached_at) VALUES (?, ?, ?, ?)",
-        [(gender_id, tid, name, now) for tid, name in tiers.items()],
+        "INSERT INTO tiers_seasoned (gender_id, season_id, tier_id, name, cached_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(gender_id, season_id, tid, name, now) for tid, name in tiers.items()],
       )
       con.commit()
       return tiers
@@ -384,6 +406,7 @@ class Cache:
       con.execute("DELETE FROM associations")
       con.execute("DELETE FROM concelhos")
       con.execute("DELETE FROM tiers")
+      con.execute("DELETE FROM tiers_seasoned")
       con.execute("DELETE FROM license_to_id")
       con.execute("DELETE FROM license_nif")
       con.execute("DELETE FROM batch_number_to_id")

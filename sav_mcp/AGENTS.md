@@ -1,0 +1,158 @@
+# sav-mcp — Agent Reference
+
+MCP server for the FPB SAV2 basketball management system. Authoritative reference for an LLM driving this server through tool calls.
+
+This file is intended to be loaded as the LLM's system prompt (or first context message). It documents the workflow, terminology, and enum tables an LLM needs to use the tools effectively without making extra discovery calls.
+
+## Terminology
+
+| Term | Meaning |
+|------|---------|
+| **licence** (licença) | Player registration number, numeric (e.g. `301772`). Human identifier. |
+| **wallet** (carteira) | Coach registration number. Distinct from licences. |
+| **player_id** | Internal SAV2 numeric ID. Returned by `submit_enrollment`. Not the same as licence. |
+| **batch** (lote / guia) | A "Lote de Inscrição" — group of player registration requests of one type, locked to one tier+gender. |
+| **batch_number** | Human-visible batch identifier (string). All MCP tools accept the number, not the internal id. |
+| **tier** (escalão) | Age category (e.g. "Mini 12", "Sub 14", "Sénior"). `tier_id` is numeric; `tier_name` is free-text. |
+| **association** (associação) | Regional body. Numeric `id` from `list_associations`. |
+| **club** (clube / organizacao) | Numeric club ID. `club_id=0` means federation-wide search. |
+| **season** (época) | SAV2 epoch ID. `None` defaults to current season; `0` means all seasons. |
+| **val** | `1` = home team, `2` = away team. Tools expose this as `team: "home" \| "away"`. |
+| **artifact_id** | UUID returned by `parse_enrollment_forms` referencing a cached OCR result. fpb_modelo_1 results expose this also as `mod1_id`; exame_medico results expose it also as `medical_exam_id`. |
+| **needs_review** | Field-level OCR confidence is too low to trust; the user must confirm or correct. |
+
+## Sessions
+
+`get_session_info` returns the authenticated context — `club_id`, `season_id`, `user`, `profile`. Tools that scope by "the session's club" default to that `club_id`. Pass an explicit `club_id` to override, or `0` to search federation-wide.
+
+## PDF convention
+
+All PDFs cross the MCP boundary as **base64-encoded strings**.
+
+- Inputs: `parse_enrollment_forms(pdfs=[b64, b64, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
+- Outputs: `generate_game_sheet_pdf` returns `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
+
+## Enum tables
+
+### Registration types (`reg_type`)
+| ID | Label |
+|----|-------|
+| 1 | 1ª Inscrição |
+| 2 | Revalidação |
+| 3 | Transferência |
+| 4 | Subida |
+
+### Gender (`gender_id`)
+| ID | Label |
+|----|-------|
+| 1 | Masculino |
+| 2 | Feminino |
+
+### ID document types (`id_type`, used in `field_overrides`)
+| ID | Label |
+|----|-------|
+| 1 | Cartão de Cidadão |
+| 2 | Passaporte |
+| 3 | Título de Residência |
+
+### Guardian relations (`guardian_relation`, for minors)
+| ID | Label |
+|----|-------|
+| 1 | Pai |
+| 2 | Mãe |
+| 3 | Tutor |
+
+### Batch states
+| State | Open for new items? |
+|-------|---------------------|
+| Em construção | yes |
+| Devolvida | no |
+| Em Validação | no |
+| Em Pagamento | no |
+
+### Game statuses
+`Marcado` (scheduled), `Realizado` (played), `Não Marcado`, `Adiado`, `Anulado`.
+
+### Document types (`doc_type` strings)
+`fpb_modelo_1` — main enrollment form. `exame_medico` — medical exam. Other types may be returned by parsers but are not yet wired into the enrollment workflow.
+
+Use `list_tiers(gender_id)` to discover `tier_id` values dynamically — the set differs per gender and varies by season.
+
+## Enrollment workflow
+
+The canonical pipeline. Each step's output feeds the next.
+
+```
+1. parse_enrollment_forms(pdfs=[b64, ...])
+     → [{artifact_id, mod1_id, doc_type, reg_type, tier_id, gender_id, ...}, ...]
+       (one entry per PDF; medical exams return medical_exam_id instead of mod1_id)
+
+2. find_open_batch(reg_type, tier_id, gender_id)  → batch | null
+   or create_batch(reg_type, tier_id, gender_id)  → batch
+     → batch_number
+
+3. resolve_player(batch_number, mod1_id)
+     → {resolved: true, license}  ── proceed
+     or {resolved: false, candidates: [...]}  ── ask user to pick
+     or {resolved: false, candidates: []}  ── ask user for licence
+
+4. preview_enrollment(batch_number, license, mod1_id, medical_exam_id?)
+     → {player, fields: [{kwarg, status, sav_value, ocr_value, final_value}, ...], needs_review: [...]}
+       Status values:
+         "updated"      OCR overrides SAV
+         "match"        SAV kept (OCR matched)
+         "needs_review" low OCR confidence — user must confirm
+         "ocr"          field not in SAV (id_type, guardian_*, consent_*)
+
+5. submit_enrollment(batch_number, license, mod1_id, field_overrides={...}, medical_exam_id?)
+     → {success: true, player_id, source_document_upload, medical_exam_upload}
+     or {success: false, missing_guardian_fields: [...]}  ── retry with guardian fields added
+```
+
+### Required overrides for `submit_enrollment`
+
+`field_overrides` must include:
+
+- Every field listed in `preview.needs_review`.
+- `exam_date: "YYYY-MM-DD"` when no medical exam was parsed (or to override the parsed date).
+- For minors, all four guardian fields when prompted: `guardian_name`, `guardian_relation` (id), `guardian_phone`, `guardian_email`.
+
+Re-call `submit_enrollment` with the added fields after a `missing_guardian_fields` response.
+
+## Other workflows
+
+### Read / update an already-enrolled player
+- `read_enrollment(license)` — show current enrollment.
+- `update_enrollment(license, fields={...})` — patch contact / address / id fields.
+- `update_enrollment_with_document(license, pdf=b64, doc_type?, field_overrides={...}, file_only?)` — re-reconcile from a fresh PDF and optionally upload it.
+
+### Manual enrollment (no PDF)
+- `create_enrollment_manual(batch_number, license, fields={...})`.
+
+### Ad-hoc documents
+- `list_player_documents(license)` — what's uploaded for this player.
+- `upload_player_document(license, pdf_base64, doc_type?)`.
+- `replace_player_document(license, pdf_base64, doc_type?)` — replaces existing doc of that type.
+- `delete_player_document(doc_id)` — by galeria id from `list_player_documents`.
+
+### Batch admin
+- `list_batch_enrollments(batch_number)` — every player in a batch.
+- `delete_enrollment(license)` — remove one player.
+- `delete_batch(batch_number)` — only allowed for open ("Em construção") batches.
+
+## Error handling
+
+Two kinds of failure surface:
+
+- **Structured error dicts** (LLM-actionable, no exception raised):
+  - `{error: "license_not_enrolled", license, open_batches: [...]}` — from `read_enrollment`, `update_enrollment`, `update_enrollment_with_document`, `delete_enrollment`, `list_player_documents`, `upload_player_document`, `replace_player_document`.
+  - `{success: false, missing_guardian_fields: [...]}` — from `submit_enrollment` when the player is a minor.
+- **Raised exceptions** — programming errors (unknown `mod1_id`, invalid `team`, malformed base64). Surface these to the user; they indicate a bug or a malformed input.
+
+## Things to avoid
+
+- Don't fabricate `tier_id` values — call `list_tiers(gender_id)` or get them from `parse_enrollment_forms`.
+- Don't call `submit_enrollment` before `preview_enrollment` for the same `mod1_id` — the reconciliation state is cached and required.
+- Don't pass the internal SAV batch `id`; tools always use the human-visible `batch_number`.
+- Don't loop blindly through batches to find one — use `get_batch(batch_number)`.
+- Don't ask the user for the current club/season — call `get_session_info()`.
