@@ -307,6 +307,8 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
     "doc_type": DocType.FPB_MOD1.value,
     "status": "ok",
     "error": None,
+    "has_club_stamp": None,
+    "stamp_warning": None,
   }
   assert result["medical_exam_upload"] is None
 
@@ -403,6 +405,8 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
     "doc_type": DocType.EM.value,
     "status": "ok",
     "error": None,
+    "has_club_stamp": None,
+    "stamp_warning": None,
   }
   assert captured["close"] == [
     ("proc-form", None),

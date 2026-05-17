@@ -37,6 +37,7 @@ from sav_client.exceptions import (
   SavResponseError,
 )
 from sav_shared.clubs import find_club_matches
+from sav_shared.files import staged_pdf
 from sav_shared.enrollment import (
   KWARG_TO_SAV_KEY,
   create_and_fetch_batch,
@@ -48,7 +49,7 @@ from sav_shared.enrollment import (
   try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
-from sav_shared.fpb_mod1 import reconcile_fpb_mod1
+from sav_shared.fpb_mod1 import read_carimbo_present, reconcile_fpb_mod1, stamped_pdf
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
   DOC_TYPE_CHOICES,
@@ -1554,6 +1555,15 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   console = _console()
   err_console = _console(err=True)
 
+  # Convert any non-PDF inputs (images) to PDFs up front so OCR, classify,
+  # and upload all see PDF paths. PDFs pass through unchanged. Cleanup is
+  # registered on the Click context.
+  pdfs = tuple(ctx.with_resource(staged_pdf(p)) for p in pdfs)
+  if mod1_path:
+    mod1_path = ctx.with_resource(staged_pdf(mod1_path))
+  if medical_exam:
+    medical_exam = ctx.with_resource(staged_pdf(medical_exam))
+
   # Pre-classify each positional PDF and bucket by doc type. Explicit
   # --mod1 / --medical-exam paths are appended directly (no classify call).
   positional_mod1: list[str] = []
@@ -1840,14 +1850,20 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     with console.status(
       "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
     ):
-      ok, err = try_replace_document(
-        client, batch_id, license, pdf_path,
-        tipo_doc=doc_type_to_tipo_doc(doc_type),
-      )
+      with stamped_pdf(pdf_path, carimbo_present=read_carimbo_present(parsed)) as (upload_path, _, stamp_error):
+        ok, err = try_replace_document(
+          client, batch_id, license, upload_path,
+          tipo_doc=doc_type_to_tipo_doc(doc_type),
+        )
     if ok:
       console.print(
         f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
       )
+      if stamp_error:
+        err_console.print(
+          f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
+          "please stamp the document manually."
+        )
     else:
       err_console.print(
         f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
@@ -1856,6 +1872,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       with console.status(
         "[bold cyan]:page_facing_up: Uploading medical exam (exame_medico)...[/]"
       ):
+        # Medical exams don't have a carimbo concept → skip stamping.
         ok, err = try_replace_document(
           client, batch_id, license, medical_exam_path,
           tipo_doc=doc_type_to_tipo_doc(DocType.EM),
@@ -2118,6 +2135,15 @@ def enrollment_update_cmd(
   console = _console()
   err_console = _console(err=True)
 
+  # Convert any non-PDF inputs (images) to PDFs up front; cleanup is registered
+  # on the Click context.
+  if pdf:
+    pdf = ctx.with_resource(staged_pdf(pdf))
+  if mod1_path:
+    mod1_path = ctx.with_resource(staged_pdf(mod1_path))
+  if medical_exam_path:
+    medical_exam_path = ctx.with_resource(staged_pdf(medical_exam_path))
+
   # Mode B — doc-only replace (pdf/--mod1 + --file-only).
   if has_pdf and file_only:
     active_pdf = mod1_path or pdf
@@ -2142,6 +2168,8 @@ def enrollment_update_cmd(
     batch_id = _resolve_batch_id_by_license_or_raise(client, license_)
     batch_number = _batch_number_for_log(client, batch_id)
     try:
+      # --file-only path: no OCR field parse runs → can't tell if the club stamp
+      # is already present, so skip stamping.
       client.replace_player_registration_document(
         batch_id, license_, active_pdf, tipo_doc=tipo_doc,
       )
@@ -2247,14 +2275,20 @@ def enrollment_update_cmd(
       console.print(f"[green]:white_check_mark: Updated licence {license_} in batch #{batch_number}.[/]")
 
       try:
-        client.replace_player_registration_document(
-          batch_id, license_, active_pdf, tipo_doc=tipo_doc,
-        )
+        with stamped_pdf(active_pdf, carimbo_present=read_carimbo_present(parsed)) as (upload_path, _, stamp_error):
+          client.replace_player_registration_document(
+            batch_id, license_, upload_path, tipo_doc=tipo_doc,
+          )
         console.print(
           f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/]"
           f" [dim]({active_pdf})[/]",
           soft_wrap=True,
         )
+        if stamp_error:
+          err_console.print(
+            f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
+            "please stamp the document manually."
+          )
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
         err_console.print(
           f"[yellow]:warning: Field update succeeded but document upload failed:[/] {exc}"
@@ -2315,19 +2349,21 @@ def _upload_medical_exam_update(
     console = _console()
   if err_console is None:
     err_console = _console(err=True)
-  try:
-    train_classifier(path, DocType.EM)
-  except Exception as exc:
-    err_console.print(f"[yellow]:warning: Could not submit classifier training for exam:[/] {exc}")
-  tipo_doc = _tipo_doc_for_upload(DocType.EM)
-  try:
-    client.replace_player_registration_document(batch_id, license, path, tipo_doc=tipo_doc)
-    console.print(
-      f"[green]:white_check_mark: Uploaded exame_medico[/] [dim]({path})[/]",
-      soft_wrap=True,
-    )
-  except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-    err_console.print(f"[yellow]:warning: Medical exam upload failed:[/] {exc}")
+  with staged_pdf(path) as pdf_path:
+    try:
+      train_classifier(pdf_path, DocType.EM)
+    except Exception as exc:
+      err_console.print(f"[yellow]:warning: Could not submit classifier training for exam:[/] {exc}")
+    tipo_doc = _tipo_doc_for_upload(DocType.EM)
+    try:
+      # Medical exams don't have a carimbo concept → skip stamping.
+      client.replace_player_registration_document(batch_id, license, pdf_path, tipo_doc=tipo_doc)
+      console.print(
+        f"[green]:white_check_mark: Uploaded exame_medico[/] [dim]({path})[/]",
+        soft_wrap=True,
+      )
+    except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+      err_console.print(f"[yellow]:warning: Medical exam upload failed:[/] {exc}")
 
 
 @enrollment_grp.command("delete")

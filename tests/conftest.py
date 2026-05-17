@@ -3,6 +3,12 @@ import pytest
 from sav_client import SavClient
 
 
+@pytest.fixture(autouse=True)
+def _unset_club_stamp_path(monkeypatch):
+  """Tests don't exercise the stamp overlay; isolate from the user's env."""
+  monkeypatch.delenv("CLUB_STAMP_PATH", raising=False)
+
+
 @pytest.fixture(scope="session")
 def client():
   c = SavClient.from_env()

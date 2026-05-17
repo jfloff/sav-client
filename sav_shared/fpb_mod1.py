@@ -7,10 +7,19 @@ kwargs and the reconciliation against a stored SAV profile.
 from __future__ import annotations
 
 import difflib
+import logging
+import os
 import re
+import tempfile
 import unicodedata
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
+
+from .files import bottom_right_rect, overlay_image_on_pdf
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from sav_parsers import ParsedField
@@ -20,6 +29,11 @@ from .fields import (
   RECONCILE_TEXT    as _RECONCILE_TEXT,
 )
 from .lookups import distrito_name, find_distrito_id, find_id_by_name
+
+
+# Stamp placement: fraction of page width for stamp size, plus margin.
+_STAMP_WIDTH_FRACTION = 0.20
+_STAMP_MARGIN_FRACTION = 0.03
 
 
 # tipo_identificacao SAV2 int values — OCR side is a multi-checkbox group,
@@ -79,6 +93,114 @@ def _pick_checked(fields: dict[str, ParsedField], mapping: dict[str, int]) -> in
     if f and f.value:
       return int_val
   return None
+
+
+def read_carimbo_present(parsed: dict[str, ParsedField]) -> bool | None:
+  """Read 'carimbo_clube_presente' from a parse_fpb_mod1 fields dict.
+
+  Returns True/False when OCR resolved the field, None when the field is
+  missing or unresolved — callers can use the tri-state to drive a
+  conditional club-stamp overlay.
+  """
+  field = parsed.get("carimbo_clube_presente")
+  if field is None or field.value is None:
+    return None
+  return bool(field.value)
+
+
+def overlay_club_stamp(pdf_bytes: bytes, *, carimbo_present: bool | None = None) -> bytes:
+  """Overlay the club stamp from CLUB_STAMP_PATH onto the first page of a
+  mod 1 PDF, sized to a fraction of the page width and anchored bottom-right.
+
+  Composes the generic overlay_image_on_pdf primitive with the club-stamp-
+  specific bits: env var, conditional based on OCR, stamp image on disk,
+  corner placement.
+
+  carimbo_present:
+    False - OCR ran and found no club stamp → stamp the PDF.
+    True  - OCR ran and detected an existing club stamp → skip.
+    None  - no OCR ran (unknown) → skip, to avoid double-stamping.
+
+  No-op when CLUB_STAMP_PATH is unset. Raises on overlay failures — the
+  stamped_pdf context manager catches those, falls back to the unstamped
+  bytes, and surfaces a human-readable error to the caller so a stamp
+  failure can't abort a post-commit upload.
+  """
+  stamp_path = os.environ.get("CLUB_STAMP_PATH")
+  if not stamp_path or carimbo_present is not False:
+    return pdf_bytes
+
+  with open(stamp_path, "rb") as f:
+    stamp_bytes = f.read()
+  rect = bottom_right_rect(
+    pdf_bytes, stamp_bytes,
+    width_fraction=_STAMP_WIDTH_FRACTION,
+    margin_fraction=_STAMP_MARGIN_FRACTION,
+  )
+  return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect)
+
+
+@contextmanager
+def stamped_pdf(
+  pdf_path: str, *, carimbo_present: bool | None = None,
+) -> Iterator[tuple[str, bool | None, str | None]]:
+  """Yield (upload_path, has_club_stamp, stamp_error).
+
+  `has_club_stamp` reflects the state of the uploaded PDF (not just whether
+  *we* applied the stamp). The truth table:
+
+    carimbo_present | env var | overlay | has_club_stamp
+    True            | any     | skipped | True   (OCR already saw a stamp)
+    False           | unset   | skipped | False  (OCR saw no stamp, none added)
+    False           | set     | ok      | True   (we just added one)
+    False           | set     | failed  | False  (we tried; uploaded unstamped)
+    None            | any     | skipped | None   (no OCR — unknown)
+
+  `stamp_error` is set only in the "tried but failed" row, so callers can
+  pair `has_club_stamp is False` + `stamp_error` to distinguish "we tried
+  and failed; please stamp manually" from "OCR confirmed it was missing and
+  we weren't configured to add one".
+
+  These contexts run after a SAV-side commit, so the upload always
+  proceeds; the caller is responsible for surfacing stamp_error to the user.
+  """
+  # Fast path: if stamping definitively won't fire (no env var, or OCR says
+  # the stamp is already there / unknown), skip the read+overlay pipeline so
+  # non-stamping uploads pay zero extra I/O and have no new failure surface.
+  if not os.environ.get("CLUB_STAMP_PATH") or carimbo_present is not False:
+    yield (pdf_path, carimbo_present, None)
+    return
+
+  tmp_path: str | None = None
+  has_club_stamp: bool = False
+  stamp_error: str | None = None
+  try:
+    with open(pdf_path, "rb") as f:
+      pdf_bytes = f.read()
+    stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present)
+    # Assign tmp_path before writing so a mid-write failure can be cleaned up.
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+      tmp_path = f.name
+      f.write(stamped)
+    has_club_stamp = True
+  except Exception as exc:
+    logger.warning(
+      "Failed to prepare stamped PDF for %r; uploading the original.",
+      pdf_path, exc_info=True,
+    )
+    stamp_error = f"club stamp failed: {exc}"
+    if tmp_path and os.path.exists(tmp_path):
+      try:
+        os.unlink(tmp_path)
+      except OSError:
+        pass
+    tmp_path = None
+
+  try:
+    yield (tmp_path or pdf_path, has_club_stamp, stamp_error)
+  finally:
+    if tmp_path and os.path.exists(tmp_path):
+      os.unlink(tmp_path)
 
 
 def effective_distrito_id(

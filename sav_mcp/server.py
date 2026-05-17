@@ -42,6 +42,7 @@ from sav_client.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
+from sav_shared.files import ensure_pdf
 from sav_shared.enrollment import (
     create_and_fetch_batch,
     derive_enrollment_params,
@@ -50,7 +51,7 @@ from sav_shared.enrollment import (
     try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
-from sav_shared.fpb_mod1 import reconcile_fpb_mod1
+from sav_shared.fpb_mod1 import read_carimbo_present, reconcile_fpb_mod1, stamped_pdf
 from sav_shared.games import filter_games
 from sav_shared.lookups import GENERO, REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
 from sav_shared.medical_exam import extract_medical_exam_info
@@ -492,8 +493,16 @@ def _replace_player_document_from_bytes(
     pdf_bytes: bytes | None,
     *,
     doc_type: DocType,
+    parsed: dict | None = None,
 ) -> dict[str, Any]:
-    """Upload cached PDF bytes as a replacement registration document."""
+    """Upload cached PDF bytes as a replacement registration document.
+
+    `parsed` is the fpb_modelo_1 fields dict from parse_fpb_mod1 (when
+    available); used to decide whether to overlay the club stamp.
+    """
+    # has_club_stamp / stamp_warning describe the uploaded PDF, so they're
+    # only added to the status when status == "ok"; on "skipped" / "error"
+    # there's no uploaded PDF to describe.
     status = {
         "doc_type": doc_type.value,
         "status": "skipped",
@@ -502,17 +511,26 @@ def _replace_player_document_from_bytes(
     if not pdf_bytes:
         return status
 
+    carimbo = (
+        read_carimbo_present(parsed)
+        if (doc_type == DocType.FPB_MOD1 and parsed) else None
+    )
     tmp_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bytes)
-            tmp_path = f.name
-        ok, error = try_replace_document(
-            client, batch_id, license, tmp_path,
-            tipo_doc=doc_type_to_tipo_doc(doc_type),
-        )
-        status["status"] = "ok" if ok else "error"
-        status["error"] = error
+        tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
+        with stamped_pdf(tmp_path, carimbo_present=carimbo) as (upload_path, has_club_stamp, stamp_error):
+            ok, error = try_replace_document(
+                client, batch_id, license, upload_path,
+                tipo_doc=doc_type_to_tipo_doc(doc_type),
+            )
+            status["status"] = "ok" if ok else "error"
+            status["error"] = error
+            if ok:
+                status["has_club_stamp"] = has_club_stamp
+                status["stamp_warning"] = (
+                    f"{stamp_error} — document uploaded without the club stamp; "
+                    "please stamp it manually."
+                ) if stamp_error else None
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -558,9 +576,7 @@ def parse_enrollment_forms(
 
         tmp_path: str | None = None
         try:
-            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-                f.write(pdf_bytes)
-                tmp_path = f.name
+            tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
             if hint is not None:
                 # Type is already known — skip classify and train the classifier.
@@ -813,7 +829,11 @@ def submit_enrollment(
         guardian info is absent — call submit_enrollment again with those fields
         added to field_overrides.
       success=true also includes source_document_upload and
-      medical_exam_upload with {doc_type, status, error}.
+      medical_exam_upload with {doc_type, status, error}. When status=="ok"
+      these also carry has_club_stamp (True/False/None — whether the
+      uploaded PDF has the club stamp; None when no OCR ran) and
+      stamp_warning (str when the overlay was attempted but failed, else
+      None — surface it so the user can stamp manually).
     """
     from sav_parsers import close_processing
 
@@ -877,6 +897,7 @@ def submit_enrollment(
         license,
         form.get("pdf_bytes"),
         doc_type=form["doc_type"],
+        parsed=form.get("parsed"),
     )
     medical_exam_upload = (
         _replace_player_document_from_bytes(
@@ -1055,9 +1076,7 @@ def update_enrollment_with_document(
 
     tmp_path: str | None = None
     try:
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-            f.write(pdf_bytes)
-            tmp_path = f.name
+        tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
         _hint_map = {"fpb_modelo_1": DocType.FPB_MOD1, "exame_medico": DocType.EM}
         if doc_type is not None:
@@ -1078,6 +1097,7 @@ def update_enrollment_with_document(
             return batch_id
 
         if file_only:
+            # No OCR ran → can't tell if the club stamp is already present, so skip stamping.
             client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
             return {"success": True, "fields_updated": False, "document_uploaded": True}
 
@@ -1106,7 +1126,8 @@ def update_enrollment_with_document(
             }
             patch_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
             client.update_player_in_registration_batch(batch_id, license, **patch_kwargs)
-            client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
+            with stamped_pdf(tmp_path, carimbo_present=read_carimbo_present(parsed)) as (upload_path, has_club_stamp, stamp_error):
+                client.replace_player_registration_document(batch_id, license, upload_path, tipo_doc=tipo_doc)
 
             corrections: dict[str, str] = {}
             for kwarg in result.needs_review:
@@ -1127,7 +1148,18 @@ def update_enrollment_with_document(
                 except Exception:
                     logger.debug("close_processing fallback failed", exc_info=True)
 
-        return {"success": True, "fields_updated": True, "document_uploaded": True}
+        response = {
+            "success": True,
+            "fields_updated": True,
+            "document_uploaded": True,
+            "has_club_stamp": has_club_stamp,
+        }
+        if stamp_error:
+            response["stamp_warning"] = (
+                f"{stamp_error} — document uploaded without the club stamp; "
+                "please stamp it manually."
+            )
+        return response
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -1246,13 +1278,16 @@ def list_player_documents(license: int) -> list[dict] | dict:
     ]
 
 
-def _decode_pdf_to_tempfile(pdf_base64: str, suffix: str = ".pdf") -> str:
-    """Decode a base64-encoded payload into a temp file; caller must unlink."""
-    pdf_bytes = base64.b64decode(pdf_base64)
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as f:
-        f.write(pdf_bytes)
+def _pdf_bytes_to_tempfile(data: bytes) -> str:
+    """Write PDF/image bytes to a .pdf temp file (converting images); caller must unlink."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        f.write(ensure_pdf(data))
         return f.name
 
+
+def _decode_pdf_to_tempfile(pdf_base64: str) -> str:
+    """Decode a base64-encoded payload into a .pdf temp file; caller must unlink."""
+    return _pdf_bytes_to_tempfile(base64.b64decode(pdf_base64))
 
 def _resolve_document_upload_type(tmp_path: str, doc_type: str | None) -> str:
     """Return explicit doc_type or classify tmp_path when omitted."""
@@ -1289,6 +1324,8 @@ def upload_player_document(
         batch_id = _resolve_license_batch(client, license)
         if isinstance(batch_id, dict):
             return batch_id
+        # classify-only path: no OCR field parse, so we don't know whether the
+        # club stamp is already present → skip stamping to avoid double-stamping.
         client.upload_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
@@ -1332,6 +1369,7 @@ def replace_player_document(
         batch_id = _resolve_license_batch(client, license)
         if isinstance(batch_id, dict):
             return batch_id
+        # classify-only path: see comment in upload_player_document. Skip stamping.
         client.replace_player_registration_document(
             batch_id, license, tmp_path, tipo_doc=tipo_doc,
         )
