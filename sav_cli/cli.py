@@ -49,7 +49,7 @@ from sav_shared.enrollment import (
   try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
-from sav_shared.fpb_mod1 import read_carimbo_present, reconcile_fpb_mod1, stamped_pdf
+from sav_shared.fpb_mod1 import read_carimbo, reconcile_fpb_mod1, stamped_pdf
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
   DOC_TYPE_CHOICES,
@@ -1850,7 +1850,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     with console.status(
       "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
     ):
-      with stamped_pdf(pdf_path, carimbo_present=read_carimbo_present(parsed)) as (upload_path, _, stamp_error):
+      carimbo, carimbo_bbox = read_carimbo(parsed)
+      with stamped_pdf(pdf_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, _, stamp_error):
         ok, err = try_replace_document(
           client, batch_id, license, upload_path,
           tipo_doc=doc_type_to_tipo_doc(doc_type),
@@ -2275,7 +2276,8 @@ def enrollment_update_cmd(
       console.print(f"[green]:white_check_mark: Updated licence {license_} in batch #{batch_number}.[/]")
 
       try:
-        with stamped_pdf(active_pdf, carimbo_present=read_carimbo_present(parsed)) as (upload_path, _, stamp_error):
+        carimbo, carimbo_bbox = read_carimbo(parsed)
+        with stamped_pdf(active_pdf, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, _, stamp_error):
           client.replace_player_registration_document(
             batch_id, license_, upload_path, tipo_doc=tipo_doc,
           )

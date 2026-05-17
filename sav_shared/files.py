@@ -119,6 +119,31 @@ def bottom_right_rect(
   )
 
 
+def bbox_to_pdf_rect(
+  pdf_bytes: bytes,
+  normalized_vertices: list[tuple[float, float]],
+  *,
+  page_index: int = 0,
+) -> tuple[float, float, float, float]:
+  """Convert normalized [0..1] top-left-origin vertices (Document AI's
+  format) to a PDF user-space rect (origin bottom-left, units in points).
+
+  Axis-aligned to vertex min/max — Document AI polys can be 4-point quads
+  with skew, and `add_overlay` wants a clean rect. Returns (x0, y0, x1, y1)
+  suitable for passing to overlay_image_on_pdf.
+  """
+  page_x0, page_y0, page_x1, page_y1 = get_pdf_page_box(pdf_bytes, page_index=page_index)
+  page_w = page_x1 - page_x0
+  page_h = page_y1 - page_y0
+  xs = [v[0] for v in normalized_vertices]
+  ys = [v[1] for v in normalized_vertices]
+  x0 = page_x0 + min(xs) * page_w
+  x1 = page_x0 + max(xs) * page_w
+  y0 = page_y1 - max(ys) * page_h
+  y1 = page_y1 - min(ys) * page_h
+  return (x0, y0, x1, y1)
+
+
 def overlay_image_on_pdf(
   pdf_bytes: bytes,
   image_bytes: bytes,

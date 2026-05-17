@@ -51,7 +51,7 @@ from sav_shared.enrollment import (
     try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
-from sav_shared.fpb_mod1 import read_carimbo_present, reconcile_fpb_mod1, stamped_pdf
+from sav_shared.fpb_mod1 import read_carimbo, reconcile_fpb_mod1, stamped_pdf
 from sav_shared.games import filter_games
 from sav_shared.lookups import GENERO, REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
 from sav_shared.medical_exam import extract_medical_exam_info
@@ -511,14 +511,14 @@ def _replace_player_document_from_bytes(
     if not pdf_bytes:
         return status
 
-    carimbo = (
-        read_carimbo_present(parsed)
-        if (doc_type == DocType.FPB_MOD1 and parsed) else None
+    carimbo, carimbo_bbox = (
+        read_carimbo(parsed)
+        if (doc_type == DocType.FPB_MOD1 and parsed) else (None, None)
     )
     tmp_path: str | None = None
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
-        with stamped_pdf(tmp_path, carimbo_present=carimbo) as (upload_path, has_club_stamp, stamp_error):
+        with stamped_pdf(tmp_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
             ok, error = try_replace_document(
                 client, batch_id, license, upload_path,
                 tipo_doc=doc_type_to_tipo_doc(doc_type),
@@ -1126,7 +1126,8 @@ def update_enrollment_with_document(
             }
             patch_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
             client.update_player_in_registration_batch(batch_id, license, **patch_kwargs)
-            with stamped_pdf(tmp_path, carimbo_present=read_carimbo_present(parsed)) as (upload_path, has_club_stamp, stamp_error):
+            carimbo, carimbo_bbox = read_carimbo(parsed)
+            with stamped_pdf(tmp_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
                 client.replace_player_registration_document(batch_id, license, upload_path, tipo_doc=tipo_doc)
 
             corrections: dict[str, str] = {}

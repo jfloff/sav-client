@@ -17,23 +17,19 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from .files import bottom_right_rect, overlay_image_on_pdf
+from .files import bbox_to_pdf_rect, overlay_image_on_pdf
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
   from sav_parsers import ParsedField
+  from sav_parsers.types import BBox
 
 from .fields import (
   RECONCILE_READONLY as _RECONCILE_READONLY,
   RECONCILE_TEXT    as _RECONCILE_TEXT,
 )
 from .lookups import distrito_name, find_distrito_id, find_id_by_name
-
-
-# Stamp placement: fraction of page width for stamp size, plus margin.
-_STAMP_WIDTH_FRACTION = 0.20
-_STAMP_MARGIN_FRACTION = 0.03
 
 
 # tipo_identificacao SAV2 int values — OCR side is a multi-checkbox group,
@@ -95,68 +91,79 @@ def _pick_checked(fields: dict[str, ParsedField], mapping: dict[str, int]) -> in
   return None
 
 
-def read_carimbo_present(parsed: dict[str, ParsedField]) -> bool | None:
+def read_carimbo(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | None]:
   """Read 'carimbo_clube_presente' from a parse_fpb_mod1 fields dict.
 
-  Returns True/False when OCR resolved the field, None when the field is
-  missing or unresolved — callers can use the tri-state to drive a
-  conditional club-stamp overlay.
+  Returns (present, bbox). present is True/False when OCR resolved the
+  field, None when the field is missing or unresolved. bbox is the
+  normalized stamp-slot box from Document AI, or None when the entity
+  wasn't detected or had no page_anchor.
   """
   field = parsed.get("carimbo_clube_presente")
-  if field is None or field.value is None:
-    return None
-  return bool(field.value)
+  if field is None:
+    return (None, None)
+  present = None if field.value is None else bool(field.value)
+  return (present, field.bbox)
 
 
-def overlay_club_stamp(pdf_bytes: bytes, *, carimbo_present: bool | None = None) -> bytes:
-  """Overlay the club stamp from CLUB_STAMP_PATH onto the first page of a
-  mod 1 PDF, sized to a fraction of the page width and anchored bottom-right.
+def overlay_club_stamp(
+  pdf_bytes: bytes,
+  *,
+  carimbo_present: bool | None = None,
+  bbox: BBox | None = None,
+) -> bytes:
+  """Overlay the club stamp from CLUB_STAMP_PATH onto a mod 1 PDF at the
+  location OCR detected for the carimbo_clube_presente entity.
 
   Composes the generic overlay_image_on_pdf primitive with the club-stamp-
   specific bits: env var, conditional based on OCR, stamp image on disk,
-  corner placement.
+  bbox-driven placement.
 
   carimbo_present:
-    False - OCR ran and found no club stamp → stamp the PDF.
+    False - OCR ran and found no club stamp → stamp the PDF at `bbox`.
     True  - OCR ran and detected an existing club stamp → skip.
     None  - no OCR ran (unknown) → skip, to avoid double-stamping.
 
-  No-op when CLUB_STAMP_PATH is unset. Raises on overlay failures — the
-  stamped_pdf context manager catches those, falls back to the unstamped
-  bytes, and surfaces a human-readable error to the caller so a stamp
-  failure can't abort a post-commit upload.
+  No-op when CLUB_STAMP_PATH is unset. Raises ValueError when stamping is
+  wanted but `bbox` is None (OCR didn't return a stamp location). Raises
+  on other overlay failures too — the stamped_pdf context manager catches
+  any of these, falls back to the unstamped bytes, and surfaces a
+  human-readable error to the caller so a stamp failure can't abort a
+  post-commit upload.
   """
   stamp_path = os.environ.get("CLUB_STAMP_PATH")
   if not stamp_path or carimbo_present is not False:
     return pdf_bytes
+  if bbox is None:
+    raise ValueError("OCR did not return a location for carimbo_clube_presente")
 
   with open(stamp_path, "rb") as f:
     stamp_bytes = f.read()
-  rect = bottom_right_rect(
-    pdf_bytes, stamp_bytes,
-    width_fraction=_STAMP_WIDTH_FRACTION,
-    margin_fraction=_STAMP_MARGIN_FRACTION,
-  )
-  return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect)
+  rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
+  return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=bbox.page)
 
 
 @contextmanager
 def stamped_pdf(
-  pdf_path: str, *, carimbo_present: bool | None = None,
+  pdf_path: str,
+  *,
+  carimbo_present: bool | None = None,
+  bbox: BBox | None = None,
 ) -> Iterator[tuple[str, bool | None, str | None]]:
   """Yield (upload_path, has_club_stamp, stamp_error).
 
   `has_club_stamp` reflects the state of the uploaded PDF (not just whether
   *we* applied the stamp). The truth table:
 
-    carimbo_present | env var | overlay | has_club_stamp
-    True            | any     | skipped | True   (OCR already saw a stamp)
-    False           | unset   | skipped | False  (OCR saw no stamp, none added)
-    False           | set     | ok      | True   (we just added one)
-    False           | set     | failed  | False  (we tried; uploaded unstamped)
-    None            | any     | skipped | None   (no OCR — unknown)
+    carimbo_present | env var | bbox    | overlay | has_club_stamp | stamp_error
+    True            | any     | any     | skipped | True           | None
+    False           | unset   | any     | skipped | False          | None
+    False           | set     | present | ok      | True           | None
+    False           | set     | missing | failed  | False          | "OCR did not return …"
+    False           | set     | present | failed  | False          | "club stamp failed: …"
+    None            | any     | any     | skipped | None           | None
 
-  `stamp_error` is set only in the "tried but failed" row, so callers can
+  `stamp_error` is set only on the "tried but failed" rows, so callers can
   pair `has_club_stamp is False` + `stamp_error` to distinguish "we tried
   and failed; please stamp manually" from "OCR confirmed it was missing and
   we weren't configured to add one".
@@ -177,7 +184,7 @@ def stamped_pdf(
   try:
     with open(pdf_path, "rb") as f:
       pdf_bytes = f.read()
-    stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present)
+    stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox)
     # Assign tmp_path before writing so a mid-write failure can be cleaned up.
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
       tmp_path = f.name
