@@ -1451,6 +1451,15 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
+def _stage_pdf(ctx: click.Context, console: Console, path: str) -> str:
+  """Stage `path` (PDF or supported image) into a PDF, register cleanup on
+  `ctx`, announce conversion to `console`, and return the staged PDF path."""
+  staged, was_converted = ctx.with_resource(staged_pdf(path))
+  if was_converted:
+    console.print(f"[cyan]:arrows_counterclockwise: Converted [bold]{path}[/] to PDF.[/]")
+  return staged
+
+
 @cli.group("enrollment")
 def enrollment_grp():
   """Create, read, update, and delete player enrolments in Revalidação batches."""
@@ -1558,11 +1567,11 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   # Convert any non-PDF inputs (images) to PDFs up front so OCR, classify,
   # and upload all see PDF paths. PDFs pass through unchanged. Cleanup is
   # registered on the Click context.
-  pdfs = tuple(ctx.with_resource(staged_pdf(p)) for p in pdfs)
+  pdfs = tuple(_stage_pdf(ctx, console, p) for p in pdfs)
   if mod1_path:
-    mod1_path = ctx.with_resource(staged_pdf(mod1_path))
+    mod1_path = _stage_pdf(ctx, console, mod1_path)
   if medical_exam:
-    medical_exam = ctx.with_resource(staged_pdf(medical_exam))
+    medical_exam = _stage_pdf(ctx, console, medical_exam)
 
   # Pre-classify each positional PDF and bucket by doc type. Explicit
   # --mod1 / --medical-exam paths are appended directly (no classify call).
@@ -1851,7 +1860,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
     ):
       carimbo, carimbo_bbox = read_carimbo(parsed)
-      with stamped_pdf(pdf_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, _, stamp_error):
+      with stamped_pdf(pdf_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
         ok, err = try_replace_document(
           client, batch_id, license, upload_path,
           tipo_doc=doc_type_to_tipo_doc(doc_type),
@@ -1860,6 +1869,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       console.print(
         f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
       )
+      if carimbo is False and has_club_stamp:
+        console.print("[green]:label:  Applied club stamp at OCR-detected location.[/]")
       if stamp_error:
         err_console.print(
           f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
@@ -2139,11 +2150,11 @@ def enrollment_update_cmd(
   # Convert any non-PDF inputs (images) to PDFs up front; cleanup is registered
   # on the Click context.
   if pdf:
-    pdf = ctx.with_resource(staged_pdf(pdf))
+    pdf = _stage_pdf(ctx, console, pdf)
   if mod1_path:
-    mod1_path = ctx.with_resource(staged_pdf(mod1_path))
+    mod1_path = _stage_pdf(ctx, console, mod1_path)
   if medical_exam_path:
-    medical_exam_path = ctx.with_resource(staged_pdf(medical_exam_path))
+    medical_exam_path = _stage_pdf(ctx, console, medical_exam_path)
 
   # Mode B — doc-only replace (pdf/--mod1 + --file-only).
   if has_pdf and file_only:
@@ -2277,7 +2288,7 @@ def enrollment_update_cmd(
 
       try:
         carimbo, carimbo_bbox = read_carimbo(parsed)
-        with stamped_pdf(active_pdf, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, _, stamp_error):
+        with stamped_pdf(active_pdf, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
           client.replace_player_registration_document(
             batch_id, license_, upload_path, tipo_doc=tipo_doc,
           )
@@ -2286,6 +2297,8 @@ def enrollment_update_cmd(
           f" [dim]({active_pdf})[/]",
           soft_wrap=True,
         )
+        if carimbo is False and has_club_stamp:
+          console.print("[green]:label:  Applied club stamp at OCR-detected location.[/]")
         if stamp_error:
           err_console.print(
             f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
@@ -2351,7 +2364,9 @@ def _upload_medical_exam_update(
     console = _console()
   if err_console is None:
     err_console = _console(err=True)
-  with staged_pdf(path) as pdf_path:
+  with staged_pdf(path) as (pdf_path, was_converted):
+    if was_converted:
+      console.print(f"[cyan]:arrows_counterclockwise: Converted [bold]{path}[/] to PDF.[/]")
     try:
       train_classifier(pdf_path, DocType.EM)
     except Exception as exc:

@@ -46,24 +46,24 @@ def ensure_pdf(data: bytes) -> bytes:
 
 
 @contextmanager
-def staged_pdf(input_path: str) -> Iterator[str]:
-  """Yield a PDF path for `input_path`.
+def staged_pdf(input_path: str) -> Iterator[tuple[str, bool]]:
+  """Yield (pdf_path, was_converted) for `input_path`.
 
-  PDFs are yielded as-is (no copy). Supported image inputs are wrapped into
-  a PDF in a temp file, which is cleaned up on exit. The size guard in
-  ensure_pdf applies to both cases.
+  PDFs are yielded as-is with was_converted=False (no copy). Supported image
+  inputs are wrapped into a PDF in a temp file (was_converted=True), which
+  is cleaned up on exit. The size guard in ensure_pdf applies to both cases.
   """
   with open(input_path, "rb") as f:
     data = f.read()
   pdf_bytes = ensure_pdf(data)
   if pdf_bytes is data:
-    yield input_path
+    yield (input_path, False)
     return
   with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
     f.write(pdf_bytes)
     tmp_path = f.name
   try:
-    yield tmp_path
+    yield (tmp_path, True)
   finally:
     if os.path.exists(tmp_path):
       os.unlink(tmp_path)
