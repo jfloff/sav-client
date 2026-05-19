@@ -1128,7 +1128,7 @@ def _find_enrolled_in_matching_batches(
 
 
 def _resolve_enroll_player(
-  client: Any, batch: Any, parsed: dict,
+  client: Any, batch: Any, parsed: dict, reg_type: int | None = None,
 ) -> tuple[int, Any] | None:
   """Return ``(license, target_batch)`` for the parsed form, or None to skip.
 
@@ -1136,6 +1136,9 @@ def _resolve_enroll_player(
   player is already enrolled in a different open batch with matching
   params — in that case the caller should add/update against the returned
   batch instead, since SAV2 won't allow re-adding to a second one.
+
+  For revalidação (reg_type=2), uses NIF-based license lookup directly,
+  skipping manual entry prompts.
   """
   console = _console()
   try:
@@ -1156,10 +1159,10 @@ def _resolve_enroll_player(
   enrolled_license: int | None = None
   if ocr_license is not None:
     enrolled_license = ocr_license
-  else:
-    nif_license = find_player_license_by_nif(parsed, client, club_id=batch.club_id)
-    if nif_license is not None:
-      enrolled_license = nif_license
+
+  nif_license = find_player_license_by_nif(parsed, client, club_id=batch.club_id)
+  if enrolled_license is None and nif_license is not None:
+    enrolled_license = nif_license
 
   if enrolled_license is not None:
     with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
@@ -1172,6 +1175,18 @@ def _resolve_enroll_player(
       else:
         console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
       return enrolled_license, target
+
+  # For revalidação, surface the NIF-based license before prompting for manual entry.
+  # Only offer if from NIF lookup (ocr_license may be misread).
+  # Note: this license may not be eligible for this specific batch; if so, submit
+  # will fail and the user will need to manually add them to the eligible list or
+  # use a different batch.
+  if reg_type == 2 and nif_license is not None and ocr_license is None:
+    console.print(
+      f"[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
+    )
+    if click.confirm("  Use this licence?", default=True):
+      return nif_license, batch
 
   if len(candidates) > 1:
     console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
@@ -1726,7 +1741,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     # batch when the player is already enrolled there — SAV2 only permits
     # one open enrolment per player).
     try:
-      resolved = _resolve_enroll_player(client, batch, parsed)
+      resolved = _resolve_enroll_player(client, batch, parsed, reg_type)
     except (SavConnectionError, SavResponseError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     if resolved is None:
