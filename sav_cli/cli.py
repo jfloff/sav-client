@@ -76,6 +76,19 @@ _VERBOSE: bool = False
 _CLUB_MATCH_LIMIT = 5
 
 
+def _require_env(name: str) -> str:
+  """Fail fast at command entry if a required env var is not set.
+
+  Called at the top of each command path that needs the var, so downstream
+  code (fpb_mod1, stamped_pdf, etc.) can trust the var is present and read
+  it directly without defensive fallback branches.
+  """
+  value = os.environ.get(name)
+  if not value:
+    raise SavCliError(f"Environment variable {name} is required but not set.", code="config_error")
+  return value
+
+
 def _console(*, err: bool = False) -> Console:
   stream_name = "stderr" if err else "stdout"
   return Console(file=click.get_text_stream(stream_name))
@@ -1451,6 +1464,26 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
+def _carimbo_extras_row(parsed: dict) -> tuple[str, str, str, str, str]:
+  """Build the (label, sav, ocr, final, source) summary row describing what
+  OCR detected for carimbo_clube_presente and the planned stamp action.
+
+  Helps diagnose silent-skip cases: when the entity isn't returned by OCR,
+  OCR column shows "—" and Final shows "skip (no OCR result)".
+  """
+  carimbo, bbox = read_carimbo(parsed)
+  ocr_str = {True: "yes", False: "no", None: "—"}[carimbo]
+  if carimbo is True:
+    final, source = "on form", "OCR"
+  elif carimbo is False and bbox is not None:
+    final, source = "will overlay", "auto"
+  elif carimbo is False and bbox is None:
+    final, source = "skip (no OCR location)", "auto"
+  else:
+    final, source = "skip (no OCR result)", "auto"
+  return ("Carimbo do Clube", "—", ocr_str, final, source)
+
+
 def _stage_pdf(ctx: click.Context, console: Console, path: str) -> str:
   """Stage `path` (PDF or supported image) into a PDF, register cleanup on
   `ctx`, announce conversion to `console`, and return the staged PDF path."""
@@ -1559,6 +1592,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     )
     return
 
+  _require_env("CLUB_STAMP_PATH")
   client = _make_client()
 
   console = _console()
@@ -1806,6 +1840,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     summary_extras: list[tuple[str, str, str, str, str]] = [
       ("Data Exame Médico", "—", exam_date_ocr_cell, exam_date_final, exam_date_source),
       ("Subida de Escalão", "—", "—", "no", "default"),
+      _carimbo_extras_row(parsed),
     ]
 
     kwargs = _confirm_enroll(
@@ -2100,10 +2135,6 @@ def enrollment_read_cmd(ctx, batch_number, license_):
   ),
 )
 @click.option(
-  "--file-only", is_flag=True, default=False,
-  help="With PDF: only replace the document; do not touch fields.",
-)
-@click.option(
   "--tipo", default=None,
   help=(
     "Document type "
@@ -2113,7 +2144,7 @@ def enrollment_read_cmd(ctx, batch_number, license_):
 )
 @click.pass_context
 def enrollment_update_cmd(
-  ctx, license_, pdf, mod1_path, medical_exam_path, fields, file_only, tipo,
+  ctx, license_, pdf, mod1_path, medical_exam_path, fields, tipo,
 ):
   """Update an existing player enrolment.
 
@@ -2124,8 +2155,6 @@ def enrollment_update_cmd(
         Same with explicit doc type (skips classify; trains classifier).
     sav enrollment update --license LICENSE FILE --field KEY=VAL [...]
         OCR-reconcile FILE, apply manual field overrides, patch, replace doc.
-    sav enrollment update --license LICENSE FILE --file-only
-        Replace document only; leave fields untouched.
     sav enrollment update --license LICENSE --field KEY=VAL [--field ...]
         Patch fields; no document.
     sav enrollment update --license LICENSE --medical-exam FILE
@@ -2139,8 +2168,6 @@ def enrollment_update_cmd(
       "Pass a PDF (positional or --mod1), --medical-exam, or --field K=V. "
       "Run `sav enrollment update --help` for examples."
     )
-  if file_only and not has_pdf:
-    raise click.UsageError("--file-only requires a PDF argument (positional or --mod1).")
 
   doc_type: DocType | None = _resolve_doc_type(tipo) if tipo is not None else None
 
@@ -2156,48 +2183,10 @@ def enrollment_update_cmd(
   if medical_exam_path:
     medical_exam_path = _stage_pdf(ctx, console, medical_exam_path)
 
-  # Mode B — doc-only replace (pdf/--mod1 + --file-only).
-  if has_pdf and file_only:
-    active_pdf = mod1_path or pdf
-    if mod1_path:
-      active_doc_type: DocType = DocType.FPB_MOD1
-      from sav_parsers import train_classifier
-      try:
-        train_classifier(mod1_path, active_doc_type)
-      except Exception as exc:
-        err_console.print(f"[yellow]:warning: Could not submit classifier training:[/] {exc}")
-    else:
-      if doc_type is None:
-        doc_type = _classify_pdf_doc_type(active_pdf)
-        active_filename = os.path.basename(active_pdf)
-        console.print(
-          f"[green]:white_check_mark: Classified {active_filename} as {_doc_type_text(doc_type)}[/]",
-          soft_wrap=True,
-        )
-      active_doc_type = doc_type
-    tipo_doc = _tipo_doc_for_upload(active_doc_type)
-    client = _make_client()
-    batch_id = _resolve_batch_id_by_license_or_raise(client, license_)
-    batch_number = _batch_number_for_log(client, batch_id)
-    try:
-      # --file-only path: no OCR field parse runs → can't tell if the club stamp
-      # is already present, so skip stamping.
-      client.replace_player_registration_document(
-        batch_id, license_, active_pdf, tipo_doc=tipo_doc,
-      )
-    except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
-      raise SavCliError(str(exc), code=_exc_code(exc))
-    console.print(
-      f"[green]:white_check_mark: Replaced {_doc_type_text(active_doc_type)}"
-      f" for licence {license_} in batch #{batch_number}.[/]"
-    )
-    if medical_exam_path:
-      _upload_medical_exam_update(batch_id, license_, medical_exam_path, client=client, console=console, err_console=err_console)
-    return
-
   # Mode A / D — PDF-driven (parse → reconcile → patch fields → replace doc).
   # Mode A: PDF only. Mode D: PDF + --field overrides.
-  if has_pdf and not file_only:
+  if has_pdf:
+    _require_env("CLUB_STAMP_PATH")
     active_pdf = mod1_path or pdf
     from sav_parsers import close_processing, parse_fpb_mod1, train_classifier
 
@@ -2219,7 +2208,7 @@ def enrollment_update_cmd(
       if doc_type != DocType.FPB_MOD1:
         raise SavCliError(
           f"Unsupported document type {_doc_type_text(doc_type)!r}; "
-          "only fpb_modelo_1 forms are reconciled. Use --file-only to upload as-is.",
+          "only fpb_modelo_1 forms are supported for enrollment update.",
           code="parse_error",
         )
       active_doc_type = doc_type
@@ -2256,6 +2245,7 @@ def enrollment_update_cmd(
       kwargs = _confirm_enroll(
         result, sav_profile, license_,
         ocr_source=f"OCR ({os.path.basename(active_pdf)})",
+        extras=[_carimbo_extras_row(parsed)],
       )
       if kwargs is None:
         console.print("[yellow]:fast_forward: Skipped.[/]")

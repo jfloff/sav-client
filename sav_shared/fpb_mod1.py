@@ -116,23 +116,24 @@ def overlay_club_stamp(
   location OCR detected for the carimbo_clube_presente entity.
 
   Composes the generic overlay_image_on_pdf primitive with the club-stamp-
-  specific bits: env var, conditional based on OCR, stamp image on disk,
-  bbox-driven placement.
+  specific bits: conditional based on OCR, stamp image on disk, bbox-driven
+  placement.
 
   carimbo_present:
     False - OCR ran and found no club stamp → stamp the PDF at `bbox`.
     True  - OCR ran and detected an existing club stamp → skip.
     None  - no OCR ran (unknown) → skip, to avoid double-stamping.
 
-  No-op when CLUB_STAMP_PATH is unset. Raises ValueError when stamping is
-  wanted but `bbox` is None (OCR didn't return a stamp location). Raises
-  on other overlay failures too — the stamped_pdf context manager catches
-  any of these, falls back to the unstamped bytes, and surfaces a
-  human-readable error to the caller so a stamp failure can't abort a
-  post-commit upload.
+  Raises ValueError when stamping is wanted but `bbox` is None (OCR didn't
+  return a stamp location). Raises on other overlay failures too — the
+  stamped_pdf context manager catches any of these, falls back to the
+  unstamped bytes, and surfaces a human-readable error to the caller so a
+  stamp failure can't abort a post-commit upload.
   """
+  if carimbo_present is not False:
+    return pdf_bytes
   stamp_path = os.environ.get("CLUB_STAMP_PATH")
-  if not stamp_path or carimbo_present is not False:
+  if not stamp_path:
     return pdf_bytes
   if bbox is None:
     raise ValueError("OCR did not return a location for carimbo_clube_presente")
@@ -171,10 +172,9 @@ def stamped_pdf(
   These contexts run after a SAV-side commit, so the upload always
   proceeds; the caller is responsible for surfacing stamp_error to the user.
   """
-  # Fast path: if stamping definitively won't fire (no env var, or OCR says
-  # the stamp is already there / unknown), skip the read+overlay pipeline so
+  # Fast path: skip the read+overlay pipeline when stamping won't fire, so
   # non-stamping uploads pay zero extra I/O and have no new failure surface.
-  if not os.environ.get("CLUB_STAMP_PATH") or carimbo_present is not False:
+  if carimbo_present is not False or not os.environ.get("CLUB_STAMP_PATH"):
     yield (pdf_path, carimbo_present, None)
     return
 

@@ -22,10 +22,20 @@ CLI client for the FPB SAV2 basketball management system. Authoritative referenc
 Credentials come from env vars or a `.env` file. Every command auto-authenticates.
 
 ```
-SAV_BASE_URL   # optional, default https://sav2.fpb.pt
-SAV_USERNAME   # required
-SAV_PASSWORD   # required
+SAV_BASE_URL        # optional, default https://sav2.fpb.pt
+SAV_USERNAME        # required
+SAV_PASSWORD        # required
+CLUB_STAMP_PATH     # required when OCR-processing a mod1 form (see below)
 ```
+
+`CLUB_STAMP_PATH` is a hard requirement whenever an fpb_modelo_1 form is uploaded to SAV. The invariant is: every mod1 upload must be stamped. Concretely, `_require_env("CLUB_STAMP_PATH")` is called at command entry in:
+
+- `enrollment create` — when any PDFs are passed (always involves a mod1 form)
+- `enrollment update` — when a PDF is passed (OCR runs, stamp applied automatically before upload)
+
+It is **not** required for field-only updates or medical-exam-only uploads — those paths never upload a mod1 form.
+
+Do not relax the `_require_env` calls to optional/skip paths in the CLI. The MCP server (`sav_mcp/server.py`) is the correct place for graceful-skip behaviour; it calls `stamped_pdf` directly and handles the unset case via the fast-path in `stamped_pdf`.
 
 ## Output
 
