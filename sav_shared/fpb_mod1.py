@@ -106,6 +106,22 @@ def read_carimbo(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | No
   return (present, field.bbox)
 
 
+# The OCR carimbo slot is sized to the form's printed box, which is smaller
+# than the physical stamp. Scale the placement rect (about its center) so the
+# overlaid stamp reads at a realistic size.
+_CLUB_STAMP_SCALE = 5.0
+
+
+def _scale_rect(
+  rect: tuple[float, float, float, float], scale: float
+) -> tuple[float, float, float, float]:
+  """Scale a (x0, y0, x1, y1) rect by `scale` about its center."""
+  x0, y0, x1, y1 = rect
+  cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+  half_w, half_h = (x1 - x0) / 2 * scale, (y1 - y0) / 2 * scale
+  return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
 def overlay_club_stamp(
   pdf_bytes: bytes,
   *,
@@ -141,6 +157,7 @@ def overlay_club_stamp(
   with open(stamp_path, "rb") as f:
     stamp_bytes = f.read()
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
+  rect = _scale_rect(rect, _CLUB_STAMP_SCALE)
   return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=bbox.page)
 
 
@@ -150,8 +167,14 @@ def stamped_pdf(
   *,
   carimbo_present: bool | None = None,
   bbox: BBox | None = None,
+  dest_dir: str | os.PathLike[str] | None = None,
 ) -> Iterator[tuple[str, bool | None, str | None]]:
   """Yield (upload_path, has_club_stamp, stamp_error).
+
+  `dest_dir`, when given, is where the stamped copy is written (as
+  `stamped.pdf`) instead of a standalone temp file; the caller then owns its
+  lifecycle (e.g. an OCR processing dir that gets cleaned up wholesale). When
+  None, a NamedTemporaryFile is used and removed on context exit.
 
   `has_club_stamp` reflects the state of the uploaded PDF (not just whether
   *we* applied the stamp). The truth table:
@@ -181,14 +204,22 @@ def stamped_pdf(
   tmp_path: str | None = None
   has_club_stamp: bool = False
   stamp_error: str | None = None
+  # In dest_dir mode the caller owns the directory's lifecycle, so we never
+  # unlink the file we wrote — it's swept when the dir is.
+  owns_file = dest_dir is None
   try:
     with open(pdf_path, "rb") as f:
       pdf_bytes = f.read()
     stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox)
     # Assign tmp_path before writing so a mid-write failure can be cleaned up.
-    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-      tmp_path = f.name
-      f.write(stamped)
+    if dest_dir is not None:
+      tmp_path = os.path.join(os.fspath(dest_dir), "stamped.pdf")
+      with open(tmp_path, "wb") as f:
+        f.write(stamped)
+    else:
+      with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
+        tmp_path = f.name
+        f.write(stamped)
     has_club_stamp = True
   except Exception as exc:
     logger.warning(
@@ -196,7 +227,7 @@ def stamped_pdf(
       pdf_path, exc_info=True,
     )
     stamp_error = f"club stamp failed: {exc}"
-    if tmp_path and os.path.exists(tmp_path):
+    if owns_file and tmp_path and os.path.exists(tmp_path):
       try:
         os.unlink(tmp_path)
       except OSError:
@@ -206,7 +237,7 @@ def stamped_pdf(
   try:
     yield (tmp_path or pdf_path, has_club_stamp, stamp_error)
   finally:
-    if tmp_path and os.path.exists(tmp_path):
+    if owns_file and tmp_path and os.path.exists(tmp_path):
       os.unlink(tmp_path)
 
 

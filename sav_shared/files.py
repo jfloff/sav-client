@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -11,6 +12,12 @@ from contextlib import contextmanager
 import img2pdf
 import pikepdf
 from PIL import Image
+
+# img2pdf logs a WARNING for every alpha-channel PNG it wraps ("Image contains
+# an alpha channel. Computing a separate soft mask (/SMask) image..."). Our
+# club-stamp overlay is a transparent PNG, so this fires on every stamp and is
+# just noise — quiet it to ERROR.
+logging.getLogger("img2pdf").setLevel(logging.ERROR)
 
 _PDF_MAGIC = b"%PDF-"
 _IMAGE_MAGICS: tuple[tuple[bytes, str], ...] = (

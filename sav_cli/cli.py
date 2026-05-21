@@ -23,6 +23,7 @@ from datetime import date
 from typing import Any
 
 import click
+from dotenv import load_dotenv
 from rich import box
 from rich.console import Console
 from rich.table import Table
@@ -345,6 +346,7 @@ def _batch_number_for_log(client: SavClient, batch_id: int, fallback: str | None
 @click.pass_context
 def cli(ctx, output, verbose, fields):
   """SAV2 API client."""
+  load_dotenv(".env", override=False)
   global _OUTPUT_MODE, _VERBOSE
   _OUTPUT_MODE = output
   _VERBOSE = verbose
@@ -1151,6 +1153,7 @@ def _resolve_enroll_player(
     raise SavCliError(f"Could not fetch eligible players: {exc}", code="fetch_failed")
 
   if license is not None:
+    console.print(f"[green]:dart: Matched player licence {license}.[/]")
     return license, batch
 
   # Already-enrolled fallback: licence-first, then NIF, against open batches
@@ -1479,24 +1482,66 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
-def _carimbo_extras_row(parsed: dict) -> tuple[str, str, str, str, str]:
+def _carimbo_extras_row(
+  carimbo: bool | None, has_club_stamp: bool | None, stamp_error: str | None,
+) -> tuple[str, str, str, str, str]:
   """Build the (label, sav, ocr, final, source) summary row describing what
-  OCR detected for carimbo_clube_presente and the planned stamp action.
+  OCR detected for carimbo_clube_presente and the stamp action we already
+  took (see `_prepare_club_stamp`).
 
-  Helps diagnose silent-skip cases: when the entity isn't returned by OCR,
-  OCR column shows "—" and Final shows "skip (no OCR result)".
+  Because the overlay runs before the summary, Final reports the real outcome
+  rather than a prediction. Helps diagnose silent-skip cases: when the entity
+  isn't returned by OCR, OCR column shows "—" and Final shows
+  "skip (no OCR result)".
   """
-  carimbo, bbox = read_carimbo(parsed)
   ocr_str = {True: "yes", False: "no", None: "—"}[carimbo]
   if carimbo is True:
     final, source = "on form", "OCR"
-  elif carimbo is False and bbox is not None:
-    final, source = "will overlay", "auto"
-  elif carimbo is False and bbox is None:
-    final, source = "skip (no OCR location)", "auto"
+  elif carimbo is False and has_club_stamp:
+    final, source = "missing", "overlay"
+  elif carimbo is False and stamp_error:
+    final, source = "missing", "overlay failed"
+  elif carimbo is False:
+    final, source = "missing", "skip"
   else:
     final, source = "skip (no OCR result)", "auto"
   return ("Carimbo do Clube", "—", ocr_str, final, source)
+
+
+def _prepare_club_stamp(
+  ctx: click.Context, console: Console, err_console: Console,
+  parsed: dict, pdf_path: str, processing_id: str,
+) -> tuple[str, bool | None, bool | None, str | None]:
+  """Overlay the club stamp (when OCR says it's missing) *before* the summary,
+  so the summary reports the real outcome and the user sees what was done up
+  front. Returns (upload_path, carimbo, has_club_stamp, stamp_error).
+
+  The stamped copy is written into the OCR processing dir for `processing_id`,
+  so it shares that session's lifecycle (close_processing/gc sweep it) instead
+  of leaking a standalone temp file. Registered on `ctx` so it survives the
+  confirm→submit→upload span. The overlay never raises out here — `stamped_pdf`
+  catches failures and falls back to the original PDF — so doing it before the
+  SAV-side commit can't abort anything.
+  """
+  from sav_parsers import processing_dir
+
+  carimbo, bbox = read_carimbo(parsed)
+  upload_path, has_club_stamp, stamp_error = ctx.with_resource(
+    stamped_pdf(
+      pdf_path, carimbo_present=carimbo, bbox=bbox,
+      dest_dir=processing_dir(processing_id),
+    )
+  )
+  if carimbo is False and has_club_stamp:
+    console.print(
+      f"[green]:label:  Applied club stamp to [bold]{os.path.basename(pdf_path)}[/] at OCR-detected location.[/]"
+    )
+  if stamp_error:
+    err_console.print(
+      f"[yellow]:warning: {stamp_error}[/] — will upload WITHOUT the club stamp; "
+      "please stamp the document manually."
+    )
+  return upload_path, carimbo, has_club_stamp, stamp_error
 
 
 def _stage_pdf(ctx: click.Context, console: Console, path: str) -> str:
@@ -1689,7 +1734,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
 
   # Step 2 — parse
   try:
-    with console.status("[bold cyan]:robot: Running OCR and parsing form...[/]"):
+    with console.status("[bold cyan]:robot: Running OCR and extracting mod1 form fields...[/]"):
       parse_result = parse_fpb_mod1(pdf_path)
       parsed = parse_result["fields"]
       processing_id = parse_result["processing_id"]
@@ -1772,7 +1817,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     medical_exam_info = None
     if medical_exam_path:
       try:
-        with console.status("[bold cyan]:stethoscope: Processing medical exam...[/]"):
+        with console.status("[bold cyan]:stethoscope: Running OCR and extracting medical exam fields...[/]"):
           medical_parse_result = parse_em(medical_exam_path)
         print(medical_parse_result)
         medical_processing_id = medical_parse_result["processing_id"]
@@ -1850,12 +1895,17 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       exam_date_final = entered
       manual_exam_date = medical_exam_info is not None
 
-    # Step 8 — confirm with user. Pre-render extras as full row tuples so the
-    # medical exam date follows the same OCR/confidence pattern as other rows.
+    # Step 8 — stamp the club mark (if OCR says it's missing) up front so the
+    # summary reports what we actually did, then confirm with user. Pre-render
+    # extras as full row tuples so the medical exam date follows the same
+    # OCR/confidence pattern as other rows.
+    upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
+      ctx, console, err_console, parsed, pdf_path, processing_id,
+    )
     summary_extras: list[tuple[str, str, str, str, str]] = [
       ("Data Exame Médico", "—", exam_date_ocr_cell, exam_date_final, exam_date_source),
       ("Subida de Escalão", "—", "—", "no", "default"),
-      _carimbo_extras_row(parsed),
+      _carimbo_extras_row(carimbo, has_club_stamp, stamp_error),
     ]
 
     kwargs = _confirm_enroll(
@@ -1909,23 +1959,15 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     with console.status(
       "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
     ):
-      carimbo, carimbo_bbox = read_carimbo(parsed)
-      with stamped_pdf(pdf_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
-        ok, err = try_replace_document(
-          client, batch_id, license, upload_path,
-          tipo_doc=doc_type_to_tipo_doc(doc_type),
-        )
+      # upload_path is the already-stamped copy from _prepare_club_stamp.
+      ok, err = try_replace_document(
+        client, batch_id, license, upload_path,
+        tipo_doc=doc_type_to_tipo_doc(doc_type),
+      )
     if ok:
       console.print(
         f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
       )
-      if carimbo is False and has_club_stamp:
-        console.print("[green]:label:  Applied club stamp at OCR-detected location.[/]")
-      if stamp_error:
-        err_console.print(
-          f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
-          "please stamp the document manually."
-        )
     else:
       err_console.print(
         f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
@@ -2257,10 +2299,15 @@ def enrollment_update_cmd(
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(f"Reconcile failed: {exc}", code=_exc_code(exc))
 
+      # Stamp the club mark (if OCR says it's missing) up front so the summary
+      # reports what we actually did, not a prediction.
+      upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
+        ctx, console, err_console, parsed, active_pdf, processing_id,
+      )
       kwargs = _confirm_enroll(
         result, sav_profile, license_,
         ocr_source=f"OCR ({os.path.basename(active_pdf)})",
-        extras=[_carimbo_extras_row(parsed)],
+        extras=[_carimbo_extras_row(carimbo, has_club_stamp, stamp_error)],
       )
       if kwargs is None:
         console.print("[yellow]:fast_forward: Skipped.[/]")
@@ -2292,23 +2339,15 @@ def enrollment_update_cmd(
       console.print(f"[green]:white_check_mark: Updated licence {license_} in batch #{batch_number}.[/]")
 
       try:
-        carimbo, carimbo_bbox = read_carimbo(parsed)
-        with stamped_pdf(active_pdf, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
-          client.replace_player_registration_document(
-            batch_id, license_, upload_path, tipo_doc=tipo_doc,
-          )
+        # upload_path is the already-stamped copy from _prepare_club_stamp.
+        client.replace_player_registration_document(
+          batch_id, license_, upload_path, tipo_doc=tipo_doc,
+        )
         console.print(
           f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/]"
           f" [dim]({active_pdf})[/]",
           soft_wrap=True,
         )
-        if carimbo is False and has_club_stamp:
-          console.print("[green]:label:  Applied club stamp at OCR-detected location.[/]")
-        if stamp_error:
-          err_console.print(
-            f"[yellow]:warning: {stamp_error}[/] — uploaded WITHOUT the club stamp; "
-            "please stamp the document manually."
-          )
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
         err_console.print(
           f"[yellow]:warning: Field update succeeded but document upload failed:[/] {exc}"
