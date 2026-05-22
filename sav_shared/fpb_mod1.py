@@ -108,8 +108,10 @@ def read_carimbo(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | No
 
 # The OCR carimbo slot is sized to the form's printed box, which is smaller
 # than the physical stamp. Scale the placement rect (about its center) so the
-# overlaid stamp reads at a realistic size.
-_CLUB_STAMP_SCALE = 5.0
+# overlaid stamp reads at a realistic size, then nudge it up by a fraction of
+# its scaled height so it sits above the printed slot rather than over it.
+_CLUB_STAMP_SCALE = 5.5
+_CLUB_STAMP_Y_SHIFT = 0.5
 
 
 def _scale_rect(
@@ -158,6 +160,9 @@ def overlay_club_stamp(
     stamp_bytes = f.read()
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
   rect = _scale_rect(rect, _CLUB_STAMP_SCALE)
+  x0, y0, x1, y1 = rect
+  dy = (y1 - y0) * _CLUB_STAMP_Y_SHIFT  # PDF origin is bottom-left, so up is +y
+  rect = (x0, y0 + dy, x1, y1 + dy)
   return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=bbox.page)
 
 
