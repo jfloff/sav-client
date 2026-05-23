@@ -513,7 +513,7 @@ def _replace_player_document_from_bytes(
 
     carimbo, carimbo_bbox = (
         read_carimbo(parsed)
-        if (doc_type == DocType.FPB_MOD1 and parsed) else (None, None)
+        if (doc_type == DocType.FPB_MODELO_1 and parsed) else (None, None)
     )
     tmp_path: str | None = None
     try:
@@ -580,7 +580,7 @@ def parse_enrollment_forms(
 
             if hint is not None:
                 # Type is already known — skip classify and train the classifier.
-                _hint_map = {"fpb_modelo_1": DocType.FPB_MOD1, "exame_medico": DocType.EM}
+                _hint_map = {"fpb_modelo_1": DocType.FPB_MODELO_1, "exame_medico": DocType.EXAME_MEDICO}
                 if hint not in _hint_map:
                     results.append({"index": i, "error": f"Unknown doc_type hint: {hint!r}"})
                     continue
@@ -592,19 +592,19 @@ def parse_enrollment_forms(
             else:
                 doc_type = classify(tmp_path)
 
-            if doc_type == DocType.FPB_MOD1:
+            if doc_type == DocType.FPB_MODELO_1:
                 parse_result = parse_fpb_mod1(tmp_path)
                 parsed = parse_result["fields"]
                 processing_id = parse_result["processing_id"]
                 reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
                 tiers = client.list_player_registration_tiers(gender_id=gender_id)
                 tier_name = tiers.get(tier_id, str(tier_id))
-            elif doc_type == DocType.EM:
+            elif doc_type == DocType.EXAME_MEDICO:
                 parse_result = parse_em(tmp_path)
                 parsed = parse_result["fields"]
                 processing_id = parse_result["processing_id"]
                 try:
-                    train_classifier(tmp_path, DocType.EM)
+                    train_classifier(tmp_path, DocType.EXAME_MEDICO)
                 except Exception:
                     logger.debug("train_classifier failed for EM", exc_info=True)
             else:
@@ -624,7 +624,7 @@ def parse_enrollment_forms(
             "doc_type": doc_type,
             "pdf_bytes": pdf_bytes,
         }
-        if doc_type == DocType.FPB_MOD1:
+        if doc_type == DocType.FPB_MODELO_1:
             artifact.update({
                 "reg_type": reg_type,
                 "tier_id": tier_id,
@@ -632,7 +632,7 @@ def parse_enrollment_forms(
             })
         _forms[artifact_id] = artifact
 
-        if doc_type == DocType.FPB_MOD1:
+        if doc_type == DocType.FPB_MODELO_1:
             results.append({
                 "index": i,
                 "artifact_id": artifact_id,
@@ -711,7 +711,7 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
     form = _forms.get(mod1_id)
     if form is None:
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
-    if form.get("doc_type") != DocType.FPB_MOD1:
+    if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
@@ -772,7 +772,7 @@ def preview_enrollment(
     form = _forms.get(mod1_id)
     if form is None:
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
-    if form.get("doc_type") != DocType.FPB_MOD1:
+    if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
@@ -797,7 +797,7 @@ def preview_enrollment(
         artifact = _forms.get(medical_exam_id)
         if artifact is None:
             raise ValueError(f"Unknown medical_exam_id: {medical_exam_id!r}")
-        if artifact.get("doc_type") != DocType.EM:
+        if artifact.get("doc_type") != DocType.EXAME_MEDICO:
             raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
         preview["medical_exam"] = _build_medical_exam_payload(medical_exam_id, artifact)
     return preview
@@ -840,7 +840,7 @@ def submit_enrollment(
     form = _forms.get(mod1_id)
     if form is None:
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
-    if form.get("doc_type") != DocType.FPB_MOD1:
+    if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     result = form.get("reconcile_result")
@@ -853,7 +853,7 @@ def submit_enrollment(
         medical_exam = _forms.get(medical_exam_id)
         if medical_exam is None:
             raise ValueError(f"Unknown medical_exam_id: {medical_exam_id!r}")
-        if medical_exam.get("doc_type") != DocType.EM:
+        if medical_exam.get("doc_type") != DocType.EXAME_MEDICO:
             raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
         medical_exam_info = extract_medical_exam_info(medical_exam["parsed"])
 
@@ -1078,7 +1078,7 @@ def update_enrollment_with_document(
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
-        _hint_map = {"fpb_modelo_1": DocType.FPB_MOD1, "exame_medico": DocType.EM}
+        _hint_map = {"fpb_modelo_1": DocType.FPB_MODELO_1, "exame_medico": DocType.EXAME_MEDICO}
         if doc_type is not None:
             if doc_type not in _hint_map:
                 raise ValueError(f"Unknown doc_type: {doc_type!r}. Use 'fpb_modelo_1' or 'exame_medico'.")
@@ -1101,7 +1101,7 @@ def update_enrollment_with_document(
             client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
             return {"success": True, "fields_updated": False, "document_uploaded": True}
 
-        if active_doc_type != DocType.FPB_MOD1:
+        if active_doc_type != DocType.FPB_MODELO_1:
             raise ValueError(
                 f"Document type {active_doc_type.value!r} cannot be reconciled; "
                 "only fpb_modelo_1 forms are supported. Use file_only=True to upload as-is."
@@ -1309,9 +1309,11 @@ def upload_player_document(
 
     The batch is resolved automatically from the license.
 
-    doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4, outros.
+    doc_type: one of exame_medico, fpb_modelo_1, fpb_modelo_4,
+    atestado_residencia, documento_identificacao, certidao_matricula, outros.
     When omitted, sav-parsers classifies the PDF first.
-    Recognized but unmapped types such as outros fail before the SAV2 call.
+    Types recognized by sav-parsers but without a SAV2 tipo_doc mapping fail
+    before the SAV2 call.
 
     Returns {"success": True} on success, or
     {"error": "license_not_enrolled", "license": int, "open_batches": [...]}

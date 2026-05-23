@@ -61,6 +61,7 @@ from sav_shared.lookups import (
   doc_type_to_tipo_doc,
   find_distrito_id,
   find_id_by_name,
+  is_uploadable_doc_type,
   normalize_doc_type,
 )
 from sav_shared.medical_exam import extract_medical_exam_info
@@ -1276,6 +1277,7 @@ def _confirm_enroll(
   *,
   ocr_source: str = "OCR",
   extras: list[tuple[str, str, str, str, str]] | None = None,
+  documents: list[tuple[str, str]] | None = None,
 ) -> dict | None:
   """
   Show reconciliation summary and prompt for needs_review fields.
@@ -1285,7 +1287,8 @@ def _confirm_enroll(
   rows (e.g. "OCR (form.pdf)"). `extras` are extra rows for the summary
   table — same (label, sav, ocr, final, source) shape as the internal rows,
   for fields outside the OCR/SAV reconcile model (e.g. medical exam date,
-  subida de escalão).
+  subida de escalão). `documents` are (doc_type, filename) pairs listed before
+  the confirm prompt so the user sees exactly what will be uploaded.
   """
   console = _console()
   kwargs = dict(result.kwargs)
@@ -1338,6 +1341,11 @@ def _confirm_enroll(
     kwargs, result, sav_profile,
     ocr_source=ocr_source, extras=extras,
   )
+
+  if documents:
+    console.print("[bold]:open_file_folder: Documents to upload:[/]")
+    for doc_type_label, filename in documents:
+      console.print(f"    • {doc_type_label}  [dim]{filename}[/]")
 
   if not click.confirm(f"  Submit {player_label}?", default=True):
     return None
@@ -1671,6 +1679,10 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   # --mod1 / --medical-exam paths are appended directly (no classify call).
   positional_mod1: list[str] = []
   positional_em: list[str] = []
+  # Supplementary docs (atestado_residencia, documento_identificacao, …): no
+  # parser extracts fields, but each has a tipo_doc mapping, so we attach them
+  # to the player with the classified type instead of dropping them.
+  extra_docs: list[tuple[str, DocType]] = []
   for path in pdfs:
     filename = os.path.basename(path)
     try:
@@ -1678,18 +1690,24 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         dt = _classify_pdf_doc_type(path)
     except Exception as exc:
       raise SavCliError(f"Classify error for {path}: {exc}", code="parse_error")
-    if dt == DocType.FPB_MOD1:
+    if dt == DocType.FPB_MODELO_1:
       console.print(
         f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
         soft_wrap=True,
       )
       positional_mod1.append(path)
-    elif dt == DocType.EM:
+    elif dt == DocType.EXAME_MEDICO:
       console.print(
         f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
         soft_wrap=True,
       )
       positional_em.append(path)
+    elif is_uploadable_doc_type(dt):
+      console.print(
+        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
+        soft_wrap=True,
+      )
+      extra_docs.append((path, dt))
     else:
       console.print(
         f"[yellow]:warning: Unsupported document type {_doc_type_text(dt)!r}; ignored.[/] "
@@ -1718,7 +1736,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     )
 
   pdf_path = mod1_candidates[0]
-  doc_type = DocType.FPB_MOD1
+  doc_type = DocType.FPB_MODELO_1
   medical_exam_path: str | None = em_candidates[0] if em_candidates else None
   # Train the classifier on the mod1 only when the user pinned it with --mod1;
   # an auto-classified positional already represents a confident classify call.
@@ -1819,7 +1837,6 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       try:
         with console.status("[bold cyan]:stethoscope: Running OCR and extracting medical exam fields...[/]"):
           medical_parse_result = parse_em(medical_exam_path)
-        print(medical_parse_result)
         medical_processing_id = medical_parse_result["processing_id"]
         medical_close_pending = True
         medical_exam_info = extract_medical_exam_info(medical_parse_result["fields"])
@@ -1835,7 +1852,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       if medical_exam is not None:
         try:
           with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
-            train_classifier(medical_exam_path, DocType.EM)
+            train_classifier(medical_exam_path, DocType.EXAME_MEDICO)
         except Exception as exc:
           err_console.print(
             f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
@@ -1908,10 +1925,21 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       _carimbo_extras_row(carimbo, has_club_stamp, stamp_error),
     ]
 
+    # Mirror the upload steps below (mod1, then optional exam, then extras) so
+    # the user confirms exactly the set of files that gets uploaded.
+    documents = [(_doc_type_text(doc_type), os.path.basename(pdf_path))]
+    if medical_exam_path:
+      documents.append((_doc_type_text(DocType.EXAME_MEDICO), os.path.basename(medical_exam_path)))
+    documents.extend(
+      (_doc_type_text(extra_dt), os.path.basename(extra_path))
+      for extra_path, extra_dt in extra_docs
+    )
+
     kwargs = _confirm_enroll(
       result, sav_profile, license,
       ocr_source=f"OCR ({os.path.basename(pdf_path)})",
       extras=summary_extras,
+      documents=documents,
     )
     if kwargs is None:
       console.print("[yellow]:fast_forward: Skipped.[/]")
@@ -1979,7 +2007,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         # Medical exams don't have a carimbo concept → skip stamping.
         ok, err = try_replace_document(
           client, batch_id, license, medical_exam_path,
-          tipo_doc=doc_type_to_tipo_doc(DocType.EM),
+          tipo_doc=doc_type_to_tipo_doc(DocType.EXAME_MEDICO),
         )
       if ok:
         console.print(
@@ -1988,6 +2016,27 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       else:
         err_console.print(
           f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {err}"
+        )
+
+    # Step 9c — attach supplementary docs with their classified type. Replace
+    # semantics (per tipo_doc) keep re-submits idempotent, matching mod1/em; two
+    # files of the same type would collapse to the last one. Non-fatal.
+    for extra_path, extra_dt in extra_docs:
+      with console.status(
+        f"[bold cyan]:page_facing_up: Uploading {_doc_type_text(extra_dt)}...[/]"
+      ):
+        ok, err = try_replace_document(
+          client, batch_id, license, extra_path,
+          tipo_doc=doc_type_to_tipo_doc(extra_dt),
+        )
+      if ok:
+        console.print(
+          f"[green]:white_check_mark: Uploaded {extra_path} ({_doc_type_text(extra_dt)}).[/]"
+        )
+      else:
+        err_console.print(
+          f"[yellow]:warning: Enrollment succeeded but {_doc_type_text(extra_dt)} "
+          f"upload failed:[/] {err}"
         )
 
     # Step 10 — close processing session; only send corrections the user
@@ -2216,6 +2265,9 @@ def enrollment_update_cmd(
         Patch fields; no document.
     sav enrollment update --license LICENSE --medical-exam FILE
         Upload medical exam document only.
+    sav enrollment update --license LICENSE FILE --tipo atestado_residencia
+        Upload FILE as a supplementary document (classified, or pinned with
+        --tipo; no OCR, replaces any existing doc of that type).
   """
   if pdf and (mod1_path or medical_exam_path):
     raise click.UsageError("Positional pdf and --mod1/--medical-exam are mutually exclusive.")
@@ -2240,40 +2292,67 @@ def enrollment_update_cmd(
   if medical_exam_path:
     medical_exam_path = _stage_pdf(ctx, console, medical_exam_path)
 
-  # Mode A / D — PDF-driven (parse → reconcile → patch fields → replace doc).
-  # Mode A: PDF only. Mode D: PDF + --field overrides.
+  # Mode A / D — PDF-driven. fpb_modelo_1 runs the full OCR-reconcile-patch
+  # flow; every other type has no field parser, so it's a plain attachment.
   if has_pdf:
-    _require_env("CLUB_STAMP_PATH")
     active_pdf = mod1_path or pdf
+    active_filename = os.path.basename(active_pdf)
     from sav_parsers import close_processing, parse_fpb_mod1, train_classifier
 
     if mod1_path:
-      # Explicit type: skip classify, train classifier.
-      active_doc_type: DocType = DocType.FPB_MOD1
+      # Explicit mod1: skip classify, train classifier.
+      active_doc_type: DocType = DocType.FPB_MODELO_1
       try:
         train_classifier(mod1_path, active_doc_type)
       except Exception as exc:
         err_console.print(f"[yellow]:warning: Could not submit classifier training:[/] {exc}")
-    else:
-      if doc_type is None:
-        doc_type = _classify_pdf_doc_type(pdf)
-        active_filename = os.path.basename(active_pdf)
-        console.print(
-          f"[green]:white_check_mark: Classified {active_filename} as {_doc_type_text(doc_type)}[/]",
-          soft_wrap=True,
-        )
-      if doc_type != DocType.FPB_MOD1:
-        raise SavCliError(
-          f"Unsupported document type {_doc_type_text(doc_type)!r}; "
-          "only fpb_modelo_1 forms are supported for enrollment update.",
-          code="parse_error",
-        )
+    elif doc_type is not None:
       active_doc_type = doc_type
-    tipo_doc = _tipo_doc_for_upload(active_doc_type)
+    else:
+      active_doc_type = _classify_pdf_doc_type(pdf)
+      console.print(
+        f"[green]:white_check_mark: Classified {active_filename} as {_doc_type_text(active_doc_type)}[/]",
+        soft_wrap=True,
+      )
 
     client = _make_client()
     batch_id = _resolve_batch_id_by_license_or_raise(client, license_)
     batch_number = _batch_number_for_log(client, batch_id)
+
+    # Non-mod1 docs have no field parser: upload as-is (replace per tipo_doc),
+    # optionally applying --field patches, and skip OCR/reconcile/stamping.
+    if active_doc_type != DocType.FPB_MODELO_1:
+      if fields:
+        _patch_enrollment_fields(client, batch_id, license_, fields, console, batch_number)
+      if active_doc_type == DocType.EXAME_MEDICO:
+        _upload_medical_exam_update(
+          batch_id, license_, active_pdf,
+          client=client, console=console, err_console=err_console,
+        )
+      elif is_uploadable_doc_type(active_doc_type):
+        tipo_doc = _tipo_doc_for_upload(active_doc_type)
+        try:
+          client.replace_player_registration_document(
+            batch_id, license_, active_pdf, tipo_doc=tipo_doc,
+          )
+        except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+          raise SavCliError(str(exc), code=_exc_code(exc))
+        console.print(
+          f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/] "
+          f"[dim]({active_pdf}) to batch #{batch_number}[/]",
+          soft_wrap=True,
+        )
+      else:
+        raise SavCliError(
+          f"Document type {_doc_type_text(active_doc_type)!r} has no SAV2 "
+          "tipo_doc mapping; cannot upload.",
+          code="parse_error",
+        )
+      return
+
+    # fpb_modelo_1 — full OCR-reconcile-patch-replace flow.
+    _require_env("CLUB_STAMP_PATH")
+    tipo_doc = _tipo_doc_for_upload(active_doc_type)
 
     try:
       with console.status("[bold cyan]:mag: Processing OCR...[/]"):
@@ -2308,6 +2387,7 @@ def enrollment_update_cmd(
         result, sav_profile, license_,
         ocr_source=f"OCR ({os.path.basename(active_pdf)})",
         extras=[_carimbo_extras_row(carimbo, has_club_stamp, stamp_error)],
+        documents=[(_doc_type_text(active_doc_type), os.path.basename(active_pdf))],
       )
       if kwargs is None:
         console.print("[yellow]:fast_forward: Skipped.[/]")
@@ -2381,19 +2461,25 @@ def enrollment_update_cmd(
   batch_id = _resolve_batch_id_by_license_or_raise(client, license_)
   batch_number = _batch_number_for_log(client, batch_id)
   if fields:
-    patch_kwargs = _parse_update_fields(fields)
-    try:
-      client.update_player_in_registration_batch(
-        batch_id, license_, **patch_kwargs,
-      )
-    except (SavConnectionError, SavResponseError, ValueError) as exc:
-      raise SavCliError(str(exc), code=_exc_code(exc))
-    applied = ", ".join(sorted(patch_kwargs))
-    console.print(
-      f"[green]:white_check_mark: Updated licence {license_} in batch #{batch_number}:[/] {applied}."
-    )
+    _patch_enrollment_fields(client, batch_id, license_, fields, console, batch_number)
   if medical_exam_path:
     _upload_medical_exam_update(batch_id, license_, medical_exam_path, client=client, console=console, err_console=err_console)
+
+
+def _patch_enrollment_fields(
+  client: Any, batch_id: int, license_: int, fields: tuple[str, ...],
+  console: Any, batch_number: Any,
+) -> None:
+  """Apply --field K=V overrides to an existing enrolment record."""
+  patch_kwargs = _parse_update_fields(fields)
+  try:
+    client.update_player_in_registration_batch(batch_id, license_, **patch_kwargs)
+  except (SavConnectionError, SavResponseError, ValueError) as exc:
+    raise SavCliError(str(exc), code=_exc_code(exc))
+  applied = ", ".join(sorted(patch_kwargs))
+  console.print(
+    f"[green]:white_check_mark: Updated licence {license_} in batch #{batch_number}:[/] {applied}."
+  )
 
 
 def _upload_medical_exam_update(
@@ -2412,10 +2498,10 @@ def _upload_medical_exam_update(
     if was_converted:
       console.print(f"[cyan]:arrows_counterclockwise: Converted [bold]{path}[/] to PDF.[/]")
     try:
-      train_classifier(pdf_path, DocType.EM)
+      train_classifier(pdf_path, DocType.EXAME_MEDICO)
     except Exception as exc:
       err_console.print(f"[yellow]:warning: Could not submit classifier training for exam:[/] {exc}")
-    tipo_doc = _tipo_doc_for_upload(DocType.EM)
+    tipo_doc = _tipo_doc_for_upload(DocType.EXAME_MEDICO)
     try:
       # Medical exams don't have a carimbo concept → skip stamping.
       client.replace_player_registration_document(batch_id, license, pdf_path, tipo_doc=tipo_doc)

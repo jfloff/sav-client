@@ -129,10 +129,24 @@ GENERO: dict[int, str] = {
 
 DOC_TYPE_CHOICES: tuple[str, ...] = tuple(doc_type.value for doc_type in DocType)
 
+# Maps sav-parsers DocType → SAV2 upload modal integer (`tipo_doc`).
+# SAV2 doc types with no sav-parsers equivalent yet (add the value to the map
+# below when the parser gains the matching DocType, so it doesn't need
+# re-looking-up):
+#    16  FIBA Players Self Declaration
+#    17  FIBA National Team Declaration
+#    21  Contrato Formação Desportiva
+#    23  Visto, MI, Aut. Residência
+#    25  Boletim de Jogo
+#    26  Declaração Agregado Familiar
 _DOC_TYPE_TO_TIPO_DOC: dict[DocType, int] = {
-  DocType.FPB_MOD1: 1,
-  DocType.EM: 2,
-  DocType.FPB_MOD4: 6,
+  DocType.FPB_MODELO_1: 1,
+  DocType.EXAME_MEDICO: 2,
+  DocType.FPB_MODELO_4: 6,
+  DocType.ATESTADO_RESIDENCIA: 15,
+  DocType.DOCUMENTO_IDENTIFICACAO: 18,
+  DocType.CERTIDAO_MATRICULA: 24,
+  DocType.OUTROS: 22,
 }
 _TIPO_DOC_TO_DOC_TYPE: dict[int, DocType] = {
   tipo_doc: doc_type
@@ -156,6 +170,14 @@ def normalize_doc_type(value: DocType | str) -> DocType:
     raise ValueError(
       f"Unknown doc_type {value!r}. Use one of: {', '.join(DOC_TYPE_CHOICES)}."
     ) from exc
+
+
+def is_uploadable_doc_type(doc_type: DocType | str) -> bool:
+  """True when the doc type has a SAV2 tipo_doc mapping (i.e. can be uploaded)."""
+  try:
+    return normalize_doc_type(doc_type) in _DOC_TYPE_TO_TIPO_DOC
+  except ValueError:
+    return False
 
 
 def doc_type_to_tipo_doc(doc_type: DocType | str) -> int:
