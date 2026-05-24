@@ -24,7 +24,7 @@ def test_upload_player_document_translates_doc_type(monkeypatch):
   result = server_module.upload_player_document(
     license=301772,
     pdf_base64=_pdf_b64(),
-    doc_type=DocType.EM.value,
+    doc_type=DocType.EXAME_MEDICO.value,
   )
 
   assert result == {"success": True}
@@ -42,7 +42,7 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
       captured["call"] = (batch_id, license, tipo_doc)
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
-  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EXAME_MEDICO)
 
   result = server_module.upload_player_document(
     license=301772,
@@ -68,7 +68,7 @@ def test_replace_player_document_translates_doc_type(monkeypatch):
   result = server_module.replace_player_document(
     license=301772,
     pdf_base64=_pdf_b64(),
-    doc_type=DocType.FPB_MOD4.value,
+    doc_type=DocType.FPB_MODELO_4.value,
   )
 
   assert result == {"success": True}
@@ -86,7 +86,7 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
       captured["call"] = (batch_id, license, tipo_doc)
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
-  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EXAME_MEDICO)
 
   result = server_module.replace_player_document(
     license=301772,
@@ -115,10 +115,10 @@ def test_list_player_documents_returns_parser_doc_types(monkeypatch):
   result = server_module.list_player_documents(license=301772)
 
   assert result == [
-    {"doc_id": 1, "doc_type": DocType.FPB_MOD1.value},
-    {"doc_id": 2, "doc_type": DocType.EM.value},
-    {"doc_id": 3, "doc_type": DocType.FPB_MOD4.value},
-    {"doc_id": 4, "doc_type": None},
+    {"doc_id": 1, "doc_type": DocType.FPB_MODELO_1.value},
+    {"doc_id": 2, "doc_type": DocType.EXAME_MEDICO.value},
+    {"doc_id": 3, "doc_type": DocType.FPB_MODELO_4.value},
+    {"doc_id": 4, "doc_type": DocType.DOCUMENTO_IDENTIFICACAO.value},
   ]
 
 
@@ -128,7 +128,7 @@ def test_parse_enrollment_forms_returns_doc_type(monkeypatch):
       return {7: "Sub 14"}
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
-  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MOD1)
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MODELO_1)
   monkeypatch.setattr(
     "sav_parsers.parse_fpb_mod1",
     lambda pdf: {"fields": {"nome": "A"}, "processing_id": "proc-1"},
@@ -140,13 +140,13 @@ def test_parse_enrollment_forms_returns_doc_type(monkeypatch):
 
   assert len(result) == 1
   assert result[0]["artifact_id"] == result[0]["mod1_id"]
-  assert result[0]["doc_type"] == DocType.FPB_MOD1.value
-  assert server_module._forms[result[0]["mod1_id"]]["doc_type"] == DocType.FPB_MOD1
+  assert result[0]["doc_type"] == DocType.FPB_MODELO_1.value
+  assert server_module._forms[result[0]["mod1_id"]]["doc_type"] == DocType.FPB_MODELO_1
 
 
 def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: object())
-  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EXAME_MEDICO)
   monkeypatch.setattr(
     "sav_parsers.parse_em",
     lambda pdf: {
@@ -166,7 +166,7 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
       "index": 0,
       "artifact_id": result[0]["artifact_id"],
       "medical_exam_id": result[0]["artifact_id"],
-      "doc_type": DocType.EM.value,
+      "doc_type": DocType.EXAME_MEDICO.value,
       "exam_date": "2026-05-01",
       "raw_exam_date": None,
       "exam_date_confidence": 0.91,
@@ -174,12 +174,12 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
       "needs_review": False,
     }
   ]
-  assert server_module._forms[result[0]["artifact_id"]]["doc_type"] == DocType.EM
+  assert server_module._forms[result[0]["artifact_id"]]["doc_type"] == DocType.EXAME_MEDICO
 
 
 def test_parse_enrollment_forms_returns_raw_medical_exam_date_when_unusable(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: object())
-  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EM)
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EXAME_MEDICO)
   monkeypatch.setattr(
     "sav_parsers.parse_em",
     lambda pdf: {
@@ -226,7 +226,7 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
       "form-1": {
         "parsed": {"nome": "A"},
         "processing_id": "proc-form",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
       },
       "exam-1": {
         "parsed": {
@@ -234,7 +234,7 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
           "doctor_validation_present": ParsedField(value=True, confidence=0.8),
         },
         "processing_id": "proc-em",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
@@ -246,7 +246,7 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
   assert result["medical_exam"] == {
     "artifact_id": "exam-1",
     "medical_exam_id": "exam-1",
-    "doc_type": DocType.EM.value,
+    "doc_type": DocType.EXAME_MEDICO.value,
     "exam_date": "2026-05-01",
     "raw_exam_date": None,
     "exam_date_confidence": 0.93,
@@ -288,7 +288,7 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
         "reconcile_result": result_obj,
         "processing_id": "proc-1",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
         "sav_profile": {"nome": "Player A"},
       }
     },
@@ -304,11 +304,13 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
   assert result["success"] is True
   assert replace_calls == [1]
   assert result["source_document_upload"] == {
-    "doc_type": DocType.FPB_MOD1.value,
+    "doc_type": DocType.FPB_MODELO_1.value,
     "status": "ok",
     "error": None,
     "has_club_stamp": None,
     "stamp_warning": None,
+    "has_inscricao_mark": None,
+    "inscricao_warning": None,
   }
   assert result["medical_exam_upload"] is None
 
@@ -335,7 +337,7 @@ def test_submit_enrollment_raises_when_exam_date_missing_without_medical_exam(mo
         "reconcile_result": result_obj,
         "processing_id": "proc-1",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
         "sav_profile": {"nome": "Player A"},
       }
     },
@@ -383,14 +385,14 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
         "reconcile_result": result_obj,
         "processing_id": "proc-form",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
         "sav_profile": {"nome": "Player A"},
       },
       "exam-1": {
         "parsed": {"exam_date": ParsedField(value="2026-05-01", confidence=0.91)},
         "processing_id": "proc-em",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
@@ -402,11 +404,13 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
   assert captured["kwargs"]["exam_date"] == "2026-05-01"
   assert replace_calls == [1, 2]
   assert result["medical_exam_upload"] == {
-    "doc_type": DocType.EM.value,
+    "doc_type": DocType.EXAME_MEDICO.value,
     "status": "ok",
     "error": None,
     "has_club_stamp": None,
     "stamp_warning": None,
+    "has_inscricao_mark": None,
+    "inscricao_warning": None,
   }
   assert captured["close"] == [
     ("proc-form", None),
@@ -451,14 +455,14 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
         "reconcile_result": result_obj,
         "processing_id": "proc-form",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
         "sav_profile": {"nome": "Player A"},
       },
       "exam-1": {
         "parsed": {"exam_date": ParsedField(value="2026-05-01", confidence=0.91)},
         "processing_id": "proc-em",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
@@ -497,14 +501,14 @@ def test_submit_enrollment_raises_when_exam_date_missing(monkeypatch):
         "reconcile_result": result_obj,
         "processing_id": "proc-form",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.FPB_MOD1,
+        "doc_type": DocType.FPB_MODELO_1,
         "sav_profile": {"nome": "Player A"},
       },
       "exam-1": {
         "parsed": {"exam_date": ParsedField(value="13/05/2026", confidence=0.30)},
         "processing_id": "proc-em",
         "pdf_bytes": b"%PDF-1.4\n",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
@@ -526,7 +530,7 @@ def test_resolve_player_rejects_non_fpb_mod1_artifact(monkeypatch):
       "exam-1": {
         "parsed": {},
         "processing_id": "proc-em",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
@@ -546,7 +550,7 @@ def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
       "exam-1": {
         "parsed": {},
         "processing_id": "proc-em",
-        "doc_type": DocType.EM,
+        "doc_type": DocType.EXAME_MEDICO,
       },
     },
   )
