@@ -49,7 +49,15 @@ from sav_shared.enrollment import (
   try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
-from sav_shared.fpb_mod1 import read_carimbo, reconcile_fpb_mod1, stamped_pdf
+from sav_shared.fpb_mod1 import (
+  OverlayResult,
+  carimbo_overlay,
+  inscricao_overlay,
+  overlaid_pdf,
+  read_carimbo,
+  read_tipo_inscricao,
+  reconcile_fpb_mod1,
+)
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
   DOC_TYPE_CHOICES,
@@ -1048,8 +1056,11 @@ def _resolve_enroll_batch(
   reg_type: int,
   tier_id: int,
   gender_id: int,
+  *,
+  indent: str = "",
 ) -> tuple[int, Any]:
-  """Interactively find an open batch or create one. Returns (batch_id, batch)."""
+  """Interactively find an open batch or create one. Returns (batch_id, batch).
+  `indent` prefixes the messages so they nest under a document scope."""
   console = _console()
   type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
   gender_label = "Feminino" if gender_id == 2 else "Masculino"
@@ -1072,27 +1083,27 @@ def _resolve_enroll_batch(
 
   if existing:
     console.print(
-      f"[cyan]:open_file_folder: Open batch found:[/] #{existing.number} "
+      f"{indent}[cyan]:open_file_folder: Open batch found:[/] #{existing.number} "
       f"({type_label} · {existing.tier} · {gender_label} · "
       f"{existing.item_count} player(s) already added)"
     )
     choice = click.prompt(
-      click.style("  Use existing or create new?", fg="cyan"),
+      click.style(f"{indent}  Use existing or create new?", fg="cyan"),
       type=click.Choice(["existing", "new"]),
       default="existing",
     )
     if choice == "new":
       if not click.confirm(
-        click.style(f"  Create new {type_label} batch ({tier_name} · {gender_label})?", fg="cyan")
+        click.style(f"{indent}  Create new {type_label} batch ({tier_name} · {gender_label})?", fg="cyan")
       ):
         raise click.Abort()
       return _create()
     return existing.id, existing
 
   console.print(
-    f"[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
+    f"{indent}[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
   )
-  if not click.confirm(click.style("  Create new batch?", fg="cyan")):
+  if not click.confirm(click.style(f"{indent}  Create new batch?", fg="cyan")):
     raise click.Abort()
   return _create()
 
@@ -1131,6 +1142,8 @@ def _find_enrolled_in_matching_batches(
 
 def _resolve_enroll_player(
   client: Any, batch: Any, parsed: dict, reg_type: int | None = None,
+  *,
+  indent: str = "",
 ) -> tuple[int, Any] | None:
   """Return ``(license, target_batch)`` for the parsed form, or None to skip.
 
@@ -1140,7 +1153,8 @@ def _resolve_enroll_player(
   batch instead, since SAV2 won't allow re-adding to a second one.
 
   For revalidação (reg_type=2), uses NIF-based license lookup directly,
-  skipping manual entry prompts.
+  skipping manual entry prompts. `indent` prefixes the messages so they nest
+  under a document scope.
   """
   console = _console()
   try:
@@ -1153,7 +1167,8 @@ def _resolve_enroll_player(
     raise SavCliError(f"Could not fetch eligible players: {exc}", code="fetch_failed")
 
   if license is not None:
-    console.print(f"[green]:dart: Matched player licence {license}.[/]")
+    name_suffix = f" — {ocr_name}" if ocr_name else ""
+    console.print(f"{indent}[green]:dart: Matched player licence {license}{name_suffix}.[/]")
     return license, batch
 
   # Already-enrolled fallback: licence-first, then NIF, against open batches
@@ -1173,10 +1188,10 @@ def _resolve_enroll_player(
     if target is not None:
       if target.id != batch.id:
         console.print(
-          f"[cyan]:repeat: Already enrolled in batch #{target.number}; updating there."
+          f"{indent}[cyan]:repeat: Already enrolled in batch #{target.number}; updating there."
         )
       else:
-        console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
+        console.print(f"{indent}[cyan]:repeat: Already enrolled in this batch — updating.[/]")
       return enrolled_license, target
 
   # For revalidação, surface the NIF-based license before prompting for manual entry.
@@ -1186,37 +1201,37 @@ def _resolve_enroll_player(
   # use a different batch.
   if reg_type == 2 and nif_license is not None and ocr_license is None:
     console.print(
-      f"[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
+      f"{indent}[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
     )
-    if click.confirm("  Use this licence?", default=True):
+    if click.confirm(f"{indent}  Use this licence?", default=True):
       return nif_license, batch
 
   if len(candidates) > 1:
-    console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
+    console.print(f"{indent}[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
     for i, p in enumerate(candidates, 1):
-      console.print(f"  {i}.  {p.name}  (licence {p.license})")
-    idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
+      console.print(f"{indent}  {i}.  {p.name}  (licence {p.license})")
+    idx = click.prompt(f"{indent}  Pick", type=click.IntRange(1, len(candidates)))
     return int(candidates[idx - 1].license), batch
 
   if ocr_license is not None:
     console.print(
-      f"[yellow]:warning: OCR licence {ocr_license} is not in the eligible list for this batch.[/]"
+      f"{indent}[yellow]:warning: OCR licence {ocr_license} is not in the eligible list for this batch.[/]"
     )
-    if click.confirm("  Use it anyway?"):
+    if click.confirm(f"{indent}  Use it anyway?"):
       return ocr_license, batch
   elif ocr_name:
-    console.print(f"[yellow]:warning: Player not found for {ocr_name!r} in eligible list.[/]")
+    console.print(f"{indent}[yellow]:warning: Player not found for {ocr_name!r} in eligible list.[/]")
   else:
-    console.print("[yellow]:warning: Could not determine player from OCR.[/]")
+    console.print(f"{indent}[yellow]:warning: Could not determine player from OCR.[/]")
 
   while True:
-    raw = click.prompt("  Licence number (blank to skip)", default="")
+    raw = click.prompt(f"{indent}  Licence number (blank to skip)", default="")
     if not raw:
       return None
     try:
       lic = int(raw)
     except ValueError:
-      console.print("[yellow]:warning: Not a valid number.[/]")
+      console.print(f"{indent}[yellow]:warning: Not a valid number.[/]")
       continue
     if lic not in eligible:
       with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
@@ -1224,15 +1239,15 @@ def _resolve_enroll_player(
       if target is not None:
         if target.id != batch.id:
           console.print(
-            f"[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number}; updating there."
+            f"{indent}[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number}; updating there."
           )
         else:
-          console.print(f"[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
+          console.print(f"{indent}[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
         return lic, target
       console.print(
-        f"[yellow]:warning: Licence {lic} is not in the eligible list for this batch.[/]"
+        f"{indent}[yellow]:warning: Licence {lic} is not in the eligible list for this batch.[/]"
       )
-      if not click.confirm("  Use it anyway?"):
+      if not click.confirm(f"{indent}  Use it anyway?"):
         continue
     return lic, batch
 
@@ -1423,7 +1438,7 @@ def _print_submission_summary(
     return
 
   console = _console()
-  console.print(f"{indent}[bold]:page_facing_up: Fields:[/]")
+  console.print(f"{indent}[bold]:clipboard: Reconciling form fields:[/]")
   for label, sav, ocr, final, source in rows:
     line = (
       f"{indent}    [green]:white_check_mark:[/] {label}  {final}  [dim]({source})[/]"
@@ -1455,23 +1470,19 @@ _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
 
 
 def _carimbo_extras_row(
-  carimbo: bool | None, has_club_stamp: bool | None, stamp_error: str | None,
+  carimbo: bool | None, r: OverlayResult,
 ) -> tuple[str, str, str, str, str]:
-  """Build the (label, sav, ocr, final, source) summary row describing what
-  OCR detected for carimbo_clube_presente and the stamp action we already
-  took (see `_prepare_club_stamp`).
+  """Build the (label, sav, ocr, final, source) summary row for carimbo_clube_presente.
 
-  Because the overlay runs before the summary, Final reports the real outcome
-  rather than a prediction. Helps diagnose silent-skip cases: when the entity
-  isn't returned by OCR, OCR column shows "—" and Final shows
-  "skip (no OCR result)".
+  Uses the OCR value for the OCR column and the OverlayResult for what we did.
+  Because the overlay runs before the summary, Final reports the real outcome.
   """
   ocr_str = {True: "yes", False: "no", None: "—"}[carimbo]
   if carimbo is True:
     final, source = "on form", "OCR"
-  elif carimbo is False and has_club_stamp:
+  elif r.applied is True:
     final, source = "missing", "overlay"
-  elif carimbo is False and stamp_error:
+  elif r.applied is False:
     final, source = "missing", "overlay failed"
   elif carimbo is False:
     final, source = "missing", "skip"
@@ -1480,40 +1491,75 @@ def _carimbo_extras_row(
   return ("Carimbo do Clube", "—", ocr_str, final, source)
 
 
+def _inscricao_extras_row(
+  reg_type: int | None,
+  tipo_checked: bool | None,
+  r: OverlayResult,
+) -> tuple[str, str, str, str, str]:
+  """Build the (label, sav, ocr, final, source) summary row for tipo_inscricao."""
+  label = REGISTRATION_TYPE_LABELS.get(reg_type or 0, "Tipo Inscrição")
+  ocr_str = {True: "yes", False: "no", None: "—"}[tipo_checked]
+  if tipo_checked is True:
+    final, source = "on form", "OCR"
+  elif r.applied is True:
+    final, source = "missing", "overlay"
+  elif r.applied is False:
+    final, source = "missing", "overlay failed"
+  elif tipo_checked is False:
+    final, source = "missing", "skip"
+  else:
+    final, source = "skip (no OCR result)", "auto"
+  return (label, "—", ocr_str, final, source)
+
+
 def _prepare_club_stamp(
   ctx: click.Context, console: Console, err_console: Console,
   parsed: dict, pdf_path: str, processing_id: str,
-) -> tuple[str, bool | None, bool | None, str | None]:
-  """Overlay the club stamp (when OCR says it's missing) *before* the summary,
-  so the summary reports the real outcome and the user sees what was done up
-  front. Returns (upload_path, carimbo, has_club_stamp, stamp_error).
+  *, reg_type: int | None = None, indent: str = "",
+) -> tuple[str, bool | None, OverlayResult, bool | None, OverlayResult]:
+  """Overlay the inscription checkbox and/or club stamp (when OCR says they
+  are missing) *before* the summary, so the summary reports the real outcome.
 
-  The stamped copy is written into the OCR processing dir for `processing_id`,
-  so it shares that session's lifecycle (close_processing/gc sweep it) instead
-  of leaking a standalone temp file. Registered on `ctx` so it survives the
-  confirm→submit→upload span. The overlay never raises out here — `stamped_pdf`
-  catches failures and falls back to the original PDF — so doing it before the
-  SAV-side commit can't abort anything.
+  Returns (upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r).
+
+  The modified copy is written into the OCR processing dir for `processing_id`,
+  sharing that session's lifecycle. Registered on `ctx` so it survives the
+  confirm→submit→upload span. Neither overlay raises out here — overlaid_pdf
+  catches failures inside each factory and falls back to the original PDF.
   """
   from sav_parsers import processing_dir
 
   carimbo, bbox = read_carimbo(parsed)
-  upload_path, has_club_stamp, stamp_error = ctx.with_resource(
-    stamped_pdf(
-      pdf_path, carimbo_present=carimbo, bbox=bbox,
+  tipo_checked, tipo_bbox = (
+    read_tipo_inscricao(parsed, reg_type) if reg_type is not None else (None, None)
+  )
+  upload_path, (inscricao_r, carimbo_r) = ctx.with_resource(
+    overlaid_pdf(
+      pdf_path,
+      inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
+      carimbo_overlay(carimbo_present=carimbo, bbox=bbox),
       dest_dir=processing_dir(processing_id),
     )
   )
-  if carimbo is False and has_club_stamp:
+  if inscricao_r.applied is True:
+    tipo_label = "Revalidação" if reg_type == 2 else "1ª Inscrição"
     console.print(
-      f"[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
+      f"{indent}[green]:ballot_box_with_check:  Marked {tipo_label} checkbox on [bold]{_display_name(pdf_path)}[/].[/]"
     )
-  if stamp_error:
+  if inscricao_r.error:
     err_console.print(
-      f"[yellow]:warning: {stamp_error}[/] — will upload WITHOUT the club stamp; "
+      f"[yellow]:warning: {inscricao_r.error}[/] — please mark the checkbox manually."
+    )
+  if carimbo_r.applied is True:
+    console.print(
+      f"{indent}[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
+    )
+  if carimbo_r.error:
+    err_console.print(
+      f"[yellow]:warning: {carimbo_r.error}[/] — will upload WITHOUT the club stamp; "
       "please stamp the document manually."
     )
-  return upload_path, carimbo, has_club_stamp, stamp_error
+  return upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r
 
 
 # Maps a staged temp-PDF path back to the user's original filename. Image
@@ -1760,6 +1806,15 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   medical_close_pending = False
   manual_exam_date = False
   try:
+    # ── mod1 scope: OCR result, batch/player resolution, and the field list ──
+    # Everything for the mod1 form nests under one header, in execution order:
+    # OCR → registration type → batch → matched player → club stamp → fields.
+    console.print("[bold]:clipboard: Processing mod1:[/]")
+    console.print(
+      f"  [green]:white_check_mark:[/] OCR ready [dim]({processing_id})[/]",
+      soft_wrap=True,
+    )
+
     # Step 4 — resolve batch
     # When the form has neither tipo_inscricao box checked, derive_enrollment_params
     # falls back to a NIF-based club-roster scan. Surface that since reg_type
@@ -1778,9 +1833,9 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
       if type_inferred:
         label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
-        console.print(f"[cyan]:information_source: Inferred registration type:[/] {label}")
+        console.print(f"  [cyan]:information_source:[/] Inferred registration type: {label}")
       batch_id, batch = _resolve_enroll_batch(
-        client, reg_type, tier_id, gender_id,
+        client, reg_type, tier_id, gender_id, indent="  ",
       )
     except ValueError as exc:
       raise SavCliError(str(exc), code="parse_error")
@@ -1793,7 +1848,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     # batch when the player is already enrolled there — SAV2 only permits
     # one open enrolment per player).
     try:
-      resolved = _resolve_enroll_player(client, batch, parsed, reg_type)
+      resolved = _resolve_enroll_player(client, batch, parsed, reg_type, indent="  ")
     except (SavConnectionError, SavResponseError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     if resolved is None:
@@ -1821,26 +1876,23 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     except Exception as exc:
       raise SavCliError(f"Reconcile error: {exc}", code="reconcile_error")
 
-    # ── mod1 scope: OCR result, field review, and the final field list ──
     player_label = _player_label(sav_profile, license)
-    console.print(f"[bold]:clipboard: Enrolling {player_label} through mod 1:[/]")
-    console.print(
-      f"  [green]:white_check_mark:[/] OCR ready [dim]({processing_id})[/]",
-      soft_wrap=True,
+
+    # Stamp the club mark and/or mark the inscription checkbox (when OCR says
+    # they are missing) before the field list so the summary rows report what
+    # we actually did, not a prediction.
+    upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r = _prepare_club_stamp(
+      ctx, console, err_console, parsed, pdf_path, processing_id,
+      reg_type=reg_type, indent="  ",
     )
     kwargs = _review_and_fill(result, sav_profile, indent="  ")
-
-    # Stamp the club mark (if OCR says it's missing) before the field list so
-    # the carimbo row reports what we actually did, not a prediction.
-    upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
-      ctx, console, err_console, parsed, pdf_path, processing_id,
-    )
     _print_submission_summary(
       kwargs, result, sav_profile,
       ocr_source=f"OCR ({_display_name(pdf_path)})",
       extras=[
+        _inscricao_extras_row(reg_type, tipo_checked, inscricao_r),
         ("Subida de Escalão", "—", "—", "no", "default"),
-        _carimbo_extras_row(carimbo, has_club_stamp, stamp_error),
+        _carimbo_extras_row(carimbo, carimbo_r),
       ],
       indent="  ",
     )
@@ -2373,17 +2425,28 @@ def enrollment_update_cmd(
       except (SavConnectionError, SavResponseError) as exc:
         raise SavCliError(f"Reconcile failed: {exc}", code=_exc_code(exc))
 
-      # Stamp the club mark (if OCR says it's missing) up front so the summary
-      # reports what we actually did, not a prediction.
-      upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
+      # Stamp the club mark and/or mark the inscription checkbox (when OCR says
+      # they are missing) up front so the summary reports what we actually did.
+      # In the update flow reg_type is not derived from SAV, so fall back to
+      # whatever OCR can see; if neither box is checked we skip the overlay.
+      _ocr_reg_type = (
+        2 if parsed_bool(parsed, "tipo_inscricao_revalidacao") else
+        1 if parsed_bool(parsed, "tipo_inscricao_primeira") else
+        None
+      )
+      upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r = _prepare_club_stamp(
         ctx, console, err_console, parsed, active_pdf, processing_id,
+        reg_type=_ocr_reg_type,
       )
       player_label = _player_label(sav_profile, license_)
       kwargs = _review_and_fill(result, sav_profile)
       _print_submission_summary(
         kwargs, result, sav_profile,
         ocr_source=f"OCR ({_display_name(active_pdf)})",
-        extras=[_carimbo_extras_row(carimbo, has_club_stamp, stamp_error)],
+        extras=[
+          _inscricao_extras_row(_ocr_reg_type, tipo_checked, inscricao_r),
+          _carimbo_extras_row(carimbo, carimbo_r),
+        ],
       )
       if not _confirm_documents_and_submit(
         player_label,

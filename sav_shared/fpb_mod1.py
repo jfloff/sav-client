@@ -7,12 +7,13 @@ kwargs and the reconciliation against a stored SAV profile.
 from __future__ import annotations
 
 import difflib
+import io
 import logging
 import os
 import re
 import tempfile
 import unicodedata
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -31,6 +32,14 @@ from .fields import (
 )
 from .lookups import distrito_name, find_distrito_id, find_id_by_name
 
+
+# tipo_inscricao SAV2 int values → OCR entity name.  When neither checkbox is
+# checked on the form, derive_enrollment_params falls back to a NIF lookup and
+# we then need to overlay the mark ourselves before uploading.
+_INSCRICAO_FIELD: dict[int, str] = {
+  1: "tipo_inscricao_primeira",
+  2: "tipo_inscricao_revalidacao",
+}
 
 # tipo_identificacao SAV2 int values — OCR side is a multi-checkbox group,
 # not a single text entity, so this stays bespoke instead of going through
@@ -106,6 +115,74 @@ def read_carimbo(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | No
   return (present, field.bbox)
 
 
+def read_tipo_inscricao(
+  parsed: dict[str, ParsedField], reg_type: int,
+) -> tuple[bool | None, BBox | None]:
+  """Read whether the tipo_inscricao checkbox for `reg_type` is already marked.
+
+  Returns (already_checked, bbox):
+    True  — OCR found the checkbox already marked → skip overlay.
+    False — OCR found it blank → overlay needed; bbox is the page_anchor.
+    None  — field absent or unresolved → skip (safe, avoid double-mark).
+
+  `reg_type` 1 = 1ª Inscrição, 2 = Revalidação (any other value → None, None).
+  Mirrors read_carimbo.
+  """
+  entity = _INSCRICAO_FIELD.get(reg_type)
+  if entity is None:
+    return (None, None)
+  field = parsed.get(entity)
+  if field is None:
+    return (None, None)
+  already_checked = None if field.value is None else bool(field.value)
+  return (already_checked, field.bbox)
+
+
+def _make_cross_png(width: int, height: int) -> bytes:
+  """Return PNG bytes of a bold × on a transparent background, sized `width`×`height`."""
+  from PIL import Image, ImageDraw
+  img  = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+  draw = ImageDraw.Draw(img)
+  pad  = max(2, min(width, height) // 6)
+  lw   = max(2, min(width, height) // 5)
+  draw.line([(pad, pad), (width - pad, height - pad)], fill=(0, 0, 0, 255), width=lw)
+  draw.line([(width - pad, pad), (pad, height - pad)], fill=(0, 0, 0, 255), width=lw)
+  buf = io.BytesIO()
+  img.save(buf, format="PNG")
+  return buf.getvalue()
+
+
+def overlay_tipo_inscricao(
+  pdf_bytes: bytes,
+  *,
+  reg_type: int,
+  already_checked: bool | None = None,
+  bbox: BBox | None = None,
+) -> bytes:
+  """Overlay an × mark on the tipo_inscricao checkbox when it is not already marked.
+
+  already_checked:
+    False - OCR ran and found the box blank → mark it.
+    True  - OCR ran and found it already checked → skip.
+    None  - no OCR result (unknown) → skip, to avoid marking incorrectly.
+
+  Raises ValueError when marking is wanted but `bbox` is None (OCR didn't
+  return a location). Raises on overlay failures.
+  Use inscricao_overlay() to get error-catching + OverlayResult wrapping.
+  """
+  if already_checked is not False:
+    return pdf_bytes
+  if bbox is None:
+    entity = _INSCRICAO_FIELD.get(reg_type, f"tipo_inscricao (reg_type={reg_type})")
+    raise ValueError(f"OCR did not return a location for {entity}")
+  rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
+  x0, y0, x1, y1 = rect
+  w = max(1, int(round(x1 - x0)))
+  h = max(1, int(round(y1 - y0)))
+  cross_bytes = _make_cross_png(w, h)
+  return overlay_image_on_pdf(pdf_bytes, cross_bytes, rect=rect, page_index=bbox.page)
+
+
 # The OCR carimbo slot is sized to the form's printed box, which is smaller
 # than the physical stamp. Scale the placement rect (about its center) so the
 # overlaid stamp reads at a realistic size, then nudge it up by a fraction of
@@ -133,20 +210,14 @@ def overlay_club_stamp(
   """Overlay the club stamp from CLUB_STAMP_PATH onto a mod 1 PDF at the
   location OCR detected for the carimbo_clube_presente entity.
 
-  Composes the generic overlay_image_on_pdf primitive with the club-stamp-
-  specific bits: conditional based on OCR, stamp image on disk, bbox-driven
-  placement.
-
   carimbo_present:
     False - OCR ran and found no club stamp → stamp the PDF at `bbox`.
     True  - OCR ran and detected an existing club stamp → skip.
     None  - no OCR ran (unknown) → skip, to avoid double-stamping.
 
   Raises ValueError when stamping is wanted but `bbox` is None (OCR didn't
-  return a stamp location). Raises on other overlay failures too — the
-  stamped_pdf context manager catches any of these, falls back to the
-  unstamped bytes, and surfaces a human-readable error to the caller so a
-  stamp failure can't abort a post-commit upload.
+  return a stamp location). Raises on other overlay failures.
+  Use carimbo_overlay() to get error-catching + OverlayResult wrapping.
   """
   if carimbo_present is not False:
     return pdf_bytes
@@ -166,81 +237,150 @@ def overlay_club_stamp(
   return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=bbox.page)
 
 
-@contextmanager
-def stamped_pdf(
-  pdf_path: str,
-  *,
-  carimbo_present: bool | None = None,
-  bbox: BBox | None = None,
-  dest_dir: str | os.PathLike[str] | None = None,
-) -> Iterator[tuple[str, bool | None, str | None]]:
-  """Yield (upload_path, has_club_stamp, stamp_error).
+@dataclass
+class OverlayResult:
+  """Outcome of a single PDF overlay pass.
 
-  `dest_dir`, when given, is where the stamped copy is written (as
+  applied:
+    True  — the overlay was applied successfully.
+    None  — skipped; not needed or precondition unknown (see effective).
+    False — attempted but failed; `error` is set.
+
+  effective:
+    True  — the feature is present in the uploaded PDF (was already there
+            or we just added it).
+    False — the feature is absent (missing and we couldn't / didn't add it).
+    None  — unknown (OCR didn't resolve the pre-condition).
+
+  error: human-readable failure description when applied is False.
+  """
+  applied:   bool | None
+  effective: bool | None
+  error:     str | None = None
+
+
+def carimbo_overlay(
+  *, carimbo_present: bool | None, bbox: BBox | None,
+) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
+  """Return an overlay callable that applies the club stamp when OCR says it's missing.
+
+  Skips (applied=None) when carimbo_present is not False or CLUB_STAMP_PATH is
+  unset.  effective reflects the final stamp state in the PDF regardless of
+  whether *we* applied it.  Captures params via closure.
+  """
+  def apply(pdf_bytes: bytes) -> tuple[bytes, OverlayResult]:
+    if carimbo_present is True:
+      return pdf_bytes, OverlayResult(applied=None, effective=True)
+    if carimbo_present is None:
+      return pdf_bytes, OverlayResult(applied=None, effective=None)
+    # carimbo_present is False — stamp is missing
+    if not os.environ.get("CLUB_STAMP_PATH"):
+      return pdf_bytes, OverlayResult(applied=None, effective=False)
+    try:
+      return (
+        overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox),
+        OverlayResult(applied=True, effective=True),
+      )
+    except Exception as exc:
+      logger.warning("carimbo overlay failed", exc_info=True)
+      return pdf_bytes, OverlayResult(applied=False, effective=False, error=f"club stamp failed: {exc}")
+  return apply
+
+
+def inscricao_overlay(
+  *, reg_type: int | None, already_checked: bool | None, bbox: BBox | None,
+) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
+  """Return an overlay callable that marks the tipo_inscricao checkbox when it's blank.
+
+  Skips when already_checked is not False or reg_type is None (unknown type).
+  effective reflects whether the correct checkbox is marked in the PDF.
+  Captures params via closure.
+  """
+  def apply(pdf_bytes: bytes) -> tuple[bytes, OverlayResult]:
+    if already_checked is True:
+      return pdf_bytes, OverlayResult(applied=None, effective=True)
+    if already_checked is None or reg_type is None:
+      return pdf_bytes, OverlayResult(applied=None, effective=None)
+    # already_checked is False — checkbox is blank
+    try:
+      return (
+        overlay_tipo_inscricao(pdf_bytes, reg_type=reg_type, already_checked=already_checked, bbox=bbox),
+        OverlayResult(applied=True, effective=True),
+      )
+    except Exception as exc:
+      logger.warning("inscricao overlay failed", exc_info=True)
+      return pdf_bytes, OverlayResult(applied=False, effective=False, error=f"inscription checkbox failed: {exc}")
+  return apply
+
+
+@contextmanager
+def overlaid_pdf(
+  pdf_path: str,
+  *overlays: Callable[[bytes], tuple[bytes, OverlayResult]],
+  dest_dir: str | os.PathLike[str] | None = None,
+) -> Iterator[tuple[str, list[OverlayResult]]]:
+  """Yield (upload_path, has_club_stamp, stamp_error, has_inscricao_mark, inscricao_error).
+
+  `dest_dir`, when given, is where the modified copy is written (as
   `stamped.pdf`) instead of a standalone temp file; the caller then owns its
   lifecycle (e.g. an OCR processing dir that gets cleaned up wholesale). When
   None, a NamedTemporaryFile is used and removed on context exit.
 
-  `has_club_stamp` reflects the state of the uploaded PDF (not just whether
-  *we* applied the stamp). The truth table:
+  Applies up to two overlays in order: inscription checkbox mark first, then
+  Each overlay is a ``Callable[[bytes], tuple[bytes, OverlayResult]]`` — use
+  carimbo_overlay() and inscricao_overlay() (or any compatible factory) to
+  build them.  Overlays run in order; failures are caught inside each factory
+  so one bad overlay never blocks the next.
 
-    carimbo_present | env var | bbox    | overlay | has_club_stamp | stamp_error
-    True            | any     | any     | skipped | True           | None
-    False           | unset   | any     | skipped | False          | None
-    False           | set     | present | ok      | True           | None
-    False           | set     | missing | failed  | False          | "OCR did not return …"
-    False           | set     | present | failed  | False          | "club stamp failed: …"
-    None            | any     | any     | skipped | None           | None
+  When no overlay fires (all results have applied=None), the original
+  `pdf_path` is yielded unchanged — no temp file is written.
 
-  `stamp_error` is set only on the "tried but failed" rows, so callers can
-  pair `has_club_stamp is False` + `stamp_error` to distinguish "we tried
-  and failed; please stamp manually" from "OCR confirmed it was missing and
-  we weren't configured to add one".
-
-  These contexts run after a SAV-side commit, so the upload always
-  proceeds; the caller is responsible for surfacing stamp_error to the user.
+  `dest_dir`, when given, is where the modified copy is written (as
+  ``stamped.pdf``); the caller owns that directory's lifecycle.  When None,
+  a NamedTemporaryFile is used and removed on context exit.
   """
-  # Fast path: skip the read+overlay pipeline when stamping won't fire, so
-  # non-stamping uploads pay zero extra I/O and have no new failure surface.
-  if carimbo_present is not False or not os.environ.get("CLUB_STAMP_PATH"):
-    yield (pdf_path, carimbo_present, None)
+  if not overlays:
+    yield pdf_path, []
+    return
+
+  with open(pdf_path, "rb") as f:
+    pdf_bytes = f.read()
+
+  results: list[OverlayResult] = []
+  changed = False
+  for fn in overlays:
+    pdf_bytes, r = fn(pdf_bytes)
+    results.append(r)
+    if r.applied is True:
+      changed = True
+
+  if not changed:
+    # Nothing was modified — yield the original path, no I/O needed.
+    yield pdf_path, results
     return
 
   tmp_path: str | None = None
-  has_club_stamp: bool = False
-  stamp_error: str | None = None
   # In dest_dir mode the caller owns the directory's lifecycle, so we never
-  # unlink the file we wrote — it's swept when the dir is.
+  # unlink the file we wrote — it is swept when the dir is.
   owns_file = dest_dir is None
   try:
-    with open(pdf_path, "rb") as f:
-      pdf_bytes = f.read()
-    stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox)
-    # Assign tmp_path before writing so a mid-write failure can be cleaned up.
     if dest_dir is not None:
       tmp_path = os.path.join(os.fspath(dest_dir), "stamped.pdf")
       with open(tmp_path, "wb") as f:
-        f.write(stamped)
+        f.write(pdf_bytes)
     else:
       with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
         tmp_path = f.name
-        f.write(stamped)
-    has_club_stamp = True
-  except Exception as exc:
+        f.write(pdf_bytes)
+  except Exception:
     logger.warning(
-      "Failed to prepare stamped PDF for %r; uploading the original.",
+      "Failed to write overlaid PDF for %r; uploading the original.",
       pdf_path, exc_info=True,
     )
-    stamp_error = f"club stamp failed: {exc}"
-    if owns_file and tmp_path and os.path.exists(tmp_path):
-      try:
-        os.unlink(tmp_path)
-      except OSError:
-        pass
     tmp_path = None
 
   try:
-    yield (tmp_path or pdf_path, has_club_stamp, stamp_error)
+    yield tmp_path or pdf_path, results
   finally:
     if owns_file and tmp_path and os.path.exists(tmp_path):
       os.unlink(tmp_path)

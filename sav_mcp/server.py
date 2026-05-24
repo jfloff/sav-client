@@ -51,7 +51,14 @@ from sav_shared.enrollment import (
     try_replace_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
-from sav_shared.fpb_mod1 import read_carimbo, reconcile_fpb_mod1, stamped_pdf
+from sav_shared.fpb_mod1 import (
+    carimbo_overlay,
+    inscricao_overlay,
+    overlaid_pdf,
+    read_carimbo,
+    read_tipo_inscricao,
+    reconcile_fpb_mod1,
+)
 from sav_shared.games import filter_games
 from sav_shared.lookups import GENERO, REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
 from sav_shared.medical_exam import extract_medical_exam_info
@@ -494,15 +501,18 @@ def _replace_player_document_from_bytes(
     *,
     doc_type: DocType,
     parsed: dict | None = None,
+    reg_type: int | None = None,
 ) -> dict[str, Any]:
     """Upload cached PDF bytes as a replacement registration document.
 
     `parsed` is the fpb_modelo_1 fields dict from parse_fpb_mod1 (when
-    available); used to decide whether to overlay the club stamp.
+    available); used to decide whether to overlay the club stamp and/or
+    the inscription checkbox mark.  `reg_type` (1 or 2) drives the
+    inscription overlay — pass it when known (enrollment create flow).
     """
-    # has_club_stamp / stamp_warning describe the uploaded PDF, so they're
-    # only added to the status when status == "ok"; on "skipped" / "error"
-    # there's no uploaded PDF to describe.
+    # has_club_stamp / stamp_warning / has_inscricao_mark / inscricao_warning
+    # describe the uploaded PDF, so they're only added to status when
+    # status == "ok"; on "skipped" / "error" there's no uploaded PDF to describe.
     status = {
         "doc_type": doc_type.value,
         "status": "skipped",
@@ -511,14 +521,20 @@ def _replace_player_document_from_bytes(
     if not pdf_bytes:
         return status
 
-    carimbo, carimbo_bbox = (
-        read_carimbo(parsed)
-        if (doc_type == DocType.FPB_MODELO_1 and parsed) else (None, None)
+    is_mod1 = doc_type == DocType.FPB_MODELO_1 and parsed
+    carimbo, carimbo_bbox = read_carimbo(parsed) if is_mod1 else (None, None)
+    tipo_checked, tipo_bbox = (
+        read_tipo_inscricao(parsed, reg_type)
+        if (is_mod1 and reg_type is not None) else (None, None)
     )
     tmp_path: str | None = None
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
-        with stamped_pdf(tmp_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
+        with overlaid_pdf(
+            tmp_path,
+            inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
+            carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),
+        ) as (upload_path, (inscricao_r, carimbo_r)):
             ok, error = try_replace_document(
                 client, batch_id, license, upload_path,
                 tipo_doc=doc_type_to_tipo_doc(doc_type),
@@ -526,11 +542,15 @@ def _replace_player_document_from_bytes(
             status["status"] = "ok" if ok else "error"
             status["error"] = error
             if ok:
-                status["has_club_stamp"] = has_club_stamp
+                status["has_club_stamp"] = carimbo_r.effective
                 status["stamp_warning"] = (
-                    f"{stamp_error} — document uploaded without the club stamp; "
+                    f"{carimbo_r.error} — document uploaded without the club stamp; "
                     "please stamp it manually."
-                ) if stamp_error else None
+                ) if carimbo_r.error else None
+                status["has_inscricao_mark"] = inscricao_r.effective
+                status["inscricao_warning"] = (
+                    f"{inscricao_r.error} — please mark the inscription checkbox manually."
+                ) if inscricao_r.error else None
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -898,6 +918,7 @@ def submit_enrollment(
         form.get("pdf_bytes"),
         doc_type=form["doc_type"],
         parsed=form.get("parsed"),
+        reg_type=form.get("reg_type"),
     )
     medical_exam_upload = (
         _replace_player_document_from_bytes(
@@ -1127,7 +1148,21 @@ def update_enrollment_with_document(
             patch_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
             client.update_player_in_registration_batch(batch_id, license, **patch_kwargs)
             carimbo, carimbo_bbox = read_carimbo(parsed)
-            with stamped_pdf(tmp_path, carimbo_present=carimbo, bbox=carimbo_bbox) as (upload_path, has_club_stamp, stamp_error):
+            # Derive reg_type from OCR checkboxes only (no NIF lookup in update flow).
+            _ocr_reg_type = (
+                2 if parsed.get("tipo_inscricao_revalidacao") and parsed["tipo_inscricao_revalidacao"].value
+                else 1 if parsed.get("tipo_inscricao_primeira") and parsed["tipo_inscricao_primeira"].value
+                else None
+            )
+            tipo_checked, tipo_bbox = (
+                read_tipo_inscricao(parsed, _ocr_reg_type)
+                if _ocr_reg_type is not None else (None, None)
+            )
+            with overlaid_pdf(
+                tmp_path,
+                inscricao_overlay(reg_type=_ocr_reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
+                carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),
+            ) as (upload_path, (_, carimbo_r)):
                 client.replace_player_registration_document(batch_id, license, upload_path, tipo_doc=tipo_doc)
 
             corrections: dict[str, str] = {}
@@ -1153,11 +1188,11 @@ def update_enrollment_with_document(
             "success": True,
             "fields_updated": True,
             "document_uploaded": True,
-            "has_club_stamp": has_club_stamp,
+            "has_club_stamp": carimbo_r.effective,
         }
-        if stamp_error:
+        if carimbo_r.error:
             response["stamp_warning"] = (
-                f"{stamp_error} — document uploaded without the club stamp; "
+                f"{carimbo_r.error} — document uploaded without the club stamp; "
                 "please stamp it manually."
             )
         return response
