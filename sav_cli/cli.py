@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import json
 import os
+from pathlib import Path
 import shutil
 from dataclasses import asdict
 from datetime import date
@@ -24,9 +25,7 @@ from typing import Any
 
 import click
 from dotenv import load_dotenv
-from rich import box
 from rich.console import Console
-from rich.table import Table
 from sav_parsers.types import DocType
 
 from sav_client import SavClient, Player
@@ -1244,16 +1243,17 @@ def _prompt_field(
   *,
   field_type: str | Mapping[Any, str] = "text",
   prompt_text: str | None = None,
+  indent: str = "",
 ) -> Any:
   """Prompt the user for one field value, returning the entered value or None."""
   console = _console()
-  label = f"    {kwarg}" + (f"  ({hint})" if hint else "")
+  label = f"{indent}    {kwarg}" + (f"  ({hint})" if hint else "")
   if isinstance(field_type, Mapping):
     if not field_type:
       raise ValueError("Choice field_type must not be empty.")
     console.print(label)
     options_text = "  ".join(f"{key}={value}" for key, value in field_type.items())
-    console.print(f"[dim]      {options_text}[/]")
+    console.print(f"[dim]{indent}      {options_text}[/]")
     choices = {str(key): key for key in field_type}
     entered = click.prompt(prompt_text or label, type=click.Choice(tuple(choices)))
     return choices[entered]
@@ -1272,35 +1272,23 @@ def _prompt_field(
   return entered if entered else None
 
 
-def _confirm_enroll(
-  result: Any, sav_profile: dict, license: int,
-  *,
-  ocr_source: str = "OCR",
-  extras: list[tuple[str, str, str, str, str]] | None = None,
-  documents: list[tuple[str, str]] | None = None,
-) -> dict | None:
-  """
-  Show reconciliation summary and prompt for needs_review fields.
-  Returns final kwargs dict (license already popped out) or None to skip.
+def _player_label(sav_profile: dict, license: int) -> str:
+  """Human-readable player label for headers and prompts."""
+  name_str = sav_profile.get("nome", "") or ""
+  return f"{name_str} (licence {license})" if name_str else f"licence {license}"
 
-  `ocr_source` is the label used in the Source column for OCR-derived FPB
-  rows (e.g. "OCR (form.pdf)"). `extras` are extra rows for the summary
-  table — same (label, sav, ocr, final, source) shape as the internal rows,
-  for fields outside the OCR/SAV reconcile model (e.g. medical exam date,
-  subida de escalão). `documents` are (doc_type, filename) pairs listed before
-  the confirm prompt so the user sees exactly what will be uploaded.
+
+def _review_and_fill(result: Any, sav_profile: dict, *, indent: str = "") -> dict:
+  """Prompt for needs_review fields and return the final kwargs dict.
+
+  Fields flagged for low OCR confidence are prompted one by one; distrito and
+  concelho answers are resolved to ids. `indent` nests the output under a
+  document scope. The license key is popped out of the returned dict.
   """
   console = _console()
   kwargs = dict(result.kwargs)
-  any_changes = bool(result.updated or result.kept or result.needs_review)
-
-  if result.updated:
-    console.print("[green]:white_check_mark: Updated (OCR overrides SAV):[/]")
-    for kwarg, (sav_val, ocr_val) in result.updated.items():
-      console.print(f"    {kwarg}:  {sav_val!r}  ->  {ocr_val!r}")
-
   if result.needs_review:
-    console.print("[yellow]:warning: Needs review (low OCR confidence):[/]")
+    console.print(f"{indent}[bold]:memo: Review & fill:[/]")
     for kwarg in result.needs_review:
       sav_key = KWARG_TO_SAV_KEY.get(kwarg, "")
       sav_val = str(sav_profile.get(sav_key) or "") if sav_key else ""
@@ -1311,47 +1299,42 @@ def _confirm_enroll(
         hint = f"SAV: {sav_val!r} (kept if blank)"
       else:
         hint = "no value found"
-      val = _prompt_field(kwarg, hint)
+      val = _prompt_field(kwarg, hint, indent=indent)
       if val is None:
         continue
       if kwarg == "distrito_id":
         resolved = find_distrito_id(val) if isinstance(val, str) else None
         if resolved is None:
-          console.print(f"[yellow]:warning: {val!r} is not a known distrito; keeping SAV value.[/]")
+          console.print(f"{indent}[yellow]:warning: {val!r} is not a known distrito; keeping SAV value.[/]")
           continue
         kwargs[kwarg] = resolved
       elif kwarg == "concelho_id":
         resolved = find_id_by_name(val, result.concelhos) if isinstance(val, str) else None
         if resolved is None:
           known = ", ".join(sorted(result.concelhos.values())) or "(none — distrito unknown)"
-          console.print(f"[yellow]:warning: {val!r} is not a known concelho for this distrito.[/]")
-          console.print(f"[dim]    Known: {known}[/]")
+          console.print(f"{indent}[yellow]:warning: {val!r} is not a known concelho for this distrito.[/]")
+          console.print(f"[dim]{indent}    Known: {known}[/]")
           continue
         kwargs[kwarg] = resolved
       else:
         kwargs[kwarg] = val
+  elif not (result.updated or result.kept):
+    console.print(f"{indent}[cyan]:information_source: No changes (OCR matches SAV).[/]")
 
-  name_str = sav_profile.get("nome", "") or ""
-  player_label = f"{name_str} (licence {license})" if name_str else f"licence {license}"
+  kwargs.pop("license", None)
+  return kwargs
 
-  if not any_changes:
-    console.print(f"[cyan]:information_source: No changes for {player_label}.[/]")
 
-  _print_submission_summary(
-    kwargs, result, sav_profile,
-    ocr_source=ocr_source, extras=extras,
-  )
-
+def _confirm_documents_and_submit(
+  player_label: str, documents: list[tuple[str, str]] | None,
+) -> bool:
+  """List the documents to upload and prompt for the submit confirmation."""
+  console = _console()
   if documents:
     console.print("[bold]:open_file_folder: Documents to upload:[/]")
     for doc_type_label, filename in documents:
       console.print(f"    • {doc_type_label}  [dim]{filename}[/]")
-
-  if not click.confirm(f"  Submit {player_label}?", default=True):
-    return None
-
-  kwargs.pop("license", None)
-  return kwargs
+  return click.confirm(f"  Submit {player_label}?", default=True)
 
 
 def _format_submit_value(
@@ -1391,15 +1374,16 @@ def _print_submission_summary(
   *,
   ocr_source: str = "OCR",
   extras: list[tuple[str, str, str, str, str]] | None = None,
+  indent: str = "",
 ) -> None:
-  """Render the final pre-submit summary.
+  """Render the final pre-submit field list.
 
-  Default mode shows a compact field/value/source view. Verbose mode expands
-  that into the full SAV vs OCR side-by-side table with the chosen final value.
-  Empty SAV/OCR cells render as em-dash.
+  Each field shows its final value and source. Verbose mode appends the SAV/OCR
+  origin in dim text. Empty values render as em-dash. `indent` prefixes every
+  line so the list can nest under a document scope.
 
-  `ocr_source` overrides the Source-column label for OCR-derived FPB rows so
-  callers can include the originating filename, e.g. "OCR (form.pdf)".
+  `ocr_source` overrides the Source label for OCR-derived FPB rows so callers
+  can include the originating filename, e.g. "OCR (form.pdf)".
   `extras` appends pre-rendered (label, sav, ocr, final, source) rows for
   fields outside the OCR/SAV reconcile model.
   """
@@ -1439,34 +1423,14 @@ def _print_submission_summary(
     return
 
   console = _console()
-  if _VERBOSE:
-    table = Table(
-      box=box.SIMPLE_HEAVY,
-      header_style="bold cyan",
-      title="Submission Summary",
-      title_style="bold cyan",
+  console.print(f"{indent}[bold]:page_facing_up: Fields:[/]")
+  for label, sav, ocr, final, source in rows:
+    line = (
+      f"{indent}    [green]:white_check_mark:[/] {label}  {final}  [dim]({source})[/]"
     )
-    table.add_column("Field", style="bold")
-    table.add_column("SAV")
-    table.add_column("OCR")
-    table.add_column("Final", style="green")
-    for label, sav, ocr, final, source in rows:
-      table.add_row(label, sav, ocr, f"{final}  [{source}]")
-  else:
-    table = Table(
-      box=box.SIMPLE_HEAVY,
-      header_style="bold cyan",
-      title="Submission Summary",
-      title_style="bold cyan",
-    )
-    table.add_column("Field", style="bold")
-    table.add_column("Value", style="green")
-    table.add_column("Source", style="cyan")
-    for label, _, _, final, source in rows:
-      table.add_row(label, final, source)
-  console.print()
-  console.print(table)
-  console.print()
+    if _VERBOSE:
+      line += f" [dim](SAV: {sav} → OCR: {ocr})[/]"
+    console.print(line, soft_wrap=True)
 
 
 # Field types accepted by enrollment create/update --field. Defined here (before the
@@ -1542,7 +1506,7 @@ def _prepare_club_stamp(
   )
   if carimbo is False and has_club_stamp:
     console.print(
-      f"[green]:label:  Applied club stamp to [bold]{os.path.basename(pdf_path)}[/] at OCR-detected location.[/]"
+      f"[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
     )
   if stamp_error:
     err_console.print(
@@ -1552,13 +1516,43 @@ def _prepare_club_stamp(
   return upload_path, carimbo, has_club_stamp, stamp_error
 
 
-def _stage_pdf(ctx: click.Context, console: Console, path: str) -> str:
+# Maps a staged temp-PDF path back to the user's original filename. Image
+# inputs are converted to temp PDFs with random names (tmpXXXX.pdf); without
+# this, every downstream log would show the meaningless temp name.
+_STAGED_DISPLAY_NAMES: dict[str, str] = {}
+
+
+def _display_name(path: str) -> str:
+  """User-facing filename for `path`: the original name when `path` is a staged
+  temp PDF, otherwise its basename."""
+  return _STAGED_DISPLAY_NAMES.get(path, os.path.basename(path))
+
+
+def _stage_pdf(
+  ctx: click.Context, console: Console, path: str,
+  *, converted: list[str] | None = None,
+) -> str:
   """Stage `path` (PDF or supported image) into a PDF, register cleanup on
-  `ctx`, announce conversion to `console`, and return the staged PDF path."""
+  `ctx`, and return the staged PDF path. If `converted` is given, append the
+  source basename to it on conversion (the caller prints a grouped block);
+  otherwise announce the conversion inline."""
   staged, was_converted = ctx.with_resource(staged_pdf(path))
   if was_converted:
-    console.print(f"[cyan]:arrows_counterclockwise: Converted [bold]{path}[/] to PDF.[/]")
+    _STAGED_DISPLAY_NAMES[staged] = os.path.basename(path)
+    if converted is not None:
+      converted.append(os.path.basename(path))
+    else:
+      console.print(f"[cyan]:arrows_counterclockwise: Converted [bold]{path}[/] to PDF.[/]")
   return staged
+
+
+def _print_converted(console: Console, converted: list[str]) -> None:
+  """Print the grouped block of image→PDF conversions, if any happened."""
+  if not converted:
+    return
+  console.print("[bold]:arrows_counterclockwise: Converted to PDF:[/]")
+  for name in converted:
+    console.print(f"  [green]:white_check_mark:[/] {name}", soft_wrap=True)
 
 
 @cli.group("enrollment")
@@ -1669,11 +1663,13 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   # Convert any non-PDF inputs (images) to PDFs up front so OCR, classify,
   # and upload all see PDF paths. PDFs pass through unchanged. Cleanup is
   # registered on the Click context.
-  pdfs = tuple(_stage_pdf(ctx, console, p) for p in pdfs)
+  converted: list[str] = []
+  pdfs = tuple(_stage_pdf(ctx, console, p, converted=converted) for p in pdfs)
   if mod1_path:
-    mod1_path = _stage_pdf(ctx, console, mod1_path)
+    mod1_path = _stage_pdf(ctx, console, mod1_path, converted=converted)
   if medical_exam:
-    medical_exam = _stage_pdf(ctx, console, medical_exam)
+    medical_exam = _stage_pdf(ctx, console, medical_exam, converted=converted)
+  _print_converted(console, converted)
 
   # Pre-classify each positional PDF and bucket by doc type. Explicit
   # --mod1 / --medical-exam paths are appended directly (no classify call).
@@ -1683,36 +1679,32 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
   # parser extracts fields, but each has a tipo_doc mapping, so we attach them
   # to the player with the classified type instead of dropping them.
   extra_docs: list[tuple[str, DocType]] = []
+  if pdfs:
+    console.print("[bold]:mag: Classified:[/]")
   for path in pdfs:
-    filename = os.path.basename(path)
+    filename = _display_name(path)
     try:
       with console.status(f"[bold cyan]:mag: Classifying {filename}...[/]"):
         dt = _classify_pdf_doc_type(path)
     except Exception as exc:
       raise SavCliError(f"Classify error for {path}: {exc}", code="parse_error")
     if dt == DocType.FPB_MODELO_1:
-      console.print(
-        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
-        soft_wrap=True,
-      )
       positional_mod1.append(path)
     elif dt == DocType.EXAME_MEDICO:
-      console.print(
-        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
-        soft_wrap=True,
-      )
       positional_em.append(path)
     elif is_uploadable_doc_type(dt):
-      console.print(
-        f"[green]:white_check_mark: Classified {filename} as {_doc_type_text(dt)}[/]",
-        soft_wrap=True,
-      )
       extra_docs.append((path, dt))
     else:
       console.print(
-        f"[yellow]:warning: Unsupported document type {_doc_type_text(dt)!r}; ignored.[/] "
-        f"[dim]({path})[/]"
+        f"  [yellow]:warning:[/] {filename} "
+        f"[dim](unsupported type {_doc_type_text(dt)!r}; ignored)[/]",
+        soft_wrap=True,
       )
+      continue
+    console.print(
+      f"  [green]:white_check_mark:[/] {filename} [dim]({_doc_type_text(dt)})[/]",
+      soft_wrap=True,
+    )
 
   mod1_candidates = positional_mod1 + ([mod1_path] if mod1_path else [])
   em_candidates = positional_em + ([medical_exam] if medical_exam else [])
@@ -1758,9 +1750,6 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       processing_id = parse_result["processing_id"]
   except Exception as exc:
     raise SavCliError(f"Parse error for {pdf_path}: {exc}", code="parse_error")
-  console.print(
-    f"[green]:white_check_mark: OCR ready[/] [dim]{pdf_path} ({processing_id})[/]"
-  )
 
   # Once parse_fpb_mod1 has created a processing session, we must close it
   # on every exit path or the dir leaks under files/processing/<id>/ until
@@ -1832,8 +1821,40 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     except Exception as exc:
       raise SavCliError(f"Reconcile error: {exc}", code="reconcile_error")
 
+    # ── mod1 scope: OCR result, field review, and the final field list ──
+    player_label = _player_label(sav_profile, license)
+    console.print(f"[bold]:clipboard: Enrolling {player_label} through mod 1:[/]")
+    console.print(
+      f"  [green]:white_check_mark:[/] OCR ready [dim]({processing_id})[/]",
+      soft_wrap=True,
+    )
+    kwargs = _review_and_fill(result, sav_profile, indent="  ")
+
+    # Stamp the club mark (if OCR says it's missing) before the field list so
+    # the carimbo row reports what we actually did, not a prediction.
+    upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
+      ctx, console, err_console, parsed, pdf_path, processing_id,
+    )
+    _print_submission_summary(
+      kwargs, result, sav_profile,
+      ocr_source=f"OCR ({_display_name(pdf_path)})",
+      extras=[
+        ("Subida de Escalão", "—", "—", "no", "default"),
+        _carimbo_extras_row(carimbo, has_club_stamp, stamp_error),
+      ],
+      indent="  ",
+    )
+
+    # ── medical exam scope: its own OCR result and the (required) exam date ──
+    # exam_date is mandatory for every enrollment; the exam PDF is optional and
+    # only supplies an OCR candidate. Resolve it before the submit confirm so
+    # the value confirmed is the value submitted.
     medical_exam_info = None
+    exam_date_final: str | None = None
     if medical_exam_path:
+      console.print(
+        f"[bold]:stethoscope: Medical exam — {_display_name(medical_exam_path)}:[/]"
+      )
       try:
         with console.status("[bold cyan]:stethoscope: Running OCR and extracting medical exam fields...[/]"):
           medical_parse_result = parse_em(medical_exam_path)
@@ -1847,6 +1868,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
           f"Medical exam parse error: {exc} ({medical_exam_path})",
           code="parse_error",
         )
+      console.print("  [green]:white_check_mark:[/] OCR ready", soft_wrap=True)
       # Train the classifier on the medical exam only when the user pinned it
       # with --medical-exam; a positional was already auto-classified.
       if medical_exam is not None:
@@ -1854,33 +1876,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
           with console.status("[bold cyan]:bookmark_tabs: Labeling medical exam for classifier training...[/]"):
             train_classifier(medical_exam_path, DocType.EXAME_MEDICO)
         except Exception as exc:
-          err_console.print(
-            f"[yellow]:warning: Could not submit classifier training for medical exam:[/] "
-            f"{exc} [dim]({medical_exam_path})[/]"
-          )
+          err_console.print(f"  [yellow]:warning:[/] Could not submit classifier training: {exc}")
 
-      if medical_exam_info.exam_date:
-        console.print(
-          f"[cyan]:information_source: Medical exam date:[/] "
-          f"{medical_exam_info.exam_date} [dim]({medical_exam_path})[/]"
-        )
-      else:
-        raw_text = medical_exam_info.raw_exam_date or "not found"
-        console.print(
-          f"[yellow]:warning: Medical exam date needs review:[/] "
-          f"{raw_text!r} [dim]({medical_exam_path})[/]"
-        )
-
-    # Resolve exam_date before the summary so the value confirmed is the value
-    # submitted — otherwise the user would confirm a "needs input" row and only
-    # then be prompted for the actual date.
-    exam_date_ocr_cell = "—"
-    exam_date_final: str | None = None
-    exam_date_source = "user"
-    exam_ocr_source = (
-      f"OCR ({os.path.basename(medical_exam_path)})" if medical_exam_path else "OCR"
-    )
-    if medical_exam_info is not None:
       conf_suffix = (
         f" ({medical_exam_info.exam_date_confidence:.0%})"
         if medical_exam_info.exam_date_confidence is not None
@@ -1888,10 +1885,19 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       )
       if medical_exam_info.exam_date:
         exam_date_final = medical_exam_info.exam_date
-        exam_date_source = exam_ocr_source
-        exam_date_ocr_cell = f"{medical_exam_info.exam_date}{conf_suffix}"
-      elif medical_exam_info.raw_exam_date:
-        exam_date_ocr_cell = f"{medical_exam_info.raw_exam_date!r}{conf_suffix}"
+        console.print(
+          f"  [cyan]:information_source:[/] Exam date: {exam_date_final}{conf_suffix}",
+          soft_wrap=True,
+        )
+      else:
+        raw_text = medical_exam_info.raw_exam_date or "not found"
+        console.print(
+          f"  [yellow]:warning:[/] Exam date needs review: {raw_text!r}{conf_suffix}",
+          soft_wrap=True,
+        )
+    else:
+      console.print("[bold]:stethoscope: Medical exam:[/]")
+
     if exam_date_final is None:
       entered = _prompt_field(
         "exam_date",
@@ -1901,6 +1907,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
           else "required"
         ),
         field_type="date",
+        indent="  ",
       )
       if entered is None:
         raise SavCliError(
@@ -1912,36 +1919,18 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       exam_date_final = entered
       manual_exam_date = medical_exam_info is not None
 
-    # Step 8 — stamp the club mark (if OCR says it's missing) up front so the
-    # summary reports what we actually did, then confirm with user. Pre-render
-    # extras as full row tuples so the medical exam date follows the same
-    # OCR/confidence pattern as other rows.
-    upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
-      ctx, console, err_console, parsed, pdf_path, processing_id,
-    )
-    summary_extras: list[tuple[str, str, str, str, str]] = [
-      ("Data Exame Médico", "—", exam_date_ocr_cell, exam_date_final, exam_date_source),
-      ("Subida de Escalão", "—", "—", "no", "default"),
-      _carimbo_extras_row(carimbo, has_club_stamp, stamp_error),
-    ]
-
+    # ── documents + submit confirmation ─────────────────────────────────
     # Mirror the upload steps below (mod1, then optional exam, then extras) so
     # the user confirms exactly the set of files that gets uploaded.
-    documents = [(_doc_type_text(doc_type), os.path.basename(pdf_path))]
+    documents = [(_doc_type_text(doc_type), _display_name(pdf_path))]
     if medical_exam_path:
-      documents.append((_doc_type_text(DocType.EXAME_MEDICO), os.path.basename(medical_exam_path)))
+      documents.append((_doc_type_text(DocType.EXAME_MEDICO), _display_name(medical_exam_path)))
     documents.extend(
-      (_doc_type_text(extra_dt), os.path.basename(extra_path))
+      (_doc_type_text(extra_dt), _display_name(extra_path))
       for extra_path, extra_dt in extra_docs
     )
 
-    kwargs = _confirm_enroll(
-      result, sav_profile, license,
-      ocr_source=f"OCR ({os.path.basename(pdf_path)})",
-      extras=summary_extras,
-      documents=documents,
-    )
-    if kwargs is None:
+    if not _confirm_documents_and_submit(player_label, documents):
       console.print("[yellow]:fast_forward: Skipped.[/]")
       return
     kwargs["exam_date"] = exam_date_final
@@ -1984,6 +1973,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     # any prior fpb_modelo_1 for this player+batch is deleted first so a
     # re-submit leaves exactly the new file in place. Non-fatal: if it
     # fails the player is still registered, so we just warn and continue.
+    console.print("[bold]:outbox_tray: Uploaded:[/]")
     with console.status(
       "[bold cyan]:page_facing_up: Uploading source document (fpb_modelo_1)...[/]"
     ):
@@ -1994,11 +1984,12 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       )
     if ok:
       console.print(
-        f"[green]:white_check_mark: Uploaded {pdf_path} (fpb_modelo_1).[/]"
+        f"  [green]:white_check_mark:[/] {_display_name(pdf_path)} [dim](fpb_modelo_1)[/]",
+        soft_wrap=True,
       )
     else:
       err_console.print(
-        f"[yellow]:warning: Enrollment succeeded but document upload failed:[/] {err}"
+        f"  [yellow]:warning:[/] {_display_name(pdf_path)} (fpb_modelo_1) upload failed: {err}"
       )
     if medical_exam_path:
       with console.status(
@@ -2011,11 +2002,12 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         )
       if ok:
         console.print(
-          f"[green]:white_check_mark: Uploaded {medical_exam_path} (exame_medico).[/]"
+          f"  [green]:white_check_mark:[/] {_display_name(medical_exam_path)} [dim](exame_medico)[/]",
+          soft_wrap=True,
         )
       else:
         err_console.print(
-          f"[yellow]:warning: Enrollment succeeded but medical exam upload failed:[/] {err}"
+          f"  [yellow]:warning:[/] {_display_name(medical_exam_path)} (exame_medico) upload failed: {err}"
         )
 
     # Step 9c — attach supplementary docs with their classified type. Replace
@@ -2031,12 +2023,13 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         )
       if ok:
         console.print(
-          f"[green]:white_check_mark: Uploaded {extra_path} ({_doc_type_text(extra_dt)}).[/]"
+          f"  [green]:white_check_mark:[/] {_display_name(extra_path)} [dim]({_doc_type_text(extra_dt)})[/]",
+          soft_wrap=True,
         )
       else:
         err_console.print(
-          f"[yellow]:warning: Enrollment succeeded but {_doc_type_text(extra_dt)} "
-          f"upload failed:[/] {err}"
+          f"  [yellow]:warning:[/] {_display_name(extra_path)} ({_doc_type_text(extra_dt)}) "
+          f"upload failed: {err}"
         )
 
     # Step 10 — close processing session; only send corrections the user
@@ -2285,18 +2278,20 @@ def enrollment_update_cmd(
 
   # Convert any non-PDF inputs (images) to PDFs up front; cleanup is registered
   # on the Click context.
+  converted: list[str] = []
   if pdf:
-    pdf = _stage_pdf(ctx, console, pdf)
+    pdf = _stage_pdf(ctx, console, pdf, converted=converted)
   if mod1_path:
-    mod1_path = _stage_pdf(ctx, console, mod1_path)
+    mod1_path = _stage_pdf(ctx, console, mod1_path, converted=converted)
   if medical_exam_path:
-    medical_exam_path = _stage_pdf(ctx, console, medical_exam_path)
+    medical_exam_path = _stage_pdf(ctx, console, medical_exam_path, converted=converted)
+  _print_converted(console, converted)
 
   # Mode A / D — PDF-driven. fpb_modelo_1 runs the full OCR-reconcile-patch
   # flow; every other type has no field parser, so it's a plain attachment.
   if has_pdf:
     active_pdf = mod1_path or pdf
-    active_filename = os.path.basename(active_pdf)
+    active_filename = _display_name(active_pdf)
     from sav_parsers import close_processing, parse_fpb_mod1, train_classifier
 
     if mod1_path:
@@ -2339,7 +2334,7 @@ def enrollment_update_cmd(
           raise SavCliError(str(exc), code=_exc_code(exc))
         console.print(
           f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/] "
-          f"[dim]({active_pdf}) to batch #{batch_number}[/]",
+          f"[dim]({_display_name(active_pdf)}) to batch #{batch_number}[/]",
           soft_wrap=True,
         )
       else:
@@ -2383,13 +2378,17 @@ def enrollment_update_cmd(
       upload_path, carimbo, has_club_stamp, stamp_error = _prepare_club_stamp(
         ctx, console, err_console, parsed, active_pdf, processing_id,
       )
-      kwargs = _confirm_enroll(
-        result, sav_profile, license_,
-        ocr_source=f"OCR ({os.path.basename(active_pdf)})",
+      player_label = _player_label(sav_profile, license_)
+      kwargs = _review_and_fill(result, sav_profile)
+      _print_submission_summary(
+        kwargs, result, sav_profile,
+        ocr_source=f"OCR ({_display_name(active_pdf)})",
         extras=[_carimbo_extras_row(carimbo, has_club_stamp, stamp_error)],
-        documents=[(_doc_type_text(active_doc_type), os.path.basename(active_pdf))],
       )
-      if kwargs is None:
+      if not _confirm_documents_and_submit(
+        player_label,
+        [(_doc_type_text(active_doc_type), _display_name(active_pdf))],
+      ):
         console.print("[yellow]:fast_forward: Skipped.[/]")
         return
 
@@ -2425,7 +2424,7 @@ def enrollment_update_cmd(
         )
         console.print(
           f"[green]:white_check_mark: Uploaded {_doc_type_text(active_doc_type)}[/]"
-          f" [dim]({active_pdf})[/]",
+          f" [dim]({_display_name(active_pdf)})[/]",
           soft_wrap=True,
         )
       except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
@@ -2506,7 +2505,7 @@ def _upload_medical_exam_update(
       # Medical exams don't have a carimbo concept → skip stamping.
       client.replace_player_registration_document(batch_id, license, pdf_path, tipo_doc=tipo_doc)
       console.print(
-        f"[green]:white_check_mark: Uploaded exame_medico[/] [dim]({path})[/]",
+        f"[green]:white_check_mark: Uploaded exame_medico[/] [dim]({Path(path).name})[/]",
         soft_wrap=True,
       )
     except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
