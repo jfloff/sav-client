@@ -282,3 +282,22 @@ def try_replace_document(
     return True, None
   except (SavError, FileNotFoundError, ValueError) as exc:
     return False, str(exc)
+
+
+def try_upload_document(
+  client: Any, batch_id: int, license: int, source: str, *, tipo_doc: int,
+) -> tuple[bool, str | None]:
+  """Upload (append) a player document, swallowing transport/validation errors.
+
+  Like :func:`try_replace_document` but without the delete-existing step, so
+  several files can share one ``tipo_doc``. Use it for the 2nd+ file of a doc
+  type that allows multiples (documento_identificacao, outros) after the first
+  has already cleared any prior docs via ``try_replace_document``.
+  """
+  try:
+    client.upload_player_registration_document(
+      batch_id, license, source, tipo_doc=tipo_doc,
+    )
+    return True, None
+  except (SavError, FileNotFoundError, ValueError) as exc:
+    return False, str(exc)

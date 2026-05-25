@@ -47,6 +47,7 @@ from sav_shared.enrollment import (
   parsed_bool,
   resolve_player_candidates,
   try_replace_document,
+  try_upload_document,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
 from sav_shared.fpb_mod1 import (
@@ -1621,6 +1622,22 @@ def enrollment_grp():
   help="Explicit fpb_modelo_4 form; marks this enrollment as a subida de escalão.",
 )
 @click.option(
+  "--atestado", "atestado_path", type=click.Path(exists=True), default=None,
+  help="Explicit atestado_residencia PDF (skips auto-classify; at most one).",
+)
+@click.option(
+  "--certidao", "certidao_path", type=click.Path(exists=True), default=None,
+  help="Explicit certidao_matricula PDF (skips auto-classify; at most one).",
+)
+@click.option(
+  "--id-doc", "id_doc_paths", type=click.Path(exists=True), multiple=True,
+  help="Explicit documento_identificacao PDF (skips auto-classify; repeatable).",
+)
+@click.option(
+  "--outros", "outros_paths", type=click.Path(exists=True), multiple=True,
+  help="Explicit 'outros' supplementary PDF (skips auto-classify; repeatable).",
+)
+@click.option(
   "--batch", "batch_number_opt", type=str, default=None,
   help="Batch number (as shown in the SAV2 UI) for manual enrolment (no PDF).",
 )
@@ -1637,13 +1654,17 @@ def enrollment_grp():
   ),
 )
 @click.pass_context
-def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_number_opt, license_opt, fields):
+def enrollment_create_cmd(
+  ctx, pdfs, mod1_path, medical_exam, mod4_path, atestado_path, certidao_path,
+  id_doc_paths, outros_paths, batch_number_opt, license_opt, fields,
+):
   """Enroll one player into SAV from one or more supporting PDFs.
 
   A single invocation creates a single enrollment. Pass one fpb_modelo_1 form
-  (required in PDF mode) plus any number of supporting documents — currently
-  zero or one exame_medico. Positional PDFs are auto-classified; --mod1 and
-  --medical-exam pin the type explicitly (and skip classify for that file).
+  (required in PDF mode) plus any number of supporting documents. Positional
+  PDFs are auto-classified; the pin flags skip classify for that file and label
+  it for classifier training: --mod1 (one), --medical-exam (≤1), --mod4 (≤1),
+  --atestado (≤1), --certidao (≤1), --id-doc (repeatable), --outros (repeatable).
 
   \b
     sav enrollment create form.pdf
@@ -1654,6 +1675,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
         Skip classify for both; trains the classifier.
     sav enrollment create form.pdf subida.pdf
         A classified (or --mod4) fpb_modelo_4 marks a subida de escalão.
+    sav enrollment create --mod1 form.pdf --id-doc cc.pdf --id-doc passport.pdf
+        Attach several identification documents alongside the form.
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
         Manual enrolment from SAV profile, no PDF.
   """
@@ -1723,6 +1746,12 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
     medical_exam = _stage_pdf(ctx, console, medical_exam, converted=converted)
   if mod4_path:
     mod4_path = _stage_pdf(ctx, console, mod4_path, converted=converted)
+  if atestado_path:
+    atestado_path = _stage_pdf(ctx, console, atestado_path, converted=converted)
+  if certidao_path:
+    certidao_path = _stage_pdf(ctx, console, certidao_path, converted=converted)
+  id_doc_paths = tuple(_stage_pdf(ctx, console, p, converted=converted) for p in id_doc_paths)
+  outros_paths = tuple(_stage_pdf(ctx, console, p, converted=converted) for p in outros_paths)
   _print_converted(console, converted)
 
   # Pre-classify each positional PDF and bucket by doc type. Explicit
@@ -1730,6 +1759,10 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
   positional_mod1: list[str] = []
   positional_em: list[str] = []
   positional_mod4: list[str] = []
+  # atestado_residencia and certidao_matricula are per-player (at most one),
+  # so bucket them separately to enforce that limit across positional + pinned.
+  positional_atestado: list[str] = []
+  positional_certidao: list[str] = []
   # Supplementary docs (atestado_residencia, documento_identificacao, …): no
   # parser extracts fields, but each has a tipo_doc mapping, so we attach them
   # to the player with the classified type instead of dropping them.
@@ -1749,6 +1782,10 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
       positional_em.append(path)
     elif dt == DocType.FPB_MODELO_4:
       positional_mod4.append(path)
+    elif dt == DocType.ATESTADO_RESIDENCIA:
+      positional_atestado.append(path)
+    elif dt == DocType.CERTIDAO_MATRICULA:
+      positional_certidao.append(path)
     elif is_uploadable_doc_type(dt):
       extra_docs.append((path, dt))
     else:
@@ -1766,6 +1803,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
   mod1_candidates = positional_mod1 + ([mod1_path] if mod1_path else [])
   em_candidates = positional_em + ([medical_exam] if medical_exam else [])
   mod4_candidates = positional_mod4 + ([mod4_path] if mod4_path else [])
+  atestado_candidates = positional_atestado + ([atestado_path] if atestado_path else [])
+  certidao_candidates = positional_certidao + ([certidao_path] if certidao_path else [])
 
   if not mod1_candidates:
     raise click.UsageError(
@@ -1790,6 +1829,16 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
       f"got {len(mod4_candidates)}: {', '.join(mod4_candidates)}. A subida is "
       f"per-player, so attach exactly one alongside the fpb_modelo_1 form."
     )
+  if len(atestado_candidates) > 1:
+    raise click.UsageError(
+      f"enrollment create accepts at most one atestado_residencia per invocation, "
+      f"but got {len(atestado_candidates)}: {', '.join(atestado_candidates)}."
+    )
+  if len(certidao_candidates) > 1:
+    raise click.UsageError(
+      f"enrollment create accepts at most one certidao_matricula per invocation, "
+      f"but got {len(certidao_candidates)}: {', '.join(certidao_candidates)}."
+    )
 
   pdf_path = mod1_candidates[0]
   doc_type = DocType.FPB_MODELO_1
@@ -1801,6 +1850,14 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
   # Upload the mod4 alongside the other supplementary docs (tipo_doc=6).
   if mod4_doc_path is not None:
     extra_docs.append((mod4_doc_path, DocType.FPB_MODELO_4))
+  # Attach the remaining supplementary docs (positional + pinned) with their
+  # type. atestado/certidao are capped at one above; id-doc/outros may repeat.
+  if atestado_candidates:
+    extra_docs.append((atestado_candidates[0], DocType.ATESTADO_RESIDENCIA))
+  if certidao_candidates:
+    extra_docs.append((certidao_candidates[0], DocType.CERTIDAO_MATRICULA))
+  extra_docs.extend((p, DocType.DOCUMENTO_IDENTIFICACAO) for p in id_doc_paths)
+  extra_docs.extend((p, DocType.OUTROS) for p in outros_paths)
   # Train the classifier on the mod1 only when the user pinned it with --mod1;
   # an auto-classified positional already represents a confident classify call.
   if mod1_path is not None:
@@ -1821,6 +1878,25 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
       err_console.print(
         f"[yellow]:warning: Could not submit classifier training for mod4:[/] "
         f"{exc} [dim]({mod4_path})[/]"
+      )
+  # Same for pinned supplementary docs. `outros` is a catch-all (a weak label),
+  # so it's attached but never used as classifier training data.
+  pinned_to_train: list[tuple[str, DocType]] = []
+  if atestado_path is not None:
+    pinned_to_train.append((atestado_path, DocType.ATESTADO_RESIDENCIA))
+  if certidao_path is not None:
+    pinned_to_train.append((certidao_path, DocType.CERTIDAO_MATRICULA))
+  pinned_to_train.extend((p, DocType.DOCUMENTO_IDENTIFICACAO) for p in id_doc_paths)
+  for train_path, train_dt in pinned_to_train:
+    try:
+      with console.status(
+        f"[bold cyan]:bookmark_tabs: Labeling {train_dt.value} for classifier training...[/]"
+      ):
+        train_classifier(train_path, train_dt)
+    except Exception as exc:
+      err_console.print(
+        f"[yellow]:warning: Could not submit classifier training for {train_dt.value}:[/] "
+        f"{exc} [dim]({train_path})[/]"
       )
 
   # Step 2 — parse
@@ -2099,17 +2175,26 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_n
           f"  [yellow]:warning:[/] {_display_name(medical_exam_path)} (exame_medico) upload failed: {err}"
         )
 
-    # Step 9c — attach supplementary docs with their classified type. Replace
-    # semantics (per tipo_doc) keep re-submits idempotent, matching mod1/em; two
-    # files of the same type would collapse to the last one. Non-fatal.
+    # Step 9c — attach supplementary docs with their classified/pinned type.
+    # The first file of each tipo_doc replaces (clearing prior docs of that type
+    # so re-submits stay idempotent, matching mod1/em); any further files of the
+    # same type append, so multiples (documento_identificacao, outros) coexist
+    # instead of collapsing to the last one. Non-fatal.
+    cleared_tipos: set[int] = set()
     for extra_path, extra_dt in extra_docs:
+      tipo_doc = doc_type_to_tipo_doc(extra_dt)
       with console.status(
         f"[bold cyan]:page_facing_up: Uploading {_doc_type_text(extra_dt)}...[/]"
       ):
-        ok, err = try_replace_document(
-          client, batch_id, license, extra_path,
-          tipo_doc=doc_type_to_tipo_doc(extra_dt),
-        )
+        if tipo_doc in cleared_tipos:
+          ok, err = try_upload_document(
+            client, batch_id, license, extra_path, tipo_doc=tipo_doc,
+          )
+        else:
+          ok, err = try_replace_document(
+            client, batch_id, license, extra_path, tipo_doc=tipo_doc,
+          )
+          cleared_tipos.add(tipo_doc)
       if ok:
         console.print(
           f"  [green]:white_check_mark:[/] {_display_name(extra_path)} [dim]({_doc_type_text(extra_dt)})[/]",

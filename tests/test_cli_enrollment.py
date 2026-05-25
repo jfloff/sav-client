@@ -1158,6 +1158,98 @@ def test_enrollment_create_rejects_two_exam_pdfs(monkeypatch, tmp_path):
   assert "at most one exame_medico" in result.output
 
 
+def test_enrollment_create_pinned_supplementary_docs(
+  monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
+):
+  """--atestado/--id-doc skip classify, upload with the right tipo_doc, and train
+  (except --outros). Two --id-doc files coexist: first replaces, second appends."""
+  for name in ("form.pdf", "ate.pdf", "id1.pdf", "id2.pdf", "misc.pdf"):
+    (tmp_path / name).write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"replaced": [], "appended": [], "trained": [], "classify_called": False}
+
+  class StubClient:
+    def load_player_profile(self, license, club_id=None):
+      return {"nome": "Player A"}
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+      captured["replaced"].append((str(pdf), tipo_doc))
+
+    def upload_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+      captured["appended"].append((str(pdf), tipo_doc))
+
+  def fake_classify(pdf):
+    captured["classify_called"] = True
+    return DocType.FPB_MODELO_1
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id, *, indent="": (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed, reg_type=None, *, indent="": (301772, batch_stub))
+  monkeypatch.setattr(cli_module, "_confirm_documents_and_submit", lambda *a, **kw: True)
+  monkeypatch.setattr("sav_parsers.classify", fake_classify)
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod1", lambda pdf: {"fields": {}, "processing_id": "proc-form"})
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda pdf, dt: captured["trained"].append(dt))
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+  monkeypatch.setattr(cli_module, "reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    [
+      "enrollment", "create",
+      "--mod1", str(tmp_path / "form.pdf"),
+      "--atestado", str(tmp_path / "ate.pdf"),
+      "--id-doc", str(tmp_path / "id1.pdf"),
+      "--id-doc", str(tmp_path / "id2.pdf"),
+      "--outros", str(tmp_path / "misc.pdf"),
+    ],
+    input="2026-01-01\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  # Nothing was auto-classified: every doc was pinned via a flag.
+  assert not captured["classify_called"]
+  # mod1 (1), atestado (15), first id-doc (18), outros (22) all replace.
+  assert (str(tmp_path / "ate.pdf"), 15) in captured["replaced"]
+  assert (str(tmp_path / "id1.pdf"), 18) in captured["replaced"]
+  assert (str(tmp_path / "misc.pdf"), 22) in captured["replaced"]
+  # Second id-doc shares tipo_doc=18, so it appends instead of clobbering id1.
+  assert (str(tmp_path / "id2.pdf"), 18) in captured["appended"]
+  # Pinned identifiable docs train the classifier; the outros catch-all never does.
+  assert DocType.ATESTADO_RESIDENCIA in captured["trained"]
+  assert captured["trained"].count(DocType.DOCUMENTO_IDENTIFICACAO) == 2
+  assert DocType.OUTROS not in captured["trained"]
+
+
+def test_enrollment_create_rejects_two_atestado(monkeypatch, tmp_path):
+  """A positional atestado plus --atestado exceeds the per-player limit of one."""
+  form = tmp_path / "form.pdf"
+  form.write_bytes(b"%PDF-1.4\n")
+  a1 = tmp_path / "a1.pdf"
+  a1.write_bytes(b"%PDF-1.4\n")
+  a2 = tmp_path / "a2.pdf"
+  a2.write_bytes(b"%PDF-1.4\n")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {})())
+  monkeypatch.setattr(
+    "sav_parsers.classify",
+    lambda pdf: DocType.FPB_MODELO_1 if str(pdf).endswith("form.pdf") else DocType.ATESTADO_RESIDENCIA,
+  )
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli,
+    ["enrollment", "create", str(form), str(a1), "--atestado", str(a2)],
+  )
+
+  assert result.exit_code != 0
+  assert "at most one atestado_residencia" in result.output
+
+
 def test_enrollment_create_rejects_pdf_input_without_mod1(monkeypatch, tmp_path):
   """If a positional PDF doesn't classify as mod1 or em, the command fails."""
   random_pdf = tmp_path / "random.pdf"
