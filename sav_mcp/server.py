@@ -568,17 +568,20 @@ def parse_enrollment_forms(
     fpb_modelo_1 forms are parsed for the main enrollment workflow and return
     the batch parameters (registration type, tier, gender). exame_medico
     documents are parsed for step-3 metadata and return a medical_exam_id that
-    can be passed to preview_enrollment / submit_enrollment.
+    can be passed to preview_enrollment / submit_enrollment. fpb_modelo_4 forms
+    carry no fields — their presence marks a subida de escalão; they return a
+    mod4_id to pass to submit_enrollment.
 
     doc_types: optional per-PDF type hint list (same length as pdfs). When an
-    entry is "fpb_modelo_1" or "exame_medico", classification is skipped and
-    the classifier is trained with the known label. Use None or omit the list
-    to auto-classify every PDF.
+    entry is "fpb_modelo_1", "exame_medico", or "fpb_modelo_4", classification
+    is skipped and the classifier is trained with the known label. Use None or
+    omit the list to auto-classify every PDF.
 
     Returns one entry per PDF with an artifact_id and canonical doc_type to
     reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
-    exame_medico entries also include medical_exam_id. On error for a given
-    PDF the entry contains an "error" key instead.
+    exame_medico entries also include medical_exam_id; fpb_modelo_4 entries
+    also include mod4_id. On error for a given PDF the entry contains an
+    "error" key instead.
     """
     from sav_parsers import classify, parse_em, parse_fpb_mod1, train_classifier
 
@@ -600,7 +603,11 @@ def parse_enrollment_forms(
 
             if hint is not None:
                 # Type is already known — skip classify and train the classifier.
-                _hint_map = {"fpb_modelo_1": DocType.FPB_MODELO_1, "exame_medico": DocType.EXAME_MEDICO}
+                _hint_map = {
+                    "fpb_modelo_1": DocType.FPB_MODELO_1,
+                    "exame_medico": DocType.EXAME_MEDICO,
+                    "fpb_modelo_4": DocType.FPB_MODELO_4,
+                }
                 if hint not in _hint_map:
                     results.append({"index": i, "error": f"Unknown doc_type hint: {hint!r}"})
                     continue
@@ -627,6 +634,12 @@ def parse_enrollment_forms(
                     train_classifier(tmp_path, DocType.EXAME_MEDICO)
                 except Exception:
                     logger.debug("train_classifier failed for EM", exc_info=True)
+            elif doc_type == DocType.FPB_MODELO_4:
+                # No parser for mod4 — it carries no fields; its presence alone
+                # marks a subida de escalão. Store the bytes for upload + as the
+                # mod4_id submit_enrollment keys off.
+                parsed = {}
+                processing_id = None
             else:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
@@ -664,6 +677,13 @@ def parse_enrollment_forms(
                 "tier_name": tier_name,
                 "gender_id": gender_id,
                 "gender_label": GENERO.get(gender_id, str(gender_id)),
+            })
+        elif doc_type == DocType.FPB_MODELO_4:
+            results.append({
+                "index": i,
+                "artifact_id": artifact_id,
+                "mod4_id": artifact_id,
+                "doc_type": doc_type.value,
             })
         else:
             payload = _build_medical_exam_payload(artifact_id, artifact)
@@ -766,6 +786,7 @@ def preview_enrollment(
     license: int,
     mod1_id: str,
     medical_exam_id: str | None = None,
+    mod4_id: str | None = None,
 ) -> dict:
     """
     Preview the enrollment for a player.
@@ -783,7 +804,8 @@ def preview_enrollment(
     The reconciliation result is cached internally so submit_enrollment can
     use it without repeating the network call. When medical_exam_id is
     supplied, the response also includes a `medical_exam` sidecar with the
-    parsed step-3 exam metadata.
+    parsed step-3 exam metadata. When mod4_id is supplied, the response sets
+    subida_de_escalao=true (pass the same mod4_id to submit_enrollment).
 
     batch_number is accepted for workflow symmetry; only the form/license are
     needed at this stage. It is validated when submit_enrollment is called.
@@ -812,6 +834,7 @@ def preview_enrollment(
         },
         "fields": _build_preview_fields(result, sav_profile),
         "needs_review": result.needs_review,
+        "subida_de_escalao": mod4_id is not None,
     }
     if medical_exam_id is not None:
         artifact = _forms.get(medical_exam_id)
@@ -820,6 +843,12 @@ def preview_enrollment(
         if artifact.get("doc_type") != DocType.EXAME_MEDICO:
             raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
         preview["medical_exam"] = _build_medical_exam_payload(medical_exam_id, artifact)
+    if mod4_id is not None:
+        mod4 = _forms.get(mod4_id)
+        if mod4 is None:
+            raise ValueError(f"Unknown mod4_id: {mod4_id!r}")
+        if mod4.get("doc_type") != DocType.FPB_MODELO_4:
+            raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
     return preview
 
 
@@ -830,6 +859,7 @@ def submit_enrollment(
     mod1_id: str,
     field_overrides: dict[str, Any] | None = None,
     medical_exam_id: str | None = None,
+    mod4_id: str | None = None,
 ) -> dict:
     """
     Submit the player enrollment using the reconciled data from preview_enrollment.
@@ -842,6 +872,11 @@ def submit_enrollment(
     It must include exam_date (YYYY-MM-DD) when no usable medical exam date
     is available. It may also override any parsed exame_medico date when
     medical_exam_id is supplied.
+
+    mod4_id (from parse_enrollment_forms) marks this enrollment as a subida de
+    escalão: the target tier is fetched from SAV and committed, and the mod4 is
+    uploaded as a supporting document. Submitting fails if SAV offers no subida
+    tier for the player.
 
     Returns:
       success=true + player_id  on success.
@@ -877,6 +912,15 @@ def submit_enrollment(
             raise ValueError(f"Artifact {medical_exam_id!r} is not an exame_medico parse")
         medical_exam_info = extract_medical_exam_info(medical_exam["parsed"])
 
+    mod4: dict[str, Any] | None = None
+    if mod4_id is not None:
+        mod4 = _forms.get(mod4_id)
+        if mod4 is None:
+            raise ValueError(f"Unknown mod4_id: {mod4_id!r}")
+        if mod4.get("doc_type") != DocType.FPB_MODELO_4:
+            raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
+    is_subida = mod4 is not None
+
     kwargs = dict(result.kwargs)
     kwargs.pop("license", None)
     if medical_exam_info and medical_exam_info.exam_date:
@@ -900,8 +944,15 @@ def submit_enrollment(
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
     try:
-        player_id = client.add_player_to_registration_batch(batch_id, license, **kwargs)
+        player_id = client.add_player_to_registration_batch(
+            batch_id, license, is_subida=is_subida, **kwargs,
+        )
     except SavConfigError as exc:
+        # Only minor/guardian errors are retry cases; they carry the field list
+        # ("…missing required fields: …"). Other config errors (e.g. subida
+        # requested but SAV offers no tier) are not retryable — surface them.
+        if "missing required fields" not in str(exc):
+            raise
         return {
             "success": False,
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
@@ -929,6 +980,17 @@ def submit_enrollment(
             doc_type=medical_exam["doc_type"],
         )
         if medical_exam is not None
+        else None
+    )
+    subida_document_upload = (
+        _replace_player_document_from_bytes(
+            client,
+            batch_id,
+            license,
+            mod4.get("pdf_bytes"),
+            doc_type=mod4["doc_type"],
+        )
+        if mod4 is not None
         else None
     )
 
@@ -967,6 +1029,8 @@ def submit_enrollment(
         "name": sav_profile.get("nome", ""),
         "source_document_upload": upload_status,
         "medical_exam_upload": medical_exam_upload,
+        "subida_de_escalao": is_subida,
+        "subida_document_upload": subida_document_upload,
     }
 
 

@@ -1,7 +1,7 @@
 import pytest
 
 from sav_client import SavClient
-from sav_client.exceptions import SavResponseError
+from sav_client.exceptions import SavConfigError, SavResponseError
 from sav_client.models import PlayerRegistrationBatch
 
 
@@ -176,6 +176,95 @@ class TestPreHttpGuards:
 
     with pytest.raises(ValueError, match="exam_date must be YYYY-MM-DD; got None"):
       client.add_player_to_registration_batch(1, 301772)
+
+
+# ─── subida de escalão (op=21 + commit) ──────────────────────────────────────
+
+class TestSubidaDeEscalao:
+  """Subida de escalão drives the op=36 commit via the op=21 tier lookup."""
+
+  SUBIDA_MSG = (
+    "<option value='0'>\n    - Não selecionado –\n    </option>"
+    "<option value='6'>\n            Sub 14 </option>"
+  )
+
+  def _stub_enroll(self, monkeypatch, *, subida_tier):
+    """Wire a logged-in client through the wizard up to the commit, capturing
+    the commit body. `subida_tier` is what `_fetch_subida_tier` returns."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    batch = type("BatchStub", (), {
+      "id": 1, "is_open": True, "type_id": 2, "state": "Em construção",
+      "tier": "Sub 14", "gender": "Masculino", "tier_id": 7,
+    })()
+
+    monkeypatch.setattr(client, "list_player_registration_batches", lambda season=None: [batch])
+    monkeypatch.setattr(client, "_list_revalidable_licenses", lambda batch_obj: {301772})
+    monkeypatch.setattr(client, "_load_player_record", lambda batch_id, license: {"id": 88})
+    monkeypatch.setattr(client, "_build_step1_send", lambda *a, **k: "step1")
+    monkeypatch.setattr(client, "_save_registration_step1", lambda batch_id, internal_id, send: {})
+    monkeypatch.setattr(client, "_build_step2_send", lambda *a, **k: "step2")
+    monkeypatch.setattr(
+      client, "_save_registration_step2",
+      lambda batch_type, batch_id, internal_id, license, send: {
+        "menor_idade": 0, "escalao": 7, "estatuto": "A",
+      },
+    )
+    monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
+    monkeypatch.setattr(client, "_fetch_subida_tier", lambda internal_id: subida_tier)
+
+    captured = {}
+
+    def capture_commit(body):
+      captured["body"] = body
+      return {"val": 1, "resultfunction": "ok"}
+
+    monkeypatch.setattr(client, "_registration_commit", capture_commit)
+    return client, captured
+
+  def test_subida_true_fetches_and_commits_tier(self, monkeypatch):
+    client, captured = self._stub_enroll(monkeypatch, subida_tier=(6, "Sub 14"))
+    client.add_player_to_registration_batch(
+      1, 301772, exam_date="2026-05-25", is_subida=True,
+    )
+    assert captured["body"]["sub"] == "6"
+    assert captured["body"]["escalaosubida_txt"] == "Sub 14"
+
+  def test_no_subida_sends_minus_one(self, monkeypatch):
+    client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
+    client.add_player_to_registration_batch(
+      1, 301772, exam_date="2026-05-25", is_subida=False,
+    )
+    assert captured["body"]["sub"] == "-1"
+    assert captured["body"]["escalaosubida_txt"] == "- Não selecionado –"
+
+  def test_subida_with_no_option_raises(self, monkeypatch):
+    client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
+    with pytest.raises(SavConfigError, match="no subida tier"):
+      client.add_player_to_registration_batch(
+        1, 301772, exam_date="2026-05-25", is_subida=True,
+      )
+    assert "body" not in captured  # never reached the commit
+
+  def test_fetch_subida_tier_parses_single_option(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    resp = type("Resp", (), {
+      "text": '{"msg":"' + self.SUBIDA_MSG.replace("\n", "\\n") + '","val":1}',
+      "raise_for_status": lambda self: None,
+    })()
+    monkeypatch.setattr(client, "_http", type("H", (), {"get": lambda self, *a, **k: resp})())
+    assert client._fetch_subida_tier(88) == (6, "Sub 14")
+
+  def test_fetch_subida_tier_returns_none_when_only_placeholder(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    resp = type("Resp", (), {
+      "text": '{"msg":"<option value=\'0\'>- N\\u00e3o selecionado \\u2013</option>","val":1}',
+      "raise_for_status": lambda self: None,
+    })()
+    monkeypatch.setattr(client, "_http", type("H", (), {"get": lambda self, *a, **k: resp})())
+    assert client._fetch_subida_tier(88) is None
 
 
 # ─── live read-only ─────────────────────────────────────────────────────────

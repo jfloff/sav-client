@@ -995,6 +995,126 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   assert f"{exam_path.name} (exame_medico)" in result.output
 
 
+def test_enrollment_create_mod4_marks_subida(
+  monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
+):
+  """A classified fpb_modelo_4 sets is_subida=True, uploads as tipo_doc=6, and
+  shows the subida row as yes."""
+  form_path = tmp_path / "form.pdf"
+  form_path.write_bytes(b"%PDF-1.4\n")
+  exam_path = tmp_path / "exam.pdf"
+  exam_path.write_bytes(b"%PDF-1.4\n")
+  subida_path = tmp_path / "subida.pdf"
+  subida_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"add_calls": 0, "uploads": [], "trained": []}
+
+  class StubClient:
+    def load_player_profile(self, license, club_id=None):
+      return {"nome": "Player A"}
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["add_calls"] += 1
+      captured["kwargs"] = kwargs
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+      captured["uploads"].append((str(pdf), tipo_doc))
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id, *, indent="": (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed, reg_type=None, *, indent="": (301772, batch))
+  monkeypatch.setattr(cli_module, "_confirm_documents_and_submit", lambda *a, **kw: True)
+
+  def classify(pdf):
+    if str(pdf).endswith("exam.pdf"):
+      return DocType.EXAME_MEDICO
+    if str(pdf).endswith("subida.pdf"):
+      return DocType.FPB_MODELO_4
+    return DocType.FPB_MODELO_1
+
+  monkeypatch.setattr("sav_parsers.classify", classify)
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod1", lambda pdf: {"fields": {}, "processing_id": "proc-form"})
+  monkeypatch.setattr(
+    "sav_parsers.parse_em",
+    lambda pdf: {
+      "fields": {"exam_date": ParsedField(value="2026-05-01", confidence=0.92)},
+      "processing_id": "proc-em",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda pdf, dt: captured["trained"].append((str(pdf), dt)))
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+  monkeypatch.setattr(cli_module, "reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "create", str(form_path), str(exam_path), str(subida_path)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["add_calls"] == 1
+  assert captured["kwargs"].get("is_subida") is True
+  # mod4 uploaded as tipo_doc=6.
+  assert (str(subida_path), 6) in captured["uploads"]
+  # Auto-classified positional → no classifier training.
+  assert captured["trained"] == []
+  assert "Subida de Escalão" in result.output
+  assert "fpb_modelo_4" in result.output
+
+
+def test_enrollment_create_without_mod4_is_not_subida(
+  monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
+):
+  """No mod4 anywhere → is_subida=False (the default, unchanged behavior)."""
+  form_path = tmp_path / "form.pdf"
+  form_path.write_bytes(b"%PDF-1.4\n")
+  exam_path = tmp_path / "exam.pdf"
+  exam_path.write_bytes(b"%PDF-1.4\n")
+
+  captured: dict = {"uploads": []}
+
+  class StubClient:
+    def load_player_profile(self, license, club_id=None):
+      return {"nome": "Player A"}
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["kwargs"] = kwargs
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+      captured["uploads"].append((str(pdf), tipo_doc))
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+  monkeypatch.setattr(cli_module, "_resolve_enroll_batch", lambda client, reg_type, tier_id, gender_id, *, indent="": (12, batch_stub))
+  monkeypatch.setattr(cli_module, "_resolve_enroll_player", lambda client, batch, parsed, reg_type=None, *, indent="": (301772, batch))
+  monkeypatch.setattr(cli_module, "_confirm_documents_and_submit", lambda *a, **kw: True)
+  monkeypatch.setattr(
+    "sav_parsers.classify",
+    lambda pdf: DocType.EXAME_MEDICO if str(pdf).endswith("exam.pdf") else DocType.FPB_MODELO_1,
+  )
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod1", lambda pdf: {"fields": {}, "processing_id": "proc-form"})
+  monkeypatch.setattr(
+    "sav_parsers.parse_em",
+    lambda pdf: {
+      "fields": {"exam_date": ParsedField(value="2026-05-01", confidence=0.92)},
+      "processing_id": "proc-em",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+  monkeypatch.setattr("sav_parsers.train_classifier", lambda pdf, dt: None)
+  monkeypatch.setattr(cli_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
+  monkeypatch.setattr(cli_module, "reconcile_fpb_mod1", lambda parsed, sav_profile, client=None: reconcile_result_stub)
+
+  runner = CliRunner()
+  result = runner.invoke(
+    cli_module.cli, ["enrollment", "create", str(form_path), str(exam_path)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["kwargs"].get("is_subida") is False
+
+
 def test_enrollment_create_rejects_two_mod1_pdfs(monkeypatch, tmp_path):
   """Two positional PDFs both classifying as mod1 is rejected as ambiguous."""
   a = tmp_path / "a.pdf"

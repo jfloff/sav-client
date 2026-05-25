@@ -1617,6 +1617,10 @@ def enrollment_grp():
   help="Explicit exame_medico PDF (skips auto-classify for this file).",
 )
 @click.option(
+  "--mod4", "mod4_path", type=click.Path(exists=True), default=None,
+  help="Explicit fpb_modelo_4 form; marks this enrollment as a subida de escalão.",
+)
+@click.option(
   "--batch", "batch_number_opt", type=str, default=None,
   help="Batch number (as shown in the SAV2 UI) for manual enrolment (no PDF).",
 )
@@ -1633,7 +1637,7 @@ def enrollment_grp():
   ),
 )
 @click.pass_context
-def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, license_opt, fields):
+def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, mod4_path, batch_number_opt, license_opt, fields):
   """Enroll one player into SAV from one or more supporting PDFs.
 
   A single invocation creates a single enrollment. Pass one fpb_modelo_1 form
@@ -1648,6 +1652,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
         Auto-classify both PDFs into mod1 + exame_medico; enroll one player.
     sav enrollment create --mod1 form.pdf --medical-exam exam.pdf
         Skip classify for both; trains the classifier.
+    sav enrollment create form.pdf subida.pdf
+        A classified (or --mod4) fpb_modelo_4 marks a subida de escalão.
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
         Manual enrolment from SAV profile, no PDF.
   """
@@ -1715,12 +1721,15 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
     mod1_path = _stage_pdf(ctx, console, mod1_path, converted=converted)
   if medical_exam:
     medical_exam = _stage_pdf(ctx, console, medical_exam, converted=converted)
+  if mod4_path:
+    mod4_path = _stage_pdf(ctx, console, mod4_path, converted=converted)
   _print_converted(console, converted)
 
   # Pre-classify each positional PDF and bucket by doc type. Explicit
   # --mod1 / --medical-exam paths are appended directly (no classify call).
   positional_mod1: list[str] = []
   positional_em: list[str] = []
+  positional_mod4: list[str] = []
   # Supplementary docs (atestado_residencia, documento_identificacao, …): no
   # parser extracts fields, but each has a tipo_doc mapping, so we attach them
   # to the player with the classified type instead of dropping them.
@@ -1738,6 +1747,8 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       positional_mod1.append(path)
     elif dt == DocType.EXAME_MEDICO:
       positional_em.append(path)
+    elif dt == DocType.FPB_MODELO_4:
+      positional_mod4.append(path)
     elif is_uploadable_doc_type(dt):
       extra_docs.append((path, dt))
     else:
@@ -1754,6 +1765,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
 
   mod1_candidates = positional_mod1 + ([mod1_path] if mod1_path else [])
   em_candidates = positional_em + ([medical_exam] if medical_exam else [])
+  mod4_candidates = positional_mod4 + ([mod4_path] if mod4_path else [])
 
   if not mod1_candidates:
     raise click.UsageError(
@@ -1772,10 +1784,23 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       f"got {len(em_candidates)}: {', '.join(em_candidates)}. A medical exam is "
       f"per-player, so attach exactly one alongside the fpb_modelo_1 form."
     )
+  if len(mod4_candidates) > 1:
+    raise click.UsageError(
+      f"enrollment create accepts at most one fpb_modelo_4 per invocation, but "
+      f"got {len(mod4_candidates)}: {', '.join(mod4_candidates)}. A subida is "
+      f"per-player, so attach exactly one alongside the fpb_modelo_1 form."
+    )
 
   pdf_path = mod1_candidates[0]
   doc_type = DocType.FPB_MODELO_1
   medical_exam_path: str | None = em_candidates[0] if em_candidates else None
+  # A mod4 (anywhere in the input) marks this enrollment as a subida de escalão;
+  # the target tier is fetched from SAV at submit time.
+  mod4_doc_path: str | None = mod4_candidates[0] if mod4_candidates else None
+  is_subida = mod4_doc_path is not None
+  # Upload the mod4 alongside the other supplementary docs (tipo_doc=6).
+  if mod4_doc_path is not None:
+    extra_docs.append((mod4_doc_path, DocType.FPB_MODELO_4))
   # Train the classifier on the mod1 only when the user pinned it with --mod1;
   # an auto-classified positional already represents a confident classify call.
   if mod1_path is not None:
@@ -1786,6 +1811,16 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       err_console.print(
         f"[yellow]:warning: Could not submit classifier training for mod1:[/] "
         f"{exc} [dim]({pdf_path})[/]"
+      )
+  # Same for a pinned --mod4 (positional mod4s were already auto-classified).
+  if mod4_path is not None:
+    try:
+      with console.status("[bold cyan]:bookmark_tabs: Labeling mod4 form for classifier training...[/]"):
+        train_classifier(mod4_path, DocType.FPB_MODELO_4)
+    except Exception as exc:
+      err_console.print(
+        f"[yellow]:warning: Could not submit classifier training for mod4:[/] "
+        f"{exc} [dim]({mod4_path})[/]"
       )
 
   # Step 2 — parse
@@ -1891,7 +1926,9 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       ocr_source=f"OCR ({_display_name(pdf_path)})",
       extras=[
         _inscricao_extras_row(reg_type, tipo_checked, inscricao_r),
-        ("Subida de Escalão", "—", "—", "no", "default"),
+        ("Subida de Escalão", "—", "—",
+         "yes" if is_subida else "no",
+         "fpb_modelo_4" if is_subida else "default"),
         _carimbo_extras_row(carimbo, carimbo_r),
       ],
       indent="  ",
@@ -2001,7 +2038,7 @@ def enrollment_create_cmd(ctx, pdfs, mod1_path, medical_exam, batch_number_opt, 
       try:
         with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
           client.add_player_to_registration_batch(
-            batch_id, license, **kwargs,
+            batch_id, license, is_subida=is_subida, **kwargs,
           )
         console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch.number}.[/]")
         submitted = True

@@ -68,6 +68,7 @@ _GAME_SHEET_OP = "29"
 _REGISTRATIONS_PATH = "php/incricoesdb.php"
 _REGISTRATIONS_LIST_OP = "170"
 _REGISTRATIONS_TIERS_OP = "3"
+_REGISTRATIONS_SUBIDA_TIERS_OP = "21"
 _REGISTRATIONS_CREATE_OP = "4"
 _REGISTRATIONS_DELETE_OP = "9"
 _REGISTRATIONS_REMOVE_ITEM_OP = "29"
@@ -1174,6 +1175,34 @@ class SavClient:
     options = re.findall(r"<option value='(\d+)'\s*>([^<]+)</option>", resp.text)
     return {int(i): name.strip() for i, name in options if int(i) != 0}
 
+  def _fetch_subida_tier(self, internal_id: int) -> tuple[int, str] | None:
+    """Op=21 — the player's escalaosubida dropdown. Returns the single
+    selectable (tier_id, name), or None when SAV offers no real option.
+
+    The subida tier is player-specific and server-computed (it is not the
+    batch tier), so we read whatever option SAV exposes rather than guess.
+    The response is ``{"msg": "<option…>", "val": 1}`` with the same
+    ``<option value='..'>`` shape as op=3.
+    """
+    import re
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_SUBIDA_TIERS_OP, "id": internal_id},
+        timeout=self._timeout,
+        headers={"Accept": "*/*"},
+      )
+      resp.raise_for_status()
+      msg = json.loads(resp.text).get("msg", "")
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Could not fetch subida tiers (op=21): {exc}") from exc
+
+    # Tolerate single- or double-quoted values; option text may span newlines.
+    options = re.findall(r"""<option value=['"](\d+)['"]\s*>([^<]+)</option>""", msg)
+    tiers = [(int(i), name.strip()) for i, name in options if int(i) != 0]
+    return tiers[0] if tiers else None
+
   def _resolve_club_association_id(self, club_id: int) -> int:
     """Walk associations to find the one containing the club. Cached per client."""
     cache = getattr(self, "_club_assoc_cache", None)
@@ -1451,6 +1480,7 @@ class SavClient:
     taxa_id: int | None = None,
     exam_date: str | None = None,
     promote_to_tier_id: int | None = None,
+    is_subida: bool = False,
     guardian_name: str | None = None,
     guardian_relation: int | None = None,
     guardian_phone: str | None = None,
@@ -1482,7 +1512,12 @@ class SavClient:
         Step 3:
           exam_date:           Required YYYY-MM-DD date.
                                (The medical exam itself is always assumed done.)
-          promote_to_tier_id:  Numeric escalão ID for Subida; usually unset.
+          promote_to_tier_id:  Numeric escalão ID for Subida; usually unset
+                               (overrides the op=21 lookup when given).
+          is_subida:           Mark this enrollment as a subida de escalão.
+                               When True, the target tier is fetched from SAV
+                               (op=21) and sent as sub/escalaosubida_txt;
+                               raises SavConfigError if SAV offers no option.
           guardian_*:          Required when the player is a minor; raises
                                SavConfigError otherwise.
           consent_*:           GDPR consents.
@@ -1599,16 +1634,32 @@ class SavClient:
 
     exam_date = _coerce_exam_date(exam_date)
 
+    # ── Subida de escalão — fetch the player-specific target tier (op=21) ─────
+    # The subida tier is server-computed per player (not the batch tier), so
+    # we read whatever option SAV exposes rather than assume one.
+    sub_tier = self._fetch_subida_tier(internal_id) if is_subida else None
+    if is_subida and sub_tier is None:
+      raise SavConfigError(
+        f"Subida requested (mod4 present) but SAV offers no subida tier for "
+        f"licence {license} (op=21 returned only '- Não selecionado –')."
+      )
+    if sub_tier:
+      logger.info(
+        "Subida de escalão for licence %s → %s (id=%s)",
+        license, sub_tier[1], sub_tier[0],
+      )
+
     commit_body = {
       "guiaid": batch.id,
       "userid": internal_id,
       "transf": 0,
       "estatuto": str(step3_prefill.get("estatuto", "")),
       "exame": "1",
-      "sub": str(promote_to_tier_id) if promote_to_tier_id is not None else "-1",
+      "sub": str(sub_tier[0]) if sub_tier else (
+        str(promote_to_tier_id) if promote_to_tier_id is not None else "-1"),
       "obs": "",
       "dataexame": exam_date,
-      "escalaosubida_txt": "- Não selecionado –",
+      "escalaosubida_txt": sub_tier[1] if sub_tier else "- Não selecionado –",
       "taxa": str(taxa_id),
       "comp": str(companhia_id),
       "nomeEncarregado": guardian_name or "",

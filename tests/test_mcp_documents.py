@@ -557,3 +557,178 @@ def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
 
   with pytest.raises(ValueError, match="not an fpb_modelo_1"):
     server_module.preview_enrollment(batch_number="12", license=301772, mod1_id="exam-1")
+
+
+# ─── subida de escalão (mod4) ────────────────────────────────────────────────
+
+def test_parse_enrollment_forms_returns_mod4_id(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MODELO_4)
+  monkeypatch.setattr(server_module, "_forms", {})
+
+  result = server_module.parse_enrollment_forms([_pdf_b64()])
+
+  assert result == [
+    {
+      "index": 0,
+      "artifact_id": result[0]["artifact_id"],
+      "mod4_id": result[0]["artifact_id"],
+      "doc_type": DocType.FPB_MODELO_4.value,
+    }
+  ]
+  artifact = server_module._forms[result[0]["mod4_id"]]
+  assert artifact["doc_type"] == DocType.FPB_MODELO_4
+  assert artifact["pdf_bytes"] == b"%PDF-1.4\n"
+
+
+def _submit_stub_forms(result_obj, *, with_mod4: bool) -> dict:
+  forms = {
+    "form-1": {
+      "reconcile_result": result_obj,
+      "processing_id": "proc-1",
+      "pdf_bytes": b"%PDF-1.4\n",
+      "doc_type": DocType.FPB_MODELO_1,
+      "sav_profile": {"nome": "Player A"},
+    },
+  }
+  if with_mod4:
+    forms["mod4-1"] = {
+      "parsed": {},
+      "processing_id": None,
+      "pdf_bytes": b"%PDF-1.4\n",
+      "doc_type": DocType.FPB_MODELO_4,
+    }
+  return forms
+
+
+def test_submit_enrollment_with_mod4_marks_subida(monkeypatch):
+  captured: dict = {"uploads": []}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["kwargs"] = kwargs
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      captured["uploads"].append(tipo_doc)
+
+  result_obj = type("ResultStub", (), {
+    "kwargs": {"license": 301772, "nome": "A"},
+    "needs_review": [],
+    "retrain_corrections": {},
+  })()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
+  monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=True))
+
+  result = server_module.submit_enrollment(
+    batch_number="12",
+    license=301772,
+    mod1_id="form-1",
+    mod4_id="mod4-1",
+    field_overrides={"exam_date": "2026-05-01"},
+  )
+
+  assert result["success"] is True
+  assert captured["kwargs"].get("is_subida") is True
+  assert result["subida_de_escalao"] is True
+  # mod1 (tipo_doc=1) and mod4 (tipo_doc=6) both uploaded.
+  assert 6 in captured["uploads"]
+  assert result["subida_document_upload"]["status"] == "ok"
+
+
+def test_submit_enrollment_without_mod4_is_not_subida(monkeypatch):
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["kwargs"] = kwargs
+      return 77
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      pass
+
+  result_obj = type("ResultStub", (), {
+    "kwargs": {"license": 301772, "nome": "A"},
+    "needs_review": [],
+    "retrain_corrections": {},
+  })()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
+  monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=False))
+
+  result = server_module.submit_enrollment(
+    batch_number="12",
+    license=301772,
+    mod1_id="form-1",
+    field_overrides={"exam_date": "2026-05-01"},
+  )
+
+  assert captured["kwargs"].get("is_subida") is False
+  assert result["subida_de_escalao"] is False
+  assert result["subida_document_upload"] is None
+
+
+def test_submit_enrollment_rejects_non_mod4_artifact(monkeypatch):
+  import pytest
+
+  result_obj = type("ResultStub", (), {
+    "kwargs": {"license": 301772},
+    "needs_review": [],
+    "retrain_corrections": {},
+  })()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  forms = _submit_stub_forms(result_obj, with_mod4=False)
+  # Point mod4_id at the exam/mod1 artifact to trigger the type guard.
+  monkeypatch.setattr(server_module, "_forms", forms)
+
+  with pytest.raises(ValueError, match="not an fpb_modelo_4"):
+    server_module.submit_enrollment(
+      batch_number="12",
+      license=301772,
+      mod1_id="form-1",
+      mod4_id="form-1",
+      field_overrides={"exam_date": "2026-05-01"},
+    )
+
+
+def test_submit_enrollment_subida_no_tier_error_propagates(monkeypatch):
+  """A non-guardian SavConfigError (e.g. no subida tier) is re-raised, not
+  swallowed as a missing-guardian retry."""
+  import pytest
+
+  from sav_client.exceptions import SavConfigError
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return int(number)
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      raise SavConfigError("Subida requested but SAV offers no subida tier")
+
+  result_obj = type("ResultStub", (), {
+    "kwargs": {"license": 301772},
+    "needs_review": [],
+    "retrain_corrections": {},
+  })()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=True))
+
+  with pytest.raises(SavConfigError, match="no subida tier"):
+    server_module.submit_enrollment(
+      batch_number="12",
+      license=301772,
+      mod1_id="form-1",
+      mod4_id="mod4-1",
+      field_overrides={"exam_date": "2026-05-01"},
+    )
