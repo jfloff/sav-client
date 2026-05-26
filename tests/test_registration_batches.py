@@ -55,11 +55,6 @@ class TestPreHttpGuards:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.list_player_registration_batches()
 
-  def test_tiers_requires_login(self):
-    c = SavClient("https://sav2.fpb.pt", "user", "pass")
-    with pytest.raises(SavResponseError, match="Must call login"):
-      c.list_player_registration_tiers(gender_id=1)
-
   def test_create_requires_login(self):
     c = SavClient("https://sav2.fpb.pt", "user", "pass")
     with pytest.raises(SavResponseError, match="Must call login"):

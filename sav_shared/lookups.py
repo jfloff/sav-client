@@ -99,6 +99,53 @@ REGISTRATION_TYPE_LABELS: dict[int, str] = {
 }
 
 
+# ── Player registration tiers / escalões (SAV2 op=3 `escalao` dropdown) ─────────
+#
+# SAV2 assigns a *different* integer ID to the same tier name per gender (the
+# dropdown is fetched with genero=1 vs genero=2). The tier names and the set of
+# available tiers are identical across genders; only the IDs are renumbered.
+# The table is stable across seasons, so we hardcode it here instead of scraping
+# the wizard on every enrollment. Keyed by gender_id, then tier_id → name.
+PLAYER_REGISTRATION_TIERS: dict[int, dict[int, str]] = {
+  1: {  # Masculino
+     3: "Sub 16",
+     5: "Sub 14",
+    10: "Sub 18",
+    13: "Mini 8",
+    14: "Mini 10",
+    15: "Mini 12",
+    18: "Sénior",
+    29: "Masters / Veteranos",
+    31: "BCR",
+    33: "Baby-Basket",
+  },
+  2: {  # Feminino
+     1: "Sub 16",
+     2: "Mini 8",
+     6: "Sub 14",
+     7: "Mini 10",
+    11: "Mini 12",
+    19: "Sénior",
+    21: "Sub 18",
+    34: "BCR",
+    43: "Masters / Veteranos",
+    44: "Baby-Basket",
+  },
+}
+
+
+def player_registration_tiers(gender_id: int) -> dict[int, str]:
+  """{tier_id → name} for a gender (1=Masculino, 2=Feminino).
+
+  Returns a fresh copy so callers can't mutate the table. Raises ValueError on
+  an unknown gender, matching the old client-side validation.
+  """
+  try:
+    return dict(PLAYER_REGISTRATION_TIERS[gender_id])
+  except KeyError:
+    raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)") from None
+
+
 # ── ID document types (tipo_identificacao) ─────────────────────────────────────
 
 ID_TYPES: dict[int, str] = {

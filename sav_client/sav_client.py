@@ -43,6 +43,8 @@ from .cache import Cache
 from .models import Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
 from .utils import md5_hex, strip_html
 
+from sav_shared.lookups import player_registration_tiers
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -67,7 +69,6 @@ _GAME_SHEET_PATH = "php/maindb.php"
 _GAME_SHEET_OP = "29"
 _REGISTRATIONS_PATH = "php/incricoesdb.php"
 _REGISTRATIONS_LIST_OP = "170"
-_REGISTRATIONS_TIERS_OP = "3"
 _REGISTRATIONS_SUBIDA_TIERS_OP = "21"
 _REGISTRATIONS_CREATE_OP = "4"
 _REGISTRATIONS_DELETE_OP = "9"
@@ -1128,12 +1129,13 @@ class SavClient:
     self, *, gender_id: int,
   ) -> dict[int, str]:
     """
-    Return the registration tiers (escalões) available for a given gender,
-    as a mapping of numeric tier ID -> human name (e.g. 5 -> "Sub 14").
-    Cached 7 days.
+    Return the registration tiers (escalões) for a given gender, as a mapping
+    of numeric tier ID -> human name (e.g. 5 -> "Sub 14" for Masculino).
 
-    The set differs by gender (some categories are male- or female-only),
-    so a gender_id is required.
+    SAV2 renumbers the same tier names per gender, so a gender_id is required.
+    The table is stable across seasons and hardcoded in
+    ``sav_shared.lookups.PLAYER_REGISTRATION_TIERS``; this no longer hits the
+    network, so it works without a prior login().
 
     Args:
         gender_id: 1=Masculino, 2=Feminino.
@@ -1143,37 +1145,9 @@ class SavClient:
         (id=0) is excluded.
 
     Raises:
-        SavResponseError:   If the response cannot be parsed.
-        SavConnectionError: On network errors.
+        ValueError: If gender_id is not 1 or 2.
     """
-    if self.session is None:
-      raise SavResponseError(
-        "Must call login() before list_player_registration_tiers()"
-      )
-    if gender_id not in (1, 2):
-      raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)")
-
-    season_id = int(self.session.get("epoca_id") or 0)
-    return self._cache.get_tiers(
-      self._fetch_tiers, gender_id=gender_id, season_id=season_id,
-    )
-
-  def _fetch_tiers(self, gender_id: int) -> dict[int, str]:
-    import re
-
-    url = self._url(_REGISTRATIONS_PATH)
-    try:
-      resp = self._http.get(
-        url,
-        params={"op": _REGISTRATIONS_TIERS_OP, "genero": gender_id},
-        timeout=self._timeout,
-      )
-      resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-      raise SavConnectionError(f"Could not fetch tiers: {exc}") from exc
-
-    options = re.findall(r"<option value='(\d+)'\s*>([^<]+)</option>", resp.text)
-    return {int(i): name.strip() for i, name in options if int(i) != 0}
+    return player_registration_tiers(gender_id)
 
   def _fetch_subida_tier(self, internal_id: int) -> tuple[int, str] | None:
     """Op=21 — the player's escalaosubida dropdown. Returns the single
