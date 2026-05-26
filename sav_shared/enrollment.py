@@ -18,6 +18,30 @@ _DEFAULT_GUARDIAN_FIELDS = [
   "guardian_name", "guardian_relation", "guardian_phone", "guardian_email",
 ]
 
+# Batch type for a standalone Subida de escalão batch (SAV `newGuia(1,4)`),
+# distinct from the inline promote-on-enroll rider that can ride on a 1ª
+# Inscrição (1) or Revalidação (2). See validate_subida_combo.
+REGISTRATION_TYPE_SUBIDA = 4
+
+
+def validate_subida_combo(reg_type: int, inline_subida: bool) -> None:
+  """Reject contradictory enrollment-type combinations.
+
+  "Subida de escalão" is two different operations:
+    * inline_subida — promote the player *right away* while doing a 1ª Inscrição
+      or Revalidação (op=21 escalaosubida on a type-1/2 batch).
+    * a standalone Subida batch (reg_type 4) — its own batch, which IS a subida.
+
+  An inline rider on top of a standalone Subida batch is contradictory, so we
+  forbid it at the tool boundary rather than let an LLM build an invalid state.
+  """
+  if inline_subida and reg_type not in (1, 2):
+    raise ValueError(
+      f"inline_subida is only valid for 1ª Inscrição (1) or Revalidação (2) "
+      f"batches; got reg_type={reg_type}. A standalone Subida batch (type "
+      f"{REGISTRATION_TYPE_SUBIDA}) is itself a subida — don't add an inline rider."
+    )
+
 
 # kwarg → sav_profile key, for reconciled fields only (sav_key non-empty)
 KWARG_TO_SAV_KEY: dict[str, str] = {

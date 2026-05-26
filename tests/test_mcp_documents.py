@@ -634,8 +634,8 @@ def test_submit_enrollment_with_mod4_marks_subida(monkeypatch):
   )
 
   assert result["success"] is True
-  assert captured["kwargs"].get("is_subida") is True
-  assert result["subida_de_escalao"] is True
+  assert captured["kwargs"].get("inline_subida") is True
+  assert result["inline_subida"] is True
   # mod1 (tipo_doc=1) and mod4 (tipo_doc=6) both uploaded.
   assert 6 in captured["uploads"]
   assert result["subida_document_upload"]["status"] == "ok"
@@ -672,8 +672,8 @@ def test_submit_enrollment_without_mod4_is_not_subida(monkeypatch):
     field_overrides={"exam_date": "2026-05-01"},
   )
 
-  assert captured["kwargs"].get("is_subida") is False
-  assert result["subida_de_escalao"] is False
+  assert captured["kwargs"].get("inline_subida") is False
+  assert result["inline_subida"] is False
   assert result["subida_document_upload"] is None
 
 
@@ -697,6 +697,32 @@ def test_submit_enrollment_rejects_non_mod4_artifact(monkeypatch):
       license=301772,
       mod1_id="form-1",
       mod4_id="form-1",
+      field_overrides={"exam_date": "2026-05-01"},
+    )
+
+
+def test_submit_enrollment_rejects_inline_subida_on_type4(monkeypatch):
+  """The XOR guardrail: a mod1 form already routed to reg_type 4 (standalone
+  Subida) can't also carry an inline mod4 rider."""
+  import pytest
+
+  result_obj = type("ResultStub", (), {
+    "kwargs": {"license": 301772},
+    "needs_review": [],
+    "retrain_corrections": {},
+  })()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  forms = _submit_stub_forms(result_obj, with_mod4=True)
+  forms["form-1"]["reg_type"] = 4
+  monkeypatch.setattr(server_module, "_forms", forms)
+
+  with pytest.raises(ValueError, match="inline_subida is only valid"):
+    server_module.submit_enrollment(
+      batch_number="12",
+      license=301772,
+      mod1_id="form-1",
+      mod4_id="mod4-1",
       field_overrides={"exam_date": "2026-05-01"},
     )
 

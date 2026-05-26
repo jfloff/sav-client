@@ -48,6 +48,7 @@ from sav_shared.enrollment import (
   resolve_player_candidates,
   try_replace_document,
   try_upload_document,
+  validate_subida_combo,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
 from sav_shared.fpb_mod1 import (
@@ -1619,7 +1620,7 @@ def enrollment_grp():
 )
 @click.option(
   "--mod4", "mod4_path", type=click.Path(exists=True), default=None,
-  help="Explicit fpb_modelo_4 form; marks this enrollment as a subida de escalão.",
+  help="Explicit fpb_modelo_4 form; adds an inline subida de escalão (needs a mod1).",
 )
 @click.option(
   "--atestado", "atestado_path", type=click.Path(exists=True), default=None,
@@ -1674,7 +1675,7 @@ def enrollment_create_cmd(
     sav enrollment create --mod1 form.pdf --medical-exam exam.pdf
         Skip classify for both; trains the classifier.
     sav enrollment create form.pdf subida.pdf
-        A classified (or --mod4) fpb_modelo_4 marks a subida de escalão.
+        A classified (or --mod4) fpb_modelo_4 adds an inline subida de escalão.
     sav enrollment create --mod1 form.pdf --id-doc cc.pdf --id-doc passport.pdf
         Attach several identification documents alongside the form.
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
@@ -1807,6 +1808,16 @@ def enrollment_create_cmd(
   certidao_candidates = positional_certidao + ([certidao_path] if certidao_path else [])
 
   if not mod1_candidates:
+    if mod4_candidates:
+      # mod4 alone (no mod1) = a standalone Subida de escalão batch (type 4),
+      # a different SAV web flow whose submit wizard isn't built yet (planned
+      # follow-up — see SUBIDA_TODO.md). Report the intent precisely rather
+      # than the generic "needs a mod1" error.
+      raise click.UsageError(
+        "An fpb_modelo_4 on its own means a standalone Subida de escalão batch "
+        "(type 4), which isn't supported yet. For an inline subida (promote "
+        "during a 1ª inscrição/revalidação), include the fpb_modelo_1 form too."
+      )
     raise click.UsageError(
       "No fpb_modelo_1 form provided. Pass one as a positional PDF or via --mod1."
     )
@@ -1826,8 +1837,8 @@ def enrollment_create_cmd(
   if len(mod4_candidates) > 1:
     raise click.UsageError(
       f"enrollment create accepts at most one fpb_modelo_4 per invocation, but "
-      f"got {len(mod4_candidates)}: {', '.join(mod4_candidates)}. A subida is "
-      f"per-player, so attach exactly one alongside the fpb_modelo_1 form."
+      f"got {len(mod4_candidates)}: {', '.join(mod4_candidates)}. An inline subida "
+      f"is per-player, so attach exactly one alongside the fpb_modelo_1 form."
     )
   if len(atestado_candidates) > 1:
     raise click.UsageError(
@@ -1843,10 +1854,11 @@ def enrollment_create_cmd(
   pdf_path = mod1_candidates[0]
   doc_type = DocType.FPB_MODELO_1
   medical_exam_path: str | None = em_candidates[0] if em_candidates else None
-  # A mod4 (anywhere in the input) marks this enrollment as a subida de escalão;
-  # the target tier is fetched from SAV at submit time.
+  # A mod4 alongside the mod1 adds an inline subida de escalão (promote during
+  # this 1ª inscrição/revalidação); the target tier is fetched from SAV at
+  # submit time. A standalone Subida batch (mod4 alone) was rejected above.
   mod4_doc_path: str | None = mod4_candidates[0] if mod4_candidates else None
-  is_subida = mod4_doc_path is not None
+  inline_subida = mod4_doc_path is not None
   # Upload the mod4 alongside the other supplementary docs (tipo_doc=6).
   if mod4_doc_path is not None:
     extra_docs.append((mod4_doc_path, DocType.FPB_MODELO_4))
@@ -1942,6 +1954,7 @@ def enrollment_create_cmd(
       )
       with console.status(status_message):
         reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+      validate_subida_combo(reg_type, inline_subida)
       if type_inferred:
         label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
         console.print(f"  [cyan]:information_source:[/] Inferred registration type: {label}")
@@ -2002,9 +2015,9 @@ def enrollment_create_cmd(
       ocr_source=f"OCR ({_display_name(pdf_path)})",
       extras=[
         _inscricao_extras_row(reg_type, tipo_checked, inscricao_r),
-        ("Subida de Escalão", "—", "—",
-         "yes" if is_subida else "no",
-         "fpb_modelo_4" if is_subida else "default"),
+        ("Subida de Escalão (inline)", "—", "—",
+         "yes" if inline_subida else "no",
+         "fpb_modelo_4" if inline_subida else "default"),
         _carimbo_extras_row(carimbo, carimbo_r),
       ],
       indent="  ",
@@ -2114,7 +2127,7 @@ def enrollment_create_cmd(
       try:
         with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
           client.add_player_to_registration_batch(
-            batch_id, license, is_subida=is_subida, **kwargs,
+            batch_id, license, inline_subida=inline_subida, **kwargs,
           )
         console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch.number}.[/]")
         submitted = True

@@ -998,8 +998,8 @@ def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
 def test_enrollment_create_mod4_marks_subida(
   monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
 ):
-  """A classified fpb_modelo_4 sets is_subida=True, uploads as tipo_doc=6, and
-  shows the subida row as yes."""
+  """A classified fpb_modelo_4 (alongside a mod1) sets inline_subida=True,
+  uploads as tipo_doc=6, and shows the inline subida row as yes."""
   form_path = tmp_path / "form.pdf"
   form_path.write_bytes(b"%PDF-1.4\n")
   exam_path = tmp_path / "exam.pdf"
@@ -1054,7 +1054,7 @@ def test_enrollment_create_mod4_marks_subida(
 
   assert result.exit_code == 0, result.output
   assert captured["add_calls"] == 1
-  assert captured["kwargs"].get("is_subida") is True
+  assert captured["kwargs"].get("inline_subida") is True
   # mod4 uploaded as tipo_doc=6.
   assert (str(subida_path), 6) in captured["uploads"]
   # Auto-classified positional → no classifier training.
@@ -1066,7 +1066,7 @@ def test_enrollment_create_mod4_marks_subida(
 def test_enrollment_create_without_mod4_is_not_subida(
   monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
 ):
-  """No mod4 anywhere → is_subida=False (the default, unchanged behavior)."""
+  """No mod4 anywhere → inline_subida=False (the default, unchanged behavior)."""
   form_path = tmp_path / "form.pdf"
   form_path.write_bytes(b"%PDF-1.4\n")
   exam_path = tmp_path / "exam.pdf"
@@ -1112,7 +1112,25 @@ def test_enrollment_create_without_mod4_is_not_subida(
   )
 
   assert result.exit_code == 0, result.output
-  assert captured["kwargs"].get("is_subida") is False
+  assert captured["kwargs"].get("inline_subida") is False
+
+
+def test_enrollment_create_mod4_alone_rejected_as_standalone_subida(
+  monkeypatch, tmp_path,
+):
+  """A mod4 with no mod1 is a standalone Subida batch (type 4), not yet
+  supported → a clear UsageError, not the generic 'needs a mod1' message."""
+  subida_path = tmp_path / "subida.pdf"
+  subida_path.write_bytes(b"%PDF-1.4\n")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: object())
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MODELO_4)
+
+  runner = CliRunner()
+  result = runner.invoke(cli_module.cli, ["enrollment", "create", str(subida_path)])
+
+  assert result.exit_code != 0
+  assert "standalone Subida de escalão batch" in result.output
 
 
 def test_enrollment_create_rejects_two_mod1_pdfs(monkeypatch, tmp_path):

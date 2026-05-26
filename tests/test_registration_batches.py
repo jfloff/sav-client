@@ -227,7 +227,7 @@ class TestSubidaDeEscalao:
   def test_subida_true_fetches_and_commits_tier(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=(6, "Sub 14"))
     client.add_player_to_registration_batch(
-      1, 301772, exam_date="2026-05-25", is_subida=True,
+      1, 301772, exam_date="2026-05-25", inline_subida=True,
     )
     assert captured["body"]["sub"] == "6"
     assert captured["body"]["escalaosubida_txt"] == "Sub 14"
@@ -235,7 +235,7 @@ class TestSubidaDeEscalao:
   def test_no_subida_sends_minus_one(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
     client.add_player_to_registration_batch(
-      1, 301772, exam_date="2026-05-25", is_subida=False,
+      1, 301772, exam_date="2026-05-25", inline_subida=False,
     )
     assert captured["body"]["sub"] == "-1"
     assert captured["body"]["escalaosubida_txt"] == "- Não selecionado –"
@@ -244,7 +244,7 @@ class TestSubidaDeEscalao:
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
     with pytest.raises(SavConfigError, match="no subida tier"):
       client.add_player_to_registration_batch(
-        1, 301772, exam_date="2026-05-25", is_subida=True,
+        1, 301772, exam_date="2026-05-25", inline_subida=True,
       )
     assert "body" not in captured  # never reached the commit
 

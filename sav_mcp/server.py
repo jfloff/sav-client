@@ -49,6 +49,7 @@ from sav_shared.enrollment import (
     parse_missing_guardian_fields,
     resolve_player_candidates,
     try_replace_document,
+    validate_subida_combo,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import (
@@ -569,8 +570,8 @@ def parse_enrollment_forms(
     the batch parameters (registration type, tier, gender). exame_medico
     documents are parsed for step-3 metadata and return a medical_exam_id that
     can be passed to preview_enrollment / submit_enrollment. fpb_modelo_4 forms
-    carry no fields — their presence marks a subida de escalão; they return a
-    mod4_id to pass to submit_enrollment.
+    carry no fields — alongside an fpb_modelo_1 their presence adds an inline
+    subida de escalão; they return a mod4_id to pass to preview/submit_enrollment.
 
     doc_types: optional per-PDF type hint list (same length as pdfs). When an
     entry is "fpb_modelo_1", "exame_medico", or "fpb_modelo_4", classification
@@ -635,9 +636,9 @@ def parse_enrollment_forms(
                 except Exception:
                     logger.debug("train_classifier failed for EM", exc_info=True)
             elif doc_type == DocType.FPB_MODELO_4:
-                # No parser for mod4 — it carries no fields; its presence alone
-                # marks a subida de escalão. Store the bytes for upload + as the
-                # mod4_id submit_enrollment keys off.
+                # No parser for mod4 — it carries no fields; alongside a mod1 its
+                # presence adds an inline subida de escalão. Store the bytes for
+                # upload + as the mod4_id preview/submit_enrollment keys off.
                 parsed = {}
                 processing_id = None
             else:
@@ -804,8 +805,13 @@ def preview_enrollment(
     The reconciliation result is cached internally so submit_enrollment can
     use it without repeating the network call. When medical_exam_id is
     supplied, the response also includes a `medical_exam` sidecar with the
-    parsed step-3 exam metadata. When mod4_id is supplied, the response sets
-    subida_de_escalao=true (pass the same mod4_id to submit_enrollment).
+    parsed step-3 exam metadata.
+
+    The response always states the enrollment route so it can be confirmed
+    before submit: `reg_type` (1/2) + `reg_type_label`, `inline_subida` (true
+    when mod4_id is supplied → the player is also promoted right away), and a
+    plain-language `enrollment_route`. Pass the same mod4_id to
+    submit_enrollment to actually commit the inline subida.
 
     batch_number is accepted for workflow symmetry; only the form/license are
     needed at this stage. It is validated when submit_enrollment is called.
@@ -826,6 +832,20 @@ def preview_enrollment(
     form["reconcile_result"] = result
     form["sav_profile"] = sav_profile
 
+    # Route: a mod1 is always present here, so this is a 1ª Inscrição /
+    # Revalidação; a mod4 alongside it promotes the player inline. Reject the
+    # contradictory combo (a standalone Subida batch can't carry an inline rider).
+    reg_type = form.get("reg_type")
+    inline_subida = mod4_id is not None
+    if reg_type is not None:
+        validate_subida_combo(reg_type, inline_subida)
+    reg_type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
+    enrollment_route = (
+        f"Will promote during the {reg_type_label} (inline subida de escalão)"
+        if inline_subida
+        else f"{reg_type_label} (no subida)"
+    )
+
     preview = {
         "player": {
             "name": sav_profile.get("nome", ""),
@@ -834,7 +854,10 @@ def preview_enrollment(
         },
         "fields": _build_preview_fields(result, sav_profile),
         "needs_review": result.needs_review,
-        "subida_de_escalao": mod4_id is not None,
+        "reg_type": reg_type,
+        "reg_type_label": reg_type_label,
+        "inline_subida": inline_subida,
+        "enrollment_route": enrollment_route,
     }
     if medical_exam_id is not None:
         artifact = _forms.get(medical_exam_id)
@@ -873,10 +896,11 @@ def submit_enrollment(
     is available. It may also override any parsed exame_medico date when
     medical_exam_id is supplied.
 
-    mod4_id (from parse_enrollment_forms) marks this enrollment as a subida de
-    escalão: the target tier is fetched from SAV and committed, and the mod4 is
-    uploaded as a supporting document. Submitting fails if SAV offers no subida
-    tier for the player.
+    mod4_id (from parse_enrollment_forms) adds an inline subida de escalão to
+    this 1ª Inscrição / Revalidação: the target tier is fetched from SAV and
+    committed, and the mod4 is uploaded as a supporting document. Submitting
+    fails if SAV offers no subida tier for the player. (This is the inline
+    rider, not a standalone type-4 Subida batch.)
 
     Returns:
       success=true + player_id  on success.
@@ -919,7 +943,10 @@ def submit_enrollment(
             raise ValueError(f"Unknown mod4_id: {mod4_id!r}")
         if mod4.get("doc_type") != DocType.FPB_MODELO_4:
             raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
-    is_subida = mod4 is not None
+    inline_subida = mod4 is not None
+    reg_type = form.get("reg_type")
+    if reg_type is not None:
+        validate_subida_combo(reg_type, inline_subida)
 
     kwargs = dict(result.kwargs)
     kwargs.pop("license", None)
@@ -945,7 +972,7 @@ def submit_enrollment(
     batch_id = client.resolve_batch_id(batch_number)
     try:
         player_id = client.add_player_to_registration_batch(
-            batch_id, license, is_subida=is_subida, **kwargs,
+            batch_id, license, inline_subida=inline_subida, **kwargs,
         )
     except SavConfigError as exc:
         # Only minor/guardian errors are retry cases; they carry the field list
@@ -1029,7 +1056,7 @@ def submit_enrollment(
         "name": sav_profile.get("nome", ""),
         "source_document_upload": upload_status,
         "medical_exam_upload": medical_exam_upload,
-        "subida_de_escalao": is_subida,
+        "inline_subida": inline_subida,
         "subida_document_upload": subida_document_upload,
     }
 

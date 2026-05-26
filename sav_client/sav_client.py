@@ -1480,7 +1480,7 @@ class SavClient:
     taxa_id: int | None = None,
     exam_date: str | None = None,
     promote_to_tier_id: int | None = None,
-    is_subida: bool = False,
+    inline_subida: bool = False,
     guardian_name: str | None = None,
     guardian_relation: int | None = None,
     guardian_phone: str | None = None,
@@ -1514,10 +1514,12 @@ class SavClient:
                                (The medical exam itself is always assumed done.)
           promote_to_tier_id:  Numeric escalão ID for Subida; usually unset
                                (overrides the op=21 lookup when given).
-          is_subida:           Mark this enrollment as a subida de escalão.
-                               When True, the target tier is fetched from SAV
-                               (op=21) and sent as sub/escalaosubida_txt;
-                               raises SavConfigError if SAV offers no option.
+          inline_subida:       Promote the player right away as part of this
+                               1ª Inscrição / Revalidação (the inline rider, not
+                               a standalone type-4 Subida batch). When True, the
+                               target tier is fetched from SAV (op=21) and sent
+                               as sub/escalaosubida_txt; raises SavConfigError if
+                               SAV offers no option.
           guardian_*:          Required when the player is a minor; raises
                                SavConfigError otherwise.
           consent_*:           GDPR consents.
@@ -1634,14 +1636,15 @@ class SavClient:
 
     exam_date = _coerce_exam_date(exam_date)
 
-    # ── Subida de escalão — fetch the player-specific target tier (op=21) ─────
+    # ── Inline subida de escalão — fetch the player-specific target tier (op=21) ─
     # The subida tier is server-computed per player (not the batch tier), so
-    # we read whatever option SAV exposes rather than assume one.
-    sub_tier = self._fetch_subida_tier(internal_id) if is_subida else None
-    if is_subida and sub_tier is None:
+    # we read whatever option SAV exposes rather than assume one. This is the
+    # promote-on-enroll rider; a standalone Subida batch (type 4) is separate.
+    sub_tier = self._fetch_subida_tier(internal_id) if inline_subida else None
+    if inline_subida and sub_tier is None:
       raise SavConfigError(
-        f"Subida requested (mod4 present) but SAV offers no subida tier for "
-        f"licence {license} (op=21 returned only '- Não selecionado –')."
+        f"Inline subida requested (mod4 present) but SAV offers no subida tier "
+        f"for licence {license} (op=21 returned only '- Não selecionado –')."
       )
     if sub_tier:
       logger.info(
