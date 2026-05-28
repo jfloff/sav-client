@@ -562,8 +562,21 @@ def test_preview_enrollment_rejects_non_fpb_mod1_artifact(monkeypatch):
 # ─── subida de escalão (mod4) ────────────────────────────────────────────────
 
 def test_parse_enrollment_forms_returns_mod4_id(monkeypatch):
+  from sav_parsers.types import ParsedField
   monkeypatch.setattr(server_module, "_get_client", lambda: object())
   monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.FPB_MODELO_4)
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod4",
+    lambda pdf: {
+      "fields": {
+        "licenca_nr": ParsedField(value="301772", confidence=0.95),
+        "nome_jogador": ParsedField(value="Player A", confidence=0.92),
+        "escalao_subida": ParsedField(value="Sub 14", confidence=0.95),
+        "escalao_actual": ParsedField(value="Mini 12", confidence=0.90),
+      },
+      "processing_id": "proc-mod4",
+    },
+  )
   monkeypatch.setattr(server_module, "_forms", {})
 
   result = server_module.parse_enrollment_forms([_pdf_b64()])
@@ -574,11 +587,17 @@ def test_parse_enrollment_forms_returns_mod4_id(monkeypatch):
       "artifact_id": result[0]["artifact_id"],
       "mod4_id": result[0]["artifact_id"],
       "doc_type": DocType.FPB_MODELO_4.value,
+      "nome_jogador": "Player A",
+      "licenca_nr": "301772",
+      "escalao_actual": "Mini 12",
+      "escalao_subida": "Sub 14",
     }
   ]
   artifact = server_module._forms[result[0]["mod4_id"]]
   assert artifact["doc_type"] == DocType.FPB_MODELO_4
   assert artifact["pdf_bytes"] == b"%PDF-1.4\n"
+  assert artifact["parsed"]["nome_jogador"].value == "Player A"
+  assert artifact["processing_id"] == "proc-mod4"
 
 
 def _submit_stub_forms(result_obj, *, with_mod4: bool) -> dict:

@@ -40,12 +40,16 @@ from sav_shared.clubs import find_club_matches
 from sav_shared.files import staged_pdf
 from sav_shared.enrollment import (
   KWARG_TO_SAV_KEY,
+  REGISTRATION_TYPE_SUBIDA,
   create_and_fetch_batch,
   derive_enrollment_params,
   find_player_license_by_nif,
+  gender_id_for_license,
   parse_missing_guardian_fields,
   parsed_bool,
   resolve_player_candidates,
+  resolve_subida_player,
+  resolve_subida_tier,
   try_replace_document,
   try_upload_document,
   validate_subida_combo,
@@ -1058,11 +1062,8 @@ def _resolve_enroll_batch(
   reg_type: int,
   tier_id: int,
   gender_id: int,
-  *,
-  indent: str = "",
 ) -> tuple[int, Any]:
-  """Interactively find an open batch or create one. Returns (batch_id, batch).
-  `indent` prefixes the messages so they nest under a document scope."""
+  """Interactively find an open batch or create one. Returns (batch_id, batch)."""
   console = _console()
   type_label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
   gender_label = "Feminino" if gender_id == 2 else "Masculino"
@@ -1085,27 +1086,27 @@ def _resolve_enroll_batch(
 
   if existing:
     console.print(
-      f"{indent}[cyan]:open_file_folder: Open batch found:[/] #{existing.number} "
+      f"[cyan]:open_file_folder: Open batch found:[/] #{existing.number} "
       f"({type_label} · {existing.tier} · {gender_label} · "
       f"{existing.item_count} player(s) already added)"
     )
     choice = click.prompt(
-      click.style(f"{indent}  Use existing or create new?", fg="cyan"),
+      click.style("  Use existing or create new?", fg="cyan"),
       type=click.Choice(["existing", "new"]),
       default="existing",
     )
     if choice == "new":
       if not click.confirm(
-        click.style(f"{indent}  Create new {type_label} batch ({tier_name} · {gender_label})?", fg="cyan")
+        click.style(f"  Create new {type_label} batch ({tier_name} · {gender_label})?", fg="cyan")
       ):
         raise click.Abort()
       return _create()
     return existing.id, existing
 
   console.print(
-    f"{indent}[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
+    f"[yellow]:warning: No open batch for {type_label} · {tier_name} · {gender_label}.[/]"
   )
-  if not click.confirm(click.style(f"{indent}  Create new batch?", fg="cyan")):
+  if not click.confirm(click.style("  Create new batch?", fg="cyan")):
     raise click.Abort()
   return _create()
 
@@ -1144,8 +1145,6 @@ def _find_enrolled_in_matching_batches(
 
 def _resolve_enroll_player(
   client: Any, batch: Any, parsed: dict, reg_type: int | None = None,
-  *,
-  indent: str = "",
 ) -> tuple[int, Any] | None:
   """Return ``(license, target_batch)`` for the parsed form, or None to skip.
 
@@ -1155,8 +1154,7 @@ def _resolve_enroll_player(
   batch instead, since SAV2 won't allow re-adding to a second one.
 
   For revalidação (reg_type=2), uses NIF-based license lookup directly,
-  skipping manual entry prompts. `indent` prefixes the messages so they nest
-  under a document scope.
+  skipping manual entry prompts.
   """
   console = _console()
   try:
@@ -1170,7 +1168,7 @@ def _resolve_enroll_player(
 
   if license is not None:
     name_suffix = f" — {ocr_name}" if ocr_name else ""
-    console.print(f"{indent}[green]:dart: Matched player licence {license}{name_suffix}.[/]")
+    console.print(f"[green]:dart: Matched player licence {license}{name_suffix}.[/]")
     return license, batch
 
   # Already-enrolled fallback: licence-first, then NIF, against open batches
@@ -1190,10 +1188,10 @@ def _resolve_enroll_player(
     if target is not None:
       if target.id != batch.id:
         console.print(
-          f"{indent}[cyan]:repeat: Already enrolled in batch #{target.number}; updating there."
+          f"[cyan]:repeat: Already enrolled in batch #{target.number}; updating there."
         )
       else:
-        console.print(f"{indent}[cyan]:repeat: Already enrolled in this batch — updating.[/]")
+        console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
       return enrolled_license, target
 
   # For revalidação, surface the NIF-based license before prompting for manual entry.
@@ -1203,37 +1201,37 @@ def _resolve_enroll_player(
   # use a different batch.
   if reg_type == 2 and nif_license is not None and ocr_license is None:
     console.print(
-      f"{indent}[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
+      f"[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
     )
-    if click.confirm(f"{indent}  Use this licence?", default=True):
+    if click.confirm("  Use this licence?", default=True):
       return nif_license, batch
 
   if len(candidates) > 1:
-    console.print(f"{indent}[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
+    console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
     for i, p in enumerate(candidates, 1):
-      console.print(f"{indent}  {i}.  {p.name}  (licence {p.license})")
-    idx = click.prompt(f"{indent}  Pick", type=click.IntRange(1, len(candidates)))
+      console.print(f"  {i}.  {p.name}  (licence {p.license})")
+    idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
     return int(candidates[idx - 1].license), batch
 
   if ocr_license is not None:
     console.print(
-      f"{indent}[yellow]:warning: OCR licence {ocr_license} is not in the eligible list for this batch.[/]"
+      f"[yellow]:warning: OCR licence {ocr_license} is not in the eligible list for this batch.[/]"
     )
-    if click.confirm(f"{indent}  Use it anyway?"):
+    if click.confirm("  Use it anyway?"):
       return ocr_license, batch
   elif ocr_name:
-    console.print(f"{indent}[yellow]:warning: Player not found for {ocr_name!r} in eligible list.[/]")
+    console.print(f"[yellow]:warning: Player not found for {ocr_name!r} in eligible list.[/]")
   else:
-    console.print(f"{indent}[yellow]:warning: Could not determine player from OCR.[/]")
+    console.print("[yellow]:warning: Could not determine player from OCR.[/]")
 
   while True:
-    raw = click.prompt(f"{indent}  Licence number (blank to skip)", default="")
+    raw = click.prompt("  Licence number (blank to skip)", default="")
     if not raw:
       return None
     try:
       lic = int(raw)
     except ValueError:
-      console.print(f"{indent}[yellow]:warning: Not a valid number.[/]")
+      console.print("[yellow]:warning: Not a valid number.[/]")
       continue
     if lic not in eligible:
       with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
@@ -1241,15 +1239,15 @@ def _resolve_enroll_player(
       if target is not None:
         if target.id != batch.id:
           console.print(
-            f"{indent}[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number}; updating there."
+            f"[cyan]:repeat: Licence {lic} is enrolled in batch #{target.number}; updating there."
           )
         else:
-          console.print(f"{indent}[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
+          console.print(f"[cyan]:repeat: Licence {lic} is already in this batch — updating.[/]")
         return lic, target
       console.print(
-        f"{indent}[yellow]:warning: Licence {lic} is not in the eligible list for this batch.[/]"
+        f"[yellow]:warning: Licence {lic} is not in the eligible list for this batch.[/]"
       )
-      if not click.confirm(f"{indent}  Use it anyway?"):
+      if not click.confirm("  Use it anyway?"):
         continue
     return lic, batch
 
@@ -1260,17 +1258,16 @@ def _prompt_field(
   *,
   field_type: str | Mapping[Any, str] = "text",
   prompt_text: str | None = None,
-  indent: str = "",
 ) -> Any:
   """Prompt the user for one field value, returning the entered value or None."""
   console = _console()
-  label = f"{indent}    {kwarg}" + (f"  ({hint})" if hint else "")
+  label = f"    {kwarg}" + (f"  ({hint})" if hint else "")
   if isinstance(field_type, Mapping):
     if not field_type:
       raise ValueError("Choice field_type must not be empty.")
     console.print(label)
     options_text = "  ".join(f"{key}={value}" for key, value in field_type.items())
-    console.print(f"[dim]{indent}      {options_text}[/]")
+    console.print(f"[dim]      {options_text}[/]")
     choices = {str(key): key for key in field_type}
     entered = click.prompt(prompt_text or label, type=click.Choice(tuple(choices)))
     return choices[entered]
@@ -1295,17 +1292,17 @@ def _player_label(sav_profile: dict, license: int) -> str:
   return f"{name_str} (licence {license})" if name_str else f"licence {license}"
 
 
-def _review_and_fill(result: Any, sav_profile: dict, *, indent: str = "") -> dict:
+def _review_and_fill(result: Any, sav_profile: dict) -> dict:
   """Prompt for needs_review fields and return the final kwargs dict.
 
   Fields flagged for low OCR confidence are prompted one by one; distrito and
-  concelho answers are resolved to ids. `indent` nests the output under a
-  document scope. The license key is popped out of the returned dict.
+  concelho answers are resolved to ids. The license key is popped out of the
+  returned dict.
   """
   console = _console()
   kwargs = dict(result.kwargs)
   if result.needs_review:
-    console.print(f"{indent}[bold]:memo: Review & fill:[/]")
+    console.print("[bold]:memo: Review & fill:[/]")
     for kwarg in result.needs_review:
       sav_key = KWARG_TO_SAV_KEY.get(kwarg, "")
       sav_val = str(sav_profile.get(sav_key) or "") if sav_key else ""
@@ -1316,27 +1313,27 @@ def _review_and_fill(result: Any, sav_profile: dict, *, indent: str = "") -> dic
         hint = f"SAV: {sav_val!r} (kept if blank)"
       else:
         hint = "no value found"
-      val = _prompt_field(kwarg, hint, indent=indent)
+      val = _prompt_field(kwarg, hint)
       if val is None:
         continue
       if kwarg == "distrito_id":
         resolved = find_distrito_id(val) if isinstance(val, str) else None
         if resolved is None:
-          console.print(f"{indent}[yellow]:warning: {val!r} is not a known distrito; keeping SAV value.[/]")
+          console.print(f"[yellow]:warning: {val!r} is not a known distrito; keeping SAV value.[/]")
           continue
         kwargs[kwarg] = resolved
       elif kwarg == "concelho_id":
         resolved = find_id_by_name(val, result.concelhos) if isinstance(val, str) else None
         if resolved is None:
           known = ", ".join(sorted(result.concelhos.values())) or "(none — distrito unknown)"
-          console.print(f"{indent}[yellow]:warning: {val!r} is not a known concelho for this distrito.[/]")
-          console.print(f"[dim]{indent}    Known: {known}[/]")
+          console.print(f"[yellow]:warning: {val!r} is not a known concelho for this distrito.[/]")
+          console.print(f"[dim]    Known: {known}[/]")
           continue
         kwargs[kwarg] = resolved
       else:
         kwargs[kwarg] = val
   elif not (result.updated or result.kept):
-    console.print(f"{indent}[cyan]:information_source: No changes (OCR matches SAV).[/]")
+    console.print("[cyan]:information_source: No changes (OCR matches SAV).[/]")
 
   kwargs.pop("license", None)
   return kwargs
@@ -1391,13 +1388,11 @@ def _print_submission_summary(
   *,
   ocr_source: str = "OCR",
   extras: list[tuple[str, str, str, str, str]] | None = None,
-  indent: str = "",
 ) -> None:
   """Render the final pre-submit field list.
 
   Each field shows its final value and source. Verbose mode appends the SAV/OCR
-  origin in dim text. Empty values render as em-dash. `indent` prefixes every
-  line so the list can nest under a document scope.
+  origin in dim text. Empty values render as em-dash.
 
   `ocr_source` overrides the Source label for OCR-derived FPB rows so callers
   can include the originating filename, e.g. "OCR (form.pdf)".
@@ -1440,10 +1435,10 @@ def _print_submission_summary(
     return
 
   console = _console()
-  console.print(f"{indent}[bold]:clipboard: Reconciling form fields:[/]")
+  console.print("[bold]:clipboard: Reconciling form fields:[/]")
   for label, sav, ocr, final, source in rows:
     line = (
-      f"{indent}    [green]:white_check_mark:[/] {label}  {final}  [dim]({source})[/]"
+      f"    [green]:white_check_mark:[/] {label}  {final}  [dim]({source})[/]"
     )
     if _VERBOSE:
       line += f" [dim](SAV: {sav} → OCR: {ocr})[/]"
@@ -1517,7 +1512,7 @@ def _inscricao_extras_row(
 def _prepare_club_stamp(
   ctx: click.Context, console: Console, err_console: Console,
   parsed: dict, pdf_path: str, processing_id: str,
-  *, reg_type: int | None = None, indent: str = "",
+  *, reg_type: int | None = None,
 ) -> tuple[str, bool | None, OverlayResult, bool | None, OverlayResult]:
   """Overlay the inscription checkbox and/or club stamp (when OCR says they
   are missing) *before* the summary, so the summary reports the real outcome.
@@ -1546,7 +1541,7 @@ def _prepare_club_stamp(
   if inscricao_r.applied is True:
     tipo_label = "Revalidação" if reg_type == 2 else "1ª Inscrição"
     console.print(
-      f"{indent}[green]:ballot_box_with_check:  Marked {tipo_label} checkbox on [bold]{_display_name(pdf_path)}[/].[/]"
+      f"[green]:ballot_box_with_check:  Marked {tipo_label} checkbox on [bold]{_display_name(pdf_path)}[/].[/]"
     )
   if inscricao_r.error:
     err_console.print(
@@ -1554,7 +1549,7 @@ def _prepare_club_stamp(
     )
   if carimbo_r.applied is True:
     console.print(
-      f"{indent}[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
+      f"[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
     )
   if carimbo_r.error:
     err_console.print(
@@ -1608,6 +1603,253 @@ def enrollment_grp():
   """Create, read, update, and delete player enrolments in Revalidação batches."""
 
 
+def _resolve_subida_player_or_prompt(
+  parsed: dict, client: Any, club_id: int, console: Console,
+) -> int | None:
+  """Resolve the mod4 player; prompt when name search returns >1 or 0 hits.
+
+  Returns the licence to use, or None when the user aborts the prompt.
+  """
+  license, candidates, ocr_name, ocr_license = resolve_subida_player(
+    parsed, client, club_id=club_id,
+  )
+  if license is not None:
+    name_suffix = f" — {ocr_name}" if ocr_name else ""
+    via = "licence" if ocr_license is not None else "name search"
+    console.print(
+      f"[green]:dart: Matched player licence {license} (via {via}){name_suffix}.[/]"
+    )
+    return license
+
+  if len(candidates) > 1:
+    console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
+    for i, p in enumerate(candidates, 1):
+      console.print(
+        f"  {i}.  {p.name}  (licence {p.license})  [{p.gender}]"
+      )
+    idx = click.prompt(
+      click.style("  Pick", fg="cyan"),
+      type=click.IntRange(1, len(candidates)),
+    )
+    return int(candidates[idx - 1].license)
+
+  if ocr_name:
+    console.print(
+      f"[yellow]:warning: No player matches {ocr_name!r} in your club roster.[/]"
+    )
+  else:
+    console.print("[yellow]:warning: Could not determine player from mod4.[/]")
+  while True:
+    raw = click.prompt(
+      click.style("  Licence number (blank to skip)", fg="cyan"),
+      default="",
+    )
+    if not raw:
+      return None
+    try:
+      return int(raw)
+    except ValueError:
+      console.print("[yellow]:warning: Not a valid number.[/]")
+
+
+def _run_subida_ocr_mode(
+  ctx, *, mod4_path: str, fields,
+) -> None:
+  """OCR-driven standalone Subida (type 4): parse mod4 → resolve player and
+  destination tier from its fields → find/create the type-4 batch →
+  commit + upload the mod4. No --batch / --license needed.
+  """
+  from sav_parsers import close_processing, parse_fpb_mod4
+
+  client = _make_client()
+  console = _console()
+  err_console = _console(err=True)
+
+  converted: list[str] = []
+  mod4_path = _stage_pdf(ctx, console, mod4_path, converted=converted)
+  _print_converted(console, converted)
+
+  console.print("[bold]:clipboard: Processing mod4:[/]")
+  try:
+    with console.status("[bold cyan]:robot: Running OCR on mod4...[/]"):
+      parse_result = parse_fpb_mod4(mod4_path)
+      parsed = parse_result["fields"]
+      processing_id = parse_result["processing_id"]
+  except Exception as exc:
+    raise SavCliError(f"Parse error for {mod4_path}: {exc}", code="parse_error")
+  console.print(
+    f"  [green]:white_check_mark:[/] OCR ready [dim]({processing_id})[/]",
+    soft_wrap=True,
+  )
+
+  close_called = False
+  try:
+    club_id = int(client.session.get("organizacao") or 0) if client.session else 0
+    try:
+      with console.status("[bold cyan]:busts_in_silhouette: Resolving player...[/]"):
+        license = _resolve_subida_player_or_prompt(
+          parsed, client, club_id, console,
+        )
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    if license is None:
+      console.print("[yellow]:fast_forward: Skipped.[/]")
+      return
+
+    try:
+      with console.status("[bold cyan]:open_book: Looking up player gender for tier resolution...[/]"):
+        gender_id = gender_id_for_license(client, license)
+    except (ValueError, SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+
+    try:
+      tier_id = resolve_subida_tier(parsed, client, gender_id=gender_id)
+    except ValueError as exc:
+      raise SavCliError(str(exc), code="parse_error")
+
+    try:
+      batch_id, batch = _resolve_enroll_batch(
+        client, REGISTRATION_TYPE_SUBIDA, tier_id, gender_id,
+      )
+    except click.Abort:
+      return
+
+    try:
+      with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
+        sav_profile = client.load_player_profile(license, club_id=batch.club_id)
+    except (SavConnectionError, SavResponseError) as exc:
+      raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
+
+    field_overrides = _parse_update_fields(fields)
+    player_label = _player_label(sav_profile, license)
+    console.print(
+      f"[bold]Enrolling:[/] {player_label} in batch #{batch.number} "
+      f"[dim](Subida → {batch.tier} {batch.gender})[/]"
+    )
+    console.print(f"  Source: {_display_name(mod4_path)}")
+    if field_overrides:
+      console.print(
+        "[cyan]:information_source: Field overrides:[/] "
+        + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+      )
+    if not click.confirm("Proceed?"):
+      console.print("[yellow]:fast_forward: Aborted.[/]")
+      return
+
+    try:
+      with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
+        client.add_player_to_registration_batch(
+          batch_id, license, **field_overrides,
+        )
+    except (SavConnectionError, SavResponseError, ValueError) as exc:
+      raise SavCliError(str(exc), code=_exc_code(exc))
+    console.print(
+      f"[green]:white_check_mark: Enrolled licence {license} in batch #{batch.number}.[/]"
+    )
+
+    with console.status(
+      "[bold cyan]:page_facing_up: Uploading mod4 (fpb_modelo_4)...[/]"
+    ):
+      ok, err = try_replace_document(
+        client, batch_id, license, mod4_path,
+        tipo_doc=doc_type_to_tipo_doc(DocType.FPB_MODELO_4),
+      )
+    if ok:
+      console.print(
+        f"  [green]:white_check_mark:[/] {_display_name(mod4_path)} [dim](fpb_modelo_4)[/]",
+        soft_wrap=True,
+      )
+    else:
+      err_console.print(
+        f"  [yellow]:warning:[/] {_display_name(mod4_path)} (fpb_modelo_4) upload failed: {err}"
+      )
+    try:
+      close_processing(processing_id, corrections=None)
+      close_called = True
+    except Exception:
+      pass
+  finally:
+    if not close_called:
+      try:
+        close_processing(processing_id, corrections=None)
+      except Exception:
+        pass
+
+
+def _run_manual_mode_enrollment(
+  ctx,
+  *,
+  batch_number: str,
+  license_opt: int,
+  mod4_path: str | None,
+  fields,
+) -> None:
+  """Run the OCR-free enrolment path: --batch + --license, optional mod4 upload.
+
+  Shared by the pure manual mode (no positional PDF) and the positional
+  mod4-alone path: both routes reach the same SAV calls (resolve batch →
+  add_player_to_registration_batch → optionally upload mod4 as tipo_doc=6).
+  """
+  client = _make_client()
+  field_overrides = _parse_update_fields(fields)
+  console = _console()
+  converted: list[str] = []
+  if mod4_path:
+    mod4_path = _stage_pdf(ctx, console, mod4_path, converted=converted)
+    _print_converted(console, converted)
+  with console.status("[bold cyan]:open_file_folder: Resolving batch...[/]"):
+    batch_id = _resolve_batch_id_or_raise(client, batch_number)
+  try:
+    with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
+      sav_profile = client.load_player_profile(license_opt)
+  except (SavConnectionError, SavResponseError) as exc:
+    raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
+  console.print(
+    f"[bold]Enrolling:[/] {sav_profile.get('nome', '?')} "
+    f"(licence {license_opt}) in batch #{batch_number}"
+  )
+  if mod4_path:
+    console.print(
+      f"[cyan]:information_source: Subida mod4:[/] {_display_name(mod4_path)}"
+    )
+  if field_overrides:
+    console.print(
+      "[cyan]:information_source: Field overrides:[/] "
+      + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
+    )
+  if not click.confirm("Proceed?"):
+    console.print("[yellow]:fast_forward: Aborted.[/]")
+    return
+  try:
+    with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
+      client.add_player_to_registration_batch(
+        batch_id, license_opt, **field_overrides,
+      )
+  except (SavConnectionError, SavResponseError, ValueError) as exc:
+    raise SavCliError(str(exc), code=_exc_code(exc))
+  console.print(
+    f"[green]:white_check_mark: Enrolled licence {license_opt} in batch #{batch_number}.[/]"
+  )
+  if mod4_path:
+    err_console = _console(err=True)
+    with console.status(
+      "[bold cyan]:page_facing_up: Uploading mod4 (fpb_modelo_4)...[/]"
+    ):
+      ok, err = try_replace_document(
+        client, batch_id, license_opt, mod4_path,
+        tipo_doc=doc_type_to_tipo_doc(DocType.FPB_MODELO_4),
+      )
+    if ok:
+      console.print(
+        f"  [green]:white_check_mark:[/] {_display_name(mod4_path)} [dim](fpb_modelo_4)[/]",
+        soft_wrap=True,
+      )
+    else:
+      err_console.print(
+        f"  [yellow]:warning:[/] {_display_name(mod4_path)} (fpb_modelo_4) upload failed: {err}"
+      )
+
+
 @enrollment_grp.command("create")
 @click.argument("pdfs", nargs=-1, required=False, type=click.Path(exists=True))
 @click.option(
@@ -1620,7 +1862,10 @@ def enrollment_grp():
 )
 @click.option(
   "--mod4", "mod4_path", type=click.Path(exists=True), default=None,
-  help="Explicit fpb_modelo_4 form; adds an inline subida de escalão (needs a mod1).",
+  help=(
+    "Explicit fpb_modelo_4 form. Alongside a mod1 it adds an inline subida; "
+    "alone with --batch + --license it submits a standalone Subida batch."
+  ),
 )
 @click.option(
   "--atestado", "atestado_path", type=click.Path(exists=True), default=None,
@@ -1680,6 +1925,12 @@ def enrollment_create_cmd(
         Attach several identification documents alongside the form.
     sav enrollment create --batch ID --license ID [--field KEY=VAL ...]
         Manual enrolment from SAV profile, no PDF.
+    sav enrollment create [--mod4] subida.pdf
+        Standalone Subida (type 4) driven by mod4 OCR: auto-resolves the
+        player (by licença or name) and the destination batch (existing
+        type-4 batch for the destination tier, or a new one if none).
+    sav enrollment create [--mod4] subida.pdf --batch ID --license ID
+        Standalone Subida — skip OCR; commit the explicit player+batch.
   """
   from sav_parsers import close_processing, parse_em, parse_fpb_mod1, train_classifier
   from sav_shared.fields import KWARG_TO_ENTITY
@@ -1694,39 +1945,16 @@ def enrollment_create_cmd(
   if medical_exam and not pdf_mode:
     raise click.UsageError("--medical-exam requires a PDF or --mod1.")
 
-  # Manual mode: no PDF, enroll directly from SAV profile + optional field overrides.
+  # Manual mode: no mod1 OCR. Either pure profile-driven enrolment, or a
+  # standalone Subida (mod4 only + --batch + --license) where the mod4 is the
+  # sole PDF — uploaded after the type-4 commit since the player is already
+  # in SAV. Reached either via `--batch + --license` (with optional --mod4) or
+  # via positional mod4-alone classification (handled later in pdf_mode).
   if manual_mode and not pdf_mode:
-    client = _make_client()
-    field_overrides = _parse_update_fields(fields)
-    console = _console()
-    with console.status("[bold cyan]:open_file_folder: Resolving batch...[/]"):
-      batch_id = _resolve_batch_id_or_raise(client, batch_number_opt)
-    try:
-      with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
-        sav_profile = client.load_player_profile(license_opt)
-    except (SavConnectionError, SavResponseError) as exc:
-      raise SavCliError(f"Could not load player profile: {exc}", code=_exc_code(exc))
-    console.print(
-      f"[bold]Enrolling:[/] {sav_profile.get('nome', '?')} "
-      f"(licence {license_opt}) in batch #{batch_number_opt}"
-    )
-    if field_overrides:
-      console.print(
-        "[cyan]:information_source: Field overrides:[/] "
-        + ", ".join(f"{k}={v}" for k, v in sorted(field_overrides.items()))
-      )
-    if not click.confirm("Proceed?"):
-      console.print("[yellow]:fast_forward: Aborted.[/]")
-      return
-    try:
-      with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
-        client.add_player_to_registration_batch(
-          batch_id, license_opt, **field_overrides,
-        )
-    except (SavConnectionError, SavResponseError, ValueError) as exc:
-      raise SavCliError(str(exc), code=_exc_code(exc))
-    console.print(
-      f"[green]:white_check_mark: Enrolled licence {license_opt} in batch #{batch_number_opt}.[/]"
+    _run_manual_mode_enrollment(
+      ctx,
+      batch_number=batch_number_opt, license_opt=license_opt,
+      mod4_path=mod4_path, fields=fields,
     )
     return
 
@@ -1809,15 +2037,34 @@ def enrollment_create_cmd(
 
   if not mod1_candidates:
     if mod4_candidates:
-      # mod4 alone (no mod1) = a standalone Subida de escalão batch (type 4),
-      # a different SAV web flow whose submit wizard isn't built yet (planned
-      # follow-up — see SUBIDA_TODO.md). Report the intent precisely rather
-      # than the generic "needs a mod1" error.
-      raise click.UsageError(
-        "An fpb_modelo_4 on its own means a standalone Subida de escalão batch "
-        "(type 4), which isn't supported yet. For an inline subida (promote "
-        "during a 1ª inscrição/revalidação), include the fpb_modelo_1 form too."
-      )
+      # mod4 alone (no mod1) = a standalone Subida de escalão batch (type 4).
+      # Two paths:
+      #   - --batch + --license given → fast manual path: skip OCR, just commit
+      #     and upload the mod4.
+      #   - otherwise → OCR-driven Subida: parse the mod4, resolve the player
+      #     from licenca_nr/nome_jogador, derive the destination tier from
+      #     escalao_subida, find-or-create the type-4 batch, then commit+upload.
+      if len(mod4_candidates) > 1:
+        raise click.UsageError(
+          f"enrollment create accepts at most one fpb_modelo_4 per invocation, "
+          f"but got {len(mod4_candidates)}: {', '.join(mod4_candidates)}."
+        )
+      if em_candidates or atestado_candidates or certidao_candidates \
+         or id_doc_paths or outros_paths or extra_docs:
+        raise click.UsageError(
+          "A standalone Subida only uploads the fpb_modelo_4. Re-run without "
+          "the supplementary documents, or include an fpb_modelo_1 form if you "
+          "intended an inline subida (promote during a 1ª inscrição/revalidação)."
+        )
+      if manual_mode:
+        _run_manual_mode_enrollment(
+          ctx,
+          batch_number=batch_number_opt, license_opt=license_opt,
+          mod4_path=mod4_candidates[0], fields=fields,
+        )
+        return
+      _run_subida_ocr_mode(ctx, mod4_path=mod4_candidates[0], fields=fields)
+      return
     raise click.UsageError(
       "No fpb_modelo_1 form provided. Pass one as a positional PDF or via --mod1."
     )
@@ -1959,7 +2206,7 @@ def enrollment_create_cmd(
         label = REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type))
         console.print(f"  [cyan]:information_source:[/] Inferred registration type: {label}")
       batch_id, batch = _resolve_enroll_batch(
-        client, reg_type, tier_id, gender_id, indent="  ",
+        client, reg_type, tier_id, gender_id,
       )
     except ValueError as exc:
       raise SavCliError(str(exc), code="parse_error")
@@ -1972,7 +2219,7 @@ def enrollment_create_cmd(
     # batch when the player is already enrolled there — SAV2 only permits
     # one open enrolment per player).
     try:
-      resolved = _resolve_enroll_player(client, batch, parsed, reg_type, indent="  ")
+      resolved = _resolve_enroll_player(client, batch, parsed, reg_type)
     except (SavConnectionError, SavResponseError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
     if resolved is None:
@@ -2007,9 +2254,9 @@ def enrollment_create_cmd(
     # we actually did, not a prediction.
     upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r = _prepare_club_stamp(
       ctx, console, err_console, parsed, pdf_path, processing_id,
-      reg_type=reg_type, indent="  ",
+      reg_type=reg_type,
     )
-    kwargs = _review_and_fill(result, sav_profile, indent="  ")
+    kwargs = _review_and_fill(result, sav_profile)
     _print_submission_summary(
       kwargs, result, sav_profile,
       ocr_source=f"OCR ({_display_name(pdf_path)})",
@@ -2020,7 +2267,6 @@ def enrollment_create_cmd(
          "fpb_modelo_4" if inline_subida else "default"),
         _carimbo_extras_row(carimbo, carimbo_r),
       ],
-      indent="  ",
     )
 
     # ── medical exam scope: its own OCR result and the (required) exam date ──
@@ -2085,7 +2331,6 @@ def enrollment_create_cmd(
           else "required"
         ),
         field_type="date",
-        indent="  ",
       )
       if entered is None:
         raise SavCliError(

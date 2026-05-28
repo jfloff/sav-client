@@ -74,6 +74,12 @@ _REGISTRATIONS_CREATE_OP = "4"
 _REGISTRATIONS_DELETE_OP = "9"
 _REGISTRATIONS_REMOVE_ITEM_OP = "29"
 _REGISTRATIONS_LIST_REVALIDABLE_OP = "139"
+_REGISTRATIONS_LIST_SUBIDA_OP = "48"
+_REGISTRATIONS_LOAD_SUBIDA_ORIGIN_OP = "49"
+_REGISTRATIONS_LOAD_SUBIDA_SEGURO_OP = "128"
+_REGISTRATIONS_LOAD_SUBIDA_TAXA_OP = "134"
+_REGISTRATIONS_LOAD_SUBIDA_COMPANHIA_OP = "126"
+_REGISTRATIONS_SUBIDA_COMMIT_OP = "50"
 _REGISTRATIONS_LOAD_PLAYER_OP = "35"
 _REGISTRATIONS_BATCH_DETAIL_OP = "10"
 _REGISTRATIONS_LOAD_EXISTING_PLAYER_OP = "30"
@@ -93,6 +99,7 @@ _REGISTRATIONS_DOC_DELETE_OP = "94"
 _REGISTRATIONS_AGENTE_PLAYER = 1
 _REGISTRATIONS_STATE_OPEN = 1
 _REGISTRATIONS_TYPE_REVALIDACAO = 2
+_REGISTRATIONS_TYPE_SUBIDA = 4
 # tipo_doc values (from <select id="tipo1"> in the upload modal)
 _REGISTRATIONS_DOC_TIPO_MODELO_1 = 1   # Modelo 1 - Inscrição jogadores
 _REGISTRATIONS_DOC_TIPO_EXAME_MEDICO = 2
@@ -1464,13 +1471,18 @@ class SavClient:
     consent_marketing: bool = False,
   ) -> int:
     """
-    Add a player to an open Revalidação batch by walking the SAV2 multi-step
-    enrolment wizard (load player → save step 1 → save step 2 → insurance
-    cascade → pre-commit → commit) and return the player's internal SAV2 id.
+    Add a player to an open Revalidação or Subida batch.
 
-    Currently only Revalidação (type_id=2) is supported; 1ª Inscrição,
-    Transferência, and Subida have different field surfaces and follow-up
-    in a later release.
+    Dispatches by ``batch.type_id``:
+      * type 2 (Revalidação) — walks the SAV2 multi-step enrolment wizard
+        (load player → save step 1 → save step 2 → insurance cascade →
+        pre-commit → commit) and returns the player's internal SAV2 id.
+      * type 4 (Subida)      — submits the standalone Subida flow
+        (eligibility list → origin → seguro/companhia/taxa cascade → commit
+        op=50) and returns the player's licence. The kwargs below are
+        Revalidação-only and ignored on Subida except for ``taxa_id``.
+
+    1ª Inscrição (type 1) and Transferência (type 3) remain unsupported.
 
     Args:
         batch_id: Target open batch (must be in 'Em construção' state).
@@ -1525,10 +1537,12 @@ class SavClient:
         f"Batch {batch.id} is not open (state={batch.state!r}); "
         "items can only be added to 'Em construção' batches."
       )
+    if batch.type_id == _REGISTRATIONS_TYPE_SUBIDA:
+      return self._add_player_to_subida_batch(batch, license, taxa_id=taxa_id)
     if batch.type_id != _REGISTRATIONS_TYPE_REVALIDACAO:
       raise NotImplementedError(
-        f"Only Revalidação batches are supported (type_id=2); "
-        f"got type_id={batch.type_id} ({batch.type!r})."
+        f"Only Revalidação (type_id=2) and Subida (type_id=4) batches are "
+        f"supported; got type_id={batch.type_id} ({batch.type!r})."
       )
 
     eligible = self._list_revalidable_licenses(batch)
@@ -2111,6 +2125,298 @@ class SavClient:
     return {
       int(m) for m in re.findall(r"<option value='(\d+)'", resp.text) if int(m) > 0
     }
+
+  def _list_subida_licenses(
+    self, batch: PlayerRegistrationBatch,
+  ) -> set[int]:
+    """
+    Op=48 — list licences eligible for Subida (type-4) in a batch.
+
+    Body params mirror the SAV2 web flow: ``perfil``, ``guia``, ``user``,
+    ``organizacao``. The response is a JSON wrapper with a ``body`` field
+    carrying the form-prefill HTML (origin/destination fields + initial
+    novataxa list) and a ``footer``; only the player ``<option value='N'>``
+    list inside ``body`` is consumed here.
+    """
+    import re
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LIST_SUBIDA_OP},
+        data={
+          "perfil": self.session.get("perfil", 0),
+          "guia": batch.id,
+          "user": self.session.get("user", ""),
+          "organizacao": self.session.get("organizacao", 0),
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not list subida players for batch {batch.id}: {exc}"
+      ) from exc
+    body = resp.text
+    try:
+      body = json.loads(resp.text).get("body", body)
+    except ValueError:
+      pass
+    return {
+      int(m) for m in re.findall(r"<option value='(\d+)'", body) if int(m) > 0
+    }
+
+  def _load_subida_origin(self, license: int) -> dict[str, Any]:
+    """Op=49 — load a Subida candidate's origin (escalão/taxa/seguro/etc).
+
+    Returns the raw JSON; the only commit-relevant field is ``estatuto``,
+    but the rest mirrors the disabled origin inputs on the SAV2 modal and
+    is kept for debug parity.
+    """
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_SUBIDA_ORIGIN_OP},
+        data={"atleta": license},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not load subida origin for licence {license}: {exc}"
+      ) from exc
+    try:
+      return json.loads(resp.text)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse subida origin: {resp.text[:200]!r}"
+      ) from exc
+
+  def _resolve_subida_taxa_id(
+    self, batch: PlayerRegistrationBatch, license: int,
+  ) -> int:
+    """Op=134 — refine the novataxa dropdown for this player+batch; auto-pick
+    when exactly one real option is offered (multi-option → raise so the
+    caller passes ``taxa_id``).
+
+    Distinct from op=26 (Revalidação) which keys off ``estatuto``+``user``;
+    op=134 keys off the licence directly and is Subida-only.
+    """
+    import re
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_SUBIDA_TAXA_OP},
+        data={"n_licenca": license, "guiaid": batch.id},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not load subida taxa options: {exc}"
+      ) from exc
+    try:
+      msg = json.loads(r.text).get("taxas", "")
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse subida taxa response: {r.text[:200]!r}"
+      ) from exc
+    options = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='(-?\d+)'[^>]*>\s*([^<]+?)\s*<", msg
+      )
+      if int(val) > 0
+    }
+    if len(options) == 1:
+      return next(iter(options))
+    if not options:
+      raise SavResponseError(
+        f"No subida taxa options returned for batch {batch.id}, "
+        f"licence {license}: {msg!r}"
+      )
+    listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
+    raise SavConfigError(
+      f"Multiple subida taxa options for batch {batch.id}, licence {license}: "
+      f"{listing}. Pass taxa_id= to disambiguate."
+    )
+
+  def _resolve_subida_insurance_cascade(
+    self, batch: PlayerRegistrationBatch, license: int,
+  ) -> tuple[int, int]:
+    """Subida insurance cascade: op=128 (novoseguro) → op=126 (novacomp) →
+    op=24 (apólice, display-only).
+
+    Returns ``(seguro_id, companhia_id)``. Op=50 only sends ``companhia``,
+    but op=126 needs the picked seguro to enumerate companhia options, so
+    we run both even though seguro_id is dropped at commit time.
+    """
+    import re
+    # op=128: novoseguro options (auto-pick when single)
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_SUBIDA_SEGURO_OP},
+        data={"atleta": license, "guiaid": batch.id, "seguro": 0},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Subida insurance op=128 failed: {exc}"
+      ) from exc
+    try:
+      msg = json.loads(r.text).get("msg", "")
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse subida seguro response: {r.text[:200]!r}"
+      ) from exc
+    seguros = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='(-?\d+)'[^>]*>\s*([^<]+?)\s*<", msg
+      )
+      if int(val) > 0
+    }
+    if not seguros:
+      raise SavResponseError(
+        f"No subida seguro options for batch {batch.id}, licence {license}: {msg!r}"
+      )
+    if len(seguros) > 1:
+      listing = ", ".join(f"{i}={n!r}" for i, n in sorted(seguros.items()))
+      raise SavConfigError(
+        f"Multiple subida seguro options for batch {batch.id}, licence "
+        f"{license}: {listing}."
+      )
+    seguro_id = next(iter(seguros))
+
+    # op=126: novacomp options for the picked seguro (auto-pick when single)
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_SUBIDA_COMPANHIA_OP},
+        data={"seguro": seguro_id, "guia": batch.id},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Subida insurance op=126 failed: {exc}"
+      ) from exc
+    try:
+      msg = json.loads(r.text).get("msg", "")
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Could not parse subida companhia response: {r.text[:200]!r}"
+      ) from exc
+    companhias = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='(-?\d+)'[^>]*>\s*([^<]+?)\s*<", msg
+      )
+      if int(val) > 0
+    }
+    if not companhias:
+      raise SavResponseError(
+        f"No subida companhia options for seguro {seguro_id}, batch {batch.id}: "
+        f"{msg!r}"
+      )
+    if len(companhias) > 1:
+      listing = ", ".join(f"{i}={n!r}" for i, n in sorted(companhias.items()))
+      raise SavConfigError(
+        f"Multiple subida companhia options for seguro {seguro_id}: {listing}."
+      )
+    companhia_id = next(iter(companhias))
+
+    # op=24: apólice (display-only — fire for parity, ignore the result)
+    try:
+      self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_APOLICE_OP, "companhia": companhia_id},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=24 subida apolice fetch failed — non-fatal", exc_info=True)
+
+    return seguro_id, companhia_id
+
+  def _add_player_to_subida_batch(
+    self,
+    batch: PlayerRegistrationBatch,
+    license: int,
+    *,
+    taxa_id: int | None,
+  ) -> int:
+    """Submit a standalone Subida (type-4) enrollment.
+
+    The Subida flow is much shorter than Revalidação: the player already
+    exists in SAV, so there's no personal-data / address wizard — just
+    eligibility check → cascades → op=50 commit. Returns the licence
+    (SAV2 surfaces no separate internal id for Subida).
+    """
+    eligible = self._list_subida_licenses(batch)
+    if license not in eligible:
+      enrolled = {
+        item["license"] for item in self.list_player_registration_batch_items(batch.id)
+      }
+      if license in enrolled:
+        logger.info(
+          "Licence %s already enrolled in subida batch %s — skipping commit.",
+          license, batch.id,
+        )
+        return license
+      raise ValueError(
+        f"Licence {license} is not eligible for subida in batch {batch.id} "
+        f"({batch.tier} {batch.gender}). The server's eligible list has "
+        f"{len(eligible)} player(s); pass one of those licences."
+      )
+
+    # op=49 origin fetch — fired for browser-flow parity; estatuto and the
+    # origin display fields aren't part of the op=50 commit body.
+    self._load_subida_origin(license)
+
+    _seguro_id, companhia_id = self._resolve_subida_insurance_cascade(batch, license)
+    if taxa_id is None:
+      taxa_id = self._resolve_subida_taxa_id(batch, license)
+
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_SUBIDA_COMMIT_OP},
+        data={
+          "atleta": license,
+          "guia": batch.id,
+          "taxa": taxa_id,
+          "companhia": companhia_id,
+          "epoca": batch.season,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Subida commit failed: {exc}") from exc
+    # The SAV2 web UI doesn't inspect op=50's body; it may return JSON
+    # ({"val":1,...}) or a bare success string. Treat HTTP 2xx as success
+    # unless the response is a JSON dict with an explicit val!=1.
+    try:
+      data = json.loads(resp.text)
+    except ValueError:
+      data = None
+    if isinstance(data, dict) and "val" in data and str(data["val"]) != "1":
+      raise SavResponseError(
+        f"Subida commit failed: {data.get('msg') or data!r}"
+      )
+    logger.info(
+      "Added licence %s to subida batch %s (tier=%s, taxa=%s, companhia=%s).",
+      license, batch.id, batch.tier, taxa_id, companhia_id,
+    )
+    self._cache.record_license_batch(license, batch.id)
+    return license
 
   def list_player_registration_batch_items(
     self, batch_id: int,

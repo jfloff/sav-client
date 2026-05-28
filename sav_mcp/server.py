@@ -8,11 +8,17 @@ agent can drive them without an interactive UI — the chat is the confirmation
 loop.
 
 Enrollment workflow:
-    1. parse_enrollment_forms  → mod1_id(s) / medical_exam_id(s) + parsed metadata
+    1. parse_enrollment_forms  → mod1_id(s) / medical_exam_id(s) / mod4_id(s) + parsed metadata
     2. find_open_batch / create_batch  → batch_number
     3. resolve_player  → license (or candidate list if ambiguous)
     4. preview_enrollment  → full reconciled profile (+ optional medical exam sidecar)
     5. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
+
+Standalone Subida (type-4) uses the mod4 OCR fields (licenca_nr/name/escalao_subida):
+    1. parse_enrollment_forms  → mod4_id + parsed metadata
+    2. resolve_subida_target   → license + tier_id + gender_id (or candidates)
+    3. find_open_batch(reg_type=4, …) / create_batch  → Subida batch_number
+    4. submit_subida_enrollment(batch_number, license, mod4_id)
 
 Document tools (post-enrollment, ad-hoc):
     list_player_documents / upload_player_document /
@@ -44,10 +50,14 @@ from sav_client.exceptions import (
 logger = logging.getLogger(__name__)
 from sav_shared.files import ensure_pdf
 from sav_shared.enrollment import (
+    REGISTRATION_TYPE_SUBIDA,
     create_and_fetch_batch,
     derive_enrollment_params,
+    gender_id_for_license,
     parse_missing_guardian_fields,
     resolve_player_candidates,
+    resolve_subida_player,
+    resolve_subida_tier,
     try_replace_document,
     validate_subida_combo,
 )
@@ -584,7 +594,7 @@ def parse_enrollment_forms(
     also include mod4_id. On error for a given PDF the entry contains an
     "error" key instead.
     """
-    from sav_parsers import classify, parse_em, parse_fpb_mod1, train_classifier
+    from sav_parsers import classify, parse_em, parse_fpb_mod1, parse_fpb_mod4, train_classifier
 
     client = _get_client()
     results: list[dict] = []
@@ -636,11 +646,12 @@ def parse_enrollment_forms(
                 except Exception:
                     logger.debug("train_classifier failed for EM", exc_info=True)
             elif doc_type == DocType.FPB_MODELO_4:
-                # No parser for mod4 — it carries no fields; alongside a mod1 its
-                # presence adds an inline subida de escalão. Store the bytes for
-                # upload + as the mod4_id preview/submit_enrollment keys off.
-                parsed = {}
-                processing_id = None
+                # Mod4 carries nome_jogador (mandatory), licenca_nr (optional),
+                # escalao_actual, escalao_subida, and the club-signature signal —
+                # enough to drive a standalone Subida without --batch / --license.
+                parse_result = parse_fpb_mod4(tmp_path)
+                parsed = parse_result["fields"]
+                processing_id = parse_result["processing_id"]
             else:
                 results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
                 continue
@@ -680,11 +691,18 @@ def parse_enrollment_forms(
                 "gender_label": GENERO.get(gender_id, str(gender_id)),
             })
         elif doc_type == DocType.FPB_MODELO_4:
+            def _f(key: str) -> Any:
+                pf = parsed.get(key)
+                return pf.value if pf else None
             results.append({
                 "index": i,
                 "artifact_id": artifact_id,
                 "mod4_id": artifact_id,
                 "doc_type": doc_type.value,
+                "nome_jogador": _f("nome_jogador"),
+                "licenca_nr": _f("licenca_nr"),
+                "escalao_actual": _f("escalao_actual"),
+                "escalao_subida": _f("escalao_subida"),
             })
         else:
             payload = _build_medical_exam_payload(artifact_id, artifact)
@@ -778,6 +796,71 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
         ],
         "ocr_name": ocr_name,
         "ocr_license": ocr_license,
+    }
+
+
+@server.tool()
+def resolve_subida_target(mod4_id: str) -> dict:
+    """
+    Resolve the Subida target for a parsed mod4: licence, destination tier_id,
+    and gender_id, walking the same pipeline the CLI uses.
+
+      - licença from licenca_nr when present (validated via SAV);
+      - else a name search inside the session's club.
+    Once a licence is known, the player's gender is fetched and the
+    destination tier_id is mapped from `escalao_subida` against the
+    gender-scoped tier table.
+
+    Use the result to call find_open_batch / create_batch (reg_type=4) and
+    then submit_subida_enrollment.
+
+    Returns:
+      resolved=true + license + tier_id + tier_name + gender_id + gender_label
+        when a single player is identified.
+      resolved=false + candidates  when the name search returns multiple hits
+        (caller picks).
+      resolved=false + empty candidates  when no candidate is found (caller
+        supplies a licence directly).
+    """
+    form = _forms.get(mod4_id)
+    if form is None:
+        raise ValueError(f"Unknown mod4_id: {mod4_id!r}")
+    if form.get("doc_type") != DocType.FPB_MODELO_4:
+        raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
+
+    client = _get_client()
+    club_id = int(client.session.get("organizacao") or 0) if client.session else 0
+    license, candidates, ocr_name, ocr_license = resolve_subida_player(
+        form["parsed"], client, club_id=club_id,
+    )
+    if license is None:
+        return {
+            "resolved": False,
+            "license": None,
+            "candidates": [
+                {
+                    "license": int(p.license),
+                    "name": p.name,
+                    "gender": p.gender,
+                    "birth_date": p.birth_date,
+                }
+                for p in candidates
+            ],
+            "ocr_name": ocr_name,
+            "ocr_license": ocr_license,
+        }
+
+    gender_id = gender_id_for_license(client, license)
+    tier_id = resolve_subida_tier(form["parsed"], client, gender_id=gender_id)
+    tiers = client.list_player_registration_tiers(gender_id=gender_id)
+    return {
+        "resolved": True,
+        "license": license,
+        "tier_id": tier_id,
+        "tier_name": tiers.get(tier_id, str(tier_id)),
+        "gender_id": gender_id,
+        "gender_label": GENERO.get(gender_id, str(gender_id)),
+        "reg_type": REGISTRATION_TYPE_SUBIDA,
     }
 
 
@@ -1057,6 +1140,73 @@ def submit_enrollment(
         "source_document_upload": upload_status,
         "medical_exam_upload": medical_exam_upload,
         "inline_subida": inline_subida,
+        "subida_document_upload": subida_document_upload,
+    }
+
+
+@server.tool()
+def submit_subida_enrollment(
+    batch_number: str,
+    license: int,
+    mod4_id: str,
+) -> dict:
+    """
+    Submit a standalone Subida de escalão enrollment (type-4 batch).
+
+    Distinct from submit_enrollment's inline-subida rider: this commits the
+    player to a *standalone* Subida batch via the SAV2 "add player to a
+    Subida batch" web flow (eligibility list → cascades → commit op=50).
+    The mod4 carries no OCR fields, so there is no preview/reconciliation
+    step — the licence must be passed directly and is checked against the
+    server's eligible list. The mod4 PDF is uploaded after the commit as
+    the supporting document (tipo_doc=6).
+
+    Args:
+        batch_number:  Human-visible Subida batch number.
+        license:       Player licence (must already exist in SAV).
+        mod4_id:       Artifact id of an fpb_modelo_4 from parse_enrollment_forms.
+
+    Returns:
+        success=true + license + name + subida_document_upload on success.
+    """
+    form = _forms.get(mod4_id)
+    if form is None:
+        raise ValueError(f"Unknown mod4_id: {mod4_id!r}")
+    if form.get("doc_type") != DocType.FPB_MODELO_4:
+        raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
+
+    client = _get_client()
+    batch_id = client.resolve_batch_id(batch_number)
+    batch = next(
+        (b for b in client.list_player_registration_batches() if b.id == batch_id),
+        None,
+    )
+    if batch is None:
+        raise ValueError(f"Batch {batch_number!r} not found")
+    if batch.type_id != 4:
+        raise ValueError(
+            f"Batch {batch_number!r} is type {batch.type_id} ({batch.type!r}); "
+            f"submit_subida_enrollment requires a Subida (type-4) batch. For an "
+            f"inline subida on a 1ª Inscrição / Revalidação, use submit_enrollment "
+            f"with mod4_id."
+        )
+
+    client.add_player_to_registration_batch(batch_id, license)
+
+    subida_document_upload = _replace_player_document_from_bytes(
+        client, batch_id, license, form.get("pdf_bytes"), doc_type=form["doc_type"],
+    )
+
+    sav_profile: dict[str, Any] = {}
+    try:
+        sav_profile = client.load_player_profile(license)
+    except (SavConnectionError, SavResponseError):
+        logger.debug("Could not load player profile for subida response", exc_info=True)
+
+    return {
+        "success": True,
+        "license": license,
+        "name": sav_profile.get("nome", ""),
         "subida_document_upload": subida_document_upload,
     }
 
