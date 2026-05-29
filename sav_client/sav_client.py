@@ -98,8 +98,20 @@ _REGISTRATIONS_DOC_UPLOAD_OP = "92"
 _REGISTRATIONS_DOC_DELETE_OP = "94"
 _REGISTRATIONS_AGENTE_PLAYER = 1
 _REGISTRATIONS_STATE_OPEN = 1
+_REGISTRATIONS_TYPE_PRIMEIRA = 1
 _REGISTRATIONS_TYPE_REVALIDACAO = 2
 _REGISTRATIONS_TYPE_SUBIDA = 4
+# 1ª Inscrição (type-1) wizard ops — distinct from Revalidação because the player
+# doesn't exist in SAV yet; op=12 creates the record and yields the userid that
+# everything downstream keys off.
+_REGISTRATIONS_PRIMEIRA_DUPLICATE_OP = "11"      # POST {info=<json>} — pre-create duplicate check
+_REGISTRATIONS_PRIMEIRA_CREATE_OP = "12"         # POST text/plain JSON — creates player, returns userid
+_REGISTRATIONS_PRIMEIRA_AGE_GATE_OP = "14"       # GET datanasc&guia — confirms birthdate fits tier age window
+_REGISTRATIONS_PRIMEIRA_STEP2_OP = "20"          # POST text/plain JSON — saves address, returns menor_idade
+_REGISTRATIONS_PRIMEIRA_COMMIT_OP = "27"         # POST text/plain JSON — final commit
+_REGISTRATIONS_PRIMEIRA_BATCH_CTX_OP = "161"     # POST guiaid — refreshes batch header context
+_REGISTRATIONS_PRIMEIRA_ID_DOC_CHECK_OP = "163"  # POST numid&userid — id-doc uniqueness check
+_REGISTRATIONS_PRIMEIRA_ESTATUTOS_OP = "151"     # POST userid&tipo&guiaid — loads estatuto dropdown for new player
 # tipo_doc values (from <select id="tipo1"> in the upload modal)
 _REGISTRATIONS_DOC_TIPO_MODELO_1 = 1   # Modelo 1 - Inscrição jogadores
 _REGISTRATIONS_DOC_TIPO_EXAME_MEDICO = 2
@@ -1156,14 +1168,14 @@ class SavClient:
     """
     return player_registration_tiers(gender_id)
 
-  def _fetch_subida_tier(self, internal_id: int) -> tuple[int, str] | None:
-    """Op=21 — the player's escalaosubida dropdown. Returns the single
-    selectable (tier_id, name), or None when SAV offers no real option.
+  def _list_subida_tier_options(self, internal_id: int) -> list[tuple[int, str]]:
+    """Op=21 — return every selectable (tier_id, name) for the player's
+    escalaosubida dropdown. Empty list when SAV only exposes the
+    "- Não selecionado –" placeholder.
 
     The subida tier is player-specific and server-computed (it is not the
-    batch tier), so we read whatever option SAV exposes rather than guess.
-    The response is ``{"msg": "<option…>", "val": 1}`` with the same
-    ``<option value='..'>`` shape as op=3.
+    batch tier). The response is ``{"msg": "<option…>", "val": 1}`` with the
+    same ``<option value='..'>`` shape as op=3.
     """
     import re
 
@@ -1181,8 +1193,49 @@ class SavClient:
 
     # Tolerate single- or double-quoted values; option text may span newlines.
     options = re.findall(r"""<option value=['"](\d+)['"]\s*>([^<]+)</option>""", msg)
-    tiers = [(int(i), name.strip()) for i, name in options if int(i) != 0]
-    return tiers[0] if tiers else None
+    return [(int(i), name.strip()) for i, name in options if int(i) != 0]
+
+  def _pick_subida_tier(
+    self, internal_id: int, prefer_tier_id: int | None = None,
+  ) -> tuple[int, str] | None:
+    """Decide which subida tier to commit, given SAV's offered options and
+    an optional caller hint (the mod4-derived tier from
+    ``resolve_subida_tier``).
+
+    Rules:
+      * No options offered → ``None`` (caller must surface "no subida tier").
+      * ``prefer_tier_id`` set → must match one of the offered tiers; raises
+        ``SavConfigError`` when the hint is incompatible with what SAV will
+        accept (e.g. mod4 says Sub 18 but SAV only offers Sub 16).
+      * No hint + exactly one option → auto-pick it.
+      * No hint + multiple options → raise ``SavConfigError`` with the listing
+        so the caller passes ``promote_to_tier_id`` explicitly.
+
+    Returns the ``(tier_id, name)`` to be committed, or ``None`` for the
+    no-subida case.
+    """
+    options = self._list_subida_tier_options(internal_id)
+    if not options:
+      return None
+    if prefer_tier_id is not None:
+      for tier_id, name in options:
+        if tier_id == int(prefer_tier_id):
+          return (tier_id, name)
+      listing = ", ".join(f"{i}={n!r}" for i, n in options)
+      raise SavConfigError(
+        f"Requested subida tier_id={prefer_tier_id} is not among SAV's "
+        f"offered options for player {internal_id}: {listing}. The form "
+        f"and the server disagree — pick one of the offered tiers."
+      )
+    if len(options) == 1:
+      return options[0]
+    listing = ", ".join(f"{i}={n!r}" for i, n in options)
+    raise SavConfigError(
+      f"SAV offers multiple subida tiers for player {internal_id}: "
+      f"{listing}. Pass promote_to_tier_id= to disambiguate (or supply a "
+      f"mod4 whose escalao_subida names the desired tier)."
+    )
+
 
   def _resolve_club_association_id(self, club_id: int) -> int:
     """Walk associations to find the one containing the club. Cached per client."""
@@ -1433,11 +1486,24 @@ class SavClient:
   def add_player_to_registration_batch(
     self,
     batch_id: int,
-    license: int,
+    license: int = 0,
     *,
-    # ─── STEP 1 — Personal data (op=33) ───────────────────────────────────────
-    # Auto-derived from op=35: nome, data_nascimento, genero, nacionalidade,
-    # paisnascimento, nif. None on overrides = keep player's stored value.
+    # ─── New-player demographics (type-1 only; ignored for types 2/4) ─────────
+    # 1ª Inscrição has no SAV record to load from, so the caller must supply
+    # the full demographic surface up front. Revalidação reads the same
+    # values from op=35; Subida reuses the existing licence.
+    name: str | None = None,
+    birth_date: str | None = None,
+    gender_id: int | None = None,
+    nif: str | None = None,
+    nationality_id: int = _REGISTRATIONS_PORTUGAL_ID,
+    naturalidade_id: int = _REGISTRATIONS_PORTUGAL_ID,
+    country_id: int = _REGISTRATIONS_PORTUGAL_ID,
+    localidade_id: int = 0,
+    estatuto: int | None = None,
+    # ─── STEP 1 — Personal data (op=33 revalidação / op=12 primeira) ──────────
+    # Revalidação: auto-derived from op=35; None = keep stored value.
+    # 1ª Inscrição: id_type/id_number/id_expiry are required.
     id_type: int | None = None,
     id_number: str | None = None,
     id_expiry: str | None = None,
@@ -1446,18 +1512,15 @@ class SavClient:
     email: str | None = None,
     nome_pai: str | None = None,
     nome_mae: str | None = None,
-    # ─── STEP 2 — Address (op=31) ─────────────────────────────────────────────
-    # Auto-derived: pais (always Portugal=155, locked in UI).
+    # ─── STEP 2 — Address (op=31 revalidação / op=20 primeira) ────────────────
+    # Revalidação: pais locked to Portugal; address overrides None-default.
+    # 1ª Inscrição: morada/cod_postal/distrito_id/concelho_id all required.
     morada: str | None = None,
     cod_postal: str | None = None,
     localidade_txt: str | None = None,
     distrito_id: int | None = None,
     concelho_id: int | None = None,
-    # ─── STEP 3 — Sport-specific + consents (op=36) ───────────────────────────
-    # Auto-derived from batch metadata: tipo, escalao, epoca, transf=0.
-    # Auto-derived from op=87/175 cascade: tipoSeguro=1, seguro, comp.
-    # Auto-derived from op=31 prefill: estatuto, menor_idade.
-    # Auto-derived from op=26 (errors with available list when ambiguous): taxa.
+    # ─── STEP 3 — Sport-specific + consents (op=36 / op=27) ───────────────────
     taxa_id: int | None = None,
     exam_date: str | None = None,
     promote_to_tier_id: int | None = None,
@@ -1471,18 +1534,25 @@ class SavClient:
     consent_marketing: bool = False,
   ) -> int:
     """
-    Add a player to an open Revalidação or Subida batch.
+    Add a player to an open registration batch.
 
     Dispatches by ``batch.type_id``:
-      * type 2 (Revalidação) — walks the SAV2 multi-step enrolment wizard
-        (load player → save step 1 → save step 2 → insurance cascade →
-        pre-commit → commit) and returns the player's internal SAV2 id.
-      * type 4 (Subida)      — submits the standalone Subida flow
-        (eligibility list → origin → seguro/companhia/taxa cascade → commit
-        op=50) and returns the player's licence. The kwargs below are
-        Revalidação-only and ignored on Subida except for ``taxa_id``.
+      * type 1 (1ª Inscrição) — walks the SAV2 wizard for a player not yet in
+        the federation (duplicate check → age gate → create player → save
+        address → estatuto/taxa/insurance cascades → commit op=27). Requires
+        the full demographic surface (``name``, ``birth_date``, ``gender_id``,
+        ``nif``, id-doc + address fields); ``license`` is ignored. Returns
+        the new SAV ``userid``.
+      * type 2 (Revalidação) — walks the multi-step edit wizard against an
+        existing licence (load player → save step 1 → save step 2 →
+        insurance cascade → pre-commit → commit op=36) and returns the
+        player's internal SAV2 id.
+      * type 4 (Subida)      — submits the standalone Subida flow (eligibility
+        list → origin → seguro/companhia/taxa cascade → commit op=50) and
+        returns the player's licence. Most kwargs are ignored on Subida
+        except ``taxa_id``.
 
-    1ª Inscrição (type 1) and Transferência (type 3) remain unsupported.
+    Transferência (type 3) remains unsupported.
 
     Args:
         batch_id: Target open batch (must be in 'Em construção' state).
@@ -1539,10 +1609,45 @@ class SavClient:
       )
     if batch.type_id == _REGISTRATIONS_TYPE_SUBIDA:
       return self._add_player_to_subida_batch(batch, license, taxa_id=taxa_id)
+    if batch.type_id == _REGISTRATIONS_TYPE_PRIMEIRA:
+      missing = [
+        label for label, value in [
+          ("name", name), ("birth_date", birth_date), ("gender_id", gender_id),
+          ("nif", nif), ("id_type", id_type), ("id_number", id_number),
+          ("id_expiry", id_expiry), ("email", email),
+          ("morada", morada), ("cod_postal", cod_postal),
+          ("distrito_id", distrito_id), ("concelho_id", concelho_id),
+        ]
+        if value in (None, "")
+      ]
+      if missing:
+        raise ValueError(
+          f"1ª Inscrição (type-1) requires: {', '.join(missing)}. "
+          f"Pass them as keyword arguments to add_player_to_registration_batch."
+        )
+      return self._add_player_to_primeira_batch(
+        batch,
+        name=name, birth_date=birth_date, gender_id=gender_id, nif=nif,
+        id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+        email=email, telemovel=telemovel, telefone=telefone,
+        nationality_id=nationality_id, naturalidade_id=naturalidade_id,
+        nome_pai=nome_pai, nome_mae=nome_mae,
+        country_id=country_id,
+        morada=morada, cod_postal=cod_postal,
+        distrito_id=distrito_id, concelho_id=concelho_id,
+        localidade_id=localidade_id, localidade_txt=localidade_txt or "",
+        exam_date=exam_date, taxa_id=taxa_id, estatuto=estatuto,
+        promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
+        guardian_name=guardian_name, guardian_relation=guardian_relation,
+        guardian_phone=guardian_phone, guardian_email=guardian_email,
+        consent_data=consent_data,
+        consent_communications=consent_communications,
+        consent_marketing=consent_marketing,
+      )
     if batch.type_id != _REGISTRATIONS_TYPE_REVALIDACAO:
       raise NotImplementedError(
-        f"Only Revalidação (type_id=2) and Subida (type_id=4) batches are "
-        f"supported; got type_id={batch.type_id} ({batch.type!r})."
+        f"Transferência (type_id=3) batches are not supported; "
+        f"got type_id={batch.type_id} ({batch.type!r})."
       )
 
     eligible = self._list_revalidable_licenses(batch)
@@ -1625,10 +1730,15 @@ class SavClient:
     exam_date = _coerce_exam_date(exam_date)
 
     # ── Inline subida de escalão — fetch the player-specific target tier (op=21) ─
-    # The subida tier is server-computed per player (not the batch tier), so
-    # we read whatever option SAV exposes rather than assume one. This is the
-    # promote-on-enroll rider; a standalone Subida batch (type 4) is separate.
-    sub_tier = self._fetch_subida_tier(internal_id) if inline_subida else None
+    # The subida tier is server-computed per player (not the batch tier).
+    # When a mod4 is involved, its escalao_subida text resolves upstream to a
+    # tier_id passed here as promote_to_tier_id; _pick_subida_tier enforces
+    # that the form's stated target is one SAV will accept. With no caller
+    # hint, single-option lists auto-pick and multi-option lists raise.
+    sub_tier = (
+      self._pick_subida_tier(internal_id, prefer_tier_id=promote_to_tier_id)
+      if inline_subida else None
+    )
     if inline_subida and sub_tier is None:
       raise SavConfigError(
         f"Inline subida requested (mod4 present) but SAV offers no subida tier "
@@ -1646,8 +1756,7 @@ class SavClient:
       "transf": 0,
       "estatuto": str(step3_prefill.get("estatuto", "")),
       "exame": "1",
-      "sub": str(sub_tier[0]) if sub_tier else (
-        str(promote_to_tier_id) if promote_to_tier_id is not None else "-1"),
+      "sub": str(sub_tier[0]) if sub_tier else "-1",
       "obs": "",
       "dataexame": exam_date,
       "escalaosubida_txt": sub_tier[1] if sub_tier else "- Não selecionado –",
@@ -3008,6 +3117,616 @@ class SavClient:
       raise SavResponseError(
         f"Could not parse commit response: {resp.text[:200]!r}"
       ) from exc
+
+  # ------------------------------------------------------------------
+  # 1ª Inscrição (type-1) wizard helpers
+  # ------------------------------------------------------------------
+  #
+  # Unlike Revalidação, the player doesn't exist in SAV yet — op=12 creates
+  # the record and returns the userid. The wizard then mirrors the
+  # Revalidação shape (step-2 → estatuto → taxa → insurance → commit) but
+  # with renamed fields and a different commit op (27, not 36).
+
+  def _check_primeira_player_duplicate(
+    self, *, gender_id: int, birth_date: str, id_number: str,
+  ) -> dict[str, Any]:
+    """Op=11 — pre-create duplicate check on (genero, datanasc, n_identificacao).
+
+    Sent form-encoded with the JSON URL-encoded under ``info=`` (the modal
+    re-fires it on "Seguinte"; the typeahead variant uses text/plain JSON
+    but the form-encoded shape is the one the server treats as authoritative
+    so we mirror that here).
+
+    Returns the parsed JSON. ``existe:0`` is the happy path — anything else
+    means a player with the same id already exists in SAV, in which case the
+    caller must surface the duplicate rather than silently re-create.
+    """
+    info = json.dumps({
+      "num": 3, "tipo_guia": _REGISTRATIONS_TYPE_PRIMEIRA,
+      "input0": str(gender_id), "bd0": "genero_id",
+      "input1": birth_date,     "bd1": "data_nascimento",
+      "input2": str(id_number), "bd2": "n_identificacao",
+    }, ensure_ascii=False)
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_DUPLICATE_OP},
+        data={"info": info},
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      return json.loads(r.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Duplicate-check op=11 failed: {exc}") from exc
+
+  def _check_primeira_id_doc(self, id_number: str) -> None:
+    """Op=163 — fire-and-forget id-doc uniqueness probe; empty body on success."""
+    try:
+      self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_ID_DOC_CHECK_OP},
+        data={"numid": id_number, "userid": 0},
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=163 id-doc check failed — non-fatal", exc_info=True)
+
+  def _check_primeira_birthdate_fits_tier(
+    self, batch: PlayerRegistrationBatch, birth_date: str,
+  ) -> None:
+    """Op=14 — hard gate: birthdate must fall inside the batch tier's age window.
+
+    Response shape: ``{"de", "a", "es", "datanas", "val"}`` — ``val:1`` is OK,
+    anything else means the player is too young / too old for the tier and
+    the wizard refuses to create them. Raises ValueError with the window so
+    the caller can route to a different batch.
+    """
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_PRIMEIRA_AGE_GATE_OP,
+          "datanasc": birth_date,
+          "guia": batch.id,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      data = json.loads(r.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Age-gate op=14 failed: {exc}") from exc
+    if int(data.get("val", 0)) != 1:
+      raise ValueError(
+        f"Birthdate {birth_date} does not fit tier {batch.tier!r} "
+        f"(server window {data.get('de')}..{data.get('a')}). "
+        f"Pick a batch with an age range that includes the player."
+      )
+
+  def _primeira_batch_context_refresh(self, batch_id: int) -> None:
+    """Op=161 — fire-and-forget batch-header context refresh the modal does.
+
+    Fired between step transitions for parity with the browser flow; the
+    response (escalao/entidade/epoca/genero/descri_escalao) is purely for
+    the UI header and not consumed by the wizard logic.
+    """
+    try:
+      self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_BATCH_CTX_OP},
+        data={"guiaid": batch_id},
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=161 batch-context refresh failed — non-fatal", exc_info=True)
+
+  @staticmethod
+  def _quote_phone(value: str | None) -> str:
+    """Mirror SAV2's quirk of wrapping phone numbers in single quotes in the wire payload."""
+    return f"'{value}'" if value else ""
+
+  def _create_primeira_player(
+    self,
+    *,
+    batch: PlayerRegistrationBatch,
+    name: str,
+    birth_date: str,
+    gender_id: int,
+    email: str,
+    telemovel: str | None,
+    telefone: str | None,
+    nif: str,
+    id_type: int,
+    id_number: str,
+    id_expiry: str,
+    nationality_id: int,
+    naturalidade_id: int,
+    nome_pai: str | None,
+    nome_mae: str | None,
+  ) -> int:
+    """Op=12 — create a new player record. Returns the new SAV userid.
+
+    Body is text/plain raw JSON (not form-encoded). Phone fields are
+    wrapped in literal single quotes; ``hab`` is the literal string
+    ``"NULL"`` when empty; ``profissao`` and ``estadoc`` default to 0
+    (the UI exposes them as optional). ``role:1`` flags the record as an
+    atleta — coach/etc. profiles would use different roles.
+    """
+    body = {
+      "guiaid": batch.id,
+      "nome": name,
+      "datenasc": birth_date,
+      "email": email or "",
+      "genero": str(gender_id),
+      "telem": self._quote_phone(telemovel),
+      "telefo": self._quote_phone(telefone),
+      "profissao": 0,
+      "nif": nif,
+      "tipoi": str(id_type),
+      "numid": str(id_number),
+      "dataval": id_expiry,
+      "estadoc": "0",
+      "hab": "NULL",
+      "nacionalidade": str(nationality_id),
+      "naturalidade": str(naturalidade_id),
+      "mae": nome_mae or "",
+      "pai": nome_pai or "",
+      "role": 1,
+    }
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_CREATE_OP},
+        data=json.dumps(body, ensure_ascii=False),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      data = json.loads(r.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Create-player op=12 failed: {exc}") from exc
+    if int(data.get("val", 0)) != 1 or not data.get("userid"):
+      raise SavResponseError(
+        f"Create-player op=12 rejected: {data.get('msg') or data!r}"
+      )
+    return int(data["userid"])
+
+  def _save_primeira_step2(
+    self,
+    *,
+    batch: PlayerRegistrationBatch,
+    userid: int,
+    country_id: int,
+    distrito_id: int,
+    concelho_id: int,
+    localidade_id: int,
+    localidade_txt: str,
+    morada: str,
+    cod_postal: str,
+  ) -> dict[str, Any]:
+    """Op=20 — save the address step; response carries the menor_idade flag.
+
+    Distinct from Revalidação's op=31:
+      * text/plain JSON body (vs multipart form).
+      * Renamed keys (``codpostal`` not ``cod_postal``; ``locastring`` is the
+        free-text city; ``pais`` is mandatory rather than implicit Portugal).
+      * Response carries ``clube``/``clube_id``/``nome``/``flagEstadaPerm``
+        alongside ``menor_idade`` — only the latter is consumed by the
+        commit logic, but we surface the full dict so callers can log it.
+    """
+    body = {
+      "guiaid": batch.id,
+      "userid": userid,
+      "pais": str(country_id),
+      "distrito": str(distrito_id),
+      "concelho": str(concelho_id),
+      "localidade": str(localidade_id) if localidade_id else "",
+      "morada": morada,
+      "codpostal": cod_postal,
+      "locastring": localidade_txt or "",
+    }
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_STEP2_OP},
+        data=json.dumps(body, ensure_ascii=False),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      data = json.loads(r.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Step-2 op=20 failed: {exc}") from exc
+    if int(data.get("val", 0)) != 1:
+      raise SavResponseError(
+        f"Step-2 op=20 rejected: {data.get('msg') or data!r}"
+      )
+    return data
+
+  def _load_primeira_estatuto(
+    self, batch: PlayerRegistrationBatch, userid: int,
+  ) -> int:
+    """Op=151 — pick the player's estatuto from the dropdown SAV exposes.
+
+    Revalidação reads estatuto off the stored player record; for type-1
+    there's nothing stored yet so SAV serves a dropdown. The UI locks
+    Portuguese FBP players to a single option, so we auto-pick when exactly
+    one real (>0) option is returned. Multi-option means a non-PT athlete
+    (Comunitário / Não Comunitário / Equiparado) — surface a config error
+    asking the caller to pass an explicit choice.
+    """
+    import re
+
+    try:
+      r = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_ESTATUTOS_OP},
+        data={
+          "userid": userid,
+          "tipo": _REGISTRATIONS_TYPE_PRIMEIRA,
+          "guiaid": batch.id,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      data = json.loads(r.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Estatuto op=151 failed: {exc}") from exc
+
+    options = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='?(-?\d+)'?[^>]*>\s*([^<]+?)\s*<",
+        data.get("estatutos", ""),
+      )
+      if int(val) > 0
+    }
+    if len(options) == 1:
+      return next(iter(options))
+    if not options:
+      raise SavResponseError(
+        f"No estatuto options returned for batch {batch.id}, "
+        f"player {userid}: {data!r}"
+      )
+    listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
+    raise SavConfigError(
+      f"Multiple estatuto options for batch {batch.id}, player {userid}: "
+      f"{listing}. Pass estatuto= to disambiguate (non-PT athletes)."
+    )
+
+  def _resolve_primeira_taxa_id(
+    self,
+    batch: PlayerRegistrationBatch,
+    userid: int,
+    estatuto: int,
+    *,
+    subida_tier_id: int = -1,
+    subida_escalao_id: int = 0,
+  ) -> int:
+    """Op=26 — same taxa endpoint Revalidação uses, but the type-1 wizard
+    also sends ``subida`` / ``subida_escalao`` (defaulting to -1/0 when no
+    inline subida) since the available taxa can differ for promotion cases.
+
+    Auto-picks a single real option; raises with the listing when ambiguous
+    so the caller passes ``taxa_id`` explicitly.
+    """
+    import re
+
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_TAXA_OP,
+          "estatuto": estatuto,
+          "guia": batch.id,
+          "esc": 1,
+          "subida": subida_tier_id,
+          "subida_escalao": subida_escalao_id,
+          "user": userid,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      msg = json.loads(r.text).get("msg", "")
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(f"Taxa op=26 failed: {exc}") from exc
+
+    options = {
+      int(val): label.strip()
+      for val, label in re.findall(
+        r"<option value='(-?\d+)'[^>]*>\s*([^<]+?)\s*<", msg
+      )
+      if int(val) > 0
+    }
+    if len(options) == 1:
+      return next(iter(options))
+    if not options:
+      raise SavResponseError(
+        f"No taxa options for primeira batch {batch.id}, player {userid}: {msg!r}"
+      )
+    listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
+    raise SavConfigError(
+      f"Multiple taxa options for primeira batch {batch.id}, player {userid}: "
+      f"{listing}. Pass taxa_id= to disambiguate."
+    )
+
+  def _resolve_primeira_insurance_cascade(
+    self, batch: PlayerRegistrationBatch, userid: int,
+  ) -> tuple[int, int, str]:
+    """Run the type-1 seguro → companhia → apolice cascade.
+
+    Returns ``(seguro_id, companhia_id, apolice)``. For the single-option
+    case observed in practice op=175 returns an empty body and the commit
+    just reuses the seguro_id for the ``companhia`` field — so we collapse
+    them. op=24's apólice string IS sent in the op=27 body (unlike the
+    Revalidação flow where it's display-only).
+    """
+    season_param = f"'{batch.season}'"
+
+    # op=87: pick tipoSeguro=1 → returns seguro id under (overloaded) "companhia"
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_SEGURO_OP,
+          "id": userid,
+          "agente": _REGISTRATIONS_AGENTE_PLAYER,
+          "epoca": season_param,
+          "guia": batch.id,
+          "tiposeguro": _REGISTRATIONS_TIPOSEGURO_FEDERACAO,
+        },
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      seguro_id = int(json.loads(r.text)["companhia"])
+    except (requests.exceptions.RequestException, ValueError, KeyError) as exc:
+      raise SavConnectionError(
+        f"Primeira insurance op=87 failed: {exc}"
+      ) from exc
+
+    # op=175: fire-and-forget for the single-option case (empty body). We
+    # still send it for parity with the browser flow; a future multi-option
+    # case would need to parse the response for a real companhia id.
+    try:
+      self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={
+          "op": _REGISTRATIONS_LOAD_COMPANHIA_OP,
+          "seguro": seguro_id,
+          "escalao": batch.tier_id,
+          "guia": batch.id,
+          "epoca": season_param,
+          "nivel": 0,
+        },
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=175 primeira companhia fetch failed — non-fatal", exc_info=True)
+
+    # op=24: apólice — text/plain string in the body (not JSON). Required
+    # at commit-time for type-1 (the body carries it verbatim).
+    try:
+      r = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LOAD_APOLICE_OP, "companhia": seguro_id},
+        timeout=self._timeout,
+      )
+      r.raise_for_status()
+      apolice = r.text.strip()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Primeira apolice op=24 failed: {exc}"
+      ) from exc
+
+    # The single-insurance cascade collapses seguro_id and companhia_id —
+    # both are sent as the same value in the op=27 commit body.
+    return seguro_id, seguro_id, apolice
+
+  def _primeira_commit(self, body: dict[str, Any]) -> dict[str, Any]:
+    """Op=27 — type-1 final commit. JSON body sent with text/plain Content-Type."""
+    try:
+      resp = self._http.post(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_PRIMEIRA_COMMIT_OP},
+        data=json.dumps(body, ensure_ascii=False),
+        headers={"Content-Type": "text/plain;charset=UTF-8"},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+      return json.loads(resp.text)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+      raise SavConnectionError(
+        f"Primeira commit op=27 failed: {exc}"
+      ) from exc
+
+  def _add_player_to_primeira_batch(
+    self,
+    batch: PlayerRegistrationBatch,
+    *,
+    # ── new-player demographics (no SAV record to fall back on) ──
+    name: str,
+    birth_date: str,
+    gender_id: int,
+    nif: str,
+    id_type: int,
+    id_number: str,
+    id_expiry: str,
+    email: str,
+    telemovel: str | None,
+    telefone: str | None,
+    nationality_id: int,
+    naturalidade_id: int,
+    nome_pai: str | None,
+    nome_mae: str | None,
+    # ── address ──
+    country_id: int,
+    morada: str,
+    cod_postal: str,
+    distrito_id: int,
+    concelho_id: int,
+    localidade_id: int,
+    localidade_txt: str,
+    # ── step-3 ──
+    exam_date: str,
+    taxa_id: int | None,
+    estatuto: int | None,
+    promote_to_tier_id: int | None,
+    inline_subida: bool,
+    guardian_name: str | None,
+    guardian_relation: int | None,
+    guardian_phone: str | None,
+    guardian_email: str | None,
+    consent_data: bool,
+    consent_communications: bool,
+    consent_marketing: bool,
+  ) -> int:
+    """Walk the 1ª Inscrição wizard and return the new SAV userid.
+
+    Mirrors the Revalidação shape but with type-1's renamed field surface
+    and a different commit op. Sequence:
+        modal-open guards (op=15/op=161, fire-and-forget) →
+        duplicate check (op=11) →
+        id-doc check (op=163) →
+        age gate (op=14) →
+        create player (op=12, yields userid) →
+        save address (op=20, yields menor_idade) →
+        load estatuto (op=151) →
+        taxa cascade (op=26) →
+        insurance cascade (op=87 → op=175 → op=24) →
+        commit (op=27).
+    """
+    # Modal-open guards (mirror what the UI does on "Novo jogador" click)
+    try:
+      self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": "15", "guia": batch.id},
+        timeout=self._timeout,
+      )
+    except requests.exceptions.RequestException:
+      logger.debug("op=15 primeira modal guard failed — non-fatal", exc_info=True)
+    self._primeira_batch_context_refresh(batch.id)
+
+    # Pre-create checks (server-side; treat duplicate as a hard stop)
+    dup = self._check_primeira_player_duplicate(
+      gender_id=gender_id, birth_date=birth_date, id_number=id_number,
+    )
+    if int(dup.get("existe", 0)) != 0:
+      existing_id = dup.get("id") or dup.get("atleta") or ""
+      raise SavResponseError(
+        f"A player matching (genero={gender_id}, datanasc={birth_date}, "
+        f"id_number={id_number}) already exists in SAV (id={existing_id!r}); "
+        f"use Revalidação on the existing licence rather than 1ª Inscrição."
+      )
+    self._check_primeira_id_doc(id_number)
+    self._check_primeira_birthdate_fits_tier(batch, birth_date)
+    self._primeira_batch_context_refresh(batch.id)
+
+    # op=12 — create the player record; this is where userid is born.
+    userid = self._create_primeira_player(
+      batch=batch,
+      name=name, birth_date=birth_date, gender_id=gender_id,
+      email=email, telemovel=telemovel, telefone=telefone,
+      nif=nif, id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+      nationality_id=nationality_id, naturalidade_id=naturalidade_id,
+      nome_pai=nome_pai, nome_mae=nome_mae,
+    )
+
+    # op=20 — save address; response carries menor_idade for the guardian gate.
+    step2 = self._save_primeira_step2(
+      batch=batch, userid=userid,
+      country_id=country_id,
+      distrito_id=distrito_id, concelho_id=concelho_id,
+      localidade_id=localidade_id, localidade_txt=localidade_txt,
+      morada=morada, cod_postal=cod_postal,
+    )
+    is_minor = bool(step2.get("menor_idade"))
+    if is_minor:
+      missing = [
+        n for n, v in [
+          ("guardian_name", guardian_name),
+          ("guardian_relation", guardian_relation),
+          ("guardian_phone", guardian_phone),
+          ("guardian_email", guardian_email),
+        ]
+        if not v
+      ]
+      if missing:
+        raise SavConfigError(
+          f"Player ({name!r}) is a minor; missing required fields: "
+          f"{', '.join(missing)}"
+        )
+
+    # Estatuto (auto-pick single FBP option for PT athletes)
+    if estatuto is None:
+      estatuto = self._load_primeira_estatuto(batch, userid)
+
+    # Inline subida — server-computed via op=21 like Revalidação. Skipped on
+    # tiers without a higher escalão (op=21 returns only the placeholder).
+    # promote_to_tier_id comes from the mod4's escalao_subida resolution and
+    # is enforced against SAV's offered options by _pick_subida_tier.
+    sub_tier = (
+      self._pick_subida_tier(userid, prefer_tier_id=promote_to_tier_id)
+      if inline_subida else None
+    )
+    if inline_subida and sub_tier is None:
+      raise SavConfigError(
+        f"Inline subida requested but SAV offers no subida tier for new "
+        f"player {name!r} in batch {batch.id} (op=21 returned only "
+        f"'- Não selecionado –'). Pick a tier that has a higher escalão."
+      )
+
+    # Taxa cascade — the type-1 op=26 takes the subida pair, so pass it.
+    if taxa_id is None:
+      taxa_id = self._resolve_primeira_taxa_id(
+        batch, userid, estatuto,
+        subida_tier_id=int(sub_tier[0]) if sub_tier else -1,
+        subida_escalao_id=0,
+      )
+
+    # Insurance cascade
+    seguro_id, companhia_id, apolice = (
+      self._resolve_primeira_insurance_cascade(batch, userid)
+    )
+
+    exam_date = _coerce_exam_date(exam_date)
+
+    commit_body = {
+      "guiaid": batch.id,
+      "userid": userid,
+      "tipo": _REGISTRATIONS_TYPE_PRIMEIRA,
+      "exame": "1",
+      "subida": str(sub_tier[0]) if sub_tier else "-1",
+      "obs": "",
+      "dataexame": exam_date,
+      "escalaosubida_txt": sub_tier[1] if sub_tier else "- Não selecionado –",
+      "taxa": str(taxa_id),
+      "estatuto": str(estatuto),
+      "seguro": str(seguro_id),
+      "companhia": str(companhia_id),
+      "apolice": apolice,
+      "nomeEncarregado": guardian_name or "",
+      "tipoRegulacao": str(guardian_relation) if guardian_relation else "0",
+      "telefoneEncarregado": guardian_phone or "",
+      "emailEncarregado": guardian_email or "",
+      "consentimentoDados": 1 if consent_data else 0,
+      "comunicacoes": 1 if consent_communications else 0,
+      "marketing": 1 if consent_marketing else 0,
+    }
+
+    result = self._primeira_commit(commit_body)
+    if int(result.get("val", 0)) != 1:
+      raise SavResponseError(
+        f"Primeira commit failed: {result.get('msg') or result!r}"
+      )
+    logger.info(
+      "Created primeira-inscrição player %r (userid=%s) in batch %s — "
+      "result: %s",
+      name, userid, batch.id, result.get("resultexame") or "ok",
+    )
+    return userid
 
   @staticmethod
   def _parse_registration_batch(row: dict[str, Any]) -> PlayerRegistrationBatch:

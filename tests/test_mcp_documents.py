@@ -608,6 +608,7 @@ def _submit_stub_forms(result_obj, *, with_mod4: bool) -> dict:
       "pdf_bytes": b"%PDF-1.4\n",
       "doc_type": DocType.FPB_MODELO_1,
       "sav_profile": {"nome": "Player A"},
+      "previewed": True,
     },
   }
   if with_mod4:
@@ -777,3 +778,200 @@ def test_submit_enrollment_subida_no_tier_error_propagates(monkeypatch):
       mod4_id="mod4-1",
       field_overrides={"exam_date": "2026-05-01"},
     )
+
+
+# ─── 1ª Inscrição (type-1) MCP paths ────────────────────────────────────────
+
+def _type1_batch_stub():
+  """Live-account-shape stub of a type-1 batch returned by
+  list_player_registration_batches."""
+  return type("BatchStub", (), {
+    "id": 629084, "number": "726", "type_id": 1, "is_open": True,
+    "tier": "Baby-Basket", "gender": "Masculino",
+    "tier_id": 33, "gender_id": 1, "season": "2025/2026",
+    "club_id": 2430,
+  })()
+
+
+def test_resolve_player_type1_returns_new_player_when_no_duplicate(monkeypatch):
+  """For a type-1 batch, resolve_player skips the eligibility list and the
+  duplicate check passes — it should return resolved=true with license=null."""
+  from sav_parsers.types import ParsedField
+
+  batch = _type1_batch_stub()
+
+  class StubClient:
+    def list_player_registration_batches(self, season=None):
+      return [batch]
+
+    def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
+      return {"existe": 0}
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", {
+    "form-1": {
+      "doc_type": DocType.FPB_MODELO_1,
+      "parsed": {
+        "nome_completo": ParsedField(value="João Loff", confidence=0.95),
+        "data_nascimento": ParsedField(value="2020-09-26", confidence=0.95),
+        "num_doc_identificacao": ParsedField(value="12345699", confidence=0.95),
+        "genero_masculino": ParsedField(value=True, confidence=0.95),
+      },
+      "reg_type": 1,
+    },
+  })
+
+  result = server_module.resolve_player(batch_number="726", mod1_id="form-1")
+  assert result["resolved"] is True
+  assert result["license"] is None
+  assert result["reg_type"] == 1
+  assert result["ocr_name"] == "João Loff"
+  assert result["ocr_birth_date"] == "2020-09-26"
+  assert result["ocr_gender_id"] == 1
+
+
+def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
+  """When op=11 says the player already exists, resolve_player must reject
+  the 1ª Inscrição path with a structured error rather than proceeding."""
+  from sav_parsers.types import ParsedField
+
+  batch = _type1_batch_stub()
+
+  class StubClient:
+    def list_player_registration_batches(self, season=None):
+      return [batch]
+
+    def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
+      return {"existe": 1, "id": 99}
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", {
+    "form-1": {
+      "doc_type": DocType.FPB_MODELO_1,
+      "parsed": {
+        "nome_completo": ParsedField(value="João Loff", confidence=0.95),
+        "data_nascimento": ParsedField(value="2020-09-26", confidence=0.95),
+        "num_doc_identificacao": ParsedField(value="12345699", confidence=0.95),
+      },
+      "reg_type": 1,
+    },
+  })
+
+  result = server_module.resolve_player(batch_number="726", mod1_id="form-1")
+  assert result["resolved"] is False
+  assert result["error"] == "player_already_in_sav"
+  assert result["existing_sav_id"] == 99
+
+
+def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
+  """Type-1 submit must pass the OCR-derived demographics (name, birth_date,
+  gender_id, nif, …) instead of a reconcile result. It must also look up the
+  newly-assigned licence in the batch listing so the source PDF upload
+  targets the right player."""
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 629084
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["kwargs"] = kwargs
+      captured["license_arg"] = license
+      return 277534  # the SAV userid
+
+    def list_player_registration_batch_items(self, batch_id):
+      return [{"license": 321160, "name": "João Loff"}]
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      captured.setdefault("uploads", []).append((license, tipo_doc))
+
+  primeira_kwargs = {
+    "name": "João Loff", "birth_date": "2020-09-26", "gender_id": 1,
+    "nif": "277544319", "id_type": 1, "id_number": "12345699",
+    "id_expiry": "2029-09-26", "email": "x@y.pt",
+    "morada": "Praceta", "cod_postal": "1300-536",
+    "distrito_id": 1, "concelho_id": 5,
+  }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
+  monkeypatch.setattr(server_module, "_forms", {
+    "form-1": {
+      "doc_type": DocType.FPB_MODELO_1,
+      "reg_type": 1,
+      "parsed": {},
+      "primeira_kwargs": primeira_kwargs,
+      "primeira_concelhos": {5: "Aveiro"},
+      "previewed": True,
+      "processing_id": "proc-1",
+      "pdf_bytes": b"%PDF-1.4\n",
+    },
+  })
+
+  result = server_module.submit_enrollment(
+    batch_number="726",
+    license=None,
+    mod1_id="form-1",
+    field_overrides={"exam_date": "2025-09-26"},
+  )
+
+  assert result["success"] is True
+  assert result["license"] == 321160  # looked up from the batch listing
+  assert result["name"] == "João Loff"
+  # The wizard got the licence kwarg as 0 (sentinel for "no licence yet").
+  assert captured["license_arg"] == 0
+  # Demographics flowed through.
+  assert captured["kwargs"]["name"] == "João Loff"
+  assert captured["kwargs"]["nif"] == "277544319"
+  assert captured["kwargs"]["gender_id"] == 1
+  # Upload targeted the new licence (not 0).
+  assert captured["uploads"] == [(321160, 1)]
+
+
+def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypatch):
+  """If the post-commit batch listing doesn't contain a row matching the
+  supplied name, the upload is skipped with a clear status rather than
+  silently uploading against licence=0."""
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 629084
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      return 277534
+
+    def list_player_registration_batch_items(self, batch_id):
+      return [{"license": 999, "name": "Someone Else"}]
+
+    def replace_player_registration_document(self, *a, **k):
+      raise AssertionError("upload must not be attempted when licence lookup fails")
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
+  monkeypatch.setattr(server_module, "_forms", {
+    "form-1": {
+      "doc_type": DocType.FPB_MODELO_1,
+      "reg_type": 1,
+      "parsed": {},
+      "primeira_kwargs": {
+        "name": "João Loff", "birth_date": "2020-09-26", "gender_id": 1,
+        "nif": "277544319", "id_type": 1, "id_number": "12345699",
+        "id_expiry": "2029-09-26", "email": "x@y.pt",
+        "morada": "x", "cod_postal": "1000-000",
+        "distrito_id": 1, "concelho_id": 5,
+      },
+      "previewed": True,
+      "processing_id": "proc-1",
+      "pdf_bytes": b"%PDF-1.4\n",
+    },
+  })
+
+  result = server_module.submit_enrollment(
+    batch_number="726", license=None, mod1_id="form-1",
+    field_overrides={"exam_date": "2025-09-26"},
+  )
+
+  assert result["success"] is True
+  assert result["license"] is None
+  assert result["source_document_upload"]["status"] == "skipped"
+  assert "type-1 commit" in result["source_document_upload"]["error"]

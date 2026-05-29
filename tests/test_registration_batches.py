@@ -185,7 +185,8 @@ class TestSubidaDeEscalao:
 
   def _stub_enroll(self, monkeypatch, *, subida_tier):
     """Wire a logged-in client through the wizard up to the commit, capturing
-    the commit body. `subida_tier` is what `_fetch_subida_tier` returns."""
+    the commit body. `subida_tier` is the tuple ``_pick_subida_tier`` returns
+    (None when SAV offers no real option)."""
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"organizacao": "270"}
     batch = type("BatchStub", (), {
@@ -208,7 +209,10 @@ class TestSubidaDeEscalao:
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
     monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
-    monkeypatch.setattr(client, "_fetch_subida_tier", lambda internal_id: subida_tier)
+    monkeypatch.setattr(
+      client, "_pick_subida_tier",
+      lambda internal_id, prefer_tier_id=None: subida_tier,
+    )
 
     captured = {}
 
@@ -243,23 +247,217 @@ class TestSubidaDeEscalao:
       )
     assert "body" not in captured  # never reached the commit
 
-  def test_fetch_subida_tier_parses_single_option(self, monkeypatch):
-    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+  def _stub_op21(self, monkeypatch, client, msg: str):
     resp = type("Resp", (), {
-      "text": '{"msg":"' + self.SUBIDA_MSG.replace("\n", "\\n") + '","val":1}',
+      "text": '{"msg":"' + msg.replace("\n", "\\n") + '","val":1}',
       "raise_for_status": lambda self: None,
     })()
     monkeypatch.setattr(client, "_http", type("H", (), {"get": lambda self, *a, **k: resp})())
-    assert client._fetch_subida_tier(88) == (6, "Sub 14")
 
-  def test_fetch_subida_tier_returns_none_when_only_placeholder(self, monkeypatch):
+  def test_list_subida_options_parses_single_option(self, monkeypatch):
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
-    resp = type("Resp", (), {
-      "text": '{"msg":"<option value=\'0\'>- N\\u00e3o selecionado \\u2013</option>","val":1}',
-      "raise_for_status": lambda self: None,
+    self._stub_op21(monkeypatch, client, self.SUBIDA_MSG)
+    assert client._list_subida_tier_options(88) == [(6, "Sub 14")]
+
+  def test_list_subida_options_returns_empty_when_only_placeholder(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    self._stub_op21(
+      monkeypatch, client,
+      "<option value='0'>- N\\u00e3o selecionado \\u2013</option>",
+    )
+    assert client._list_subida_tier_options(88) == []
+
+  def test_pick_subida_auto_picks_when_single_option(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    self._stub_op21(monkeypatch, client, self.SUBIDA_MSG)
+    assert client._pick_subida_tier(88) == (6, "Sub 14")
+
+  def test_pick_subida_honors_caller_hint(self, monkeypatch):
+    # When SAV offers Sub 16 + Sub 18, the mod4-derived tier_id wins.
+    multi = (
+      "<option value='0'>- N\\u00e3o selecionado \\u2013</option>"
+      "<option value='3'>Sub 16</option>"
+      "<option value='10'>Sub 18</option>"
+    )
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    self._stub_op21(monkeypatch, client, multi)
+    assert client._pick_subida_tier(88, prefer_tier_id=10) == (10, "Sub 18")
+
+  def test_pick_subida_raises_when_hint_not_offered(self, monkeypatch):
+    # mod4 says Sub 18 (tier_id=10) but SAV only offers Sub 16 — surface the
+    # form/server disagreement rather than silently committing the wrong tier.
+    only_sub16 = (
+      "<option value='0'>- N\\u00e3o selecionado \\u2013</option>"
+      "<option value='3'>Sub 16</option>"
+    )
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    self._stub_op21(monkeypatch, client, only_sub16)
+    with pytest.raises(SavConfigError, match="not among SAV's offered"):
+      client._pick_subida_tier(88, prefer_tier_id=10)
+
+  def test_pick_subida_raises_on_ambiguous_no_hint(self, monkeypatch):
+    multi = (
+      "<option value='0'>- N\\u00e3o selecionado \\u2013</option>"
+      "<option value='3'>Sub 16</option>"
+      "<option value='10'>Sub 18</option>"
+    )
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    self._stub_op21(monkeypatch, client, multi)
+    with pytest.raises(SavConfigError, match="multiple subida tiers"):
+      client._pick_subida_tier(88)
+
+
+# ─── 1ª Inscrição (type-1) wizard ───────────────────────────────────────────
+
+class TestPrimeiraInscricao:
+  """Type-1 wizard: dispatch + commit body shape.
+
+  The wizard end-to-end isn't exercised against the live server (it would
+  commit a real player); instead we stub the wire calls and verify the
+  dispatcher routes correctly and assembles the op=27 commit body with the
+  type-1 field names (tipo/subida/companhia/seguro/apolice).
+  """
+
+  REQUIRED = dict(
+    name="João Ferreira Loff", birth_date="2020-09-26", gender_id=1,
+    nif="277544319", id_type=1, id_number="12345699", id_expiry="2029-09-26",
+    email="x@y.pt", morada="Praceta", cod_postal="1300-536",
+    distrito_id=1, concelho_id=5, exam_date="2025-09-26",
+  )
+
+  def _stub_primeira(self, monkeypatch, *, subida_tier=None, minor=False):
+    """Wire a logged-in client through every type-1 helper up to op=27,
+    capturing the commit body."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "2430"}
+    batch = type("BatchStub", (), {
+      "id": 629084, "is_open": True, "type_id": 1, "state": "Em construção",
+      "tier": "Baby-Basket", "gender": "Masculino", "tier_id": 33, "season": "2025/2026",
     })()
-    monkeypatch.setattr(client, "_http", type("H", (), {"get": lambda self, *a, **k: resp})())
-    assert client._fetch_subida_tier(88) is None
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", lambda season=None: [batch],
+    )
+
+    # Modal-open guards + pre-create checks: every fire-and-forget op.
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate", lambda **kw: {"existe": 0},
+    )
+    monkeypatch.setattr(client, "_check_primeira_id_doc", lambda numid: None)
+    monkeypatch.setattr(
+      client, "_check_primeira_birthdate_fits_tier", lambda batch_obj, bd: None,
+    )
+    monkeypatch.setattr(
+      client, "_primeira_batch_context_refresh", lambda batch_id: None,
+    )
+    monkeypatch.setattr(client, "_create_primeira_player", lambda **kw: 277534)
+    monkeypatch.setattr(
+      client, "_save_primeira_step2",
+      lambda **kw: {"val": 1, "menor_idade": 1 if minor else 0},
+    )
+    monkeypatch.setattr(client, "_load_primeira_estatuto", lambda b, u: 6)
+    monkeypatch.setattr(
+      client, "_resolve_primeira_taxa_id",
+      lambda b, u, est, **kw: 1052,
+    )
+    monkeypatch.setattr(
+      client, "_resolve_primeira_insurance_cascade",
+      lambda b, u: (4583, 4583, "100.268/1-2-16"),
+    )
+    monkeypatch.setattr(
+      client, "_pick_subida_tier",
+      lambda u, prefer_tier_id=None: subida_tier,
+    )
+
+    # Modal-open op=15 hits self._http.get — stub the transport entirely.
+    monkeypatch.setattr(
+      client, "_http",
+      type("H", (), {"get": lambda self, *a, **k: type("R", (), {
+        "text": "1", "raise_for_status": lambda self: None,
+      })()})(),
+    )
+
+    captured = {}
+    monkeypatch.setattr(
+      client, "_primeira_commit",
+      lambda body: (captured.update(body=body), {"val": 1, "msg": "", "resultexame": "2026-09-30"})[1],
+    )
+    return client, captured
+
+  def test_dispatches_type1_and_builds_commit(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch)
+    userid = client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+    assert userid == 277534
+    body = captured["body"]
+    assert body["guiaid"] == 629084
+    assert body["userid"] == 277534
+    # Type-1 commit uses `tipo` (not Revalidação's `transf`), `subida` (not
+    # `sub`), `companhia` (not `comp`), plus new `seguro`/`apolice` keys.
+    assert body["tipo"] == 1
+    assert body["subida"] == "-1"
+    assert body["escalaosubida_txt"] == "- Não selecionado –"
+    assert body["seguro"] == "4583"
+    assert body["companhia"] == "4583"
+    assert body["apolice"] == "100.268/1-2-16"
+    assert body["taxa"] == "1052"
+    assert body["estatuto"] == "6"
+    assert body["dataexame"] == "2025-09-26"
+
+  def test_inline_subida_populates_tier(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch, subida_tier=(3, "Sub 16"))
+    client.add_player_to_registration_batch(
+      629084, inline_subida=True, **self.REQUIRED,
+    )
+    assert captured["body"]["subida"] == "3"
+    assert captured["body"]["escalaosubida_txt"] == "Sub 16"
+
+  def test_inline_subida_with_no_option_raises(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch, subida_tier=None)
+    with pytest.raises(SavConfigError, match="no subida tier"):
+      client.add_player_to_registration_batch(
+        629084, inline_subida=True, **self.REQUIRED,
+      )
+    assert "body" not in captured
+
+  def test_minor_without_guardian_fields_raises(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch, minor=True)
+    with pytest.raises(SavConfigError, match="missing required fields"):
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+  def test_minor_with_guardian_fields_commits(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch, minor=True)
+    client.add_player_to_registration_batch(
+      629084,
+      guardian_name="Pai", guardian_relation=1,
+      guardian_phone="963000000", guardian_email="p@e.pt",
+      **self.REQUIRED,
+    )
+    body = captured["body"]
+    assert body["nomeEncarregado"] == "Pai"
+    assert body["tipoRegulacao"] == "1"
+    assert body["telefoneEncarregado"] == "963000000"
+    assert body["emailEncarregado"] == "p@e.pt"
+
+  def test_missing_required_field_raises_with_field_name(self):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "2430"}
+    batch = type("BatchStub", (), {
+      "id": 1, "is_open": True, "type_id": 1, "state": "Em construção",
+      "tier": "x", "gender": "x", "tier_id": 1,
+    })()
+    client.list_player_registration_batches = lambda season=None: [batch]
+    # Missing `nif` (and all other type-1-required fields)
+    with pytest.raises(ValueError, match="1ª Inscrição.*requires"):
+      client.add_player_to_registration_batch(1, name="x", birth_date="2020-01-01")
+
+  def test_duplicate_player_raises(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {"existe": 1, "id": 99},
+    )
+    with pytest.raises(SavResponseError, match="already exists in SAV"):
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
 
 
 # ─── live read-only ─────────────────────────────────────────────────────────
@@ -361,17 +559,17 @@ class TestAddPlayerToRegistrationBatchValidation:
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
       client.add_player_to_registration_batch(999999999, 301772)
 
-  def test_non_revalidacao_batch_raises(self, client):
-    other = next(
+  def test_transferencia_batch_raises(self, client):
+    transferencia = next(
       (b for b in client.list_player_registration_batches()
-       if b.is_open and b.type_id != 2),
+       if b.is_open and b.type_id == 3),
       None,
     )
-    if other is None:
-      pytest.skip("No open non-Revalidação batch on this account")
+    if transferencia is None:
+      pytest.skip("No open Transferência batch on this account")
 
-    with pytest.raises(NotImplementedError, match="Only Revalidação"):
-      client.add_player_to_registration_batch(other.id, 301772)
+    with pytest.raises(NotImplementedError, match="Transferência"):
+      client.add_player_to_registration_batch(transferencia.id, 301772)
 
   def test_closed_batch_raises(self, client):
     closed = next(

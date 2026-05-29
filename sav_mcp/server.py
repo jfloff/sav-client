@@ -51,10 +51,13 @@ logger = logging.getLogger(__name__)
 from sav_shared.files import ensure_pdf
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_SUBIDA,
+    build_primeira_kwargs,
+    build_primeira_preview_fields,
     create_and_fetch_batch,
     derive_enrollment_params,
     gender_id_for_license,
     parse_missing_guardian_fields,
+    parsed_bool,
     resolve_player_candidates,
     resolve_subida_player,
     resolve_subida_tier,
@@ -755,16 +758,29 @@ def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
 @server.tool()
 def resolve_player(batch_number: str, mod1_id: str) -> dict:
     """
-    Resolve the player for a parsed form against the batch's eligible list.
+    Resolve the player for a parsed form against the batch.
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
-    Tries the OCR licence number first, then falls back to a name search
-    scoped to the batch's club.
+    For Revalidação (type 2): tries the OCR licence number first, then falls
+    back to a name search scoped to the batch's club.
+
+    For 1ª Inscrição (type 1): the player doesn't exist in SAV yet, so
+    there's no eligibility list to match against. Returns ``{resolved: true,
+    license: null, reg_type: 1, ocr_name, ocr_birth_date, ocr_gender_id}``
+    so the caller proceeds directly to preview_enrollment / submit_enrollment.
+    When the OCR yielded enough identifying data (gender + birth date + id
+    number) the server's op=11 duplicate check is fired pre-emptively — a
+    match means the player already has a SAV record and Revalidação is the
+    right path, so we return ``{resolved: false, error:
+    "player_already_in_sav"}`` to short-circuit before the LLM walks the
+    create-player wizard.
 
     Returns:
-      resolved=true + license  when exactly one match is found.
+      resolved=true + license  when exactly one revalidação match is found.
+      resolved=true + license:null + reg_type:1  for a fresh 1ª Inscrição.
       resolved=false + candidates  when multiple players match (user must pick).
+      resolved=false + error  when 1ª Inscrição duplicate is detected.
       resolved=false + empty candidates  when no match found (user must supply licence).
     """
     form = _forms.get(mod1_id)
@@ -778,6 +794,53 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
     batch = next((b for b in batches if b.number == batch_number), None)
     if batch is None:
         raise ValueError(f"Batch {batch_number!r} not found")
+
+    if batch.type_id == 1:
+        parsed = form["parsed"]
+        name_f = parsed.get("nome_completo")
+        bd_f = parsed.get("data_nascimento")
+        id_f = parsed.get("num_doc_identificacao")
+        ocr_name = str(name_f.value) if name_f and name_f.value else None
+        ocr_birth = str(bd_f.value) if bd_f and bd_f.value else None
+        ocr_id = str(id_f.value) if id_f and id_f.value else None
+        # Default to masculino when neither checkbox parsed (mirrors the
+        # downstream wizard default, so the duplicate probe still works).
+        gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
+
+        # Pre-emptive duplicate guard: only when OCR yielded all three
+        # identifying fields. A miss here is non-fatal — the wizard's own
+        # op=11 call at commit time will catch the case if we let it through.
+        if ocr_birth and ocr_id:
+            try:
+                dup = client._check_primeira_player_duplicate(
+                    gender_id=gender_id, birth_date=ocr_birth, id_number=ocr_id,
+                )
+            except (SavError, ValueError):
+                logger.debug("Pre-emptive op=11 failed at resolve time", exc_info=True)
+                dup = {"existe": 0}
+            if int(dup.get("existe", 0)) != 0:
+                return {
+                    "resolved": False,
+                    "license": None,
+                    "reg_type": 1,
+                    "error": "player_already_in_sav",
+                    "reason": (
+                        "A player matching the OCR'd identifying data already "
+                        "exists in SAV. 1ª Inscrição is for athletes not yet in "
+                        "the federation — use Revalidação on the existing licence."
+                    ),
+                    "existing_sav_id": dup.get("id") or dup.get("atleta") or None,
+                }
+
+        return {
+            "resolved": True,
+            "license": None,
+            "reg_type": 1,
+            "ocr_name": ocr_name,
+            "ocr_birth_date": ocr_birth,
+            "ocr_gender_id": gender_id,
+            "candidates": [],
+        }
 
     eligible = client._list_revalidable_licenses(batch)
     license, candidates, ocr_name, ocr_license = resolve_player_candidates(
@@ -867,7 +930,7 @@ def resolve_subida_target(mod4_id: str) -> dict:
 @server.tool()
 def preview_enrollment(
     batch_number: str,
-    license: int,
+    license: int | None,
     mod1_id: str,
     medical_exam_id: str | None = None,
     mod4_id: str | None = None,
@@ -877,13 +940,20 @@ def preview_enrollment(
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
-    Fetches the player's current SAV profile, runs OCR reconciliation, and
-    returns the full field-by-field picture:
+    Revalidação (license is a real SAV licence): fetches the player's current
+    SAV profile, runs OCR reconciliation, and returns the full field-by-field
+    picture:
       - Fields that match SAV (status: match) — shown for transparency
       - Fields where OCR overrides SAV (status: updated)
       - Fields where OCR confidence is too low to trust (status: needs_review)
         — the user should confirm or correct these before submitting
       - Fields with no SAV equivalent (status: ocr) — id_type, guardian_*, consent_*
+
+    1ª Inscrição (license is null/0 — the resolve_player step returned
+    reg_type=1): there is no SAV profile to reconcile against. The preview
+    echoes the OCR'd fields as-is, marking any required-but-missing or
+    low-confidence reads as needs_review so the caller supplies them via
+    field_overrides on submit_enrollment.
 
     The reconciliation result is cached internally so submit_enrollment can
     use it without repeating the network call. When medical_exam_id is
@@ -907,17 +977,6 @@ def preview_enrollment(
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
-    # resolve_player runs first in this workflow → search_players already
-    # populated the license→id cache, so this is free.
-    sav_profile = client.load_player_profile(license)
-    result = reconcile_fpb_mod1(form["parsed"], sav_profile, client=client)
-
-    form["reconcile_result"] = result
-    form["sav_profile"] = sav_profile
-
-    # Route: a mod1 is always present here, so this is a 1ª Inscrição /
-    # Revalidação; a mod4 alongside it promotes the player inline. Reject the
-    # contradictory combo (a standalone Subida batch can't carry an inline rider).
     reg_type = form.get("reg_type")
     inline_subida = mod4_id is not None
     if reg_type is not None:
@@ -929,19 +988,60 @@ def preview_enrollment(
         else f"{reg_type_label} (no subida)"
     )
 
-    preview = {
-        "player": {
-            "name": sav_profile.get("nome", ""),
-            "license": license,
-            "birth_date": sav_profile.get("nasc", ""),
-        },
-        "fields": _build_preview_fields(result, sav_profile),
-        "needs_review": result.needs_review,
-        "reg_type": reg_type,
-        "reg_type_label": reg_type_label,
-        "inline_subida": inline_subida,
-        "enrollment_route": enrollment_route,
-    }
+    if reg_type == 1:
+        # No SAV profile, no reconciliation — echo the OCR fields and mark
+        # missing-required / low-confidence as needs_review.
+        # concelhos lookup so concelho_id resolves; distrito is OCR-derived
+        # so we only fetch when OCR yielded a distrito.
+        parsed = form["parsed"]
+        from sav_shared.fpb_mod1 import effective_distrito_id
+        distrito_id = effective_distrito_id(parsed, {})
+        concelhos = client.list_concelhos(distrito_id) if distrito_id else {}
+        kwargs = build_primeira_kwargs(parsed, concelhos=concelhos)
+        fields, needs_review = build_primeira_preview_fields(parsed, kwargs)
+        form["primeira_kwargs"] = kwargs
+        form["primeira_concelhos"] = concelhos
+        form["previewed"] = True
+        preview = {
+            "player": {
+                "name": kwargs.get("name") or "",
+                "license": None,
+                "birth_date": kwargs.get("birth_date") or "",
+            },
+            "fields": fields,
+            "needs_review": needs_review,
+            "reg_type": reg_type,
+            "reg_type_label": reg_type_label,
+            "inline_subida": inline_subida,
+            "enrollment_route": enrollment_route,
+        }
+    else:
+        if license in (None, 0):
+            raise ValueError(
+                f"Revalidação preview requires a non-zero license; got {license!r}."
+            )
+        # resolve_player runs first in this workflow → search_players already
+        # populated the license→id cache, so this is free.
+        sav_profile = client.load_player_profile(license)
+        result = reconcile_fpb_mod1(form["parsed"], sav_profile, client=client)
+
+        form["reconcile_result"] = result
+        form["sav_profile"] = sav_profile
+        form["previewed"] = True
+
+        preview = {
+            "player": {
+                "name": sav_profile.get("nome", ""),
+                "license": license,
+                "birth_date": sav_profile.get("nasc", ""),
+            },
+            "fields": _build_preview_fields(result, sav_profile),
+            "needs_review": result.needs_review,
+            "reg_type": reg_type,
+            "reg_type_label": reg_type_label,
+            "inline_subida": inline_subida,
+            "enrollment_route": enrollment_route,
+        }
     if medical_exam_id is not None:
         artifact = _forms.get(medical_exam_id)
         if artifact is None:
@@ -961,22 +1061,31 @@ def preview_enrollment(
 @server.tool()
 def submit_enrollment(
     batch_number: str,
-    license: int,
+    license: int | None,
     mod1_id: str,
     field_overrides: dict[str, Any] | None = None,
     medical_exam_id: str | None = None,
     mod4_id: str | None = None,
 ) -> dict:
     """
-    Submit the player enrollment using the reconciled data from preview_enrollment.
+    Submit the player enrollment using the data prepared by preview_enrollment.
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
-    field_overrides should supply values for every field listed in
-    needs_review plus any guardian fields required for minors
-    (guardian_name, guardian_relation, guardian_phone, guardian_email).
-    It must include exam_date (YYYY-MM-DD) when no usable medical exam date
-    is available. It may also override any parsed exame_medico date when
+    Revalidação (license is a real SAV licence): the reconciled kwargs from
+    preview_enrollment are used; field_overrides supply values for every
+    field listed in needs_review.
+
+    1ª Inscrição (license is null/0): the OCR-derived demographics from
+    preview_enrollment are used; field_overrides supply values for the
+    needs_review list (typically missing-or-low-confidence reads). The
+    wizard's op=11 duplicate check inside the SAV client guards against
+    accidentally creating a player who already exists.
+
+    field_overrides should supply guardian fields required for minors
+    (guardian_name, guardian_relation, guardian_phone, guardian_email) and
+    must include exam_date (YYYY-MM-DD) when no usable medical exam date is
+    available. It may also override any parsed exame_medico date when
     medical_exam_id is supplied.
 
     mod4_id (from parse_enrollment_forms) adds an inline subida de escalão to
@@ -986,7 +1095,7 @@ def submit_enrollment(
     rider, not a standalone type-4 Subida batch.)
 
     Returns:
-      success=true + player_id  on success.
+      success=true + player_id (+ license for 1ª Inscrição) on success.
       success=false + missing_guardian_fields  when the player is a minor and
         guardian info is absent — call submit_enrollment again with those fields
         added to field_overrides.
@@ -1005,8 +1114,11 @@ def submit_enrollment(
     if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
-    result = form.get("reconcile_result")
-    if result is None:
+    reg_type = form.get("reg_type")
+    # Revalidação caches a ReconcileResult; type-1 sets `previewed: True`
+    # (no reconcile to cache). Either signal counts as "preview ran".
+    previewed = form.get("previewed") or (form.get("reconcile_result") is not None)
+    if not previewed:
         raise ValueError("Call preview_enrollment before submit_enrollment")
 
     medical_exam: dict[str, Any] | None = None
@@ -1027,14 +1139,49 @@ def submit_enrollment(
         if mod4.get("doc_type") != DocType.FPB_MODELO_4:
             raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
     inline_subida = mod4 is not None
-    reg_type = form.get("reg_type")
     if reg_type is not None:
         validate_subida_combo(reg_type, inline_subida)
 
-    kwargs = dict(result.kwargs)
-    kwargs.pop("license", None)
+    client = _get_client()
+
+    # Build the wizard kwargs from the cached preview state. For Revalidação
+    # this is the ReconcileResult; for 1ª Inscrição it's the OCR-derived dict.
+    if reg_type == 1:
+        kwargs = dict(form.get("primeira_kwargs") or {})
+        needs_review: list[str] = []
+        retrain_corrections: dict[str, str] = {}
+    else:
+        if license in (None, 0):
+            raise ValueError(
+                f"Revalidação submit requires a non-zero license; got {license!r}."
+            )
+        result = form.get("reconcile_result")
+        if result is None:
+            raise ValueError("Call preview_enrollment before submit_enrollment")
+        kwargs = dict(result.kwargs)
+        kwargs.pop("license", None)
+        needs_review = result.needs_review
+        retrain_corrections = result.retrain_corrections
+
     if medical_exam_info and medical_exam_info.exam_date:
         kwargs["exam_date"] = medical_exam_info.exam_date
+    if mod4 is not None:
+        # The mod4 names the target escalão — resolve it to a SAV tier_id and
+        # hand it to the wizard as promote_to_tier_id. _pick_subida_tier
+        # enforces that the form's stated target matches what SAV offers.
+        # OCR miss on escalao_subida → skip the hint and let the wizard pick.
+        # Type-1 has no licence yet, so we read gender from the OCR kwargs;
+        # type-2 looks it up against SAV.
+        escalao_field = mod4["parsed"].get("escalao_subida")
+        if escalao_field and escalao_field.value:
+            gender_for_subida = (
+                kwargs.get("gender_id")
+                if reg_type == 1
+                else gender_id_for_license(client, license)
+            )
+            kwargs["promote_to_tier_id"] = resolve_subida_tier(
+                mod4["parsed"], client, gender_id=gender_for_subida,
+            )
     if field_overrides:
         kwargs.update(field_overrides)
     manual_exam_override = bool(
@@ -1051,11 +1198,10 @@ def submit_enrollment(
             "field_overrides={'exam_date': 'YYYY-MM-DD'}."
         )
 
-    client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
     try:
         player_id = client.add_player_to_registration_batch(
-            batch_id, license, inline_subida=inline_subida, **kwargs,
+            batch_id, license or 0, inline_subida=inline_subida, **kwargs,
         )
     except SavConfigError as exc:
         # Only minor/guardian errors are retry cases; they carry the field list
@@ -1068,40 +1214,53 @@ def submit_enrollment(
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
         }
 
+    # For 1ª Inscrição, SAV assigned a brand-new licence at commit time but
+    # op=27 doesn't return it. Look it up by matching the just-created
+    # player's name in the batch listing so the document uploads can target it.
+    upload_license: int | None = license if license else None
+    if reg_type == 1:
+        name_supplied = (kwargs.get("name") or "").strip().casefold()
+        try:
+            for item in client.list_player_registration_batch_items(batch_id):
+                if item["name"].strip().casefold() == name_supplied:
+                    upload_license = int(item["license"])
+                    break
+        except (SavError, ValueError):
+            logger.debug(
+                "Could not resolve new licence for type-1 upload", exc_info=True,
+            )
+
     # Auto-upload the source PDF as fpb_modelo_1 (parity with `sav enroll`).
     # Non-fatal: enrollment is already committed, so we just record the
     # outcome on the response and let the caller retry via
-    # upload_player_document if it fails.
-    upload_status = _replace_player_document_from_bytes(
-        client,
-        batch_id,
-        license,
-        form.get("pdf_bytes"),
-        doc_type=form["doc_type"],
-        parsed=form.get("parsed"),
-        reg_type=form.get("reg_type"),
+    # upload_player_document if it fails. For type-1, when the licence
+    # lookup failed we skip the upload and surface a clear status.
+    skipped_upload = {
+        "doc_type": form["doc_type"].value, "status": "skipped",
+        "error": "Could not resolve new licence after type-1 commit",
+    }
+    upload_status = (
+        _replace_player_document_from_bytes(
+            client, batch_id, upload_license, form.get("pdf_bytes"),
+            doc_type=form["doc_type"],
+            parsed=form.get("parsed"),
+            reg_type=form.get("reg_type"),
+        )
+        if upload_license else skipped_upload
     )
     medical_exam_upload = (
         _replace_player_document_from_bytes(
-            client,
-            batch_id,
-            license,
-            medical_exam.get("pdf_bytes"),
-            doc_type=medical_exam["doc_type"],
+            client, batch_id, upload_license,
+            medical_exam.get("pdf_bytes"), doc_type=medical_exam["doc_type"],
         )
-        if medical_exam is not None
-        else None
+        if (medical_exam is not None and upload_license) else None
     )
     subida_document_upload = (
         _replace_player_document_from_bytes(
-            client,
-            batch_id,
-            license,
-            mod4.get("pdf_bytes"),
-            doc_type=mod4["doc_type"],
+            client, batch_id, upload_license,
+            mod4.get("pdf_bytes"), doc_type=mod4["doc_type"],
         )
-        if mod4 is not None
-        else None
+        if (mod4 is not None and upload_license) else None
     )
 
     # Only send corrections the user explicitly answered (needs_review).
@@ -1109,12 +1268,12 @@ def submit_enrollment(
     # retrain_corrections are SAV-side truths for read-only fields (nif,
     # data_nascimento) — always merged so the labeled doc anchors to them.
     corrections: dict[str, str] = {}
-    for kwarg in result.needs_review:
+    for kwarg in needs_review:
         entity = KWARG_TO_ENTITY.get(kwarg)
         val = kwargs.get(kwarg)
         if entity and val is not None:
             corrections[entity] = str(val)
-    corrections.update(result.retrain_corrections)
+    corrections.update(retrain_corrections)
     try:
         close_processing(form["processing_id"], corrections=corrections or None)
     except Exception:
@@ -1135,8 +1294,10 @@ def submit_enrollment(
     return {
         "success": True,
         "player_id": player_id,
-        "license": license,
-        "name": sav_profile.get("nome", ""),
+        "license": upload_license,
+        "name": (
+            kwargs.get("name") if reg_type == 1 else sav_profile.get("nome", "")
+        ) or "",
         "source_document_upload": upload_status,
         "medical_exam_upload": medical_exam_upload,
         "inline_subida": inline_subida,

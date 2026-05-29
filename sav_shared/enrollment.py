@@ -8,10 +8,31 @@ from typing import Any
 
 from sav_client.exceptions import SavError
 
-from .fields import ENROLLMENT_FIELD_META
+from .fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from .text import normalise_text
 
 logger = logging.getLogger(__name__)
+
+# Type-1 wizard required kwargs (mandatory for the SAV2 1ª Inscrição submit).
+# Optional ones (telefone, nome_pai/mae, country/naturalidade overrides) stay
+# off the list; the wizard defaults them.
+REQUIRED_PRIMEIRA_KWARGS: tuple[str, ...] = (
+  "name", "birth_date", "gender_id", "nif",
+  "id_type", "id_number", "id_expiry", "email",
+  "morada", "cod_postal", "distrito_id", "concelho_id",
+)
+
+# kwarg → OCR entity used to look up confidence when the kwarg isn't in
+# KWARG_TO_ENTITY (those are reconciled-text fields only). For type-1 we also
+# care about read-only fields (nif, birth_date) and checkbox-group fields
+# (gender_id, id_type) — flagging low-confidence reads as needs_review.
+_PRIMEIRA_KWARG_OCR_ENTITY: dict[str, str | tuple[str, ...]] = {
+  "name": "nome_completo",
+  "birth_date": "data_nascimento",
+  "nif": "nif",
+  "gender_id": ("genero_feminino", "genero_masculino"),
+  "id_type": ("tipo_doc_cc", "tipo_doc_passaporte", "tipo_doc_outro"),
+}
 
 
 _DEFAULT_GUARDIAN_FIELDS = [
@@ -209,6 +230,115 @@ def derive_enrollment_params(
       f"Tier {raw_name!r} not found for {gender_label}. Available: {available}"
     )
   return reg_type, match[0], gender_id
+
+
+def build_primeira_kwargs(
+  parsed: dict, *, concelhos: dict[int, str] | None = None,
+) -> dict[str, Any]:
+  """Map a parsed mod1 to type-1 wizard kwargs (no SAV reconciliation).
+
+  Builds on ``fpb_mod1_to_sav_kwargs`` (id-doc / contact / address / guardian
+  / consents) and adds the type-1-only demographics — ``name``,
+  ``birth_date``, ``gender_id``, ``nif`` — that revalidação reads from the
+  existing SAV record. The returned dict is suitable to splat directly into
+  ``add_player_to_registration_batch(batch_id, **kwargs)`` on a type-1 batch
+  (drop ``license`` and the wizard will create it via op=12).
+
+  ``concelhos`` is the distrito-scoped {id → name} lookup; without it the
+  concelho_id resolution will fail and the field appears in the preview's
+  needs_review list so the caller supplies it explicitly.
+  """
+  from .fpb_mod1 import fpb_mod1_to_sav_kwargs
+
+  base = fpb_mod1_to_sav_kwargs(parsed, concelhos=concelhos)
+  base.pop("license", None)
+
+  def val(key: str) -> Any:
+    f = parsed.get(key)
+    return f.value if f else None
+
+  base["name"] = val("nome_completo")
+  base["birth_date"] = val("data_nascimento")
+  base["nif"] = val("nif")
+  # genero_feminino takes precedence; default to masculino when neither is
+  # checked rather than dropping the field — the wizard requires a value.
+  base["gender_id"] = 2 if parsed_bool(parsed, "genero_feminino") else 1
+  return base
+
+
+def _ocr_confidence(parsed: dict, kwarg: str) -> float | None:
+  """Look up the OCR confidence for the entity backing a wizard kwarg.
+
+  Returns ``None`` when no entity is known for the kwarg (the field has no
+  OCR source — derived defaults like nationality_id), when the entity didn't
+  parse, or when the entity has no recorded confidence. For checkbox-group
+  kwargs (gender_id, id_type) we pick the confidence of whichever checkbox
+  was actually marked, since the unchecked ones carry no useful signal.
+  """
+  entity = _PRIMEIRA_KWARG_OCR_ENTITY.get(kwarg) or KWARG_TO_ENTITY.get(kwarg)
+  if entity is None:
+    return None
+  entities = (entity,) if isinstance(entity, str) else entity
+  for e in entities:
+    f = parsed.get(e)
+    if f and f.value:
+      return f.confidence
+  return None
+
+
+def build_primeira_preview_fields(
+  parsed: dict,
+  kwargs: dict[str, Any],
+  *,
+  low_confidence_threshold: float = 0.60,
+) -> tuple[list[dict], list[str]]:
+  """Echo a type-1 kwargs dict as preview field rows (no SAV reconciliation).
+
+  Status mapping:
+    * ``"ocr"`` — value present and OCR confidence is acceptable (or no
+      confidence is recorded, e.g. derived defaults).
+    * ``"needs_review"`` — value missing for a required kwarg, OR the OCR
+      confidence is below ``low_confidence_threshold``.
+
+  Optional kwargs (telefone, nome_pai, etc.) that are missing are omitted
+  rather than shown as needs_review — they're not required to commit.
+  """
+  fields: list[dict] = []
+  needs_review: list[str] = []
+  shown: set[str] = set()
+  required = set(REQUIRED_PRIMEIRA_KWARGS)
+
+  ordered = list(REQUIRED_PRIMEIRA_KWARGS) + [
+    k for k in kwargs if k not in required
+  ]
+  for kwarg in ordered:
+    if kwarg in shown:
+      continue
+    shown.add(kwarg)
+    value = kwargs.get(kwarg)
+    missing = value in (None, "")
+    if missing and kwarg not in required:
+      continue
+    confidence = _ocr_confidence(parsed, kwarg)
+    if missing:
+      status = "needs_review"
+    elif confidence is not None and confidence < low_confidence_threshold:
+      status = "needs_review"
+    else:
+      status = "ocr"
+    if status == "needs_review":
+      needs_review.append(kwarg)
+    label = ENROLLMENT_FIELD_META.get(kwarg, (kwarg, ""))[0]
+    fields.append({
+      "kwarg": kwarg, "label": label,
+      "sav_value": None,
+      "ocr_value": value,
+      "final_value": value if status == "ocr" else None,
+      "status": status,
+      **({"confidence": round(confidence, 2)} if confidence is not None else {}),
+    })
+
+  return fields, needs_review
 
 
 def parse_missing_guardian_fields(exc: Exception) -> list[str]:
