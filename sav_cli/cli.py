@@ -791,8 +791,12 @@ def clubs_cmd(ctx, query, association, all_associations):
 @click.option("--wallet", default="", help="Filter by carteira/wallet number.")
 @click.option("--tptd", default="", help="Filter by TPTD number (not returned in the result rows).")
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching coaches.")
+@click.option(
+  "--with-details", "with_details", is_flag=True, default=False,
+  help="Fetch each coach's profile to populate NIF/TPTD/TPTD expiry. Issues one extra request per coach.",
+)
 @click.pass_context
-def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count):
+def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, with_details):
   """List coaches registered to one or more clubs for a season."""
   output = ctx.obj["output"]
 
@@ -808,6 +812,7 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count):
       results.extend(client.list_coaches(
         cid, season=season, status=status,
         gender=gender, name=name, wallet=wallet, tptd=tptd,
+        with_details=with_details,
       ))
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
@@ -853,6 +858,8 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count):
   if output == "csv":
     default_fields = ["id", "carreira_id", "wallet", "name", "association", "club",
                       "gender", "season", "grade", "birth_date", "active"]
+    if with_details:
+      default_fields += ["nif", "tptd", "tptd_expiry"]
     rows = _project([asdict(c) for c in results], fields)
     csv_fields = fields or default_fields
     click.echo(",".join(csv_fields))
@@ -874,7 +881,13 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count):
     ]
     for c in results
   ]
-  _render_table(headers, rows_t, max_widths=[None, 28, 20, None, None, None, None, None])
+  widths: list = [None, 28, 20, None, None, None, None, None]
+  if with_details:
+    headers += ["NIF", "TPTD", "TPTD Expiry"]
+    for i, c in enumerate(results):
+      rows_t[i].extend([c.nif, c.tptd, c.tptd_expiry])
+    widths += [None, None, None]
+  _render_table(headers, rows_t, max_widths=widths)
   click.echo(f"\n{len(results)} coach(es) found.")
 
 

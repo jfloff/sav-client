@@ -255,6 +255,7 @@ def list_coaches(
     gender: int = 0,
     name: str = "",
     tptd: str = "",
+    with_details: bool = False,
 ) -> list[dict]:
     """
     List coaches (treinadores) registered to a club for one season.
@@ -265,6 +266,9 @@ def list_coaches(
     gender: 0 = any, 1 = Masculino, 2 = Feminino.
     name: prefix match on full name (starts-with), not substring.
     tptd: filter by TPTD number; note the result rows do not include TPTD.
+    with_details: when true, issue one extra request per coach to fill
+        nif, tptd, and tptd_expiry in the returned rows. Off by default
+        because it is N+1.
     """
     client = _get_client()
     effective_club: int = (
@@ -278,8 +282,9 @@ def list_coaches(
         gender=gender,
         name=name,
         tptd=tptd,
+        with_details=with_details,
     )
-    return [coach_to_dict(c) for c in coaches]
+    return [coach_to_dict(c, with_details=with_details) for c in coaches]
 
 
 # ── Games & sheets ────────────────────────────────────────────────────────────

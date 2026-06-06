@@ -186,6 +186,10 @@ class Coach:
       grade:        Formation grade, e.g. "Grau 3", "Estagiário Grau 2".
       birth_date:   Birth date string (YYYY-MM-DD).
       active:       True when the status icon indicates "Activo".
+      nif:          Portuguese tax number. Empty unless fetched via
+                    ``get_coach_detail`` or ``list_coaches(with_details=True)``.
+      tptd:         TPTD number (Nr. TPTD). Empty unless detail was fetched.
+      tptd_expiry:  TPTD expiry date (DD-MM-YYYY). Empty unless detail was fetched.
   """
 
   id: int
@@ -199,6 +203,9 @@ class Coach:
   grade: str
   birth_date: str
   active: bool = False
+  nif: str = ""
+  tptd: str = ""
+  tptd_expiry: str = ""
 
   def __repr__(self) -> str:
     return (

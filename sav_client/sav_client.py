@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from dataclasses import replace as _dc_replace
 from datetime import date
 from typing import Any
 from urllib.parse import urljoin
@@ -64,6 +65,8 @@ _GAMES_OP = "3"
 _COACHES_PATH = "php/treinadordb.php"
 _COACHES_OP = "1"
 _COACHES_PERFIL = "4"
+_COACH_DETAIL_PATH = "php/treinadordb.php"
+_COACH_DETAIL_OP = "2"
 _ATHLETE_DETAIL_PATH = "php/jogadoresdb.php"
 _ATHLETE_DETAIL_OP = "2"
 _CLUB_DETAIL_PATH = "php/clubesdb.php"
@@ -779,6 +782,7 @@ class SavClient:
     tptd: str = "",
     id_doc: str = "",
     birth_date: str = "",
+    with_details: bool = False,
   ) -> list[Coach]:
     """
     List coaches (treinadores) registered to a club for one season.
@@ -803,6 +807,9 @@ class SavClient:
         tptd:              Filter by TPTD number.
         id_doc:            Filter by ID document number.
         birth_date:        Filter by birth date (YYYY-MM-DD).
+        with_details:      When True, issue one extra request per coach to
+                           populate ``nif``, ``tptd``, and ``tptd_expiry``.
+                           Off by default because it is N+1.
 
     Returns:
         List of Coach objects parsed from the HTML response.
@@ -841,7 +848,61 @@ class SavClient:
     coaches = self._parse_coaches_response(html)
     if status_filter is not None:
       coaches = [c for c in coaches if c.active == status_filter]
+
+    if with_details:
+      enriched: list[Coach] = []
+      for c in coaches:
+        detail = self.get_coach_detail(c.id)
+        enriched.append(_dc_replace(
+          c, nif=detail.nif, tptd=detail.tptd, tptd_expiry=detail.tptd_expiry,
+        ))
+      coaches = enriched
+
     return coaches
+
+  def get_coach_detail(self, coach_id: int) -> Coach:
+    """
+    Fetch the SAV2 coach profile page to obtain ``nif``, ``tptd``, and
+    ``tptd_expiry`` for a single coach.
+
+    The SAV2 coaches listing does not expose these fields; this method
+    issues an extra ``treinadordb.php?op=2`` request per coach and parses
+    the embedded HTML form. Use sparingly: this is the N+1 hop behind
+    ``list_coaches(with_details=True)``.
+
+    Args:
+        coach_id: Internal SAV2 person ID (``Coach.id``).
+
+    Returns:
+        A partial Coach with ``id``, ``name``, ``nif``, ``tptd``, and
+        ``tptd_expiry`` populated; listing-only fields (wallet, club,
+        association, …) are left empty.
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError("Must call login() before get_coach_detail()")
+
+    payload = {
+      "user_id": coach_id,
+      "user": self.session.get("user", ""),
+      "perfil": _COACHES_PERFIL,
+      "organizacao": self.session.get("organizacao", 0),
+    }
+
+    logger.info("Fetching coach detail id=%s", coach_id)
+    text = self._post_form(_COACH_DETAIL_PATH, payload, params={"op": _COACH_DETAIL_OP})
+    try:
+      # SAV2 occasionally emits raw CR/LF inside string values; strict=False
+      # tolerates that without losing the embedded HTML.
+      raw = json.loads(text, strict=False)
+    except ValueError as exc:
+      raise SavResponseError(
+        f"Coach detail response was not valid JSON: {text[:200]!r}"
+      ) from exc
+    return self._parse_coach_detail_response(raw, coach_id=coach_id)
 
   @staticmethod
   def _parse_coach_status_filter(status: str) -> bool | None:
@@ -4229,6 +4290,46 @@ class SavClient:
 
     logger.info("Parsed %d coaches from search response", len(coaches))
     return coaches
+
+  def _parse_coach_detail_response(self, raw: dict[str, Any], *, coach_id: int) -> Coach:
+    """
+    Parse the JSON envelope returned by ``treinadordb.php?op=2``.
+
+    The server returns ``{"nome": str, "roles": int, "msg": "<html>..."}``
+    where ``msg`` carries a multi-tab profile form. We pull out:
+      - ``nif``           from ``<input id='nif' value='...'>``
+      - ``tptd``          from ``<input id='nrtptd' value='...'>``
+      - ``tptd_expiry``   from ``<input id='validadetptd' value='...'>``
+
+    Any field missing from the HTML is returned as an empty string rather
+    than raising — the form layout differs slightly between profile types.
+    """
+    if "msg" not in raw:
+      raise SavResponseError(
+        f"Coach detail response missing 'msg' field: {list(raw.keys())}"
+      )
+
+    html = raw["msg"]
+    name = str(raw.get("nome", ""))
+
+    import re
+    def _input_value(field_id: str) -> str:
+      m = re.search(
+        rf"<input[^>]*\bid=['\"]{re.escape(field_id)}['\"][^>]*\bvalue=['\"]([^'\"]*)['\"]",
+        html,
+      )
+      return m.group(1) if m else ""
+
+    return Coach(
+      id=coach_id, carreira_id=0,
+      wallet="", name=name,
+      association="", club="",
+      gender="", season="", grade="", birth_date="",
+      active=False,
+      nif=_input_value("nif"),
+      tptd=_input_value("nrtptd"),
+      tptd_expiry=_input_value("validadetptd"),
+    )
 
   def _parse_games_response(self, raw: dict[str, Any]) -> list[Game]:
     """

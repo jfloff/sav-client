@@ -30,8 +30,8 @@ def club_to_dict(c: Any) -> dict:
   return {"id": c.id, "name": c.name, "full_name": c.full_name, "code": c.code}
 
 
-def coach_to_dict(c: Any) -> dict:
-  return {
+def coach_to_dict(c: Any, *, with_details: bool = False) -> dict:
+  out = {
     "id": c.id, "carreira_id": c.carreira_id,
     "wallet": c.wallet, "name": c.name,
     "club": c.club, "association": c.association,
@@ -39,6 +39,11 @@ def coach_to_dict(c: Any) -> dict:
     "grade": c.grade, "birth_date": c.birth_date,
     "active": c.active,
   }
+  if with_details:
+    out["nif"] = getattr(c, "nif", "")
+    out["tptd"] = getattr(c, "tptd", "")
+    out["tptd_expiry"] = getattr(c, "tptd_expiry", "")
+  return out
 
 
 def batch_to_dict(b: Any) -> dict:
