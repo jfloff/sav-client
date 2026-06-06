@@ -79,6 +79,7 @@ from sav_shared.medical_exam import extract_medical_exam_info
 from sav_shared.serializers import (
     batch_to_dict,
     club_to_dict,
+    coach_to_dict,
     game_to_dict,
     player_to_dict,
 )
@@ -242,6 +243,43 @@ def list_clubs(association_id: int) -> list[dict]:
     client = _get_client()
     clubs = client.list_clubs(association=association_id)
     return [club_to_dict(c) for c in clubs]
+
+
+# ── Coaches ───────────────────────────────────────────────────────────────────
+
+@server.tool()
+def list_coaches(
+    club_id: int | None = None,
+    season: int | None = None,
+    status: str = "active",
+    gender: int = 0,
+    name: str = "",
+    tptd: str = "",
+) -> list[dict]:
+    """
+    List coaches (treinadores) registered to a club for one season.
+
+    club_id defaults to the session's own club when omitted.
+    season defaults to the current epoch.
+    status: "active" | "inactive" | "all" (default: active).
+    gender: 0 = any, 1 = Masculino, 2 = Feminino.
+    name: prefix match on full name (starts-with), not substring.
+    tptd: filter by TPTD number; note the result rows do not include TPTD.
+    """
+    client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    coaches = client.list_coaches(
+        effective_club,
+        season=season,
+        status=status,
+        gender=gender,
+        name=name,
+        tptd=tptd,
+    )
+    return [coach_to_dict(c) for c in coaches]
 
 
 # ── Games & sheets ────────────────────────────────────────────────────────────

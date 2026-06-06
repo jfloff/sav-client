@@ -40,7 +40,7 @@ from .exceptions import (
   SavResponseError,
 )
 from .cache import Cache
-from .models import Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
+from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
 from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import player_registration_tiers
@@ -61,6 +61,9 @@ _CLUBS_BY_ASSOC_PATH = "php/jogadoresdb.php"
 _CLUBS_BY_ASSOC_OP = "25"
 _GAMES_PATH = "php/jogosdb.php"
 _GAMES_OP = "3"
+_COACHES_PATH = "php/treinadordb.php"
+_COACHES_OP = "1"
+_COACHES_PERFIL = "4"
 _ATHLETE_DETAIL_PATH = "php/jogadoresdb.php"
 _ATHLETE_DETAIL_OP = "2"
 _CLUB_DETAIL_PATH = "php/clubesdb.php"
@@ -760,6 +763,97 @@ class SavClient:
         f"Games response was not valid JSON: {text[:200]!r}"
       ) from exc
     return self._parse_games_response(raw)
+
+  def list_coaches(
+    self,
+    club: int,
+    *,
+    season: int | None = None,
+    association: int | None = None,
+    name: str = "",
+    wallet: str = "",
+    status: str = "active",
+    gender: int = 0,
+    formation_level: int = 0,
+    competitive_level: int = 0,
+    tptd: str = "",
+    id_doc: str = "",
+    birth_date: str = "",
+  ) -> list[Coach]:
+    """
+    List coaches (treinadores) registered to a club for one season.
+
+    The SAV2 form endpoint is shared with the federation-wide coach search,
+    so this client always sends ``perfil=4`` (the coaches profile) regardless
+    of the session's own perfil.
+
+    Args:
+        club:              SAV2 club ID (required).
+        season:            SAV2 epoch ID. Defaults to the current session epoch.
+        association:       SAV2 association ID. ``None`` means no association
+                           filter.
+        name:              Filter by coach name. Server matches as a prefix
+                           on the full name (starts-with), not a substring.
+        wallet:            Filter by carteira number (exact).
+        status:            ``"active"`` (default), ``"inactive"``, or ``"all"``.
+                           Applied client-side using ``Coach.active``.
+        gender:            0 = any, 1 = Masculino, 2 = Feminino.
+        formation_level:   ``nr_formacao`` numeric code (0 = any).
+        competitive_level: ``nr_competitivo`` numeric code (0 = any).
+        tptd:              Filter by TPTD number.
+        id_doc:            Filter by ID document number.
+        birth_date:        Filter by birth date (YYYY-MM-DD).
+
+    Returns:
+        List of Coach objects parsed from the HTML response.
+
+    Raises:
+        SavResponseError:   If the response cannot be parsed.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError("Must call login() before list_coaches()")
+
+    status_filter = self._parse_coach_status_filter(status)
+
+    if season is None:
+      season = int(self.session.get("epoca_id") or 0)
+
+    payload = {
+      "treinadorClube": club,
+      "jc_epocaTrei": season,
+      "jc_treinadorAss": "" if association is None else association,
+      "jc_treiNome": name,
+      "jc_numCarteira": wallet,
+      "perfil": _COACHES_PERFIL,
+      "user": self.session.get("user", ""),
+      "organizacao": self.session.get("organizacao", 0),
+      "nr_numidentificacao": tptd,
+      "nr_formacao": formation_level,
+      "nr_competitivo": competitive_level,
+      "genero": gender,
+      "identificação": id_doc,
+      "findByBirth": birth_date,
+    }
+
+    logger.info("Listing coaches club=%s filters: %s", club, payload)
+    html = self._post_form(_COACHES_PATH, payload, params={"op": _COACHES_OP})
+    coaches = self._parse_coaches_response(html)
+    if status_filter is not None:
+      coaches = [c for c in coaches if c.active == status_filter]
+    return coaches
+
+  @staticmethod
+  def _parse_coach_status_filter(status: str) -> bool | None:
+    """Normalise a coach status filter to active/inactive/all."""
+    wanted = status.strip().lower()
+    if wanted in ("", "all"):
+      return None
+    if wanted == "active":
+      return True
+    if wanted == "inactive":
+      return False
+    raise ValueError("status must be 'active', 'inactive', or 'all'")
 
   def get_game_sheet_pdf(self, game_id: int) -> bytes | None:
     """
@@ -4070,6 +4164,71 @@ class SavClient:
 
     logger.info("Parsed %d players from search response", len(players))
     return players
+
+  def _parse_coaches_response(self, html: str) -> list[Coach]:
+    """
+    Parse the HTML table returned by the coach search endpoint
+    (``treinadordb.php?op=1``).
+
+    Each ``<tr>`` in the ``<tbody>`` maps to one Coach. The columns are:
+      0: actions buttons (contain ``seeHistorico(carreira_id)`` and
+                          ``seeTreinador(person_id)``)
+      1: status icon     (``fa-color-activo`` → active)
+      2: wallet number
+      3: name
+      4: association
+      5: club
+      6: gender
+      7: season
+      8: grade (formação)
+      9: birth date
+
+    Raises:
+        SavResponseError: If the expected table is absent from the response.
+    """
+    from bs4 import BeautifulSoup
+    import re
+
+    soup = BeautifulSoup(html, "html.parser")
+    tbody = soup.find("tbody")
+    if tbody is None:
+      raise SavResponseError(
+        f"Coach search response missing expected table: {html[:200]!r}"
+      )
+
+    coaches: list[Coach] = []
+    for row in tbody.find_all("tr"):
+      cells = row.find_all("td")
+      if len(cells) < 10:
+        continue
+
+      onclicks = " ".join(b.get("onclick", "") for b in cells[0].find_all("button"))
+      person_match = re.search(r"seeTreinador\((\d+)", onclicks)
+      carreira_match = re.search(r"seeHistorico\((\d+)", onclicks)
+      person_id = int(person_match.group(1)) if person_match else 0
+      carreira_id = int(carreira_match.group(1)) if carreira_match else 0
+
+      icon = cells[1].find("i")
+      icon_classes = " ".join(icon.get("class", [])) if icon else ""
+      icon_title = (icon.get("data-original-title", "") if icon else "").lower()
+      active = "fa-color-activo" in icon_classes or icon_title == "activo"
+
+      coaches.append(Coach(
+        id=person_id,
+        carreira_id=carreira_id,
+        wallet=cells[2].get_text(strip=True),
+        name=cells[3].get_text(strip=True),
+        association=cells[4].get_text(strip=True),
+        club=cells[5].get_text(strip=True),
+        gender=cells[6].get_text(strip=True),
+        season=cells[7].get_text(strip=True),
+        grade=cells[8].get_text(strip=True),
+        birth_date=cells[9].get_text(strip=True),
+        active=active,
+      ))
+
+    logger.info("Parsed %d coaches from search response", len(coaches))
+    return coaches
 
   def _parse_games_response(self, raw: dict[str, Any]) -> list[Game]:
     """

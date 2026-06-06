@@ -776,6 +776,108 @@ def clubs_cmd(ctx, query, association, all_associations):
 
 
 
+@cli.command("coaches")
+@click.option("--club", "clubs", default=None, multiple=True, required=True, help="Club ID or name fragment; repeatable.")
+@click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current).")
+@click.option(
+  "--status",
+  default="active",
+  show_default=True,
+  type=click.Choice(["active", "inactive", "all"], case_sensitive=False),
+  help="Filter by coach status.",
+)
+@click.option("--gender", default=0, type=int, help="Filter by gender code (0 = any, 1 = M, 2 = F).")
+@click.option("--name", default="", help="Filter by coach name (server matches as prefix on full name, not substring).")
+@click.option("--wallet", default="", help="Filter by carteira/wallet number.")
+@click.option("--tptd", default="", help="Filter by TPTD number (not returned in the result rows).")
+@click.option("--count", is_flag=True, default=False, help="Return only the number of matching coaches.")
+@click.pass_context
+def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count):
+  """List coaches registered to one or more clubs for a season."""
+  output = ctx.obj["output"]
+
+  client = _make_client()
+
+  club_ids: list[int] = []
+  for c in clubs:
+    club_ids.extend(_resolve_clubs(client, c))
+
+  try:
+    results: list = []
+    for cid in club_ids:
+      results.extend(client.list_coaches(
+        cid, season=season, status=status,
+        gender=gender, name=name, wallet=wallet, tptd=tptd,
+      ))
+  except (SavConnectionError, SavResponseError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  # Dedupe across multiple --club fragments
+  seen: set[tuple[int, int]] = set()
+  unique: list = []
+  for c in results:
+    key = (c.id, c.carreira_id)
+    if key in seen:
+      continue
+    seen.add(key)
+    unique.append(c)
+  results = unique
+
+  if count:
+    n = len(results)
+    if output == "json":
+      click.echo(json.dumps({"count": n}))
+    elif output == "csv":
+      click.echo("count")
+      click.echo(n)
+    else:
+      click.echo(f"{n} coach(es) match.")
+    return
+
+  if not results:
+    if output == "json":
+      click.echo("[]")
+    elif output == "csv":
+      pass
+    else:
+      click.echo("No coaches found.")
+    return
+
+  fields = ctx.obj.get("fields")
+
+  if output == "json":
+    rows = _project([asdict(c) for c in results], fields)
+    click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+    return
+
+  if output == "csv":
+    default_fields = ["id", "carreira_id", "wallet", "name", "association", "club",
+                      "gender", "season", "grade", "birth_date", "active"]
+    rows = _project([asdict(c) for c in results], fields)
+    csv_fields = fields or default_fields
+    click.echo(",".join(csv_fields))
+    for r in rows:
+      click.echo(",".join(str(r[f]) for f in csv_fields))
+    return
+
+  headers = ["Wallet", "Name", "Club", "Gender", "Season", "Grade", "Birth Date", "Active"]
+  rows_t = [
+    [
+      c.wallet,
+      c.name,
+      c.club,
+      c.gender,
+      c.season,
+      c.grade,
+      c.birth_date,
+      "yes" if c.active else "no",
+    ]
+    for c in results
+  ]
+  _render_table(headers, rows_t, max_widths=[None, 28, 20, None, None, None, None, None])
+  click.echo(f"\n{len(results)} coach(es) found.")
+
+
 @cli.command("games")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current).")
 @click.option("--date-from", default="", help="Start date filter (DD-MM-YYYY).")

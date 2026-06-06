@@ -30,6 +30,17 @@ def club_to_dict(c: Any) -> dict:
   return {"id": c.id, "name": c.name, "full_name": c.full_name, "code": c.code}
 
 
+def coach_to_dict(c: Any) -> dict:
+  return {
+    "id": c.id, "carreira_id": c.carreira_id,
+    "wallet": c.wallet, "name": c.name,
+    "club": c.club, "association": c.association,
+    "gender": c.gender, "season": c.season,
+    "grade": c.grade, "birth_date": c.birth_date,
+    "active": c.active,
+  }
+
+
 def batch_to_dict(b: Any) -> dict:
   return {
     "number": b.number,

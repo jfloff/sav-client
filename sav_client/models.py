@@ -169,6 +169,45 @@ class Player:
 
 
 @dataclass(frozen=True)
+class Coach:
+  """
+  Represents a coach (treinador) returned by the coaches listing.
+
+  Attributes:
+      id:           Internal SAV2 person ID (from ``seeTreinador(N)``).
+      carreira_id:  Internal SAV2 career-record ID (from ``seeHistorico(N)``).
+                    Identifies the coach's career row for the listed season.
+      wallet:       Carteira/licença number, e.g. "22174".
+      name:         Full name.
+      association:  Association name (e.g. "AB Santarém").
+      club:         Club name (e.g. "Rio Maior Basket").
+      gender:       Gender string, e.g. "Masculino" / "Feminino".
+      season:       Season string, e.g. "2025/2026".
+      grade:        Formation grade, e.g. "Grau 3", "Estagiário Grau 2".
+      birth_date:   Birth date string (YYYY-MM-DD).
+      active:       True when the status icon indicates "Activo".
+  """
+
+  id: int
+  carreira_id: int
+  wallet: str
+  name: str
+  association: str
+  club: str
+  gender: str
+  season: str
+  grade: str
+  birth_date: str
+  active: bool = False
+
+  def __repr__(self) -> str:
+    return (
+      f"Coach(id={self.id}, wallet={self.wallet!r}, "
+      f"name={self.name!r}, grade={self.grade!r}, active={self.active})"
+    )
+
+
+@dataclass(frozen=True)
 class PlayerRegistrationBatch:
   """
   Represents a player registration batch ("Lote" / "Guia") from the
