@@ -140,6 +140,16 @@ Re-call `submit_enrollment` with the added fields after a `missing_guardian_fiel
 - `delete_enrollment(license)` — remove one player.
 - `delete_batch(batch_number)` — only allowed for open ("Em construção") batches.
 
+### Coaches (treinadores)
+- `list_coaches(club_id?, season?, status="active", gender=0, name="", tptd="")` — all coaches registered to a club for a season.
+  - `club_id` defaults to the session's own club; pass an explicit ID to query another club.
+  - `season` defaults to the current epoch.
+  - `status` is `"active"` | `"inactive"` | `"all"`.
+  - `gender`: 0 = any, 1 = Masculino, 2 = Feminino.
+  - `name` is a server-side **prefix** match on the full name (`"João Ferreira"` matches; `"Loff"` does not). For substring matching, request a broader set and filter locally.
+  - `tptd` is a server-side filter only — the result rows do not contain the TPTD or NIF values. Surfacing those fields would require a per-coach detail fetch, which is not exposed yet.
+  - Returns rows of `{id, carreira_id, wallet, name, association, club, gender, season, grade, birth_date, active}`. `wallet` is a string; `carreira_id` is the integer used by SAV2's internal history URL.
+
 ## Error handling
 
 Two kinds of failure surface:

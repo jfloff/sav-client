@@ -142,6 +142,41 @@ JSON element:
 
 `license` is a string. Only `active: true` means currently eligible.
 
+### `sav coaches`
+
+List coaches (treinadores) registered to a club for a season. Read-only.
+
+```sh
+sav --output json coaches --club 270                       # current season, active only (default)
+sav --output json coaches --club 270 --status all
+sav --output json coaches --club 270 --status inactive
+sav --output json coaches --club "Rio Maior"               # name fragment; repeatable
+sav --output json coaches --club 270 --club 666            # multiple clubs, merged + deduplicated
+sav --output json coaches --club 270 --gender 2            # 1 = M, 2 = F
+sav --output json coaches --club 270 --season 63           # 2024/2025
+sav --output json coaches --club 270 --name "João"         # PREFIX match on full name (not substring)
+sav --output json coaches --club 270 --wallet 22174        # exact wallet/carteira
+sav --output json coaches --club 270 --tptd 12345          # search-only filter
+sav --output json coaches --club 270 --count               # {"count": N}
+```
+
+`--club` is required and repeatable (`--club ID --club FRAGMENT`). A name fragment may match >1 club; results from all matches are merged and deduplicated by `(id, carreira_id)`.
+
+`--status` filters client-side on the `active` flag returned by the icon column. Default is `active`; pass `all` to include inactive rows.
+
+`--name` is a server-side **prefix** match on the full name (`João Ferreira` matches; `Loff` does not). For substring matching, fetch with broader filters and filter the JSON locally.
+
+`--tptd` is a server-side filter only — the result rows do not contain the TPTD value, so you cannot read it back. Same for NIF: neither field is in the listing response. (A future `--with-details` flag could fan out per-coach detail fetches to surface them.)
+
+JSON element:
+```json
+{"id": 86510, "carreira_id": 22174, "wallet": "22174", "name": "João Ferreira Loff",
+ "association": "AB Santarém", "club": "Rio Maior Basket", "gender": "Masculino",
+ "season": "2025/2026", "grade": "Grau 1", "birth_date": "1987-09-26", "active": true}
+```
+
+`wallet` is a string (the user-facing carteira). `carreira_id` is the integer used by SAV2's internal `seeHistorico(...)` URL; in practice it equals `int(wallet)` for every observed row.
+
 ### `sav player LICENCE_NUM...`
 
 Player detail for one or more licences. Multiple licences fetched in parallel. JSON/CSV always returns a **list**; a single licence yields a 1-element list.

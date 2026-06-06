@@ -17,6 +17,8 @@ manually.
 - **Game listing** — query scheduled and played games with flexible filters
 - **Game sheet** — view eligible players/coaches/staff and generate the
   official pre-game PDF directly from SAV2
+- **Coach listing** — list all coaches (treinadores) registered to a club
+  for a season, with status / gender / TPTD filters
 - **CLI** — `sav` command with table, JSON, and CSV output formats
 
 ---
@@ -89,6 +91,12 @@ sav clubs --association 7
 sav clubs "Rio Maior" --all-associations
 sav associations
 
+# Coaches (treinadores) registered to a club
+sav coaches --club 270                              # current season, active only
+sav coaches --club "Rio Maior" --status all
+sav coaches --club 270 --gender 2                   # female coaches only
+sav coaches --club 270 --tptd 12345                 # search-only filter; TPTD not echoed in result rows
+
 # Enrollment (one player per invocation; PDFs are supporting documents)
 sav enrollment create form.pdf                          # auto-classified mod1
 sav enrollment create form.pdf exam.pdf                 # mod1 + exame_medico
@@ -117,6 +125,9 @@ players = client.search_players(name="João", tier="Sénior", status="active", c
 
 # List games
 games = client.list_games(date_from="01-04-2026", date_to="30-04-2026")
+
+# List coaches registered to a club for the current season
+coaches = client.list_coaches(270, status="active")
 
 # Get eligible players for a game
 data = client.get_eligible_players(games[0].id, val=1)  # val=1 home, val=2 away

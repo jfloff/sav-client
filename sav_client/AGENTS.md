@@ -230,6 +230,31 @@ client.list_clubs(association=7)          # clubs in one association
 client.list_clubs(all_associations=True)  # every club across every association (slow first call, cached thereafter)
 ```
 
+### `list_coaches(club, *, season=None, status="active", ...) → list[Coach]`
+
+Coaches (treinadores) registered to a club for one season. Hits `treinadordb.php?op=1` with `perfil=4` regardless of the session's own perfil.
+
+```python
+client.list_coaches(270)                                     # current season, active only
+client.list_coaches(270, status="all")                       # include inactive
+client.list_coaches(270, season=63)                          # 2024/2025
+client.list_coaches(270, gender=2)                           # 1 = M, 2 = F
+client.list_coaches(270, name="João Ferreira")               # PREFIX match on full name (not substring)
+client.list_coaches(270, wallet="22174")                     # exact carteira
+client.list_coaches(270, tptd="12345")                       # search-only; TPTD not in result rows
+```
+
+`season=None` defaults to the current session epoch. `status` is `"active"` (default), `"inactive"`, or `"all"` — applied client-side on the `Coach.active` flag. Other available filters: `association`, `formation_level`, `competitive_level`, `id_doc`, `birth_date`.
+
+`Coach` shape:
+```python
+{"id": 86510, "carreira_id": 22174, "wallet": "22174", "name": "João Ferreira Loff",
+ "association": "AB Santarém", "club": "Rio Maior Basket", "gender": "Masculino",
+ "season": "2025/2026", "grade": "Grau 1", "birth_date": "1987-09-26", "active": True}
+```
+
+`wallet` is a string; `carreira_id` is the integer used by SAV2's internal `seeHistorico(...)` URL (in practice equals `int(wallet)` for every observed row). **NIF and TPTD are not in the listing response** — they require a separate per-coach detail fetch (`seeTreinador(id)` endpoint), not yet implemented.
+
 ## Player registration batches
 
 Batches ("Lotes" / "Guias de Inscrição") group player registration requests of one type, locked to a single (tier, gender) combination. Only batches in state `Em construção` (`is_open == True`, `state_id == 1`) accept new items.
