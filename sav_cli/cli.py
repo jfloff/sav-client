@@ -406,8 +406,12 @@ def _project(rows: list[dict], fields: list[str] | None) -> list[dict]:
 @click.option("--birth-year", "birth_years", default=None, multiple=True, type=int, help="Filter by birth year; repeatable (e.g. --birth-year 2008 --birth-year 2009).")
 @click.option("--limit", default=None, type=int, help="Maximum number of results to return.")
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching players instead of the list.")
+@click.option(
+  "--with-details", "with_details", is_flag=True, default=False,
+  help="Fetch each player's profile to populate photo URL and mobile phone. Issues one extra request per player.",
+)
 @click.pass_context
-def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_years, limit, count):
+def players_cmd(ctx, name, license_, number, status, tiers, gender, season, clubs, association, all_clubs, birth_years, limit, count, with_details):
   """Search and list players. Requires exactly one of --club, --association, or --all-clubs."""
   output = ctx.obj["output"]
 
@@ -455,6 +459,7 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
       association=association_id,
       birth_year=list(birth_years) if birth_years else None,
       limit=limit,
+      with_details=with_details,
     )
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
@@ -489,6 +494,8 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
   if output == "csv":
     default_fields = ["id", "license", "name", "association", "club", "tier", "gender",
                       "season", "status", "birth_date", "nationality", "active"]
+    if with_details:
+      default_fields += ["photo_url", "mobile_phone"]
     rows = _project([asdict(a) for a in results], fields)
     csv_fields = fields or default_fields
     click.echo(",".join(csv_fields))
@@ -510,19 +517,28 @@ def players_cmd(ctx, name, license_, number, status, tiers, gender, season, club
     ]
     for a in results
   ]
-  _render_table(headers, rows, max_widths=[None, 28, 20, None, None, None, None, None])
+  widths: list = [None, 28, 20, None, None, None, None, None]
+  if with_details:
+    headers += ["Mobile"]
+    for i, a in enumerate(results):
+      rows[i].append(a.mobile_phone)
+    widths += [None]
+  _render_table(headers, rows, max_widths=widths)
   suffix = " (all seasons)" if season == 0 else ""
   click.echo(f"\n{len(results)} player(s) found{suffix}.")
 
 
 @cli.command("player")
 @click.argument("license_nums", nargs=-1, required=True)
-@click.option("--photo", is_flag=True, default=False, help="Fetch and include each player's photo URL.")
+@click.option(
+  "--with-details", "with_details", is_flag=True, default=False,
+  help="Fetch and include each player's photo URL and mobile phone.",
+)
 @click.option("--club", "clubs", default=None, multiple=True, help="Club ID or name fragment; repeatable.")
 @click.option("--association", default=None, help="Association ID or name fragment.")
 @click.option("--all-clubs", "all_clubs", is_flag=True, default=False, help="Search every club across all associations.")
 @click.pass_context
-def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
+def player_cmd(ctx, license_nums, with_details, clubs, association, all_clubs):
   """Show detail for one or more players by licence number.
 
   Pass multiple licence numbers to fetch them in parallel. JSON/CSV always
@@ -562,10 +578,10 @@ def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
     if not results:
       return None
     p = results[0]
-    if photo:
+    if with_details:
       try:
-        detail = client.get_player_detail(p.id, photo=True)
-        p = replace(p, photo_url=detail.photo_url)
+        detail = client.get_player_detail(p.id, with_details=True)
+        p = replace(p, photo_url=detail.photo_url, mobile_phone=detail.mobile_phone)
       except (SavConnectionError, SavResponseError):
         pass
     return p
@@ -596,7 +612,8 @@ def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
 
   if output == "csv":
     default_fields = ["id", "license", "name", "birth_date", "gender", "nationality",
-                      "club", "association", "tier", "status", "season", "active", "photo_url"]
+                      "club", "association", "tier", "status", "season", "active",
+                      "photo_url", "mobile_phone"]
     rows = _project([asdict(p) for p in players], projection)
     csv_fields = projection or default_fields
     click.echo(",".join(csv_fields))
@@ -620,6 +637,7 @@ def player_cmd(ctx, license_nums, photo, clubs, association, all_clubs):
       ("Season",      player.season),
       ("Active",      "yes" if player.active else ""),
       ("Photo URL",   player.photo_url),
+      ("Mobile",      player.mobile_phone),
     ]
     width = max(len(k) for k, _ in fields)
     for key, val in fields:
@@ -793,7 +811,7 @@ def clubs_cmd(ctx, query, association, all_associations):
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching coaches.")
 @click.option(
   "--with-details", "with_details", is_flag=True, default=False,
-  help="Fetch each coach's profile to populate NIF/TPTD/TPTD expiry. Issues one extra request per coach.",
+  help="Fetch each coach's profile to populate NIF/TPTD/TPTD expiry/mobile phone. Issues one extra request per coach.",
 )
 @click.pass_context
 def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, with_details):
@@ -859,7 +877,7 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, w
     default_fields = ["id", "carreira_id", "wallet", "name", "association", "club",
                       "gender", "season", "grade", "birth_date", "active"]
     if with_details:
-      default_fields += ["nif", "tptd", "tptd_expiry"]
+      default_fields += ["nif", "tptd", "tptd_expiry", "mobile_phone"]
     rows = _project([asdict(c) for c in results], fields)
     csv_fields = fields or default_fields
     click.echo(",".join(csv_fields))
@@ -883,10 +901,10 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, w
   ]
   widths: list = [None, 28, 20, None, None, None, None, None]
   if with_details:
-    headers += ["NIF", "TPTD", "TPTD Expiry"]
+    headers += ["NIF", "TPTD", "TPTD Expiry", "Mobile"]
     for i, c in enumerate(results):
-      rows_t[i].extend([c.nif, c.tptd, c.tptd_expiry])
-    widths += [None, None, None]
+      rows_t[i].extend([c.nif, c.tptd, c.tptd_expiry, c.mobile_phone])
+    widths += [None, None, None, None]
   _render_table(headers, rows_t, max_widths=widths)
   click.echo(f"\n{len(results)} coach(es) found.")
 

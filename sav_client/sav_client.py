@@ -315,6 +315,7 @@ class SavClient:
     birth_year: int | list[int] | None = None,
     page: int = 1,
     limit: int | None = None,
+    with_details: bool = False,
   ) -> list[Player]:
     """
     Search for players in the SAV2 system.
@@ -354,6 +355,10 @@ class SavClient:
                      collected.  Only affects multi-club / multi-tier parallel
                      searches — cancels remaining in-flight requests to short
                      circuit wide scans (e.g. ``--all-clubs``).
+        with_details: When True, issue one extra ``jogadoresdb.php?op=2``
+                     request per player to populate ``photo_url`` and
+                     ``mobile_phone``. Off by default because it is N+1
+                     and applied after all other filters/limits.
 
     Returns:
         List of Player objects parsed from the HTML response.
@@ -385,7 +390,15 @@ class SavClient:
     def _post_filter(results: list[Player]) -> list[Player]:
       results = self._filter_players_status(results, status_filter)
       results = self._filter_players_birth_year(results, birth_years)
-      return results[:limit] if limit is not None else results
+      results = results[:limit] if limit is not None else results
+      if with_details:
+        results = [
+          _dc_replace(p, photo_url=d.photo_url, mobile_phone=d.mobile_phone)
+          for p, d in (
+            (p, self.get_player_detail(p.id, with_details=True)) for p in results
+          )
+        ]
+      return results
 
     if isinstance(tier, list):
       results = self._search_tier_list(
@@ -643,19 +656,19 @@ class SavClient:
     self._cache.record_player_ids(pairs)
     return players
 
-  def get_player_detail(self, player_id: int, *, photo: bool = False) -> Player:
+  def get_player_detail(self, player_id: int, *, with_details: bool = False) -> Player:
     """
-    Fetch the detail page for a single athlete to obtain their photo URL.
+    Fetch the detail page for a single athlete to obtain fields not returned
+    by the listing: ``photo_url`` and ``mobile_phone``.
 
-    Because the search endpoint does not return a photo, this method makes
-    an additional request to the detail page.  Pass ``photo=True`` to
-    populate ``Player.photo_url``; with the default ``photo=False`` the
-    method is a no-op and returns a minimal Player with only ``id`` set
-    (prefer using search_players for full data).
+    Pass ``with_details=True`` to fetch and parse the detail page. With the
+    default ``with_details=False`` this is a no-op that returns a minimal
+    Player with only ``id`` set (prefer ``search_players`` for full data).
 
     Args:
-        player_id: The internal SAV2 database ID (from Player.id).
-        photo:      When True, fetch the detail page and parse the photo URL.
+        player_id:    The internal SAV2 database ID (from Player.id).
+        with_details: When True, fetch the detail page and parse
+                      ``photo_url`` and ``mobile_phone``.
 
     Raises:
         SavResponseError:   If the response cannot be parsed.
@@ -664,7 +677,7 @@ class SavClient:
     if self.session is None:
       raise SavResponseError("Must call login() before get_player_detail()")
 
-    if not photo:
+    if not with_details:
       return Player(
         id=player_id, license="", name="", association="", club="",
         tier="", gender="", birth_date="", nationality="", status="",
@@ -808,8 +821,8 @@ class SavClient:
         id_doc:            Filter by ID document number.
         birth_date:        Filter by birth date (YYYY-MM-DD).
         with_details:      When True, issue one extra request per coach to
-                           populate ``nif``, ``tptd``, and ``tptd_expiry``.
-                           Off by default because it is N+1.
+                           populate ``nif``, ``tptd``, ``tptd_expiry``, and
+                           ``mobile_phone``. Off by default because it is N+1.
 
     Returns:
         List of Coach objects parsed from the HTML response.
@@ -855,6 +868,7 @@ class SavClient:
         detail = self.get_coach_detail(c.id)
         enriched.append(_dc_replace(
           c, nif=detail.nif, tptd=detail.tptd, tptd_expiry=detail.tptd_expiry,
+          mobile_phone=detail.mobile_phone,
         ))
       coaches = enriched
 
@@ -862,8 +876,8 @@ class SavClient:
 
   def get_coach_detail(self, coach_id: int) -> Coach:
     """
-    Fetch the SAV2 coach profile page to obtain ``nif``, ``tptd``, and
-    ``tptd_expiry`` for a single coach.
+    Fetch the SAV2 coach profile page to obtain ``nif``, ``tptd``,
+    ``tptd_expiry``, and ``mobile_phone`` for a single coach.
 
     The SAV2 coaches listing does not expose these fields; this method
     issues an extra ``treinadordb.php?op=2`` request per coach and parses
@@ -874,9 +888,9 @@ class SavClient:
         coach_id: Internal SAV2 person ID (``Coach.id``).
 
     Returns:
-        A partial Coach with ``id``, ``name``, ``nif``, ``tptd``, and
-        ``tptd_expiry`` populated; listing-only fields (wallet, club,
-        association, …) are left empty.
+        A partial Coach with ``id``, ``name``, ``nif``, ``tptd``,
+        ``tptd_expiry``, and ``mobile_phone`` populated; listing-only
+        fields (wallet, club, association, …) are left empty.
 
     Raises:
         SavResponseError:   If the response cannot be parsed.
@@ -4300,6 +4314,7 @@ class SavClient:
       - ``nif``           from ``<input id='nif' value='...'>``
       - ``tptd``          from ``<input id='nrtptd' value='...'>``
       - ``tptd_expiry``   from ``<input id='validadetptd' value='...'>``
+      - ``mobile_phone``  from ``<input id='telem' value='...'>``
 
     Any field missing from the HTML is returned as an empty string rather
     than raising — the form layout differs slightly between profile types.
@@ -4329,6 +4344,7 @@ class SavClient:
       nif=_input_value("nif"),
       tptd=_input_value("nrtptd"),
       tptd_expiry=_input_value("validadetptd"),
+      mobile_phone=_input_value("telem"),
     )
 
   def _parse_games_response(self, raw: dict[str, Any]) -> list[Game]:
@@ -4464,10 +4480,11 @@ class SavClient:
 
   def _parse_player_detail_response(self, raw: dict[str, Any], *, player_id: int) -> Player:
     """
-    Parse the photo URL from the JSON envelope returned by jogadoresdb.php?op=2.
+    Parse the JSON envelope returned by jogadoresdb.php?op=2.
 
     The server returns ``{"msg": "<html>..."}``; we scan ``<img>`` tags for
-    the athlete's photo and return a minimal Player with only id + photo_url.
+    the athlete's photo and pull ``<input id="telem">`` for the mobile
+    phone, returning a minimal Player with id, photo_url and mobile_phone.
     """
     from bs4 import BeautifulSoup
 
@@ -4485,10 +4502,14 @@ class SavClient:
         photo_url = src
         break
 
+    telem = soup.find(id="telem")
+    mobile_phone = (telem.get("value", "") or "").strip() if telem else ""
+
     return Player(
       id=player_id, license="", name="", association="", club="",
       tier="", gender="", birth_date="", nationality="", status="",
       photo_url=photo_url,
+      mobile_phone=mobile_phone,
     )
 
   def __repr__(self) -> str:

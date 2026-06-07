@@ -14,6 +14,7 @@ _SAMPLE_MSG = (
   "data-parsley-nif='' disabled>"
   '<input type="text" class="form-control" id="nrtptd" value="166614" disabled>'
   '<input type="text" class="form-control" id="validadetptd" value="15-09-2028" disabled>'
+  '<input type="text" class="form-control" id="telem" value="912345678" disabled>'
   "</div>"
 )
 
@@ -42,6 +43,7 @@ class TestGetCoachDetail:
     assert result.nif == "223688177"
     assert result.tptd == "166614"
     assert result.tptd_expiry == "15-09-2028"
+    assert result.mobile_phone == "912345678"
 
   def test_tolerates_raw_newlines_in_msg(self, monkeypatch):
     """SAV2 sometimes emits raw CR/LF inside string values; strict=False handles it."""
@@ -67,6 +69,7 @@ class TestGetCoachDetail:
     assert result.nif == ""
     assert result.tptd == ""
     assert result.tptd_expiry == ""
+    assert result.mobile_phone == ""
 
   def test_raises_when_msg_missing(self, monkeypatch):
     client = _new_authed_client()
@@ -112,6 +115,7 @@ class TestListCoachesWithDetails:
       id=42, carreira_id=0, wallet="", name="Listed",
       association="", club="", gender="", season="", grade="", birth_date="",
       active=False, nif="500123456", tptd="166614", tptd_expiry="15-09-2028",
+      mobile_phone="912345678",
     )
 
     monkeypatch.setattr(client, "_post_form", lambda *a, **k: "<html/>")
@@ -130,3 +134,4 @@ class TestListCoachesWithDetails:
     assert merged.nif == "500123456"
     assert merged.tptd == "166614"
     assert merged.tptd_expiry == "15-09-2028"
+    assert merged.mobile_phone == "912345678"

@@ -159,6 +159,7 @@ def search_players(
     birth_year: list[int] | None = None,
     season: int | None = None,
     limit: int | None = None,
+    with_details: bool = False,
 ) -> list[dict]:
     """
     Search for players in the SAV system.
@@ -166,6 +167,9 @@ def search_players(
     club_id defaults to the session's own club when omitted.
     Pass club_id=0 to search all clubs (federation-wide or scoped by association_id).
     status: "active" | "inactive" | "all"
+    with_details: when true, issue one extra request per player to fill
+        photo_url and mobile_phone in the returned rows. Off by default
+        because it is N+1.
     """
     client = _get_client()
     effective_club: int | list[int] = (
@@ -183,16 +187,22 @@ def search_players(
         birth_year=birth_year,
         season=season,
         limit=limit,
+        with_details=with_details,
     )
-    return [player_to_dict(p) for p in players]
+    return [player_to_dict(p, with_details=with_details) for p in players]
 
 
 @server.tool()
-def get_player(license: str, club_id: int | None = None) -> dict | None:
+def get_player(
+    license: str,
+    club_id: int | None = None,
+    with_details: bool = False,
+) -> dict | None:
     """
     Return details for a single player by licence number.
 
     club_id defaults to the session's own club when omitted.
+    with_details: when true, also fetch photo_url and mobile_phone.
     Returns null if no player is found with that licence.
     """
     client = _get_client()
@@ -200,10 +210,12 @@ def get_player(license: str, club_id: int | None = None) -> dict | None:
         club_id if club_id is not None
         else int(client.session.get("organizacao") or 0)
     )
-    results = client.search_players(license=license, club=effective_club)
+    results = client.search_players(
+        license=license, club=effective_club, with_details=with_details,
+    )
     if not results:
         return None
-    return player_to_dict(results[0])
+    return player_to_dict(results[0], with_details=with_details)
 
 
 @server.tool()

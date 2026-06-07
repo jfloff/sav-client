@@ -5,14 +5,18 @@ from __future__ import annotations
 from typing import Any
 
 
-def player_to_dict(p: Any) -> dict:
-  return {
+def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
+  out = {
     "id": p.id, "license": p.license, "name": p.name,
     "club": p.club, "association": p.association,
     "tier": p.tier, "gender": p.gender,
     "birth_date": p.birth_date, "nationality": p.nationality,
     "status": p.status, "season": p.season, "active": p.active,
   }
+  if with_details:
+    out["photo_url"] = getattr(p, "photo_url", "")
+    out["mobile_phone"] = getattr(p, "mobile_phone", "")
+  return out
 
 
 def game_to_dict(g: Any) -> dict:
@@ -43,6 +47,7 @@ def coach_to_dict(c: Any, *, with_details: bool = False) -> dict:
     out["nif"] = getattr(c, "nif", "")
     out["tptd"] = getattr(c, "tptd", "")
     out["tptd_expiry"] = getattr(c, "tptd_expiry", "")
+    out["mobile_phone"] = getattr(c, "mobile_phone", "")
   return out
 
 

@@ -117,6 +117,36 @@ class TestSearchPlayers:
     assert [player.id for player in results] == [1]
     assert results[0].active is True
 
+  def test_with_details_true_merges_photo_url_and_mobile_phone(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+
+    listed = Player(
+      id=7, license="100", name="A", association="AB X", club="Club X",
+      tier="Mini 12", gender="Masculino", birth_date="2015-01-01",
+      nationality="Portuguesa", status="FBP", season="2025/2026", active=True,
+    )
+    monkeypatch.setattr(client, "_search_players_single", lambda **kw: [listed])
+
+    detail = Player(
+      id=7, license="", name="", association="", club="", tier="",
+      gender="", birth_date="", nationality="", status="",
+      photo_url="https://x/foto.jpg", mobile_phone="912345678",
+    )
+    monkeypatch.setattr(
+      client, "get_player_detail",
+      lambda pid, *, with_details=False: detail if with_details else Player(
+        id=pid, license="", name="", association="", club="", tier="",
+        gender="", birth_date="", nationality="", status="",
+      ),
+    )
+
+    [merged] = client.search_players(status="all", club=789, with_details=True)
+
+    assert merged.license == "100"                  # listing field preserved
+    assert merged.photo_url == "https://x/foto.jpg"  # detail merged
+    assert merged.mobile_phone == "912345678"
+
   def test_status_filter_applies_before_final_limit_for_parallel_searches(self, monkeypatch):
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"epoca_id": 123, "organizacao": 456}

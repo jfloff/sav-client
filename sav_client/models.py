@@ -144,7 +144,11 @@ class Player:
       status:       Registration status string, e.g. "FBP".
       season:       Season string, e.g. "2025/2026" (search only).
       active:       True when the status icon indicates "Activo" (search only).
-      photo_url:    Photo URL; populated only via get_player_detail(photo=True).
+      photo_url:    Photo URL. Empty unless the detail was fetched via
+                    ``get_player_detail(with_details=True)`` or
+                    ``search_players(with_details=True)``.
+      mobile_phone: Mobile phone number (telemóvel). Empty unless detail
+                    was fetched.
   """
 
   id: int
@@ -160,6 +164,7 @@ class Player:
   season: str = ""
   active: bool = False
   photo_url: str = ""
+  mobile_phone: str = ""
 
   def __repr__(self) -> str:
     return (
@@ -190,6 +195,8 @@ class Coach:
                     ``get_coach_detail`` or ``list_coaches(with_details=True)``.
       tptd:         TPTD number (Nr. TPTD). Empty unless detail was fetched.
       tptd_expiry:  TPTD expiry date (DD-MM-YYYY). Empty unless detail was fetched.
+      mobile_phone: Mobile phone number (telemóvel). Empty unless detail
+                    was fetched.
   """
 
   id: int
@@ -206,6 +213,7 @@ class Coach:
   nif: str = ""
   tptd: str = ""
   tptd_expiry: str = ""
+  mobile_phone: str = ""
 
   def __repr__(self) -> str:
     return (

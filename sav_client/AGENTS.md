@@ -58,7 +58,8 @@ class Player:
     birth_date: str   # "YYYY-MM-DD"
     nationality: str; status: str; season: str
     active: bool      # True = currently eligible (definitive signal)
-    photo_url: str    # populated only by get_player_detail(photo=True)
+    photo_url: str    # populated only by get_player_detail(with_details=True)
+    mobile_phone: str # telemóvel; populated only by get_player_detail(with_details=True)
 
 @dataclass(frozen=True)
 class Game:
@@ -149,12 +150,12 @@ client.search_players(season=0, club=0)                # all seasons
 
 Results are always sorted by `Player.id` before return, so `limit` slicing is reproducible for the same result set. (On `limit` + parallel scans the short-circuit may pick a different *subset* across runs due to network timing, but the returned list is always in stable order.)
 
-### `get_player_detail(player_id, *, photo=False) → Player`
+### `get_player_detail(player_id, *, with_details=False) → Player`
 
-Fetch photo URL. Returns a stub when `photo=False`. `player_id` is `Player.id` (internal), not licence.
+Fetch `photo_url` and `mobile_phone` for a single player. Returns a stub when `with_details=False`. `player_id` is `Player.id` (internal), not licence. Also reachable via `search_players(with_details=True)`, which issues one extra request per result (N+1, off by default).
 
 ```python
-detail = client.get_player_detail(player.id, photo=True)
+detail = client.get_player_detail(player.id, with_details=True)
 ```
 
 ### `list_games(**kwargs) → list[Game]`
@@ -253,7 +254,7 @@ client.list_coaches(270, tptd="12345")                       # search-only; TPTD
  "season": "2025/2026", "grade": "Grau 1", "birth_date": "1987-09-26", "active": True}
 ```
 
-`wallet` is a string; `carreira_id` is the integer used by SAV2's internal `seeHistorico(...)` URL (in practice equals `int(wallet)` for every observed row). **NIF and TPTD are not in the listing response** — they require a separate per-coach detail fetch (`seeTreinador(id)` endpoint), not yet implemented.
+`wallet` is a string; `carreira_id` is the integer used by SAV2's internal `seeHistorico(...)` URL (in practice equals `int(wallet)` for every observed row). **`nif`, `tptd`, `tptd_expiry`, and `mobile_phone` are not in the listing response** — pass `with_details=True` (or call `get_coach_detail(coach.id)` directly) to issue the per-coach `treinadordb.php?op=2` request that fills them.
 
 ## Player registration batches
 

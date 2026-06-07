@@ -137,7 +137,7 @@ JSON element:
 {"id": 12345, "license": "301772", "name": "João Silva", "club": "Rio Maior Basket",
  "association": "AB Santarém", "tier": "Sénior", "gender": "Masculino",
  "birth_date": "1990-05-12", "nationality": "Portuguesa", "status": "FBP",
- "season": "2025/2026", "active": true, "photo_url": ""}
+ "season": "2025/2026", "active": true, "photo_url": "", "mobile_phone": ""}
 ```
 
 `license` is a string. Only `active: true` means currently eligible.
@@ -158,6 +158,7 @@ sav --output json coaches --club 270 --name "João"         # PREFIX match on fu
 sav --output json coaches --club 270 --wallet 22174        # exact wallet/carteira
 sav --output json coaches --club 270 --tptd 12345          # search-only filter
 sav --output json coaches --club 270 --count               # {"count": N}
+sav --output json coaches --club 270 --with-details        # +nif/tptd/tptd_expiry/mobile_phone (N+1)
 ```
 
 `--club` is required and repeatable (`--club ID --club FRAGMENT`). A name fragment may match >1 club; results from all matches are merged and deduplicated by `(id, carreira_id)`.
@@ -166,7 +167,7 @@ sav --output json coaches --club 270 --count               # {"count": N}
 
 `--name` is a server-side **prefix** match on the full name (`João Ferreira` matches; `Loff` does not). For substring matching, fetch with broader filters and filter the JSON locally.
 
-`--tptd` is a server-side filter only — the result rows do not contain the TPTD value, so you cannot read it back. Same for NIF: neither field is in the listing response. (A future `--with-details` flag could fan out per-coach detail fetches to surface them.)
+`--tptd` is a server-side filter only — the result rows do not contain the TPTD value, so you cannot read it back. Same for NIF and mobile phone: none of these are in the listing response. Pass `--with-details` to issue one extra `treinadordb.php?op=2` request per coach and populate `nif`, `tptd`, `tptd_expiry`, and `mobile_phone` (N+1, off by default).
 
 JSON element:
 ```json
@@ -184,7 +185,7 @@ Player detail for one or more licences. Multiple licences fetched in parallel. J
 ```sh
 sav --output json player 301772 --all-clubs
 sav --output json player 301772 302000 303000 --all-clubs   # batch, parallel
-sav --output json player 301772 --photo --club 270          # include photo_url
+sav --output json player 301772 --with-details --club 270   # include photo_url + mobile_phone
 ```
 
 Exactly one scope is required: `--club`, `--association`, or `--all-clubs`.
