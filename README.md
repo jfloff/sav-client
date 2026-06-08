@@ -42,19 +42,51 @@ cd sav-client
 pip install -e .
 ```
 
-If you plan to use the `sav enrollment` commands or the MCP enrollment tools,
-also configure the Document AI environment described in the `sav-parsers`
-README.
-
 ---
 
 ## Configuration
 
-Create a `.env` file (or export the variables):
+Create a `.env` file (see [`.env.example`](.env.example)) or export the
+variables.
+
+### Required for all commands
 
 ```
 SAV_USERNAME=your_username
 SAV_PASSWORD=your_password
+SAV_BASE_URL=https://sav2.fpb.pt   # optional, this is the default
+```
+
+### Required for `sav enrollment` and MCP enrollment tools
+
+Enrollment flows OCR the mod1 / exame médico PDFs through Google Document AI
+(via [`sav-parsers`](https://github.com/jfloff/sav-parsers)) and stamp every
+mod1 upload with the club stamp. You need a GCP project with Document AI
+processors provisioned plus a service-account key:
+
+```
+DOCAI_PROJECT_ID=<your-gcp-project>
+DOCAI_LOCATION=eu
+DOCAI_CLASSIFIER_PROCESSOR_ID=<processor-id>
+DOCAI_EXAME_MEDICO_PROCESSOR_ID=<processor-id>
+DOCAI_FPB_MODELO_1_PROCESSOR_ID=<processor-id>
+DOCAI_FPB_MODELO_4_PROCESSOR_ID=<processor-id>
+GOOGLE_APPLICATION_CREDENTIALS=./credentials.json
+
+CLUB_STAMP_PATH=/path/to/carimbo.png
+```
+
+See the [`sav-parsers` README](https://github.com/jfloff/sav-parsers) for
+how to set up the Document AI processors. `CLUB_STAMP_PATH` is enforced at
+CLI command entry for any mod1 upload (`enrollment create` with PDFs,
+`enrollment update` with a PDF); field-only updates and medical-exam-only
+uploads do not require it.
+
+### Optional tuning
+
+```
+SAV_TIMEOUT=30        # request timeout in seconds
+SAV_LOG_LEVEL=WARNING # DEBUG / INFO / WARNING / ERROR
 ```
 
 ---
