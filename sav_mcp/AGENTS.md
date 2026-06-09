@@ -78,6 +78,37 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 
 Use `list_tiers(gender_id)` to discover `tier_id` values dynamically — the set differs per gender and varies by season.
 
+## Domain rules
+
+Each escalão spans **two consecutive birth years**: an athlete is eligible for `Sub-X` in season `Y/Y+1` iff born in `Y+1−X` or `Y+2−X`. The same arithmetic applies to `Mini 8 / 10 / 12`. Exceptions: **Sénior** is open-ended below (no upper birth year); **Baby-Basket** spans three years and the two youngest require the child to have completed 4 years before enrollment; **Masters / Veteranos** and **BCR** — `<TODO: confirm with user>` (not in the FPB youth tables).
+
+"Próximo ano / próxima época" must be derived from `get_session_info().season_id + 1` (SAV2 `epoca_id` is sequential), never from the calendar year — the July–September transition window silently picks the wrong season otherwise.
+
+### Birth-year windows
+
+For season `Y/Y+1`. Concrete column shows 2025/2026 (`Y = 2025`).
+
+| Escalão | Birth years | 2025/2026 |
+|---------|-------------|-----------|
+| Baby-Basket | `Y+1−5 .. Y+1−3` (3 years; two youngest need 4 completed years) | 2020, 2021, 2022 |
+| Mini 8 | `Y+1−8`, `Y+2−8` | 2018, 2019 |
+| Mini 10 | `Y+1−10`, `Y+2−10` | 2016, 2017 |
+| Mini 12 | `Y+1−12`, `Y+2−12` | 2014, 2015 |
+| Sub 14 | `Y+1−14`, `Y+2−14` | 2012, 2013 |
+| Sub 16 | `Y+1−16`, `Y+2−16` | 2010, 2011 |
+| Sub 18 | `Y+1−18`, `Y+2−18` | 2008, 2009 |
+| Sénior | `Y+1−18` and earlier | 2007 and earlier |
+
+When the season or the formula is ambiguous, prefer `list_tiers(gender_id)` plus a clarifying question over a silent assumption. **Never drop one of the two birth years.**
+
+### Worked example
+
+Coach asks: *"Que jogadores são para o ano Sub-14 masculinos?"* — i.e. next season.
+
+1. `get_session_info()` → current `season_id`. Next season is `season_id + 1`. If current is 2025/2026, next is 2026/2027 (`Y = 2026`).
+2. Sub-14 da época 2026/2027 → born in `2027−14 = 2013` **and** `2028−14 = 2014`.
+3. `search_players(gender_id=1, birth_year=[2013, 2014], ...)` and return **both** cohorts. Returning only 2013-born players silently drops half the eligible athletes.
+
 ## Enrollment workflow
 
 The canonical pipeline. Each step's output feeds the next.
