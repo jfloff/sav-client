@@ -1337,6 +1337,40 @@ class SavClient:
     """
     return player_registration_tiers(gender_id)
 
+  def get_current_season_start_year(self) -> int:
+    """Return the start year of the session's current season (e.g. 2025 for "2025/2026").
+
+    SAV2 stores the season as an opaque ``epoca_id`` integer in the session,
+    so the only reliable way to map it to a calendar year is to read it back
+    from any object the server tags with the season string. Registration
+    batches carry ``epoca`` as ``"YYYY/YYYY+1"``; this method picks the first
+    one returned for the session's club + current epoca_id and parses the
+    starting year.
+
+    Raises:
+        SavResponseError: If the session has no batches in the current
+        season, or the server returns a malformed season string. Callers
+        that need to work in newly-created clubs should pass the year
+        explicitly to whatever consumer needs it.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before get_current_season_start_year()"
+      )
+    batches = self.list_player_registration_batches()
+    if not batches:
+      raise SavResponseError(
+        "Cannot resolve current season start year: no registration batches "
+        "exist for the session's epoca_id."
+      )
+    season_str = batches[0].season
+    try:
+      return int(season_str.split("/", 1)[0])
+    except (ValueError, IndexError) as exc:
+      raise SavResponseError(
+        f"Could not parse season string {season_str!r} from batch"
+      ) from exc
+
   def _list_subida_tier_options(self, internal_id: int) -> list[tuple[int, str]]:
     """Op=21 — return every selectable (tier_id, name) for the player's
     escalaosubida dropdown. Empty list when SAV only exposes the

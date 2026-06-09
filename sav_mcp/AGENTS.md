@@ -80,9 +80,13 @@ Use `list_tiers(gender_id)` to discover `tier_id` values dynamically — the set
 
 ## Domain rules
 
-Each escalão spans **two consecutive birth years**: an athlete is eligible for `Sub-X` in season `Y/Y+1` iff born in `Y+1−X` or `Y+2−X`. The same arithmetic applies to `Mini 8 / 10 / 12`. Exceptions: **Sénior** is open-ended below (no upper birth year); **Baby-Basket** spans three years and the two youngest require the child to have completed 4 years before enrollment; **Masters / Veteranos** and **BCR** — `<TODO: confirm with user>` (not in the FPB youth tables).
+For roster questions about an escalão ("Que jogadores são Sub-X?", "atletas para o próximo ano") call **`roster_for_escalao(tier_id, gender_id, when="next"|"current")`**. The tool resolves both birth years deterministically, runs the off-season fallback cascade (`club + active → club + all → federation + all`), and reports which `source` matched — so the LLM never does the arithmetic or the retries. Fall back to `search_players(birth_year=[...])` only for genuinely custom queries (e.g. multiple escalões at once).
 
-"Próximo ano / próxima época" must be derived from `get_session_info().season_id + 1` (SAV2 `epoca_id` is sequential), never from the calendar year — the July–September transition window silently picks the wrong season otherwise.
+Knowledge to drive the tool correctly:
+
+- Each escalão spans **two consecutive birth years**. For season `Y/Y+1`, Sub-X = born in `Y+1−X` and `Y+2−X`; same for Mini 8/10/12.
+- **Sénior** is open-ended below (no upper birth year — the tool filters by tier name). **Baby-Basket** spans three years (ages 4–6 in `Y+1`); the two youngest require the child to have completed 4 years before enrollment. **Masters / Veteranos** and **BCR** — `<TODO: confirm with user>`; `roster_for_escalao` raises so the LLM doesn't guess.
+- "Próximo ano / próxima época" → `season_id + 1` (SAV2 `epoca_id` is sequential), never the calendar year. Between May and September the wall clock straddles a season transition **and** club rosters for the upcoming season usually do not yet exist; in that window an athlete listed as inactive is almost certainly "not yet re-registered", not retired — this is exactly what the tool's cascade handles.
 
 ### Birth-year windows
 
@@ -90,7 +94,7 @@ For season `Y/Y+1`. Concrete column shows 2025/2026 (`Y = 2025`).
 
 | Escalão | Birth years | 2025/2026 |
 |---------|-------------|-----------|
-| Baby-Basket | `Y+1−5 .. Y+1−3` (3 years; two youngest need 4 completed years) | 2020, 2021, 2022 |
+| Baby-Basket | `Y+1−6 .. Y+1−4` (ages 4–6 in `Y+1`; two youngest need 4 completed years) | 2020, 2021, 2022 |
 | Mini 8 | `Y+1−8`, `Y+2−8` | 2018, 2019 |
 | Mini 10 | `Y+1−10`, `Y+2−10` | 2016, 2017 |
 | Mini 12 | `Y+1−12`, `Y+2−12` | 2014, 2015 |
@@ -99,15 +103,16 @@ For season `Y/Y+1`. Concrete column shows 2025/2026 (`Y = 2025`).
 | Sub 18 | `Y+1−18`, `Y+2−18` | 2008, 2009 |
 | Sénior | `Y+1−18` and earlier | 2007 and earlier |
 
-When the season or the formula is ambiguous, prefer `list_tiers(gender_id)` plus a clarifying question over a silent assumption. **Never drop one of the two birth years.**
+When falling back to `search_players` directly: never drop one of the two birth years; if a club-scoped next-season query returns empty, retry at `club_id=0` with `status="all"` before reporting empty.
 
 ### Worked example
 
-Coach asks: *"Que jogadores são para o ano Sub-14 masculinos?"* — i.e. next season.
+Coach: *"Que jogadores são para o ano Sub-14 masculinos?"* (next season). One call:
 
-1. `get_session_info()` → current `season_id`. Next season is `season_id + 1`. If current is 2025/2026, next is 2026/2027 (`Y = 2026`).
-2. Sub-14 da época 2026/2027 → born in `2027−14 = 2013` **and** `2028−14 = 2014`.
-3. `search_players(gender_id=1, birth_year=[2013, 2014], ...)` and return **both** cohorts. Returning only 2013-born players silently drops half the eligible athletes.
+`roster_for_escalao(tier_id=5, gender_id=1, when="next")`
+  → `{tier: "Sub 14", season: "2026/2027", birth_years: [2014, 2013], source, step, players}`.
+
+Report the `players` list. If `source="federation"`, frame the answer in domain terms ("atletas elegíveis por ano de nascimento — ainda sem inscrição da próxima época neste clube"), not by naming `club_id=0`.
 
 ## Enrollment workflow
 
@@ -200,3 +205,4 @@ Two kinds of failure surface:
 - Don't pass the internal SAV batch `id`; tools always use the human-visible `batch_number`.
 - Don't loop blindly through batches to find one — use `get_batch(batch_number)`.
 - Don't ask the user for the current club/season — call `get_session_info()`.
+- Don't surface tool internals to end users (`season_id + 1`, `club_id=0`, `status="all"`, kwarg names, op codes). Phrase actions in domain terms — "para a próxima época", "alargado ao nível federativo", "incluindo inativos".

@@ -74,7 +74,15 @@ from sav_shared.fpb_mod1 import (
     reconcile_fpb_mod1,
 )
 from sav_shared.games import filter_games
-from sav_shared.lookups import GENERO, REGISTRATION_TYPE_LABELS, doc_type_to_tipo_doc, tipo_doc_to_doc_type
+from sav_shared.lookups import (
+    GENERO,
+    REGISTRATION_TYPE_LABELS,
+    TIER_MIN_AGE_IN_SEASON,
+    doc_type_to_tipo_doc,
+    player_registration_tiers,
+    tier_birth_years_for_season,
+    tipo_doc_to_doc_type,
+)
 from sav_shared.medical_exam import extract_medical_exam_info
 from sav_shared.serializers import (
     batch_to_dict,
@@ -449,6 +457,140 @@ def list_tiers(gender_id: int) -> list[dict]:
     client = _get_client()
     tiers = client.list_player_registration_tiers(gender_id=gender_id)
     return [{"tier_id": tid, "tier_name": name} for tid, name in tiers.items()]
+
+
+@server.tool()
+def roster_for_escalao(
+    tier_id: int,
+    gender_id: int,
+    when: str = "next",
+    club_id: int | None = None,
+) -> dict:
+    """
+    Resolve the roster of athletes for an escalão in the current or upcoming season.
+
+    Designed for natural roster questions ("Que jogadores são Sub-14 masculinos
+    próxima época?") so the LLM doesn't have to compute birth-year arithmetic,
+    handle the season transition, or override status filters by hand. Birth
+    years are resolved deterministically from ``tier_id`` + the target
+    season's start year, and the tool runs a fallback cascade so empty
+    club-scoped results during off-season silently expand:
+
+        (a) session/given club + status="active"
+        (b) session/given club + status="all"           ← not-yet-renewed
+        (c) club_id=0 + status="all" (federation)       ← off-season fallback
+
+    The first non-empty step wins. The returned ``source`` ("club" |
+    "federation" | "none") and ``step`` label tell the caller which path
+    succeeded so the LLM can frame the answer in domain terms.
+
+    Args:
+        tier_id: Numeric escalão ID. From ``list_tiers(gender_id)`` or
+            ``parse_enrollment_forms``. The mapping varies by gender.
+        gender_id: 1 = Masculino, 2 = Feminino.
+        when: "current" or "next". "next" advances both the SAV2 epoca_id and
+            the start year by 1. Defaults to "next" because that's the common
+            roster-planning question.
+        club_id: Defaults to the session's club. Pass an explicit ID to query
+            another club; the cascade still applies. Pass 0 to skip straight
+            to federation-wide.
+
+    Returns:
+        {
+          "tier": str,
+          "tier_id": int,
+          "gender_id": int,
+          "season": str,            # "YYYY/YYYY+1"
+          "birth_years": list[int] | None,  # None for open-ended tiers (Sénior)
+          "source": str,            # "club" | "federation" | "none"
+          "step": str,              # short label of the matching cascade step
+          "players": list[dict],
+        }
+
+    Raises:
+        ValueError: ``tier_id`` not valid for ``gender_id``; ``when`` not in
+            {"current", "next"}; tier's birth-year window not modelled
+            (Masters/Veteranos, BCR — query ``search_players`` with ``tier``
+            directly).
+        SavResponseError: Cannot resolve the current season's start year.
+    """
+    if when not in ("current", "next"):
+        raise ValueError(f"when must be 'current' or 'next', got {when!r}")
+
+    tiers = player_registration_tiers(gender_id)
+    tier_name = tiers.get(tier_id)
+    if tier_name is None:
+        raise ValueError(
+            f"tier_id={tier_id} not valid for gender_id={gender_id}. "
+            f"Use list_tiers(gender_id) to discover valid IDs."
+        )
+
+    client = _get_client()
+    current_year = client.get_current_season_start_year()
+    current_epoca_id = int(client.session.get("epoca_id") or 0)
+    offset = 1 if when == "next" else 0
+    target_year = current_year + offset
+    target_epoca_id = current_epoca_id + offset
+    season_str = f"{target_year}/{target_year + 1}"
+
+    birth_years = tier_birth_years_for_season(tier_name, target_year)
+    if birth_years is None and tier_name not in TIER_MIN_AGE_IN_SEASON:
+        raise ValueError(
+            f"Birth-year window for {tier_name!r} is not modelled. "
+            f"Query search_players(tier={tier_name!r}, gender_id={gender_id}, ...) "
+            f"directly."
+        )
+
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+
+    cascade: list[tuple[str, str, dict[str, Any]]] = []
+    if effective_club != 0:
+        cascade.append(("club + active", "club", {
+            "club": effective_club, "status": "active",
+        }))
+        cascade.append(("club + all", "club", {
+            "club": effective_club, "status": "all",
+        }))
+    cascade.append(("federation + all", "federation", {
+        "club": 0, "status": "all",
+    }))
+
+    common: dict[str, Any] = {
+        "gender": gender_id,
+        "season": target_epoca_id,
+        "with_details": False,
+    }
+    if birth_years is not None:
+        common["birth_year"] = birth_years
+    else:
+        common["tier"] = tier_name
+
+    chosen_label = cascade[-1][0]
+    chosen_source = "none"
+    chosen_players: list[Any] = []
+    for label, source, kw in cascade:
+        try:
+            players = client.search_players(**common, **kw)
+        except (SavResponseError, ValueError):
+            logger.debug("roster_for_escalao step %r failed", label, exc_info=True)
+            continue
+        if players:
+            chosen_label, chosen_source, chosen_players = label, source, players
+            break
+
+    return {
+        "tier": tier_name,
+        "tier_id": tier_id,
+        "gender_id": gender_id,
+        "season": season_str,
+        "birth_years": birth_years,
+        "source": chosen_source,
+        "step": chosen_label,
+        "players": [player_to_dict(p) for p in chosen_players],
+    }
 
 
 @server.tool()
