@@ -187,7 +187,8 @@ Re-call `submit_enrollment` with the added fields after a `missing_guardian_fiel
   - Returns rows of `{id, carreira_id, wallet, name, association, club, gender, season, grade, birth_date, active}` plus `{nif, tptd, tptd_expiry, mobile_phone}` when `with_details=true`. `wallet` is a string; `carreira_id` is the integer used by SAV2's internal history URL.
 
 ### Players
-- `search_players(...)` and `get_player(license, ...)` accept `with_details=false` (default). Pass `with_details=true` to issue one extra `jogadoresdb.php?op=2` request per player and add `photo_url` and `mobile_phone` (N+1).
+- `search_players(...)`, `get_player(license, ...)`, and `find_player_by_nif(nif, ...)` accept `with_details=false` (default). Pass `with_details=true` to issue one extra `jogadoresdb.php?op=2` request per player and add `photo_url` and `mobile_phone` (N+1).
+- `find_player_by_nif(nif, club_id?, with_details?)` is the inverse of `get_player(license=...)`: resolves a player by Portuguese NIF (9 digits) against the club roster. `club_id` defaults to the session's own club. Returns null when the NIF is malformed (not 9 digits) or no roster player matches. Useful for external importers (e.g. federation signup form) that key athletes by NIF.
 
 ## Error handling
 

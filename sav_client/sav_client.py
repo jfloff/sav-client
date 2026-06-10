@@ -193,7 +193,7 @@ class SavClient:
 
     self._cache = Cache()
     # Tracks which club rosters we've already scanned to build the
-    # license↔NIF map in sav_shared.enrollment.find_player_license_by_nif.
+    # license↔NIF map in SavClient.find_license_by_nif.
     self._nif_clubs_built: set[int] = set()
 
     # Reuse a single requests.Session for connection pooling and automatic
@@ -699,6 +699,84 @@ class SavClient:
         f"Player detail response was not valid JSON: {text[:200]!r}"
       ) from exc
     return self._parse_player_detail_response(raw, player_id=player_id)
+
+  def find_license_by_nif(
+    self, nif: str, *, club_id: int | None = None,
+  ) -> int | None:
+    """Return the license of the player with the given NIF in a club's roster.
+
+    Lookup tiers (cheapest first):
+      1. SQLite license↔NIF cache — O(1), survives across processes.
+      2. Per-club roster build, persisted into the SQLite cache for
+         future runs. Done at most once per club per process.
+
+    ``club_id`` defaults to the session's own club. Returns None when the
+    NIF or session club is missing, or when no roster profile matches.
+    """
+    nif = nif.strip() if nif else ""
+    if not nif:
+      return None
+
+    hit = self._cache.get_license_by_nif(nif)
+    if hit:
+      return hit
+
+    if club_id is None:
+      club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    if not club_id:
+      return None
+
+    if club_id in self._nif_clubs_built:
+      return None
+
+    nif_map = self._build_club_nif_map(club_id)
+    self._nif_clubs_built.add(club_id)
+    if nif_map:
+      self._cache.record_player_nifs([(lic, n) for n, lic in nif_map.items()])
+    return nif_map.get(nif)
+
+  def _build_club_nif_map(self, club_id: int) -> dict[str, int]:
+    """Build {nif → license} for the given club's roster (all seasons).
+
+    SAV2 has no NIF-based search, so we pay one profile fetch per unique
+    license (parallelised, max 8 workers). Used internally by
+    find_license_by_nif and cached on the client per club.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    try:
+      roster = self.search_players(club=club_id, season=0)
+    except (SavError, ValueError):
+      logger.debug("Could not list roster for club_id=%s", club_id, exc_info=True)
+      return {}
+
+    seen: set[int] = set()
+    licenses: list[int] = []
+    for p in roster:
+      try:
+        lic = int(p.license)
+      except (ValueError, TypeError):
+        continue
+      if lic not in seen:
+        seen.add(lic)
+        licenses.append(lic)
+    if not licenses:
+      return {}
+
+    def _fetch(lic: int) -> tuple[str, int]:
+      try:
+        profile = self.load_player_profile(lic, club_id=club_id)
+      except (SavError, ValueError):
+        logger.debug("Could not load profile for license=%s", lic, exc_info=True)
+        return "", 0
+      return (profile.get("nif") or "").strip(), lic
+
+    nif_map: dict[str, int] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(licenses))) as pool:
+      for nif_val, lic in pool.map(_fetch, licenses):
+        if nif_val and lic:
+          nif_map[nif_val] = lic
+    return nif_map
 
   def list_games(
     self,

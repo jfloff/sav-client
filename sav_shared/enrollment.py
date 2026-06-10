@@ -87,102 +87,20 @@ def escalao_field_to_name(field_key: str) -> str:
   return suffix.replace("_", " ").title()
 
 
-def _build_club_nif_map(client: Any, club_id: int) -> dict[str, int]:
-  """Build {nif → license} for the given club's roster (all seasons).
-
-  SAV2 has no NIF-based search, so we pay one profile fetch per unique
-  license (parallelised, max 8 workers). Used internally by
-  find_player_license_by_nif and cached on the client per club.
-  """
-  from concurrent.futures import ThreadPoolExecutor
-
-  try:
-    roster = client.search_players(club=club_id, season=0)
-  except (SavError, ValueError):
-    logger.debug("Could not list roster for club_id=%s", club_id, exc_info=True)
-    return {}
-
-  seen: set[int] = set()
-  licenses: list[int] = []
-  for p in roster:
-    try:
-      lic = int(p.license)
-    except (ValueError, TypeError):
-      continue
-    if lic not in seen:
-      seen.add(lic)
-      licenses.append(lic)
-  if not licenses:
-    return {}
-
-  def _fetch(lic: int) -> tuple[str, int]:
-    try:
-      profile = client.load_player_profile(lic, club_id=club_id)
-    except (SavError, ValueError):
-      logger.debug("Could not load profile for license=%s", lic, exc_info=True)
-      return "", 0
-    return (profile.get("nif") or "").strip(), lic
-
-  nif_map: dict[str, int] = {}
-  with ThreadPoolExecutor(max_workers=min(8, len(licenses))) as pool:
-    for nif_val, lic in pool.map(_fetch, licenses):
-      if nif_val and lic:
-        nif_map[nif_val] = lic
-  return nif_map
-
-
 def find_player_license_by_nif(
   parsed: dict, client: Any, *, club_id: int | None = None,
 ) -> int | None:
   """Return the license of the player with the OCR'd NIF in the login's club roster.
 
-  Lookup tiers (cheapest first):
-    1. SQLite license↔NIF cache — O(1), survives across processes.
-    2. Per-club roster build, persisted into the SQLite cache for
-       future runs. Done at most once per club per process.
-
-  Used both to decide reg_type when neither tipo_inscricao box is checked
-  (hit → revalidação, miss → primeira) and to recover a missing licença
-  on the form when the player is already in the roster.
-
-  Returns None when NIF or session club is missing, or when no roster
-  profile carries a matching NIF.
+  Thin wrapper around :meth:`SavClient.find_license_by_nif` that pulls the
+  NIF from a parsed OCR dict. Used both to decide reg_type when neither
+  tipo_inscricao box is checked (hit → revalidação, miss → primeira) and
+  to recover a missing licença on the form when the player is already in
+  the roster.
   """
   nif_field = parsed.get("nif")
-  nif = str(nif_field.value).strip() if (nif_field and nif_field.value) else ""
-  if not nif:
-    return None
-
-  sqlite_cache = getattr(client, "_cache", None)
-  if sqlite_cache is not None:
-    hit = sqlite_cache.get_license_by_nif(nif)
-    if hit:
-      return hit
-
-  if club_id is None:
-    club_id = int(client.session.get("organizacao") or 0) if client.session else 0
-  if not club_id:
-    return None
-
-  built = getattr(client, "_nif_clubs_built", None)
-  if built is None:
-    built = set()
-    # Real SavClient initialises this attribute in __init__, so this path is
-    # only taken by test stubs / unusual client shapes. Frozen dataclasses
-    # and slot-only classes reject assignment — fall back to a throwaway set
-    # so callers don't crash; the per-process roster cache just won't persist.
-    try:
-      client._nif_clubs_built = built
-    except (AttributeError, TypeError):
-      pass
-  if club_id in built:
-    return None
-
-  nif_map = _build_club_nif_map(client, club_id)
-  built.add(club_id)
-  if nif_map and sqlite_cache is not None:
-    sqlite_cache.record_player_nifs([(lic, n) for n, lic in nif_map.items()])
-  return nif_map.get(nif)
+  nif = str(nif_field.value) if (nif_field and nif_field.value) else ""
+  return client.find_license_by_nif(nif, club_id=club_id)
 
 
 def derive_enrollment_params(

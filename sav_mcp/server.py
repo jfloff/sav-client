@@ -32,6 +32,7 @@ import base64
 import binascii
 import logging
 import os
+import re
 import tempfile
 import uuid
 from typing import Any
@@ -220,6 +221,40 @@ def get_player(
     )
     results = client.search_players(
         license=license, club=effective_club, with_details=with_details,
+    )
+    if not results:
+        return None
+    return player_to_dict(results[0], with_details=with_details)
+
+
+@server.tool()
+def find_player_by_nif(
+    nif: str,
+    club_id: int | None = None,
+    with_details: bool = False,
+) -> dict | None:
+    """
+    Resolve a player by Portuguese NIF (9 digits) — inverse of get_player.
+
+    Returns the same shape as get_player, or null if no player in the club
+    roster matches. club_id defaults to the session's own club.
+    with_details: when true, also fetch photo_url and mobile_phone.
+    """
+    digits = re.sub(r"\D", "", nif or "")
+    if len(digits) != 9:
+        return None
+    client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    if not effective_club:
+        return None
+    license = client.find_license_by_nif(digits, club_id=effective_club)
+    if license is None:
+        return None
+    results = client.search_players(
+        license=str(license), club=effective_club, with_details=with_details,
     )
     if not results:
         return None
