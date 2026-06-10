@@ -2052,11 +2052,29 @@ def upload_player_document(
 
 
 @server.tool()
-def delete_player_document(doc_id: int) -> dict:
+def delete_player_document(license: int, doc_id: int) -> dict:
     """
     Delete a previously uploaded document by its galeria id (from list_player_documents).
+
+    The `license` is the document owner's SAV license. The server verifies
+    `doc_id` is one of that player's documents in the open batch before
+    deleting — without this check, a caller could pass their own license with
+    someone else's doc_id.
+
+    Returns {"success": True} on success,
+    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
+    if the licence is not enrolled in any open batch, or
+    {"error": "doc_not_found", "license": int, "doc_id": int} if `doc_id` does
+    not belong to that player in the resolved batch.
     """
-    _get_client().delete_player_registration_document(doc_id)
+    client = _get_client()
+    batch_id = _resolve_license_batch(client, license)
+    if isinstance(batch_id, dict):
+        return batch_id
+    docs = client.list_player_registration_documents(batch_id, license)
+    if not any(d["doc_id"] == doc_id for d in docs):
+        return {"error": "doc_not_found", "license": license, "doc_id": doc_id}
+    client.delete_player_registration_document(doc_id)
     return {"success": True}
 
 

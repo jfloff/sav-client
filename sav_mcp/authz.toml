@@ -103,10 +103,12 @@ self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
 # Wrapper-side lookup: hydrates the caller-scope (NIF → license) at onboarding.
-# Coach-only at the LLM surface so a parent cannot enumerate arbitrary NIFs.
-# The wrapper still calls it internally with its own session.
+# Parent/player may call it for their own NIF (subject_nif gate stops
+# enumeration); the wrapper also calls it internally with its own session.
 [tools.find_player_by_nif]
-roles = ["coach"]
+roles       = ["coach"]
+self_scope  = ["parent", "player"]
+subject_nif = ["nif"]
 
 
 # ── Broad / multi-subject queries — coach-only ───────────────────────────────
@@ -151,10 +153,13 @@ self_scope = ["parent", "player"]
 roles      = ["coach"]
 self_scope = ["parent", "player"]
 
-# Coach-only: shaping batch structure is a club decision.
+# Self-service fallback: if find_open_batch returns None, parent/player must
+# be able to open a batch to proceed. The (type, tier, gender) params come
+# from their own enrollment context, so no subject leakage.
 [tools.create_batch]
 capability = "write"
 roles      = ["coach"]
+self_scope = ["parent", "player"]
 
 [tools.resolve_player]
 roles      = ["coach"]
@@ -196,10 +201,13 @@ roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
-# Coach-only: no PDF means no OCR'd subject claim to verify against.
+# No PDF, but the `license` param is the subject claim — wrapper verifies via
+# subject_license. Parents typically follow up with document uploads later.
 [tools.create_enrollment_manual]
-capability = "write"
-roles      = ["coach"]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
 
 
 # ── Document management ─────────────────────────────────────────────────────
@@ -216,13 +224,23 @@ self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
 
-# ── Destructive — admin-only ─────────────────────────────────────────────────
-# capability = "delete" and roles inherited as [] from [defaults].
-[tools.delete_enrollment]
-capability = "delete"
+# ── Destructive ──────────────────────────────────────────────────────────────
+# capability = "delete"; admin-only unless an explicit self_scope is granted.
 
+# Parent/player may cancel their own enrollment; subject_license verifies.
+[tools.delete_enrollment]
+capability      = "delete"
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+# Whole-batch wipe affects other players — stays admin-only.
 [tools.delete_batch]
 capability = "delete"
 
+# Parent/player may delete their own documents; subject_license verifies the
+# `license` claim, and the server checks `doc_id` belongs to that player in
+# the resolved batch before deleting.
 [tools.delete_player_document]
-capability = "delete"
+capability      = "delete"
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
