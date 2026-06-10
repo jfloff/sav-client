@@ -97,6 +97,11 @@ roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
+[tools.get_enrollment_status]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
 [tools.list_player_documents]
 roles           = ["coach"]
 self_scope      = ["parent", "player"]

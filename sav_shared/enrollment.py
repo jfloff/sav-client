@@ -42,7 +42,127 @@ _DEFAULT_GUARDIAN_FIELDS = [
 # Batch type for a standalone Subida de escalão batch (SAV `newGuia(1,4)`),
 # distinct from the inline promote-on-enroll rider that can ride on a 1ª
 # Inscrição (1) or Revalidação (2). See validate_subida_combo.
+REGISTRATION_TYPE_PRIMEIRA = 1
+REGISTRATION_TYPE_REVALIDACAO = 2
+REGISTRATION_TYPE_TRANSFERENCIA = 3
 REGISTRATION_TYPE_SUBIDA = 4
+
+# SAV2 nationality id for Portugal (`nacional` field on the existing-record
+# payload). Drives the portuguese-vs-foreign-born split in
+# `compute_enrollment_checklist`.
+PORTUGAL_NATIONALITY_ID = 155
+
+
+def compute_enrollment_checklist(
+  reg_type: int,
+  nacional_id: int | None,
+  uploaded_doc_types: list[str | None],
+) -> dict[str, Any] | None:
+  """Build the per-enrollment required-document checklist.
+
+  The rules mirror FPB policy (the app doesn't encode them anywhere else):
+
+  * reg_type 1 / 2 — checklist depends on nationality.
+      portuguese (nacional == 155): fpb_modelo_1, exame_medico required;
+        fpb_modelo_4 optional (inline subida).
+      foreign_born (anything else): fpb_modelo_1, exame_medico,
+        atestado_residencia, certidao_matricula, and **two**
+        documento_identificacao docs (passaporte + título de residência —
+        the título can be the player's or the parent's; SAV stores both
+        under tipo_doc=18 so we can only count, not name them).
+  * reg_type 3 (Transferência) — not handled yet; returns None so callers
+    surface "checklist not implemented".
+  * reg_type 4 (Subida standalone) — only fpb_modelo_4 required, no
+    scenario distinction.
+
+  Args:
+    reg_type: SAV2 batch type id (1, 2, 3, or 4).
+    nacional_id: SAV2 nationality id from the existing-record payload's
+      `nacional` field. 155 = Portugal. None / unknown → treated as
+      foreign_born (defensive: more docs requested is the safer error).
+    uploaded_doc_types: doc_type strings (DocType.value) from
+      `list_player_documents`. Entries may be None for SAV2-only types
+      with no sav-parsers mapping — those are ignored.
+
+  Returns:
+    None for reg_type=3. Otherwise a dict with `scenario`, `reg_type`,
+    `required`, `optional`, and `missing` (human-readable strings for
+    each unsatisfied required entry).
+  """
+  if reg_type == REGISTRATION_TYPE_TRANSFERENCIA:
+    return None
+
+  counts: dict[str, int] = {}
+  for dt in uploaded_doc_types:
+    if dt:
+      counts[dt] = counts.get(dt, 0) + 1
+
+  if reg_type == REGISTRATION_TYPE_SUBIDA:
+    return _format_checklist(
+      scenario="subida_standalone",
+      reg_type=reg_type,
+      required=[("fpb_modelo_4", 1)],
+      optional=[],
+      counts=counts,
+    )
+
+  if nacional_id == PORTUGAL_NATIONALITY_ID:
+    scenario = "portuguese"
+    required = [("fpb_modelo_1", 1), ("exame_medico", 1)]
+  else:
+    scenario = "foreign_born"
+    required = [
+      ("fpb_modelo_1", 1),
+      ("exame_medico", 1),
+      ("atestado_residencia", 1),
+      ("certidao_matricula", 1),
+      ("documento_identificacao", 2),
+    ]
+  return _format_checklist(
+    scenario=scenario,
+    reg_type=reg_type,
+    required=required,
+    optional=[("fpb_modelo_4", "Subida de escalão")],
+    counts=counts,
+  )
+
+
+def _format_checklist(
+  *,
+  scenario: str,
+  reg_type: int,
+  required: list[tuple[str, int]],
+  optional: list[tuple[str, str]],
+  counts: dict[str, int],
+) -> dict[str, Any]:
+  required_rows = []
+  missing: list[str] = []
+  for doc_type, min_count in required:
+    found = counts.get(doc_type, 0)
+    satisfied = found >= min_count
+    required_rows.append({
+      "doc_type": doc_type,
+      "min_count": min_count,
+      "found_count": found,
+      "satisfied": satisfied,
+    })
+    if not satisfied:
+      if min_count > 1:
+        missing.append(f"{doc_type} (need {min_count}, found {found})")
+      else:
+        missing.append(doc_type)
+
+  optional_rows = [
+    {"doc_type": dt, "found_count": counts.get(dt, 0), "label": label}
+    for dt, label in optional
+  ]
+  return {
+    "scenario": scenario,
+    "reg_type": reg_type,
+    "required": required_rows,
+    "optional": optional_rows,
+    "missing": missing,
+  }
 
 
 def validate_subida_combo(reg_type: int, inline_subida: bool) -> None:

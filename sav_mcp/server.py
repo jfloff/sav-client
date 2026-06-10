@@ -54,6 +54,7 @@ from sav_shared.enrollment import (
     REGISTRATION_TYPE_SUBIDA,
     build_primeira_kwargs,
     build_primeira_preview_fields,
+    compute_enrollment_checklist,
     create_and_fetch_batch,
     derive_enrollment_params,
     gender_id_for_license,
@@ -1897,6 +1898,91 @@ def read_enrollment(license: int) -> dict:
     if isinstance(batch_id, dict):
         return batch_id
     return client.load_existing_registration_record(batch_id, license)
+
+
+@server.tool()
+def get_enrollment_status(license: int) -> dict:
+    """
+    Return a player's enrollment status with a required-document checklist.
+
+    Status values:
+      "enrolled"     — license is active in the session's club roster and
+                        not in any open batch.
+      "pending"      — license is in an open batch (Em construção /
+                        Devolvida / Em Validação / Em Pagamento); a
+                        document checklist is included.
+      "not_enrolled" — license is neither in an open batch nor in the
+                        active roster.
+
+    For "pending" the response carries `batch` ({number, type_id, type,
+    state}) and `checklist` ({scenario, reg_type, required, optional,
+    missing}). Scenario is "portuguese" or "foreign_born" for reg_type 1/2,
+    "subida_standalone" for reg_type 4, and the checklist is null for
+    reg_type 3 (Transferência is not handled yet).
+
+    The checklist mirrors FPB policy (the SAV API doesn't expose it):
+      portuguese: fpb_modelo_1, exame_medico; optional fpb_modelo_4.
+      foreign_born: fpb_modelo_1, exame_medico, atestado_residencia,
+        certidao_matricula, documento_identificacao × 2 (passaporte +
+        título de residência, player's or parent's). Both fall under
+        SAV tipo_doc=18, so the rule reports counts (need ≥2, found N).
+
+    For "enrolled" the response carries `player` ({license, name, tier,
+    club}). For "not_enrolled" it carries `open_batches` — the currently
+    open batches the caller could join.
+    """
+    client = _get_client()
+    try:
+        batch_id = client.resolve_batch_id_by_license(license)
+    except LicenseNotEnrolledError as exc:
+        club_id = int(client.session.get("organizacao") or 0)
+        roster_hits = (
+            client.search_players(
+                license=str(license), club=club_id, status="active",
+            )
+            if club_id else []
+        )
+        if roster_hits:
+            return {
+                "license": license,
+                "status": "enrolled",
+                "player": player_to_dict(roster_hits[0]),
+            }
+        return {
+            "license": license,
+            "status": "not_enrolled",
+            "open_batches": exc.open_batches,
+        }
+
+    batch = next(
+        (b for b in client.list_player_registration_batches() if b.id == batch_id),
+        None,
+    )
+    record = client.load_existing_registration_record(batch_id, license)
+    raw_docs = client.list_player_registration_documents(batch_id, license)
+    doc_types = [
+        (mapped.value if (mapped := tipo_doc_to_doc_type(d["tipo_doc"])) else None)
+        for d in raw_docs
+    ]
+    nacional_raw = record.get("nacional")
+    try:
+        nacional_id = (
+            int(nacional_raw) if nacional_raw not in (None, "") else None
+        )
+    except (TypeError, ValueError):
+        nacional_id = None
+    reg_type = batch.type_id if batch else 0
+    return {
+        "license": license,
+        "status": "pending",
+        "batch": {
+            "number": batch.number if batch else "",
+            "type_id": reg_type,
+            "type": batch.type if batch else "",
+            "state": batch.state if batch else "",
+        },
+        "checklist": compute_enrollment_checklist(reg_type, nacional_id, doc_types),
+    }
 
 
 @server.tool()

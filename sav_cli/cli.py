@@ -41,6 +41,7 @@ from sav_shared.files import staged_pdf
 from sav_shared.enrollment import (
   KWARG_TO_SAV_KEY,
   REGISTRATION_TYPE_SUBIDA,
+  compute_enrollment_checklist,
   create_and_fetch_batch,
   derive_enrollment_params,
   find_player_license_by_nif,
@@ -76,6 +77,7 @@ from sav_shared.lookups import (
   find_id_by_name,
   is_uploadable_doc_type,
   normalize_doc_type,
+  tipo_doc_to_doc_type,
 )
 from sav_shared.medical_exam import extract_medical_exam_info
 
@@ -2712,6 +2714,198 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
           f"distrito context which isn't available from a single --field)."
         )
   return out
+
+
+@enrollment_grp.command("status")
+@click.option("--license", "license_", type=int, required=True,
+              help="Licence number to check.")
+@click.pass_context
+def enrollment_status_cmd(ctx, license_):
+  """Show a player's enrollment status and required-document checklist.
+
+  \b
+    sav enrollment status --license LICENSE
+
+  Status is one of:
+
+  \b
+    enrolled     Active in the session's club roster, no open batch.
+    pending      In an open batch — checklist of required documents is
+                 shown, derived from reg_type and nationality:
+                   portuguese: fpb_modelo_1, exame_medico
+                       (optional: fpb_modelo_4 for inline subida)
+                   foreign_born: fpb_modelo_1, exame_medico,
+                       atestado_residencia, certidao_matricula,
+                       documento_identificacao × 2 (passaporte +
+                       título de residência)
+                   subida_standalone (reg_type 4): fpb_modelo_4 only
+                   Transferência (reg_type 3) is not handled — checklist
+                   is omitted.
+    not_enrolled Neither in an open batch nor active in the roster.
+  """
+  output = ctx.obj["output"]
+  client = _make_client()
+
+  try:
+    batch_id = client.resolve_batch_id_by_license(license_)
+  except LicenseNotEnrolledError as exc:
+    club_id = int(client.session.get("organizacao") or 0)
+    roster_hits = (
+      client.search_players(
+        license=str(license_), club=club_id, status="active",
+      )
+      if club_id else []
+    )
+    if roster_hits:
+      result = {
+        "license": license_,
+        "status": "enrolled",
+        "player": {
+          "name": roster_hits[0].name,
+          "tier": roster_hits[0].tier,
+          "club": roster_hits[0].club,
+        },
+      }
+    else:
+      result = {
+        "license": license_,
+        "status": "not_enrolled",
+        "open_batches": exc.open_batches,
+      }
+  except (SavConnectionError, SavResponseError, ValueError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+  else:
+    try:
+      batch = next(
+        (b for b in client.list_player_registration_batches() if b.id == batch_id),
+        None,
+      )
+      record = client.load_existing_registration_record(batch_id, license_)
+      raw_docs = client.list_player_registration_documents(batch_id, license_)
+    except (SavConnectionError, SavResponseError, ValueError) as e:
+      raise SavCliError(str(e), code=_exc_code(e))
+    doc_types = [
+      (mapped.value if (mapped := tipo_doc_to_doc_type(d["tipo_doc"])) else None)
+      for d in raw_docs
+    ]
+    nacional_raw = record.get("nacional")
+    try:
+      nacional_id = int(nacional_raw) if nacional_raw not in (None, "") else None
+    except (TypeError, ValueError):
+      nacional_id = None
+    reg_type = batch.type_id if batch else 0
+    result = {
+      "license": license_,
+      "status": "pending",
+      "batch": {
+        "number": batch.number if batch else "",
+        "type_id": reg_type,
+        "type": batch.type if batch else "",
+        "state": batch.state if batch else "",
+      },
+      "checklist": compute_enrollment_checklist(reg_type, nacional_id, doc_types),
+    }
+
+  if output == "json":
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    return
+
+  if output == "csv":
+    click.echo("field,value")
+    click.echo(f"license,{result['license']}")
+    click.echo(f"status,{result['status']}")
+    if result["status"] == "pending":
+      b = result["batch"]
+      click.echo(f"batch_number,{b['number']}")
+      click.echo(f"batch_type,{b['type']}")
+      click.echo(f"batch_state,{b['state']}")
+      checklist = result["checklist"]
+      if checklist is None:
+        click.echo("checklist,not_implemented")
+      else:
+        click.echo(f"scenario,{checklist['scenario']}")
+        for row in checklist["required"]:
+          click.echo(
+            f"required,{row['doc_type']} "
+            f"(need {row['min_count']}, found {row['found_count']}, "
+            f"{'ok' if row['satisfied'] else 'missing'})"
+          )
+        for row in checklist["optional"]:
+          click.echo(f"optional,{row['doc_type']} (found {row['found_count']})")
+    elif result["status"] == "enrolled":
+      p = result["player"]
+      click.echo(f"name,{p['name']}")
+      click.echo(f"tier,{p['tier']}")
+      click.echo(f"club,{p['club']}")
+    return
+
+  console = _console()
+  if result["status"] == "enrolled":
+    p = result["player"]
+    console.print(
+      f"[green]:white_check_mark: Licence {license_} — "
+      f"[bold]enrolled[/] in {p['club']!r} ({p['tier']!r}).[/]"
+    )
+    console.print(f"[dim]Player: {p['name']}[/]")
+    return
+
+  if result["status"] == "not_enrolled":
+    console.print(
+      f"[yellow]:warning: Licence {license_} — "
+      f"[bold]not enrolled[/] (no open batch, not active in club roster).[/]"
+    )
+    if result["open_batches"]:
+      console.print("\n[bold]Open batches you could join:[/]")
+      _render_table(
+        ["Number", "Tier", "Gender"],
+        [
+          [str(b["number"]), b["tier"], b["gender"]]
+          for b in result["open_batches"]
+        ],
+      )
+    return
+
+  b = result["batch"]
+  console.print(
+    f"[cyan]:hourglass_flowing_sand: Licence {license_} — "
+    f"[bold]pending[/] in batch {b['number']!r} "
+    f"({b['type']} — {b['state']}).[/]"
+  )
+  checklist = result["checklist"]
+  if checklist is None:
+    console.print(
+      "\n[yellow]:warning: Transferência (reg_type 3) checklist is not "
+      "implemented; cannot list required documents.[/]"
+    )
+    return
+  console.print(f"\n[bold]Scenario:[/] {checklist['scenario']}")
+  if checklist["required"]:
+    console.print("\n[bold]Required documents:[/]")
+    _render_table(
+      ["Document", "Need", "Found", "Status"],
+      [
+        [
+          row["doc_type"], str(row["min_count"]), str(row["found_count"]),
+          "[green]ok[/]" if row["satisfied"] else "[red]missing[/]",
+        ]
+        for row in checklist["required"]
+      ],
+    )
+  if checklist["optional"]:
+    console.print("\n[bold]Optional documents:[/]")
+    _render_table(
+      ["Document", "Found", "Label"],
+      [
+        [row["doc_type"], str(row["found_count"]), row["label"]]
+        for row in checklist["optional"]
+      ],
+    )
+  if checklist["missing"]:
+    console.print(
+      f"\n[red]:cross_mark: Missing:[/] {', '.join(checklist['missing'])}"
+    )
+  else:
+    console.print("\n[green]:white_check_mark: All required documents uploaded.[/]")
 
 
 @enrollment_grp.command("read")
