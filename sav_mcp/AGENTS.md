@@ -200,6 +200,80 @@ Two kinds of failure surface:
   - `{success: false, missing_guardian_fields: [...]}` — from `submit_enrollment` when the player is a minor.
 - **Raised exceptions** — programming errors (unknown `mod1_id`, invalid `team`, malformed base64). Surface these to the user; they indicate a bug or a malformed input.
 
+## Authorization metadata for downstream consumers
+
+sav-mcp itself is a stdio subprocess with no attested caller identity — it trusts whatever client is on the other end of the pipe. Downstream wrappers (e.g. the gedai-bot Telegram frontend) carry the trust boundary: they authenticate the end user, decide what subset of tools to expose to the LLM, and rewrite caller-identity arguments before forwarding.
+
+The per-tool policy lives in **`sav_mcp/authz.toml`** — single source of truth. The loader (`sav_mcp/authz.py`) stamps every tool's MCP `_meta` and `inputSchema` properties with the `x-sav-*` extension fields documented below. Wrappers consume the same TOML directly:
+
+```python
+from pathlib import Path
+from sav_mcp.authz import load_policy
+
+policy, _ = load_policy(Path(".../sav_mcp/authz.toml"))
+```
+
+### Extension fields
+
+On each tool's `_meta`:
+
+- **`x-sav-capability`** (`str`) — one of `"read"` | `"write"` | `"delete"`. The verb the tool performs, used by wrappers for audit logs and confirmation UX.
+- **`x-sav-roles`** (`list[str]`) — caller roles permitted to invoke the tool unconditionally, drawn from `{"coach","parent","player"}`. **An empty list combined with any capability means admin-only.** `"admin"` is implicit and never appears here.
+- **`x-sav-self-scope`** (`list[str]`, optional) — caller roles ⊂ `{"parent","player"}` permitted to invoke the tool *only when the subject belongs to them*. Layered on top of `x-sav-roles`. Wrappers verify ownership via the subject markers below before forwarding.
+
+On a parameter's JSON Schema property inside `inputSchema`:
+
+- **`x-sav-subject`** (`str`) — declares this parameter carries a subject identifier. Value is one of `"license"` (parameter is an integer SAV2 licence) or `"nif"` (parameter is a Portuguese NIF string). Wrappers verify `args[param] ∈ caller.allowed[kind]` before forwarding. Tools that need both flows (e.g. `submit_enrollment`, `preview_enrollment`) carry the marker on both a `license` and an `nif` parameter — exactly one is set per call; for 1ª Inscrição only `nif` is set, for Revalidação only `license`.
+- **`x-sav-identity`** (`bool`) — the parameter carries the *caller's* identity. Wrappers MUST overwrite the LLM-supplied value with the authenticated user's so a jailbroken LLM cannot impersonate another club member. No tool today takes such a parameter; the marker is in place for future ones.
+
+### Role vocabulary
+
+| Role | Meaning |
+|------|---------|
+| `coach` | Club coach or staff using the bot for day-to-day operations. |
+| `parent` | Parent or guardian of an enrolled player. |
+| `player` | Player enrolled in the club. |
+| `admin` | Club administrator. Implicit — never appears in `x-sav-roles`; admin-only tools have `x-sav-roles: []`. |
+
+### Capability tiers
+
+| Tier | Meaning | Examples |
+|------|---------|----------|
+| `read` | Pure lookups, no SAV2 state change (also covers OCR-only steps that cache nothing in SAV2). | `search_players`, `get_game_sheet`, `parse_enrollment_forms`, `get_artifact_subject_claim`. |
+| `write` | Mutates SAV2 (create / update). | `submit_enrollment`, `update_enrollment`, `upload_player_document`, `create_batch`. |
+| `delete` | Destructive (removes records or files). Conventionally `roles = []` (admin-only). | `delete_enrollment`, `delete_batch`, `delete_player_document`. |
+
+### Wrapper enforcement model
+
+```
+caller asks to invoke T with args:
+  if caller.role == "admin":                          allow
+  elif caller.role in T.roles:                        allow
+  elif caller.role in T.self_scope:
+        # iterate the marked subject params; each carries its kind in the marker
+        for each param p in T.inputSchema where x-sav-subject is set:
+            kind = inputSchema[p]["x-sav-subject"]      # "license" or "nif"
+            value = args.get(p)
+            if value is not None and value not in caller.allowed[kind]:
+                                                        deny
+        # if no marked param is populated, the tool is wrapper-gated by
+        # conversation context alone (e.g. parse_enrollment_forms,
+        # resolve_player) — wrapper applies its own policy
+                                                        allow
+  else:                                                 deny
+```
+
+The `caller.allowed` sets are wrapper-owned state, hydrated at onboarding:
+
+- **Player (≥18 self-enrolling):** `caller.allowed = {"license": [own_license?], "nif": [own_nif]}`. `caller.nif` is captured at onboarding; license appears once known.
+- **Parent:** `caller.allowed = {"license": [dep.license for dep], "nif": [dep.nif for dep]}` over the registered dependents `[{nif, license?, name, birth_date}, ...]`. New dependents have license `None` until 1ª Inscrição succeeds, after which the wrapper writes the assigned license (returned in `submit_enrollment`'s response payload) back into the matching dependent row.
+
+The wrapper SHOULD use `find_player_by_nif` and `get_player_profile` during onboarding to verify a parent's claim (match `nome_pai` / `nome_mae` before adding a dependent row); those calls happen with the wrapper's own SAV session, not on behalf of the end user.
+
+### Policy
+
+**Every tool MUST have a `[tools.<name>]` block in `authz.toml`.** Adding a `@server.tool()` without one fails at import time — the loader raises `RuntimeError` on drift between the live registry and the policy. Pick the narrower role set and lower capability tier when in doubt; omitted fields inherit from `[defaults]`, which is read-only / no-roles / no-scope.
+
 ## Things to avoid
 
 - Don't fabricate `tier_id` values — call `list_tiers(gender_id)` or get them from `parse_enrollment_forms`.

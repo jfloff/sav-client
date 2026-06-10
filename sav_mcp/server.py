@@ -109,6 +109,34 @@ def _get_client() -> SavClient:
     return _client
 
 
+def _verify_nif_claim(form: dict[str, Any], claimed_nif: str | None) -> None:
+    """Defense-in-depth: refuse if the caller's claimed NIF disagrees with the
+    form's OCR'd NIF.
+
+    Wrappers pass the caller-asserted dependent NIF as the `nif` argument on
+    enrollment tools so they can enforce self-scope without sav-mcp having to
+    enforce anything itself. When the form OCR yielded a NIF and the caller's
+    claim disagrees, we still raise — uploading a form for one athlete while
+    claiming another is almost certainly a mistake (or an attack).
+    """
+    if not claimed_nif:
+        return
+    parsed = form.get("parsed") or {}
+    nif_field = parsed.get("nif")
+    parsed_nif = (
+        str(nif_field.value) if nif_field and nif_field.value else None
+    )
+    if not parsed_nif:
+        return
+    norm_claim = re.sub(r"\D", "", claimed_nif)
+    norm_parsed = re.sub(r"\D", "", parsed_nif)
+    if norm_claim and norm_parsed and norm_claim != norm_parsed:
+        raise ValueError(
+            f"Claimed NIF {claimed_nif!r} does not match the form's OCR'd "
+            f"NIF {parsed_nif!r}; refusing to proceed."
+        )
+
+
 def _resolve_license_batch(client: SavClient, license: int) -> int | dict:
     """Resolve the open batch for a license.
 
@@ -1166,6 +1194,7 @@ def preview_enrollment(
     mod1_id: str,
     medical_exam_id: str | None = None,
     mod4_id: str | None = None,
+    nif: str | None = None,
 ) -> dict:
     """
     Preview the enrollment for a player.
@@ -1198,6 +1227,12 @@ def preview_enrollment(
     plain-language `enrollment_route`. Pass the same mod4_id to
     submit_enrollment to actually commit the inline subida.
 
+    nif: optional explicit subject claim — the athlete's NIF that the caller
+    asserts this enrollment is for. Used by downstream wrappers to enforce
+    self-scope on 1ª Inscrição (where there is no licence yet) and as a
+    defense-in-depth cross-check against the form's OCR'd NIF: if both are
+    set and disagree, the call is rejected.
+
     batch_number is accepted for workflow symmetry; only the form/license are
     needed at this stage. It is validated when submit_enrollment is called.
     """
@@ -1207,6 +1242,7 @@ def preview_enrollment(
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
     if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
+    _verify_nif_claim(form, nif)
 
     client = _get_client()
     reg_type = form.get("reg_type")
@@ -1298,6 +1334,7 @@ def submit_enrollment(
     field_overrides: dict[str, Any] | None = None,
     medical_exam_id: str | None = None,
     mod4_id: str | None = None,
+    nif: str | None = None,
 ) -> dict:
     """
     Submit the player enrollment using the data prepared by preview_enrollment.
@@ -1326,6 +1363,12 @@ def submit_enrollment(
     fails if SAV offers no subida tier for the player. (This is the inline
     rider, not a standalone type-4 Subida batch.)
 
+    nif: optional explicit subject claim — the athlete's NIF that the caller
+    asserts this enrollment is for. Used by downstream wrappers to enforce
+    self-scope on 1ª Inscrição (where there is no licence yet) and as a
+    defense-in-depth cross-check against the form's OCR'd NIF: if both are
+    set and disagree, the call is rejected.
+
     Returns:
       success=true + player_id (+ license for 1ª Inscrição) on success.
       success=false + missing_guardian_fields  when the player is a minor and
@@ -1345,6 +1388,7 @@ def submit_enrollment(
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
     if form.get("doc_type") != DocType.FPB_MODELO_1:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
+    _verify_nif_claim(form, nif)
 
     reg_type = form.get("reg_type")
     # Revalidação caches a ReconcileResult; type-1 sets `previewed: True`
@@ -2049,6 +2093,21 @@ def replace_player_document(
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
+
+
+# ── Authorization metadata ──────────────────────────────────────────────────
+# Per-tool policy (capability tier, role allowlist, self-scope, subject /
+# identity parameter markers) lives in `authz.toml`. Loading it here stamps
+# each registered tool's `_meta` and inputSchema with the `x-sav-*` extension
+# fields documented in AGENTS.md → "Authorization metadata for downstream
+# consumers". sav-mcp itself does NOT enforce — the wrapper does.
+
+from pathlib import Path
+
+from sav_mcp.authz import apply_to_server, load_policy
+
+_AUTHZ_POLICY, _ = load_policy(Path(__file__).with_name("authz.toml"))
+apply_to_server(server, _AUTHZ_POLICY)
 
 
 def main() -> None:

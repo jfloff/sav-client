@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.54.1"
+version = "0.56.0"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -29,4 +29,4 @@ include = ["sav_client*", "sav_cli*", "sav_mcp*", "sav_shared*"]
 [tool.setuptools.package-data]
 sav_client = ["AGENTS.md"]
 sav_cli = ["AGENTS.md"]
-sav_mcp = ["AGENTS.md"]
+sav_mcp = ["AGENTS.md", "authz.toml"]

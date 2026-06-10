@@ -1,0 +1,228 @@
+# Authorization policy for sav-mcp.
+#
+# Loaded at server startup; applied as MCP `_meta` (x-sav-*) on every tool.
+# sav-mcp does NOT enforce — the wrapper (e.g. gedai-bot) does. This file is
+# the single source of truth and is intentionally readable both by Python and
+# by the wrapper directly (`from sav_mcp.authz import load_policy`).
+#
+# Vocabulary
+# ──────────
+# capability      : what the tool *does* — "read" | "write" | "delete".
+#                     read   = lookups, no SAV2 state change.
+#                     write  = mutates SAV2 (create / update).
+#                     delete = destructive (removes records or files).
+#
+# roles           : caller roles allowed to invoke unconditionally.
+#                     Subset of {"coach", "parent", "player"}.
+#                     "admin" is implicit — admins may call any tool, so the
+#                     role never appears here; admin-only tools have
+#                     roles = [].
+#
+# self_scope      : caller roles allowed to invoke *only when the subject
+#                     belongs to them*. Subset of {"parent", "player"}.
+#                     Layered on top of `roles`. The wrapper enforces using
+#                     its own onboarding state (caller.allowed_licenses for
+#                     `subject_license` params; caller.allowed_nifs for
+#                     `subject_nif` params).
+#
+# subject_license : input parameter names that carry the subject's SAV
+#                     license (int). Stamps `x-sav-subject = "license"` on
+#                     each param. Wrapper verifies the value is in the
+#                     caller's allowed-license set.
+#
+# subject_nif     : input parameter names that carry the subject's Portuguese
+#                     NIF (string). Stamps `x-sav-subject = "nif"`. Wrapper
+#                     verifies the value is in the caller's allowed-NIF set.
+#                     Used for 1ª Inscrição where no SAV license exists yet.
+#
+# identity_params : input parameter names carrying the *caller's* identity
+#                     (e.g. a hypothetical `caller_phone`). Wrapper OVERWRITES
+#                     the LLM-supplied value with the authenticated user's so
+#                     a jailbroken LLM cannot impersonate another club member.
+#                     No tool today takes such a parameter; the field is in
+#                     place for future ones.
+#
+# Defaults: any field omitted from a [tools.X] block falls back to the
+# [defaults] table — narrowest viable: read-only, no roles, no scope.
+
+[defaults]
+capability      = "read"
+roles           = []
+self_scope      = []
+identity_params = []
+subject_license = []
+subject_nif     = []
+
+[roles]
+# Vocabulary lock — loader rejects any role outside this list.
+allowed = ["coach", "parent", "player"]
+
+
+# ── Bot session metadata ─────────────────────────────────────────────────────
+# Returns the bot's own SAV2 login context; coach-only because it could leak
+# the operating club to other roles.
+[tools.get_session_info]
+roles = ["coach"]
+
+
+# ── Federation-public lookups ────────────────────────────────────────────────
+# Static reference data; safe to expose to every authenticated role.
+[tools.list_associations]
+roles = ["coach", "parent", "player"]
+
+[tools.list_clubs]
+roles = ["coach", "parent", "player"]
+
+[tools.list_tiers]
+roles = ["coach", "parent", "player"]
+
+[tools.list_games]
+roles = ["coach", "parent", "player"]
+
+
+# ── Player records ───────────────────────────────────────────────────────────
+# Coach reads freely; parent/player only their own (license check at wrapper).
+[tools.get_player]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.get_player_profile]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.read_enrollment]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.list_player_documents]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+# Wrapper-side lookup: hydrates the caller-scope (NIF → license) at onboarding.
+# Coach-only at the LLM surface so a parent cannot enumerate arbitrary NIFs.
+# The wrapper still calls it internally with its own session.
+[tools.find_player_by_nif]
+roles = ["coach"]
+
+
+# ── Broad / multi-subject queries — coach-only ───────────────────────────────
+# These return many subjects at once; opening them to parent/player would leak
+# other people's data.
+[tools.search_players]
+roles = ["coach"]
+
+[tools.roster_for_escalao]
+roles = ["coach"]
+
+[tools.list_coaches]
+roles = ["coach"]
+
+[tools.list_batches]
+roles = ["coach"]
+
+[tools.list_batch_enrollments]
+roles = ["coach"]
+
+[tools.get_batch]
+roles = ["coach"]
+
+
+# ── Game sheets — operational coach tools ────────────────────────────────────
+[tools.list_game_sheets]
+roles = ["coach"]
+
+[tools.get_game_sheet]
+roles = ["coach"]
+
+[tools.generate_game_sheet_pdf]
+roles = ["coach"]
+
+
+# ── Enrollment workflow ──────────────────────────────────────────────────────
+[tools.parse_enrollment_forms]
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
+[tools.find_open_batch]
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
+# Coach-only: shaping batch structure is a club decision.
+[tools.create_batch]
+capability = "write"
+roles      = ["coach"]
+
+[tools.resolve_player]
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
+[tools.resolve_subida_target]
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
+# Revalidação subject = `license`; 1ª Inscrição subject = `nif`.
+[tools.preview_enrollment]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+subject_nif     = ["nif"]
+
+[tools.submit_enrollment]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+subject_nif     = ["nif"]
+
+[tools.submit_subida_enrollment]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.update_enrollment]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.update_enrollment_with_document]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+# Coach-only: no PDF means no OCR'd subject claim to verify against.
+[tools.create_enrollment_manual]
+capability = "write"
+roles      = ["coach"]
+
+
+# ── Document management ─────────────────────────────────────────────────────
+[tools.upload_player_document]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+[tools.replace_player_document]
+capability      = "write"
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
+
+# ── Destructive — admin-only ─────────────────────────────────────────────────
+# capability = "delete" and roles inherited as [] from [defaults].
+[tools.delete_enrollment]
+capability = "delete"
+
+[tools.delete_batch]
+capability = "delete"
+
+[tools.delete_player_document]
+capability = "delete"
