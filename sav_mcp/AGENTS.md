@@ -20,6 +20,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 | **val** | `1` = home team, `2` = away team. Tools expose this as `team: "home" \| "away"`. |
 | **artifact_id** | UUID returned by `parse_enrollment_forms` referencing a cached OCR result. fpb_modelo_1 results expose this also as `mod1_id`; exame_medico results expose it also as `medical_exam_id`. |
 | **needs_review** | Field-level OCR confidence is too low to trust; the user must confirm or correct. |
+| **player** | Canonical English term — never "athlete". Tool names, parameters, and English responses use `player`. Portuguese user-facing replies may use `jogador` or `atleta` (both natural to coaches). The upstream SAV2 API uses `atleta` as a JSON field name — wire contract, untouched. |
 
 ## Sessions
 
@@ -86,7 +87,7 @@ Knowledge to drive the tool correctly:
 
 - Each escalão spans **two consecutive birth years**. For season `Y/Y+1`, Sub-X = born in `Y+1−X` and `Y+2−X`; same for Mini 8/10/12.
 - **Sénior** is open-ended below (no upper birth year — the tool filters by tier name). **Baby-Basket** spans three years (ages 4–6 in `Y+1`); the two youngest require the child to have completed 4 years before enrollment. **Masters / Veteranos** and **BCR** — `<TODO: confirm with user>`; `roster_for_escalao` raises so the LLM doesn't guess.
-- "Próximo ano / próxima época" → `season_id + 1` (SAV2 `epoca_id` is sequential), never the calendar year. Between May and September the wall clock straddles a season transition **and** club rosters for the upcoming season usually do not yet exist; in that window an athlete listed as inactive is almost certainly "not yet re-registered", not retired — this is exactly what the tool's cascade handles.
+- "Próximo ano / próxima época" → `season_id + 1` (SAV2 `epoca_id` is sequential), never the calendar year. Between May and September the wall clock straddles a season transition **and** club rosters for the upcoming season usually do not yet exist; in that window a player listed as inactive is almost certainly "not yet re-registered", not retired — this is exactly what the tool's cascade handles.
 
 ### Birth-year windows
 
@@ -188,7 +189,7 @@ Re-call `submit_enrollment` with the added fields after a `missing_guardian_fiel
 
 ### Players
 - `search_players(...)`, `get_player(license, ...)`, and `find_player_by_nif(nif, ...)` accept `with_details=false` (default). Pass `with_details=true` to issue one extra `jogadoresdb.php?op=2` request per player and add `photo_url` and `mobile_phone` (N+1).
-- `find_player_by_nif(nif, club_id?, with_details?)` is the inverse of `get_player(license=...)`: resolves a player by Portuguese NIF (9 digits) against the club roster. `club_id` defaults to the session's own club. Returns null when the NIF is malformed (not 9 digits) or no roster player matches. Useful for external importers (e.g. federation signup form) that key athletes by NIF.
+- `find_player_by_nif(nif, club_id?, with_details?)` is the inverse of `get_player(license=...)`: resolves a player by Portuguese NIF (9 digits) against the club roster. `club_id` defaults to the session's own club. Returns null when the NIF is malformed (not 9 digits) or no roster player matches. Useful for external importers (e.g. federation signup form) that key players by NIF.
 
 ## Error handling
 

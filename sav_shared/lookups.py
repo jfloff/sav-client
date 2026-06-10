@@ -148,7 +148,7 @@ def player_registration_tiers(gender_id: int) -> dict[int, str]:
 
 # ── Tier → birth-year window ───────────────────────────────────────────────────
 #
-# For season Y/Y+1, an athlete born in year B is eligible for escalão E iff
+# For season Y/Y+1, a player born in year B is eligible for escalão E iff
 # (Y+1 - B) ∈ TIER_AGES_IN_SEASON[E]. Sources: FPB Comunicado 057 (Competições
 # Nacionais Escalões de Formação 2025-2026) and Associação de Basquetebol do
 # Porto Regulamento de Provas e Calendarização 2025/26 §3. Stable across
@@ -165,7 +165,7 @@ TIER_AGES_IN_SEASON: dict[str, frozenset[int]] = {
   "Sub 18":      frozenset({17, 18}),
 }
 
-# Open-ended below: every athlete reaching this age or older in Y+1 qualifies.
+# Open-ended below: every player reaching this age or older in Y+1 qualifies.
 TIER_MIN_AGE_IN_SEASON: dict[str, int] = {
   "Sénior": 19,
 }

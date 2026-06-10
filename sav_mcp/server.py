@@ -502,7 +502,7 @@ def roster_for_escalao(
     club_id: int | None = None,
 ) -> dict:
     """
-    Resolve the roster of athletes for an escalão in the current or upcoming season.
+    Resolve the roster of players for an escalão in the current or upcoming season.
 
     Designed for natural roster questions ("Que jogadores são Sub-14 masculinos
     próxima época?") so the LLM doesn't have to compute birth-year arithmetic,
@@ -1058,7 +1058,7 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
                     "error": "player_already_in_sav",
                     "reason": (
                         "A player matching the OCR'd identifying data already "
-                        "exists in SAV. 1ª Inscrição is for athletes not yet in "
+                        "exists in SAV. 1ª Inscrição is for players not yet in "
                         "the federation — use Revalidação on the existing licence."
                     ),
                     "existing_sav_id": dup.get("id") or dup.get("atleta") or None,

@@ -22,6 +22,7 @@ Python library for automating the FPB SAV2 basketball management system. Authori
 | **batch type** | `1` = 1ª Inscrição · `2` = Revalidação · `3` = Transferência · `4` = Subida de escalão. |
 | **batch state** | `1` = Em construção (open, accepts items) · plus Devolvida / Em Validação / Em Pagamento. |
 | **gender_id** | `1` = Masculino, `2` = Feminino. |
+| **player** | The canonical English term across this codebase — never "athlete". The upstream SAV2 API uses `atleta` as a JSON field name; that's wire contract and stays as-is. |
 
 ## Setup
 

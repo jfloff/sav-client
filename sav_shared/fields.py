@@ -1,7 +1,7 @@
 """Single source of truth for the FPB enrollment field surface.
 
 Each enrollment field has up to four lives:
-  - the player's SAV profile (op=2 athlete form, parsed in sav_client)
+  - the player's SAV profile (op=2 player form, parsed in sav_client)
   - the OCR'd FPB form (parsed in sav_parsers)
   - the SAV submit kwargs (add_player_to_registration_batch)
   - the human label used in the CLI/MCP summary table

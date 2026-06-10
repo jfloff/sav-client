@@ -16,6 +16,7 @@ CLI client for the FPB SAV2 basketball management system. Authoritative referenc
 | **active** | `true` = registered and eligible this season. Only definitive eligibility signal. |
 | **association** | Regional body (e.g. AB Santarém). Numeric `id` from `sav associations`. |
 | **game_status** | `"Marcado"` (scheduled) · `"Realizado"` (played) · `"Não Marcado"` · `"Adiado"` · `"Anulado"`. |
+| **player** | The canonical English term across this CLI — never "athlete". Use `--player` flags and `players` subcommand. |
 
 ## Setup
 

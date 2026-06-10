@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
 
 _LOGIN_PATH = "php/logindb.php"
 _LOGIN_OP = "1"
-_ATHLETES_PATH = "php/jogadoresdb.php"
-_ATHLETES_OP = "1"
+_PLAYERS_PATH = "php/jogadoresdb.php"
+_PLAYERS_OP = "1"
 _CLUBS_BY_ORG_PATH = "php/resultadosdb.php"
 _CLUBS_BY_ORG_OP = "17"
 _CLUBS_BY_ASSOC_PATH = "php/jogadoresdb.php"
@@ -67,8 +67,8 @@ _COACHES_OP = "1"
 _COACHES_PERFIL = "4"
 _COACH_DETAIL_PATH = "php/treinadordb.php"
 _COACH_DETAIL_OP = "2"
-_ATHLETE_DETAIL_PATH = "php/jogadoresdb.php"
-_ATHLETE_DETAIL_OP = "2"
+_PLAYER_DETAIL_PATH = "php/jogadoresdb.php"
+_PLAYER_DETAIL_OP = "2"
 _CLUB_DETAIL_PATH = "php/clubesdb.php"
 _CLUB_DETAIL_OP = "9"
 _GAME_SHEET_PATH = "php/maindb.php"
@@ -644,7 +644,7 @@ class SavClient:
     }
 
     logger.info("Searching players club=%s filters: %s", club, payload)
-    html = self._post_form(_ATHLETES_PATH, payload, params={"op": _ATHLETES_OP})
+    html = self._post_form(_PLAYERS_PATH, payload, params={"op": _PLAYERS_OP})
     players = self._parse_players_response(html)
     # Opportunistic license → internal id cache fill (persisted in SQLite).
     pairs: list[tuple[int, int]] = []
@@ -658,7 +658,7 @@ class SavClient:
 
   def get_player_detail(self, player_id: int, *, with_details: bool = False) -> Player:
     """
-    Fetch the detail page for a single athlete to obtain fields not returned
+    Fetch the detail page for a single player to obtain fields not returned
     by the listing: ``photo_url`` and ``mobile_phone``.
 
     Pass ``with_details=True`` to fetch and parse the detail page. With the
@@ -690,8 +690,8 @@ class SavClient:
       "organizacao": self.session.get("organizacao", 0),
     }
 
-    logger.info("Fetching photo for athlete id=%s", player_id)
-    text = self._post_form(_ATHLETE_DETAIL_PATH, payload, params={"op": _ATHLETE_DETAIL_OP})
+    logger.info("Fetching photo for player id=%s", player_id)
+    text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
     try:
       raw = json.loads(text)
     except ValueError as exc:
@@ -2992,7 +2992,7 @@ class SavClient:
   ) -> dict[str, Any]:
     """Read-only player profile by license, suitable for OCR reconciliation.
 
-    Single source: op=2 (jogadoresdb.php) — the athlete form view, which
+    Single source: op=2 (jogadoresdb.php) — the player form view, which
     carries everything we reconcile (personal data + the address block).
     No wizard saves, no validation gates; server-side validation surfaces
     only at real submit, which is where it belongs.
@@ -3026,16 +3026,16 @@ class SavClient:
       "perfil":      self.session.get("perfil", 0),
       "organizacao": self.session.get("organizacao", 0),
     }
-    text = self._post_form(_ATHLETE_DETAIL_PATH, payload, params={"op": _ATHLETE_DETAIL_OP})
+    text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
     try:
       raw = json.loads(text)
     except ValueError as exc:
       raise SavResponseError(
-        f"Athlete profile response was not valid JSON: {text[:200]!r}"
+        f"Player profile response was not valid JSON: {text[:200]!r}"
       ) from exc
     if "msg" not in raw:
       raise SavResponseError(
-        f"Athlete profile response missing 'msg': keys={list(raw.keys())}"
+        f"Player profile response missing 'msg': keys={list(raw.keys())}"
       )
 
     from bs4 import BeautifulSoup
@@ -3634,7 +3634,7 @@ class SavClient:
     Revalidação reads estatuto off the stored player record; for type-1
     there's nothing stored yet so SAV serves a dropdown. The UI locks
     Portuguese FBP players to a single option, so we auto-pick when exactly
-    one real (>0) option is returned. Multi-option means a non-PT athlete
+    one real (>0) option is returned. Multi-option means a non-PT player
     (Comunitário / Não Comunitário / Equiparado) — surface a config error
     asking the caller to pass an explicit choice.
     """
@@ -3675,7 +3675,7 @@ class SavClient:
     listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
     raise SavConfigError(
       f"Multiple estatuto options for batch {batch.id}, player {userid}: "
-      f"{listing}. Pass estatuto= to disambiguate (non-PT athletes)."
+      f"{listing}. Pass estatuto= to disambiguate (non-PT players)."
     )
 
   def _resolve_primeira_taxa_id(
@@ -3940,7 +3940,7 @@ class SavClient:
           f"{', '.join(missing)}"
         )
 
-    # Estatuto (auto-pick single FBP option for PT athletes)
+    # Estatuto (auto-pick single FBP option for PT players)
     if estatuto is None:
       estatuto = self._load_primeira_estatuto(batch, userid)
 
@@ -4250,7 +4250,7 @@ class SavClient:
     POST form-encoded data to `path` and return the raw response text.
 
     Used for endpoints that expect ``application/x-www-form-urlencoded``
-    rather than JSON (e.g. the athlete search endpoint).
+    rather than JSON (e.g. the player search endpoint).
 
     Raises:
         SavConnectionError: On any network or HTTP error.
@@ -4287,7 +4287,7 @@ class SavClient:
 
   def _parse_players_response(self, html: str) -> list[Player]:
     """
-    Parse the HTML table returned by the athlete search endpoint.
+    Parse the HTML table returned by the player search endpoint.
 
     Each ``<tr>`` in the ``<tbody>`` maps to one Player.  The columns are:
       0: actions button  (contains seeJogador(id, ...) — extracts DB id)
@@ -4541,7 +4541,7 @@ class SavClient:
     Return ``(full_name, code)`` for a single club from clubesdb.php?op=9.
 
     Parses the detail form HTML using the same label→sibling strategy as
-    the athlete detail parser.  Returns empty strings on any error so that
+    the player detail parser.  Returns empty strings on any error so that
     callers can gracefully fall back to storing only the display name.
     """
     try:
@@ -4595,7 +4595,7 @@ class SavClient:
     Parse the JSON envelope returned by jogadoresdb.php?op=2.
 
     The server returns ``{"msg": "<html>..."}``; we scan ``<img>`` tags for
-    the athlete's photo and pull ``<input id="telem">`` for the mobile
+    the player's photo and pull ``<input id="telem">`` for the mobile
     phone, returning a minimal Player with id, photo_url and mobile_phone.
     """
     from bs4 import BeautifulSoup

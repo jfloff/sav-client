@@ -651,7 +651,7 @@ def player_cmd(ctx, license_nums, with_details, clubs, association, all_clubs):
 def profile_cmd(ctx, license_num):
   """Show the SAV2 player profile for one license number.
 
-  Read-only fetch from jogadoresdb.php?op=2 — the athlete-form view the
+  Read-only fetch from jogadoresdb.php?op=2 — the player-form view the
   enrollment wizard prefills from. Returns the full canonical profile
   (personal data + address). License alone is enough; internal id is
   resolved transparently via the cached search.
@@ -2361,7 +2361,7 @@ def enrollment_create_cmd(
     license, batch = resolved
     batch_id = batch.id
 
-    # Step 6 — fetch SAV profile (op=2 athlete form). Read-only; any
+    # Step 6 — fetch SAV profile (op=2 player form). Read-only; any
     # server-side validation surfaces at real submit.
     try:
       with console.status("[bold cyan]:open_book: Loading SAV player profile...[/]"):
