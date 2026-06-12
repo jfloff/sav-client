@@ -45,6 +45,7 @@ from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBa
 from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import player_registration_tiers
+from sav_shared.text import iso_date
 
 logger = logging.getLogger(__name__)
 
@@ -829,6 +830,16 @@ class SavClient:
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
 
+    # SAV2's server-side date window is finicky: it only engages when BOTH
+    # inicio AND fim are present, and only parses ISO (YYYY-MM-DD), not the
+    # DD-MM-YYYY this method accepts. So translate, and when the caller gives
+    # only one bound, backfill the other with an open sentinel so the server
+    # still applies the half-open range we asked for. (Empty both = no window.)
+    inicio = fim = ""
+    if date_from or date_to:
+      inicio = iso_date(date_from) if date_from else "1900-01-01"
+      fim = iso_date(date_to) if date_to else "2999-12-31"
+
     payload = {
       "user": self.session.get("user", ""),
       "organizacao": self.session.get("organizacao", 0),
@@ -838,8 +849,8 @@ class SavClient:
       "numJogo": game_number,
       "fase": phase,
       "jornada": round_,
-      "inicio": date_from,
-      "fim": date_to,
+      "inicio": inicio,
+      "fim": fim,
       "epoca": season,
       "estadojogo": game_status,
       "estadoresult": result_status,

@@ -938,9 +938,13 @@ def games_cmd(ctx, season, date_from, date_to, tier, gender, status):
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 
-  if status.lower() != "all":
-    results = [g for g in results if g.game_status == status]
-
+  # The client narrows the window server-side, but guarantee the bounds (and
+  # apply the status filter) client-side too — same belt-and-suspenders pass
+  # the MCP list_games tool uses, so we never depend on SAV2's quirky filter.
+  status_filter = "" if status.lower() == "all" else status
+  results = filter_games(
+    results, status=status_filter, date_from=date_from, date_to=date_to,
+  )
   results = sorted(results, key=game_sort_key)
 
   if not results:
@@ -1151,9 +1155,10 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
   client = _make_client()
 
   try:
-    # Do not pass date filters to the API — the SAV2 server only returns
-    # scheduled (Marcado) games when date-filtering, dropping completed ones.
-    # Fetch all games for the season and filter by date client-side instead.
+    # Fetch the whole season and filter by date client-side. SAV2's server-side
+    # date window drops games with an empty date (postponed/cancelled/unscheduled);
+    # game sheets only concern dated games so that would be harmless here, but
+    # filtering client-side keeps date+competition+status in one consistent pass.
     results = client.list_games(season=season, tier=tier)
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))

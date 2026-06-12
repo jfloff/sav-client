@@ -75,7 +75,7 @@ from sav_shared.fpb_mod1 import (
     read_tipo_inscricao,
     reconcile_fpb_mod1,
 )
-from sav_shared.games import filter_games
+from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
     GENERO,
     REGISTRATION_TYPE_LABELS,
@@ -383,19 +383,23 @@ def list_games(
     season: int | None = None,
 ) -> list[dict]:
     """
-    List games for the session's club.
+    List games for the session's club, sorted by date (earliest first).
 
     date_from / date_to: DD-MM-YYYY format.
     status: e.g. "Marcado", "Não Marcado". Omit to return all statuses.
     """
     client = _get_client()
+    # SAV2 ignores the inicio/fim date window server-side, leaking out-of-range
+    # games, so we still send it (it narrows the payload when honored) but
+    # guarantee the bounds with a client-side pass via filter_games.
     results = client.list_games(
         season=season, tier=tier, gender=gender,
         date_from=date_from, date_to=date_to,
     )
-    if status:
-        results = [g for g in results if g.game_status == status]
-    return [game_to_dict(g) for g in results]
+    results = filter_games(
+        results, status=status, date_from=date_from, date_to=date_to,
+    )
+    return [game_to_dict(g) for g in sorted(results, key=game_sort_key)]
 
 
 @server.tool()

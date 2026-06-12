@@ -171,6 +171,8 @@ client.list_games(game_status=1)                       # numeric code
 
 Dates `DD-MM-YYYY`. Returns games for the authenticated club. `Game.id` is required by `get_eligible_players()`, `get_eligible_players_pdf()`, `get_game_sheet_pdf()`.
 
+SAV2's server-side date window is finicky — it only engages when **both** `inicio` and `fim` are present and ISO-formatted (`YYYY-MM-DD`); a single bound or `DD-MM-YYYY` is silently ignored (returns the whole season). The client hides this: it translates `DD-MM-YYYY → YYYY-MM-DD` and backfills the missing bound with an open sentinel, so `date_from` or `date_to` alone works as expected. Pass dates as `DD-MM-YYYY` and ignore the quirk.
+
 ### `get_eligible_players(game_id, *, val=1) → dict`
 
 Pre-game eligible data for one team. No PDF.
