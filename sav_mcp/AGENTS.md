@@ -81,13 +81,22 @@ Use `list_tiers(gender_id)` to discover `tier_id` values dynamically — the set
 
 ## Domain rules
 
-For roster questions about an escalão ("Que jogadores são Sub-X?", "atletas para o próximo ano") call **`roster_for_escalao(tier_id, gender_id, when="next"|"current")`**. The tool resolves both birth years deterministically, runs the off-season fallback cascade (`club + active → club + all → federation + all`), and reports which `source` matched — so the LLM never does the arithmetic or the retries. Fall back to `search_players(birth_year=[...])` only for genuinely custom queries (e.g. multiple escalões at once).
+For roster questions about an escalão ("Que jogadores são Sub-X?", "atletas para o próximo ano") call **`roster_for_escalao(tier_id, gender_id, when="next"|"current")`**. The tool resolves both birth years deterministically and runs a fallback cascade (`club + active → club + all → federation + all`), reporting which `step` matched — so the LLM never does the arithmetic or the retries. Fall back to `search_players(birth_year=[...])` only for genuinely custom queries (e.g. multiple escalões at once).
+
+**Targeting a season — relative vs absolute:**
+- `when="current"`/`"next"` is a season *relative to today*, resolved server-side. **Prefer this** for "current / próxima época" questions: you do not need to know today's season, and it avoids guessing the season from the calendar year (they diverge May–Sept).
+- `season_year` (start year; `2020` = "2020/2021") names an *absolute* season and overrides `when`. Use it only when the user names a specific season ("em 2020/2021"). Do **not** try to compute "next" yourself by passing `season_year` — that reintroduces the calendar trap; use `when="next"`.
+
+**Three regimes** follow from how the target relates to today:
+- **Future season** (`when="next"`, or a `season_year` ahead of today) is a **projection**, not a query for that season's enrollment — enrollment only ever exists for the current season. The tool keeps known players whose birth year lands in that season's window, returning `is_projection=true` and `source="projection_by_birth_year"`. An empty `players` list means "no known player projects into that cohort", never "missing data".
+- **Current season** (`when="current"`) and **past seasons** (`season_year` ≤ today) reflect actual enrollment, queried at that season's own epoch; `is_projection=false` and `source` stays `club`/`federation`/`none`.
 
 Knowledge to drive the tool correctly:
 
 - Each escalão spans **two consecutive birth years**. For season `Y/Y+1`, Sub-X = born in `Y+1−X` and `Y+2−X`; same for Mini 8/10/12.
 - **Sénior** is open-ended below (no upper birth year — the tool filters by tier name). **Baby-Basket** spans three years (ages 4–6 in `Y+1`); the two youngest require the child to have completed 4 years before enrollment. **Masters / Veteranos** and **BCR** — `<TODO: confirm with user>`; `roster_for_escalao` raises so the LLM doesn't guess.
-- "Próximo ano / próxima época" → `season_id + 1` (SAV2 `epoca_id` is sequential), never the calendar year. Between May and September the wall clock straddles a season transition **and** club rosters for the upcoming season usually do not yet exist; in that window a player listed as inactive is almost certainly "not yet re-registered", not retired — this is exactly what the tool's cascade handles.
+- "Próximo ano / próxima época" advances the season label by one (`season_id + 1`; SAV2 `epoca_id` is sequential), never the calendar year. But there is **no next-season roster to fetch** — enrollment only happens in the current season — so a next-season roster is always a projection of the current pool by birth year. `roster_for_escalao(when="next")` does this; doing it by hand means querying the *current* `epoca_id` and filtering by next season's birth years, never `season_id + 1`.
+- Between May and September the wall clock straddles a season transition: a player listed as inactive in the current season is almost certainly "not yet re-registered", not retired — the tool's `club + all` cascade step (status="all") surfaces them.
 
 ### Birth-year windows
 
@@ -104,16 +113,16 @@ For season `Y/Y+1`. Concrete column shows 2025/2026 (`Y = 2025`).
 | Sub 18 | `Y+1−18`, `Y+2−18` | 2008, 2009 |
 | Sénior | `Y+1−18` and earlier | 2007 and earlier |
 
-When falling back to `search_players` directly: never drop one of the two birth years; if a club-scoped next-season query returns empty, retry at `club_id=0` with `status="all"` before reporting empty.
+When falling back to `search_players` directly: never drop one of the two birth years; for a next-season projection query the **current** `epoca_id` (not `season_id + 1`) filtered by next season's birth years, and if a club-scoped query returns empty, retry at `club_id=0` with `status="all"` before reporting empty.
 
 ### Worked example
 
 Coach: *"Que jogadores são para o ano Sub-14 masculinos?"* (next season). One call:
 
 `roster_for_escalao(tier_id=5, gender_id=1, when="next")`
-  → `{tier: "Sub 14", season: "2026/2027", birth_years: [2014, 2013], source, step, players}`.
+  → `{tier: "Sub 14", season: "2026/2027", birth_years: [2014, 2013], is_projection: true, source: "projection_by_birth_year", step, players}`.
 
-Report the `players` list. If `source="federation"`, frame the answer in domain terms ("atletas elegíveis por ano de nascimento — ainda sem inscrição da próxima época neste clube"), not by naming `club_id=0`.
+Report the `players` list, framing it as a projection — "atletas que, pelo ano de nascimento, passam a Sub-14 na próxima época". If `step="federation + all"`, those players came from the wider federation pool, not this club's current roster; say so in domain terms ("elegíveis por ano de nascimento, ainda sem inscrição neste clube") rather than naming `club_id=0`.
 
 ## Enrollment workflow
 

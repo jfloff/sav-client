@@ -528,33 +528,59 @@ def roster_for_escalao(
     tier_id: int,
     gender_id: int,
     when: str = "next",
+    season_year: int | None = None,
     club_id: int | None = None,
 ) -> dict:
     """
-    Resolve the roster of players for an escalão in the current or upcoming season.
+    Resolve the roster of players for an escalão in a current, past, or upcoming season.
 
     Designed for natural roster questions ("Que jogadores são Sub-14 masculinos
     próxima época?") so the LLM doesn't have to compute birth-year arithmetic,
     handle the season transition, or override status filters by hand. Birth
     years are resolved deterministically from ``tier_id`` + the target
     season's start year, and the tool runs a fallback cascade so empty
-    club-scoped results during off-season silently expand:
+    club-scoped results silently expand:
 
         (a) session/given club + status="active"
         (b) session/given club + status="all"           ← not-yet-renewed
-        (c) club_id=0 + status="all" (federation)       ← off-season fallback
+        (c) club_id=0 + status="all" (federation)       ← wider fallback
 
-    The first non-empty step wins. The returned ``source`` ("club" |
-    "federation" | "none") and ``step`` label tell the caller which path
-    succeeded so the LLM can frame the answer in domain terms.
+    The first non-empty step wins; the ``step`` label tells the caller which
+    path matched.
+
+    The target season comes from ``season_year`` when given (an absolute season,
+    e.g. ``2020`` for "2020/2021"), otherwise from ``when`` (``"current"`` or
+    ``"next"``). Three regimes follow from how the target relates to today:
+
+    - **Past or current season** → actual enrollment. The tool queries that
+      season's own SAV2 epoch and reports ``is_projection=False`` with
+      ``source`` in {``"club"``, ``"federation"``, ``"none"``}.
+    - **Future season** (``when="next"`` or a ``season_year`` ahead of today)
+      → a *projection*, not a query for next-season enrollment: enrollment only
+      ever exists for the current season, so there is nothing to fetch. The
+      tool takes the players we already know and keeps those whose birth year
+      falls into the requested tier's window for that season, flagging the
+      result with ``is_projection=True`` and
+      ``source="projection_by_birth_year"`` so callers phrase it honestly ("os
+      jogadores que, pela idade, passam a Sub-14"). An empty ``players`` list
+      then simply means no known player projects into that cohort — not that
+      enrollment data is missing.
 
     Args:
         tier_id: Numeric escalão ID. From ``list_tiers(gender_id)`` or
             ``parse_enrollment_forms``. The mapping varies by gender.
         gender_id: 1 = Masculino, 2 = Feminino.
-        when: "current" or "next". "next" advances both the SAV2 epoca_id and
-            the start year by 1. Defaults to "next" because that's the common
-            roster-planning question.
+        when: "current" or "next" — a season *relative* to today, resolved
+            server-side. "next" advances the season by 1. Defaults to "next"
+            because that's the common roster-planning question. Use this (not
+            ``season_year``) for "current/próxima época" questions: the caller
+            does not need to know today's season, and it avoids the
+            calendar-year-vs-season trap. Ignored when ``season_year`` is given.
+        season_year: Absolute target season, as its start year (``2020`` means
+            "2020/2021"). Overrides ``when``. Use it only when the user names a
+            specific season ("em 2020/2021"). A past or current year reflects
+            actual enrollment; a future year is a birth-year projection just
+            like ``when="next"``.
         club_id: Defaults to the session's club. Pass an explicit ID to query
             another club; the cascade still applies. Pass 0 to skip straight
             to federation-wide.
@@ -566,7 +592,9 @@ def roster_for_escalao(
           "gender_id": int,
           "season": str,            # "YYYY/YYYY+1"
           "birth_years": list[int] | None,  # None for open-ended tiers (Sénior)
-          "source": str,            # "club" | "federation" | "none"
+          "is_projection": bool,    # True for a future season (by birth year)
+          "source": str,            # "projection_by_birth_year" (future season)
+                                    #   | "club" | "federation" | "none"
           "step": str,              # short label of the matching cascade step
           "players": list[dict],
         }
@@ -592,10 +620,22 @@ def roster_for_escalao(
     client = _get_client()
     current_year = client.get_current_season_start_year()
     current_epoca_id = int(client.session.get("epoca_id") or 0)
-    offset = 1 if when == "next" else 0
-    target_year = current_year + offset
-    target_epoca_id = current_epoca_id + offset
+
+    # season_year, when given, names an absolute season and overrides the
+    # relative `when`. SAV2 epoca_id is sequential, so a season's epoch is the
+    # current one shifted by the year delta.
+    if season_year is not None:
+        target_year = season_year
+    else:
+        target_year = current_year + (1 if when == "next" else 0)
+    target_epoca_id = current_epoca_id + (target_year - current_year)
     season_str = f"{target_year}/{target_year + 1}"
+
+    # A future season has no enrollment to fetch, so it can only be a projection
+    # of the current pool forward by birth year. The current season and any past
+    # season reflect actual enrollment, so we query that season's own epoch.
+    is_projection = target_year > current_year
+    query_epoca_id = current_epoca_id if is_projection else target_epoca_id
 
     birth_years = tier_birth_years_for_season(tier_name, target_year)
     if birth_years is None and tier_name not in TIER_MIN_AGE_IN_SEASON:
@@ -624,7 +664,7 @@ def roster_for_escalao(
 
     common: dict[str, Any] = {
         "gender": gender_id,
-        "season": target_epoca_id,
+        "season": query_epoca_id,
         "with_details": False,
     }
     if birth_years is not None:
@@ -645,13 +685,20 @@ def roster_for_escalao(
             chosen_label, chosen_source, chosen_players = label, source, players
             break
 
+    # A future season is a projection over the current pool, so the source
+    # reflects the projection rather than where the players were found (the
+    # cascade step still carries that). An empty roster then means "no player
+    # projects into this cohort", which is honest — never "none"/"missing data".
+    result_source = "projection_by_birth_year" if is_projection else chosen_source
+
     return {
         "tier": tier_name,
         "tier_id": tier_id,
         "gender_id": gender_id,
         "season": season_str,
         "birth_years": birth_years,
-        "source": chosen_source,
+        "is_projection": is_projection,
+        "source": result_source,
         "step": chosen_label,
         "players": [player_to_dict(p) for p in chosen_players],
     }

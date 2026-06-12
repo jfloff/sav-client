@@ -54,13 +54,15 @@ class TestNextSeasonSub14Masculinos:
     assert result["tier"] == "Sub 14"
     assert result["season"] == "2026/2027"
     assert result["birth_years"] == [2014, 2013]
-    assert result["source"] == "club"
+    assert result["is_projection"] is True
+    assert result["source"] == "projection_by_birth_year"
     assert result["step"] == "club + active"
     assert [pl["license"] for pl in result["players"]] == ["301772"]
-    # Confirm we asked for both birth years and the next-season epoca_id.
+    # We project from the *current* season's pool, filtered by next season's
+    # birth years — there is no next-season enrollment to query.
     first_call = stub.calls[0]
     assert sorted(first_call["birth_year"]) == [2013, 2014]
-    assert first_call["season"] == 101  # epoca_id + 1
+    assert first_call["season"] == 100  # current epoca_id, not next
     assert first_call["gender"] == 1
 
   def test_club_empty_falls_back_to_status_all(self, monkeypatch):
@@ -70,32 +72,34 @@ class TestNextSeasonSub14Masculinos:
 
     result = server_module.roster_for_escalao(tier_id=5, gender_id=1, when="next")
 
-    assert result["source"] == "club"
+    assert result["source"] == "projection_by_birth_year"
     assert result["step"] == "club + all"
     assert len(stub.calls) == 2  # active failed, all succeeded
 
   def test_club_empty_falls_back_to_federation(self, monkeypatch):
-    """Off-season case: club hasn't built next-season roster; federation has the cohort."""
+    """Club pool is empty; the wider federation pool has the cohort."""
     p = _player("301774", "Atleta 2014", "Sub 14", "2014-09-01", active=True)
     stub = _StubClient(responses={(0, "all"): [p]})
     monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
     result = server_module.roster_for_escalao(tier_id=5, gender_id=1, when="next")
 
-    assert result["source"] == "federation"
+    assert result["source"] == "projection_by_birth_year"
     assert result["step"] == "federation + all"
     assert len(stub.calls) == 3
     # Last call must be the federation-wide one.
     assert stub.calls[-1]["club"] == 0
     assert stub.calls[-1]["status"] == "all"
 
-  def test_all_empty_returns_empty_with_none_source(self, monkeypatch):
+  def test_all_empty_returns_empty_projection_not_none(self, monkeypatch):
+    """No known player projects into the cohort: still a projection, never 'none'."""
     stub = _StubClient(responses={})
     monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
     result = server_module.roster_for_escalao(tier_id=5, gender_id=1, when="next")
 
-    assert result["source"] == "none"
+    assert result["is_projection"] is True
+    assert result["source"] == "projection_by_birth_year"
     assert result["players"] == []
     assert result["step"] == "federation + all"  # last step attempted
 
@@ -110,7 +114,65 @@ class TestWhenCurrent:
 
     assert result["season"] == "2025/2026"
     assert result["birth_years"] == [2013, 2012]
+    assert result["is_projection"] is False
+    assert result["source"] == "club"  # actual enrollment, not a projection
     assert stub.calls[0]["season"] == 100  # epoca_id unchanged
+
+
+class TestExplicitSeasonYear:
+  """season_year names an absolute season and overrides `when`."""
+
+  def test_past_season_is_actual_enrollment(self, monkeypatch):
+    """A past season reflects real enrollment, queried at that season's own epoch."""
+    p = _player("301779", "Atleta 2009", "Sub 14", "2009-05-05")
+    stub = _StubClient(responses={(200, "active"): [p]})
+    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+    # current_year=2025, epoca_id=100 → 2020/2021 is 5 seasons back.
+    result = server_module.roster_for_escalao(
+      tier_id=5, gender_id=1, season_year=2020,
+    )
+
+    assert result["season"] == "2020/2021"
+    # Sub 14 in 2020/2021 → born 2021−14 and 2022−14 = 2007, 2008.
+    assert sorted(result["birth_years"]) == [2007, 2008]
+    assert result["is_projection"] is False
+    assert result["source"] == "club"  # real enrollment, not a projection
+    # Queried that season's own epoch: 100 - (2025 - 2020) = 95.
+    assert stub.calls[0]["season"] == 95
+    assert sorted(stub.calls[0]["birth_year"]) == [2007, 2008]
+
+  def test_season_year_overrides_when(self, monkeypatch):
+    """season_year wins even if `when` says otherwise."""
+    p = _player("301780", "X", "Sub 14", "2007-01-01")
+    stub = _StubClient(responses={(200, "active"): [p]})
+    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+    result = server_module.roster_for_escalao(
+      tier_id=5, gender_id=1, when="next", season_year=2020,
+    )
+
+    assert result["season"] == "2020/2021"
+    assert result["is_projection"] is False
+    assert stub.calls[0]["season"] == 95
+
+  def test_future_season_year_projects_like_next(self, monkeypatch):
+    """A season_year ahead of today is a projection over the current pool."""
+    p = _player("301781", "Atleta 2012", "Sub 14", "2012-02-02")
+    stub = _StubClient(responses={(200, "active"): [p]})
+    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+    # 2027/2028 is two seasons ahead; Sub 14 then → born 2028−14, 2029−14 = 2014, 2015.
+    result = server_module.roster_for_escalao(
+      tier_id=5, gender_id=1, season_year=2027,
+    )
+
+    assert result["season"] == "2027/2028"
+    assert sorted(result["birth_years"]) == [2014, 2015]
+    assert result["is_projection"] is True
+    assert result["source"] == "projection_by_birth_year"
+    # Projection queries the *current* pool (epoca_id 100), not the future epoch.
+    assert stub.calls[0]["season"] == 100
 
 
 class TestSenior:
@@ -167,7 +229,8 @@ class TestExplicitClubId:
       tier_id=5, gender_id=1, when="next", club_id=0,
     )
 
-    assert result["source"] == "federation"
+    assert result["source"] == "projection_by_birth_year"
+    assert result["step"] == "federation + all"
     assert len(stub.calls) == 1  # only the federation step
     assert stub.calls[0]["club"] == 0
 
@@ -180,5 +243,6 @@ class TestExplicitClubId:
       tier_id=5, gender_id=1, when="next", club_id=999,
     )
 
-    assert result["source"] == "club"
+    assert result["source"] == "projection_by_birth_year"
+    assert result["step"] == "club + active"
     assert stub.calls[0]["club"] == 999
