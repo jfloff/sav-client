@@ -232,20 +232,24 @@ subject_license = ["license"]
 # ── Destructive ──────────────────────────────────────────────────────────────
 # capability = "delete"; admin-only unless an explicit self_scope is granted.
 
-# Parent/player may cancel their own enrollment; subject_license verifies.
+# Coach may cancel any enrollment; parent/player only their own (subject_license).
 [tools.delete_enrollment]
 capability      = "delete"
+roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
-# Whole-batch wipe affects other players — stays admin-only.
+# Whole-batch wipe affects every player in the batch; coach (the club operator
+# who creates batches) and admin only — no parent/player self_scope.
 [tools.delete_batch]
 capability = "delete"
+roles      = ["coach"]
 
-# Parent/player may delete their own documents; subject_license verifies the
-# `license` claim, and the server checks `doc_id` belongs to that player in
-# the resolved batch before deleting.
+# Coach may delete any player's document; parent/player only their own
+# (subject_license verifies the `license` claim, and the server checks `doc_id`
+# belongs to that player in the resolved batch before deleting).
 [tools.delete_player_document]
 capability      = "delete"
+roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
