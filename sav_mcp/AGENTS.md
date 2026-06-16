@@ -165,6 +165,19 @@ The canonical pipeline. Each step's output feeds the next.
 
 Re-call `submit_enrollment` with the added fields after a `missing_guardian_fields` response.
 
+### Required documents depend on nationality and reg_type
+
+For any *"que documentos precisa o jogador X para se inscrever"* question — including future-season / not-yet-enrolled ones — **call `get_enrollment_status(license, reg_type?)` and report its `checklist`**, never answer from general knowledge. The list changes with the player's nationality, and only the tool grounds nationality in their actual record. The checklist is returned for every status: `pending` reflects the live batch's uploads; `enrolled` / `not_enrolled` return a `projected: true` checklist (nationality from the stored record, `reg_type` defaulting to Revalidação/1ª Inscrição). When the player has no SAV record yet (brand-new 1ª Inscrição, no licence), apply the rule below from their stated nationality.
+
+For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set splits on nationality:
+
+| Scenario | nacional | Required documents |
+| --- | --- | --- |
+| `portuguese` | Portugal (id 155) | `fpb_modelo_1`, `exame_medico` |
+| `foreign_born` | any other / unknown | `fpb_modelo_1`, `exame_medico`, `atestado_residencia`, `certidao_matricula`, `documento_identificacao` × 2 (passaporte + título de residência — the player's or a parent's) |
+
+`fpb_modelo_4` is optional in both (only when promoting an escalão inline — Subida). reg_type 4 (standalone Subida) requires only `fpb_modelo_4`; reg_type 3 (Transferência) is not handled yet (`checklist` is null). Unknown nationality is treated as `foreign_born` on purpose — asking for the extra documents is the safe error.
+
 ## Other workflows
 
 ### Read / update an already-enrolled player

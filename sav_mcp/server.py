@@ -51,6 +51,7 @@ from sav_client.exceptions import (
 logger = logging.getLogger(__name__)
 from sav_shared.files import ensure_pdf
 from sav_shared.enrollment import (
+    REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
     build_primeira_kwargs,
     build_primeira_preview_fields,
@@ -1951,8 +1952,46 @@ def read_enrollment(license: int) -> dict:
     return client.load_existing_registration_record(batch_id, license)
 
 
+def _projected_enrollment_checklist(
+    client, license: int, reg_type: int, club_id: int,
+) -> dict | None:
+    """Document checklist for a licence that is *not* in an open batch.
+
+    Grounds the portuguese-vs-foreign-born split in the player's actual
+    record — the `nacional` (nationality) id read from the op=2 profile —
+    so "what will player X need to enrol" can be answered before any batch
+    exists. There are no uploaded documents to count yet, so every required
+    entry comes back unsatisfied; `projected=True` flags this so callers
+    don't read `found_count`/`missing` as a verified gap (unlike the
+    "pending" checklist, which counts docs attached to the live batch).
+
+    Nationality lookup failures fall back to `nacional_id=None`, which
+    `compute_enrollment_checklist` treats as foreign_born — the safe error,
+    since it asks for more documents rather than fewer.
+    """
+    try:
+        profile = client.load_player_profile(license, club_id=club_id or None)
+    except SavError:
+        logger.debug(
+            "Profile lookup failed for projected checklist (license=%s)",
+            license, exc_info=True,
+        )
+        profile = {}
+    nacional_raw = profile.get("nacional")
+    try:
+        nacional_id = int(nacional_raw) if nacional_raw not in (None, "") else None
+    except (TypeError, ValueError):
+        nacional_id = None
+    checklist = compute_enrollment_checklist(reg_type, nacional_id, [])
+    if checklist is not None:
+        checklist["projected"] = True
+    return checklist
+
+
 @server.tool()
-def get_enrollment_status(license: int) -> dict:
+def get_enrollment_status(
+    license: int, reg_type: int = REGISTRATION_TYPE_REVALIDACAO,
+) -> dict:
     """
     Return a player's enrollment status with a required-document checklist.
 
@@ -1965,11 +2004,19 @@ def get_enrollment_status(license: int) -> dict:
       "not_enrolled" — license is neither in an open batch nor in the
                         active roster.
 
-    For "pending" the response carries `batch` ({number, type_id, type,
-    state}) and `checklist` ({scenario, reg_type, required, optional,
-    missing}). Scenario is "portuguese" or "foreign_born" for reg_type 1/2,
-    "subida_standalone" for reg_type 4, and the checklist is null for
-    reg_type 3 (Transferência is not handled yet).
+    Every status carries a `checklist` ({scenario, reg_type, required,
+    optional, missing}). Scenario is "portuguese" or "foreign_born" for
+    reg_type 1/2, "subida_standalone" for reg_type 4, and the checklist is
+    null for reg_type 3 (Transferência is not handled yet).
+
+    For "pending" the checklist reflects the live batch — its `reg_type`
+    and the documents actually uploaded to it (the `reg_type` argument is
+    ignored). For "enrolled" and "not_enrolled" there is no batch, so the
+    checklist is a *projection* of what the player would need to enrol:
+    nationality is grounded in their stored record, `reg_type` selects the
+    scenario (defaults to Revalidação/1ª Inscrição, which share the same
+    document split), and it carries `projected: true` with every required
+    entry unsatisfied (no batch to hold uploads yet).
 
     The checklist mirrors FPB policy (the SAV API doesn't expose it):
       portuguese: fpb_modelo_1, exame_medico; optional fpb_modelo_4.
@@ -1978,9 +2025,9 @@ def get_enrollment_status(license: int) -> dict:
         título de residência, player's or parent's). Both fall under
         SAV tipo_doc=18, so the rule reports counts (need ≥2, found N).
 
-    For "enrolled" the response carries `player` ({license, name, tier,
-    club}). For "not_enrolled" it carries `open_batches` — the currently
-    open batches the caller could join.
+    For "enrolled" the response also carries `player` ({license, name,
+    tier, club}). For "not_enrolled" it carries `open_batches` — the
+    currently open batches the caller could join.
     """
     client = _get_client()
     try:
@@ -1993,16 +2040,21 @@ def get_enrollment_status(license: int) -> dict:
             )
             if club_id else []
         )
+        checklist = _projected_enrollment_checklist(
+            client, license, reg_type, club_id,
+        )
         if roster_hits:
             return {
                 "license": license,
                 "status": "enrolled",
                 "player": player_to_dict(roster_hits[0]),
+                "checklist": checklist,
             }
         return {
             "license": license,
             "status": "not_enrolled",
             "open_batches": exc.open_batches,
+            "checklist": checklist,
         }
 
     batch = next(
