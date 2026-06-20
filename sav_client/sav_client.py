@@ -910,8 +910,9 @@ class SavClient:
         id_doc:            Filter by ID document number.
         birth_date:        Filter by birth date (YYYY-MM-DD).
         with_details:      When True, issue one extra request per coach to
-                           populate ``nif``, ``tptd``, ``tptd_expiry``, and
-                           ``mobile_phone``. Off by default because it is N+1.
+                           populate ``nif``, ``tptd``, ``tptd_expiry``,
+                           ``mobile_phone``, and ``email``. Off by default
+                           because it is N+1.
 
     Returns:
         List of Coach objects parsed from the HTML response.
@@ -957,7 +958,7 @@ class SavClient:
         detail = self.get_coach_detail(c.id)
         enriched.append(_dc_replace(
           c, nif=detail.nif, tptd=detail.tptd, tptd_expiry=detail.tptd_expiry,
-          mobile_phone=detail.mobile_phone,
+          mobile_phone=detail.mobile_phone, email=detail.email,
         ))
       coaches = enriched
 
@@ -966,7 +967,7 @@ class SavClient:
   def get_coach_detail(self, coach_id: int) -> Coach:
     """
     Fetch the SAV2 coach profile page to obtain ``nif``, ``tptd``,
-    ``tptd_expiry``, and ``mobile_phone`` for a single coach.
+    ``tptd_expiry``, ``mobile_phone``, and ``email`` for a single coach.
 
     The SAV2 coaches listing does not expose these fields; this method
     issues an extra ``treinadordb.php?op=2`` request per coach and parses
@@ -978,7 +979,7 @@ class SavClient:
 
     Returns:
         A partial Coach with ``id``, ``name``, ``nif``, ``tptd``,
-        ``tptd_expiry``, and ``mobile_phone`` populated; listing-only
+        ``tptd_expiry``, ``mobile_phone``, and ``email`` populated; listing-only
         fields (wallet, club, association, …) are left empty.
 
     Raises:
@@ -4438,6 +4439,7 @@ class SavClient:
       - ``tptd``          from ``<input id='nrtptd' value='...'>``
       - ``tptd_expiry``   from ``<input id='validadetptd' value='...'>``
       - ``mobile_phone``  from ``<input id='telem' value='...'>``
+      - ``email``         from ``<input id='email' value='...'>``
 
     Any field missing from the HTML is returned as an empty string rather
     than raising — the form layout differs slightly between profile types.
@@ -4468,6 +4470,7 @@ class SavClient:
       tptd=_input_value("nrtptd"),
       tptd_expiry=_input_value("validadetptd"),
       mobile_phone=_input_value("telem"),
+      email=_input_value("email"),
     )
 
   def _parse_games_response(self, raw: dict[str, Any]) -> list[Game]:

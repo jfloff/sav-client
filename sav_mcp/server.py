@@ -352,8 +352,8 @@ def list_coaches(
     name: prefix match on full name (starts-with), not substring.
     tptd: filter by TPTD number; note the result rows do not include TPTD.
     with_details: when true, issue one extra request per coach to fill
-        nif, tptd, and tptd_expiry in the returned rows. Off by default
-        because it is N+1.
+        nif, tptd, tptd_expiry, mobile_phone, and email in the returned
+        rows. Off by default because it is N+1.
     """
     client = _get_client()
     effective_club: int = (

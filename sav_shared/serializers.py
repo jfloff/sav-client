@@ -48,6 +48,7 @@ def coach_to_dict(c: Any, *, with_details: bool = False) -> dict:
     out["tptd"] = getattr(c, "tptd", "")
     out["tptd_expiry"] = getattr(c, "tptd_expiry", "")
     out["mobile_phone"] = getattr(c, "mobile_phone", "")
+    out["email"] = getattr(c, "email", "")
   return out
 
 

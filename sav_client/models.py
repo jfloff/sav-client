@@ -197,6 +197,7 @@ class Coach:
       tptd_expiry:  TPTD expiry date (DD-MM-YYYY). Empty unless detail was fetched.
       mobile_phone: Mobile phone number (telemóvel). Empty unless detail
                     was fetched.
+      email:        Email address. Empty unless detail was fetched.
   """
 
   id: int
@@ -214,6 +215,7 @@ class Coach:
   tptd: str = ""
   tptd_expiry: str = ""
   mobile_phone: str = ""
+  email: str = ""
 
   def __repr__(self) -> str:
     return (

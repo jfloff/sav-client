@@ -15,6 +15,7 @@ _SAMPLE_MSG = (
   '<input type="text" class="form-control" id="nrtptd" value="166614" disabled>'
   '<input type="text" class="form-control" id="validadetptd" value="15-09-2028" disabled>'
   '<input type="text" class="form-control" id="telem" value="912345678" disabled>'
+  '<input type="text" class="form-control" id="email" value="coach@example.com" disabled>'
   "</div>"
 )
 
@@ -44,6 +45,7 @@ class TestGetCoachDetail:
     assert result.tptd == "166614"
     assert result.tptd_expiry == "15-09-2028"
     assert result.mobile_phone == "912345678"
+    assert result.email == "coach@example.com"
 
   def test_tolerates_raw_newlines_in_msg(self, monkeypatch):
     """SAV2 sometimes emits raw CR/LF inside string values; strict=False handles it."""
@@ -70,6 +72,7 @@ class TestGetCoachDetail:
     assert result.tptd == ""
     assert result.tptd_expiry == ""
     assert result.mobile_phone == ""
+    assert result.email == ""
 
   def test_raises_when_msg_missing(self, monkeypatch):
     client = _new_authed_client()

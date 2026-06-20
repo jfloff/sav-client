@@ -813,7 +813,7 @@ def clubs_cmd(ctx, query, association, all_associations):
 @click.option("--count", is_flag=True, default=False, help="Return only the number of matching coaches.")
 @click.option(
   "--with-details", "with_details", is_flag=True, default=False,
-  help="Fetch each coach's profile to populate NIF/TPTD/TPTD expiry/mobile phone. Issues one extra request per coach.",
+  help="Fetch each coach's profile to populate NIF/TPTD/TPTD expiry/mobile phone/email. Issues one extra request per coach.",
 )
 @click.pass_context
 def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, with_details):
@@ -879,7 +879,7 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, w
     default_fields = ["id", "carreira_id", "wallet", "name", "association", "club",
                       "gender", "season", "grade", "birth_date", "active"]
     if with_details:
-      default_fields += ["nif", "tptd", "tptd_expiry", "mobile_phone"]
+      default_fields += ["nif", "tptd", "tptd_expiry", "mobile_phone", "email"]
     rows = _project([asdict(c) for c in results], fields)
     csv_fields = fields or default_fields
     click.echo(",".join(csv_fields))
@@ -903,10 +903,10 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, w
   ]
   widths: list = [None, 28, 20, None, None, None, None, None]
   if with_details:
-    headers += ["NIF", "TPTD", "TPTD Expiry", "Mobile"]
+    headers += ["NIF", "TPTD", "TPTD Expiry", "Mobile", "Email"]
     for i, c in enumerate(results):
-      rows_t[i].extend([c.nif, c.tptd, c.tptd_expiry, c.mobile_phone])
-    widths += [None, None, None, None]
+      rows_t[i].extend([c.nif, c.tptd, c.tptd_expiry, c.mobile_phone, c.email])
+    widths += [None, None, None, None, None]
   _render_table(headers, rows_t, max_widths=widths)
   click.echo(f"\n{len(results)} coach(es) found.")
 
