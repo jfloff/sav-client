@@ -24,7 +24,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 
 ## Sessions
 
-`get_session_info` returns the authenticated context — `club_id`, `season_id`, `user`, `profile`. Tools that scope by "the session's club" default to that `club_id`. Pass an explicit `club_id` to override, or `0` to search federation-wide.
+`get_session_info` returns the authenticated context — `club_id`, `season_id`, `season` (label like `"2025/2026"`, best-effort), `season_start_year`, `user`, `profile`. Tools that scope by "the session's club" default to that `club_id`. Pass an explicit `club_id` to override, or `0` to search federation-wide. Use `season`/`season_start_year` for the human-readable current-season label instead of scraping it off a resolved player.
 
 ## PDF convention
 

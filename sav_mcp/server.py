@@ -168,19 +168,40 @@ def get_session_info() -> dict:
     calling tools that default to it (search_players, list_games, list_batches,
     etc.).
 
-    Returns ``{user, profile, club_id, season_id}``. season_id is the current
-    epoch — pass it (or omit / pass 0 for all-seasons) to tools that accept a
-    season parameter.
+    Returns ``{user, profile, club_id, season_id, season, season_start_year}``.
+
+    season_id is the current epoch — pass it (or omit / pass 0 for all-seasons)
+    to tools that accept a season parameter.
+
+    season is the human-readable label (e.g. ``"2025/2026"``) and
+    season_start_year its starting calendar year (e.g. ``2025``). SAV2 stores
+    the season only as the opaque season_id, so the label is resolved
+    best-effort by reading it off the club's registration batches; both fields
+    are ``None`` when the club has no batches in the current epoch.
     """
     client = _get_client()
     session = client.session
     if session is None:
         raise ValueError("Session not initialized")
+
+    # The label isn't in the session dict; it has to be read back off a
+    # server object tagged with the season string. Best-effort so a club
+    # with no batches still gets a valid (label-less) session info.
+    season_start_year: int | None = None
+    season: str | None = None
+    try:
+        season_start_year = client.get_current_season_start_year()
+        season = f"{season_start_year}/{season_start_year + 1}"
+    except SavError:
+        logger.debug("Could not resolve current season label", exc_info=True)
+
     return {
         "user": session.get("user"),
         "profile": session.get("perfil"),
         "club_id": int(session.get("organizacao") or 0),
         "season_id": int(session.get("epoca_id") or 0),
+        "season": season,
+        "season_start_year": season_start_year,
     }
 
 
