@@ -2089,6 +2089,36 @@ def get_enrollment_status(
 
 
 @server.tool()
+def enrollment_status_bulk(licenses: list[int]) -> list[dict]:
+    """
+    Classify many players' enrollment status in one pass.
+
+    The bulk counterpart to get_enrollment_status. Calling that per licence
+    is N+1 — each one re-lists batches, scans every open batch's items, then
+    probes the roster. This shares that work (one batch listing, one item
+    scan per open batch, one roster query) and classifies every licence in
+    memory, so cost is O(open batches) + O(roster), independent of how many
+    licences you pass.
+
+    Returns one row per input licence, in the order given:
+      pending      → {"license", "status", "batch": {number, type_id, type,
+                      state}, "name"}
+      enrolled     → {"license", "status", "name"}   (active in the roster)
+      not_enrolled → {"license", "status", "open_batches": [...]}
+
+    Each row carries the status label plus just enough context to act on it
+    (which batch a pending player sits in; which open batches a not-enrolled
+    player could join). Rows deliberately omit the per-player document
+    `checklist` that get_enrollment_status returns: that reads the live batch
+    or the player's stored nationality, so it stays a single-player call. Use
+    get_enrollment_status(license) when you need the checklist.
+    """
+    client = _get_client()
+    classified = client.classify_enrollment_status(licenses)
+    return [{"license": int(lic), **classified[int(lic)]} for lic in licenses]
+
+
+@server.tool()
 def list_batch_enrollments(batch_number: str) -> list[dict]:
     """
     List every player enrolled in a batch.

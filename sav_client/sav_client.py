@@ -1403,6 +1403,92 @@ class SavClient:
       ],
     )
 
+  def classify_enrollment_status(
+    self,
+    licenses: list[int],
+    *,
+    season: int | None = None,
+  ) -> dict[int, dict[str, Any]]:
+    """Classify many licences' enrollment status in O(open batches) calls.
+
+    The single-licence path (``resolve_batch_id_by_license`` feeding
+    ``get_enrollment_status``) is N+1: each licence re-lists batches, scans
+    every open batch's items, then probes the roster. This collapses the
+    shared work — one batch listing, one item scan per open batch, one
+    roster query — into maps that classify every requested licence in
+    memory, independent of how many are passed.
+
+    Each entry mirrors ``get_enrollment_status`` minus the document
+    ``checklist``, which is inherently per-player (it reads the docs on a
+    live batch, or the player's stored nationality when projecting). Reach
+    for ``get_enrollment_status`` when you need the checklist for one player.
+
+    Returns a dict keyed by licence:
+      "pending"      → {"status", "batch": {number, type_id, type, state},
+                        "name"}
+      "enrolled"     → {"status", "name"}   (active in the club roster)
+      "not_enrolled" → {"status", "open_batches": [...]}
+
+    "pending" wins over "enrolled": a player sitting in an open batch is
+    mid-registration even if last season's licence is still active in the
+    roster — same precedence as the single-licence path, where the batch
+    lookup runs first.
+
+    Side effect: records each found (licence → batch) in the cache so a
+    later single-player lookup starts warm.
+    """
+    requested = [int(lic) for lic in licenses]
+
+    batches = self.list_player_registration_batches(season=season)
+    open_batches = [b for b in batches if b.is_open]
+
+    # licence → (batch, name) from one item scan per open batch.
+    license_batch: dict[int, tuple[PlayerRegistrationBatch, str]] = {}
+    for batch in open_batches:
+      # TODO: list_player_registration_batch_items re-lists batches on every
+      # call; an internal variant taking the batch object would drop this
+      # pass from O(2·open batches) to O(open batches) HTTP calls.
+      for item in self.list_player_registration_batch_items(batch.id):
+        lic = int(item.get("license", 0))
+        if lic and lic not in license_batch:
+          license_batch[lic] = (batch, item.get("name", ""))
+          self._cache.record_license_batch(lic, batch.id)
+
+    # Active roster as a licence → name map (one query for the whole club).
+    club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    active: dict[int, str] = {}
+    if club_id:
+      for p in self.search_players(club=club_id, status="active", season=season):
+        try:
+          active[int(p.license)] = p.name
+        except (TypeError, ValueError):
+          continue
+
+    open_summaries = [
+      {"number": b.number, "tier": b.tier, "gender": b.gender}
+      for b in open_batches
+    ]
+
+    out: dict[int, dict[str, Any]] = {}
+    for lic in requested:
+      if lic in license_batch:
+        batch, name = license_batch[lic]
+        out[lic] = {
+          "status": "pending",
+          "batch": {
+            "number": batch.number,
+            "type_id": batch.type_id,
+            "type": batch.type,
+            "state": batch.state,
+          },
+          "name": name,
+        }
+      elif lic in active:
+        out[lic] = {"status": "enrolled", "name": active[lic]}
+      else:
+        out[lic] = {"status": "not_enrolled", "open_batches": open_summaries}
+    return out
+
   def list_player_registration_tiers(
     self, *, gender_id: int,
   ) -> dict[int, str]:

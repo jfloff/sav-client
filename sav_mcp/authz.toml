@@ -134,6 +134,11 @@ roles = ["coach"]
 [tools.list_batch_enrollments]
 roles = ["coach"]
 
+# Multi-subject: takes a list of licenses, so it can't self-scope to one
+# parent/player the way get_enrollment_status does — coach-only.
+[tools.enrollment_status_bulk]
+roles = ["coach"]
+
 [tools.get_batch]
 roles = ["coach"]
 

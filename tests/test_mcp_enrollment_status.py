@@ -137,3 +137,37 @@ def test_reg_type_transferencia_yields_null_checklist(monkeypatch):
   result = server_module.get_enrollment_status(license=301772, reg_type=3)
 
   assert result["checklist"] is None
+
+
+# ── enrollment_status_bulk ───────────────────────────────────────────────────
+# The classification logic lives in (and is tested at) the client layer; here
+# we cover the MCP wrapper: it preserves input order and stamps each row with
+# its licence.
+
+def test_bulk_preserves_order_and_stamps_license(monkeypatch):
+  class StubClient:
+    def classify_enrollment_status(self, licenses):
+      return {
+        301772: {"status": "pending", "name": "A"},
+        301773: {"status": "enrolled", "name": "B"},
+        999: {"status": "not_enrolled", "open_batches": []},
+      }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  rows = server_module.enrollment_status_bulk([301773, 999, 301772])
+
+  assert [r["license"] for r in rows] == [301773, 999, 301772]
+  assert rows[0] == {"license": 301773, "status": "enrolled", "name": "B"}
+  assert rows[1]["status"] == "not_enrolled"
+  assert rows[2]["status"] == "pending"
+
+
+def test_bulk_empty_input(monkeypatch):
+  class StubClient:
+    def classify_enrollment_status(self, licenses):
+      return {}
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  assert server_module.enrollment_status_bulk([]) == []
