@@ -61,6 +61,8 @@ class Player:
     active: bool      # True = currently eligible (definitive signal)
     photo_url: str    # populated only by get_player_detail(with_details=True)
     mobile_phone: str # telemóvel; populated only by get_player_detail(with_details=True)
+    tier_id: int      # numeric escalão id resolved from (gender, tier) names; 0 if unknown
+    gender_id: int    # 1=Masculino, 2=Feminino; 0 if unknown
 
 @dataclass(frozen=True)
 class Game:

@@ -138,7 +138,14 @@ class Player:
       association:  Association name (e.g. "AB Santarém").
       club:         Club name (e.g. "Rio Maior Basket").
       tier:         Age/competition tier (escalão), e.g. "Sénior".
+      tier_id:      Numeric escalão ID for this (gender, tier), e.g. 5 = Sub 14
+                    (Masculino). Resolved in-memory from the tier/gender names
+                    via the static ``sav_shared.lookups`` tables — SAV renumbers
+                    the same tier per gender, so it depends on ``gender_id``. 0
+                    when the name is blank or unrecognised (graceful fallback).
       gender:       Gender string, e.g. "Masculino" / "Feminino".
+      gender_id:    1=Masculino, 2=Feminino; 0 when unknown. Resolved from the
+                    ``gender`` name.
       birth_date:   Birth date string (YYYY-MM-DD).
       nationality:  Nationality string.
       status:       Registration status string, e.g. "FBP".
@@ -167,6 +174,10 @@ class Player:
   photo_url: str = ""
   mobile_phone: str = ""
   nif: str = ""
+  # Resolved in-memory from the tier/gender *names* (see Player docstring);
+  # 0 means "unknown / unresolved", same convention as the id=0 placeholder.
+  tier_id: int = 0
+  gender_id: int = 0
 
   def __repr__(self) -> str:
     return (

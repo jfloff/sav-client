@@ -44,7 +44,7 @@ from .cache import Cache
 from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
 from .utils import md5_hex, strip_html
 
-from sav_shared.lookups import player_registration_tiers
+from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
 from sav_shared.text import iso_date
 
 logger = logging.getLogger(__name__)
@@ -4383,6 +4383,27 @@ class SavClient:
     logger.debug("Response from %s: %d bytes", url, len(response.text))
     return response.text
 
+  @staticmethod
+  def _resolve_tier_gender_ids(tier: str, gender: str) -> tuple[int, int]:
+    """Best-effort numeric (tier_id, gender_id) from a row's *display names*.
+
+    Player listing/detail HTML carries only the tier/gender names; the numeric
+    SAV ids live on the wizard (and on PlayerRegistrationBatch). Both maps are
+    static (``sav_shared.lookups``), so this resolves them in-memory with no
+    HTTP, accent-/case-/whitespace-insensitive via ``find_id_by_name``.
+
+    SAV renumbers the same tier name per gender, so ``tier_id`` is looked up
+    inside the resolved gender's table. Returns 0 for either id when the name
+    is blank or unrecognised — callers treat 0 as "unknown" (same convention
+    as the id=0 'Não selecionado' placeholder), so a tier SAV later renames
+    degrades to 0 rather than a silently wrong id.
+    """
+    gender_id = find_id_by_name(gender, GENERO) or 0
+    tier_id = 0
+    if gender_id:
+      tier_id = find_id_by_name(tier, player_registration_tiers(gender_id)) or 0
+    return tier_id, gender_id
+
   def _parse_players_response(self, html: str) -> list[Player]:
     """
     Parse the HTML table returned by the player search endpoint.
@@ -4432,14 +4453,20 @@ class SavClient:
       icon_title = (icon.get("data-original-title", "") if icon else "").lower()
       active = "fa-color-activo" in icon_classes or icon_title == "activo"
 
+      tier = cells[6].get_text(strip=True)
+      gender = cells[7].get_text(strip=True)
+      tier_id, gender_id = self._resolve_tier_gender_ids(tier, gender)
+
       players.append(Player(
         id=db_id,
         license=cells[2].get_text(strip=True),
         name=cells[3].get_text(strip=True),
         association=cells[4].get_text(strip=True),
         club=cells[5].get_text(strip=True),
-        tier=cells[6].get_text(strip=True),
-        gender=cells[7].get_text(strip=True),
+        tier=tier,
+        gender=gender,
+        tier_id=tier_id,
+        gender_id=gender_id,
         season=cells[8].get_text(strip=True),
         status=cells[9].get_text(strip=True),
         birth_date=cells[10].get_text(strip=True),

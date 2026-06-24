@@ -9,7 +9,8 @@ def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
   out = {
     "id": p.id, "license": p.license, "name": p.name,
     "club": p.club, "association": p.association,
-    "tier": p.tier, "gender": p.gender,
+    "tier": p.tier, "tier_id": p.tier_id,
+    "gender": p.gender, "gender_id": p.gender_id,
     "birth_date": p.birth_date, "nationality": p.nationality,
     "status": p.status, "season": p.season, "active": p.active,
   }

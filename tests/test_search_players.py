@@ -245,3 +245,49 @@ class TestSearchPlayers:
     client._search_players_single(club=789, association=None)
 
     assert captured["payload"]["jc_associacao"] == ""
+
+
+def _player_row(tier: str, gender: str, *, db_id: int = 1, license: str = "100") -> str:
+  """One search-result <tr> with the 12 columns _parse_players_response reads."""
+  return (
+    "<tr>"
+    f"<td><button onclick=\"seeJogador({db_id}, 1)\"></button></td>"
+    "<td><i class='fa-color-activo'></i></td>"
+    f"<td>{license}</td><td>Player Name</td><td>AB X</td><td>Club X</td>"
+    f"<td>{tier}</td><td>{gender}</td>"
+    "<td>2025/2026</td><td>FBP</td><td>2010-01-01</td><td>Portuguesa</td>"
+    "</tr>"
+  )
+
+
+class TestPlayerTierGenderIds:
+  """tier_id/gender_id are resolved in-memory from the row's display names."""
+
+  def _parse_one(self, tier: str, gender: str) -> Player:
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    [player] = client._parse_players_response(
+      f"<table><tbody>{_player_row(tier, gender)}</tbody></table>"
+    )
+    return player
+
+  def test_resolves_ids_from_names(self):
+    p = self._parse_one("Sub 14", "Masculino")
+    assert (p.tier_id, p.gender_id) == (5, 1)
+
+  def test_same_tier_renumbers_per_gender(self):
+    # SAV gives "Sub 14" id 5 for Masculino but 6 for Feminino — the tier
+    # lookup must be scoped by the resolved gender, not a global table.
+    male = self._parse_one("Sub 14", "Masculino")
+    female = self._parse_one("Sub 14", "Feminino")
+    assert male.tier_id == 5
+    assert female.tier_id == 6
+    assert (male.gender_id, female.gender_id) == (1, 2)
+
+  def test_tolerates_whitespace_and_case(self):
+    p = self._parse_one("  sub 14  ", "  MASCULINO ")
+    assert (p.tier_id, p.gender_id) == (5, 1)
+
+  def test_unknown_or_blank_names_degrade_to_zero(self):
+    assert SavClient._resolve_tier_gender_ids("Sub 14", "") == (0, 0)
+    assert SavClient._resolve_tier_gender_ids("", "Masculino") == (0, 1)
+    assert SavClient._resolve_tier_gender_ids("No Such Tier", "Masculino") == (0, 1)
