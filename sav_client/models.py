@@ -149,6 +149,7 @@ class Player:
                     ``search_players(with_details=True)``.
       mobile_phone: Mobile phone number (telemóvel). Empty unless detail
                     was fetched.
+      nif:          Portuguese tax number. Empty unless detail was fetched.
   """
 
   id: int
@@ -165,6 +166,7 @@ class Player:
   active: bool = False
   photo_url: str = ""
   mobile_phone: str = ""
+  nif: str = ""
 
   def __repr__(self) -> str:
     return (

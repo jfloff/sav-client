@@ -207,7 +207,7 @@ def search_players(
     Pass club_id=0 to search all clubs (federation-wide or scoped by association_id).
     status: "active" | "inactive" | "all"
     with_details: when true, issue one extra request per player to fill
-        photo_url and mobile_phone in the returned rows. Off by default
+        photo_url, mobile_phone and nif in the returned rows. Off by default
         because it is N+1.
     """
     client = _get_client()
@@ -241,7 +241,7 @@ def get_player(
     Return details for a single player by licence number.
 
     club_id defaults to the session's own club when omitted.
-    with_details: when true, also fetch photo_url and mobile_phone.
+    with_details: when true, also fetch photo_url, mobile_phone and nif.
     Returns null if no player is found with that licence.
     """
     client = _get_client()
@@ -268,7 +268,7 @@ def find_player_by_nif(
 
     Returns the same shape as get_player, or null if no player in the club
     roster matches. club_id defaults to the session's own club.
-    with_details: when true, also fetch photo_url and mobile_phone.
+    with_details: when true, also fetch photo_url, mobile_phone and nif.
     """
     digits = re.sub(r"\D", "", nif or "")
     if len(digits) != 9:

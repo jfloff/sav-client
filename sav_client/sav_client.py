@@ -357,9 +357,9 @@ class SavClient:
                      searches — cancels remaining in-flight requests to short
                      circuit wide scans (e.g. ``--all-clubs``).
         with_details: When True, issue one extra ``jogadoresdb.php?op=2``
-                     request per player to populate ``photo_url`` and
-                     ``mobile_phone``. Off by default because it is N+1
-                     and applied after all other filters/limits.
+                     request per player to populate ``photo_url``,
+                     ``mobile_phone`` and ``nif``. Off by default because it
+                     is N+1 and applied after all other filters/limits.
 
     Returns:
         List of Player objects parsed from the HTML response.
@@ -394,7 +394,7 @@ class SavClient:
       results = results[:limit] if limit is not None else results
       if with_details:
         results = [
-          _dc_replace(p, photo_url=d.photo_url, mobile_phone=d.mobile_phone)
+          _dc_replace(p, photo_url=d.photo_url, mobile_phone=d.mobile_phone, nif=d.nif)
           for p, d in (
             (p, self.get_player_detail(p.id, with_details=True)) for p in results
           )
@@ -4609,8 +4609,9 @@ class SavClient:
     Parse the JSON envelope returned by jogadoresdb.php?op=2.
 
     The server returns ``{"msg": "<html>..."}``; we scan ``<img>`` tags for
-    the player's photo and pull ``<input id="telem">`` for the mobile
-    phone, returning a minimal Player with id, photo_url and mobile_phone.
+    the player's photo and pull ``<input id="telem">`` / ``<input id="nif">``
+    for the mobile phone and tax number, returning a minimal Player with id,
+    photo_url, mobile_phone and nif.
     """
     from bs4 import BeautifulSoup
 
@@ -4631,11 +4632,15 @@ class SavClient:
     telem = soup.find(id="telem")
     mobile_phone = (telem.get("value", "") or "").strip() if telem else ""
 
+    nif_el = soup.find(id="nif")
+    nif = (nif_el.get("value", "") or "").strip() if nif_el else ""
+
     return Player(
       id=player_id, license="", name="", association="", club="",
       tier="", gender="", birth_date="", nationality="", status="",
       photo_url=photo_url,
       mobile_phone=mobile_phone,
+      nif=nif,
     )
 
   def __repr__(self) -> str:

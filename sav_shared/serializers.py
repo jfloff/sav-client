@@ -16,6 +16,7 @@ def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
   if with_details:
     out["photo_url"] = getattr(p, "photo_url", "")
     out["mobile_phone"] = getattr(p, "mobile_phone", "")
+    out["nif"] = getattr(p, "nif", "")
   return out
 
 
