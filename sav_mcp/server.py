@@ -282,6 +282,7 @@ def get_player(
 def find_player_by_nif(
     nif: str,
     club_id: int | None = None,
+    status: str = "active",
     with_details: bool = False,
 ) -> dict | None:
     """
@@ -289,6 +290,11 @@ def find_player_by_nif(
 
     Returns the same shape as get_player, or null if no player in the club
     roster matches. club_id defaults to the session's own club.
+    status: "active" (default) | "inactive" | "all". The default restricts
+        to the active current-season roster. Use "all" to also resolve
+        players whose current-season licence isn't active yet (e.g. pending
+        renewals) — it searches across all seasons so their tier still
+        surfaces instead of resolving to null.
     with_details: when true, also fetch photo_url, mobile_phone and nif.
     """
     digits = re.sub(r"\D", "", nif or "")
@@ -304,8 +310,12 @@ def find_player_by_nif(
     license = client.find_license_by_nif(digits, club_id=effective_club)
     if license is None:
         return None
+    # "active" stays scoped to the current season; anything broader must scan
+    # all seasons or not-yet-renewed players return no rows at all.
+    season = None if status.strip().lower() == "active" else 0
     results = client.search_players(
-        license=str(license), club=effective_club, with_details=with_details,
+        license=str(license), club=effective_club, status=status,
+        season=season, with_details=with_details,
     )
     if not results:
         return None
