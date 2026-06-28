@@ -89,6 +89,7 @@ from sav_shared.lookups import (
 from sav_shared.medical_exam import extract_medical_exam_info
 from sav_shared.serializers import (
     batch_to_dict,
+    club_game_to_dict,
     club_to_dict,
     coach_to_dict,
     game_to_dict,
@@ -407,31 +408,73 @@ def list_coaches(
 
 @server.tool()
 def list_games(
+    club_id: int | None = None,
+    season: int | None = None,
+    status: str = "all",
     tier: str = "",
     gender: int = 0,
     date_from: str = "",
     date_to: str = "",
-    status: str = "",
-    season: int | None = None,
 ) -> list[dict]:
     """
-    List games for the session's club, sorted by date (earliest first).
+    List a club's game-sheets (fixtures + results), sorted by date (earliest
+    first), each row from the club's own perspective.
 
-    date_from / date_to: DD-MM-YYYY format.
-    status: e.g. "Marcado", "Não Marcado". Omit to return all statuses.
+    club_id defaults to the session's own club. NOTE: SAV2's games endpoint only
+    ever returns the *session* club's fixtures, so a non-session club_id cannot
+    be honored — it only selects which side counts as "ours", and yields no
+    rows when it isn't a team in the session club's games.
+    season defaults to the current epoch.
+    status: "scheduled" | "played" | "all" (default). A game is "played" once it
+        has both scores.
+    tier: escalão filter (e.g. "Sub 14"). Omit for all tiers.
+    gender: 0 = any, 1 = Masculino, 2 = Feminino.
+    date_from / date_to: inclusive DD-MM-YYYY window. For "games in the last 10
+        days", pass date_from = today-10 days and date_to = today.
+
+    Each row is relative to the queried club (home / our_score / opp_score /
+    opponent are the club's, not the sheet's home/away):
+      source_id  — stable FPB game id (for idempotent upsert)
+      escalao    — tier label as on the sheet (e.g. "Sub 14 M", "Sen M")
+      gender     — "Masculino" / "Feminino" (or null)
+      starts_at  — ISO YYYY-MM-DDTHH:MM ("" when not yet scheduled)
+      opponent   — the other team's name
+      home       — true when the club plays at home
+      venue      — pavilion / location, or null
+      status     — "scheduled" or "played"
+      our_score / opp_score — ints from the club's perspective, null until played
     """
+    status_key = status.strip().lower()
+    if status_key not in ("scheduled", "played", "all"):
+        raise ValueError(
+            f"status must be 'scheduled', 'played', or 'all'; got {status!r}"
+        )
+
     client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    # Resolve the club's name so each row can be oriented to its perspective;
+    # team strings carry suffixes (" - B", "/MVP"), matched on the name.
+    full_name, code = client._fetch_club_names(effective_club)
+    club_name = full_name or code
+
     # SAV2 ignores the inicio/fim date window server-side, leaking out-of-range
     # games, so we still send it (it narrows the payload when honored) but
     # guarantee the bounds with a client-side pass via filter_games.
-    results = client.list_games(
+    games = client.list_games(
         season=season, tier=tier, gender=gender,
         date_from=date_from, date_to=date_to,
     )
-    results = filter_games(
-        results, status=status, date_from=date_from, date_to=date_to,
-    )
-    return [game_to_dict(g) for g in sorted(results, key=game_sort_key)]
+    games = filter_games(games, date_from=date_from, date_to=date_to)
+    rows = [
+        club_game_to_dict(g, club_name=club_name)
+        for g in sorted(games, key=game_sort_key)
+    ]
+    if status_key != "all":
+        rows = [r for r in rows if r["status"] == status_key]
+    return rows
 
 
 @server.tool()
@@ -475,7 +518,7 @@ def get_game_sheet(game_number: str, team: str) -> dict:
     """
     Return eligible players, coaches, and staff for one team in a game.
 
-    game_number: the human-readable game number (from list_games).
+    game_number: the human-readable game number (from list_game_sheets).
     team: "home" or "away".
     """
     if team not in ("home", "away"):
@@ -509,7 +552,7 @@ def generate_game_sheet_pdf(
     """
     Generate the eligible-players PDF for one team and return it base64-encoded.
 
-    game_number: the human-readable game number (from list_games).
+    game_number: the human-readable game number (from list_game_sheets).
     team: "home" or "away".
     player_licences: licence numbers to include. Omit to include every eligible player.
     coaches_pri: head-coach wallet numbers to include. Omit to include all eligible.
