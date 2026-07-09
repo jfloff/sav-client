@@ -1087,3 +1087,218 @@ def render_mod1(
     if image_bytes:
       pdf_bytes = overlay_image_on_pdf(pdf_bytes, image_bytes, rect=rect, page_index=0)
   return pdf_bytes
+
+
+# ── Modelo 1 form reading (inbound: filled AcroForm → OCR-entity fields) ──────
+#
+# The mirror of the rendering section above. A Modelo 1 filled from our template
+# keeps its 72 named AcroForm fields intact (render_mod1 never flattens), so a
+# filled form carries every value verbatim. This section reads those values and
+# reshapes them into the exact entity-keyed ParsedField dict parse_fpb_mod1
+# returns from Document AI — letting a template-filled form enter the
+# reconcile/preview/submit flow *without* OCR. Values are exact, so every
+# populated field carries confidence 1.0; unfilled entities pad to (None, 0.0)
+# just like parse_fpb_mod1's schema fill-out.
+#
+# The PDF field names are reused from MOD1_FILL_MAPPING (single source of truth
+# for text/date/postal/consent fields); the checkbox map below is the one place
+# that names boxes directly, since each mutually-exclusive group expands to a
+# per-option boolean entity. The round-trip test (render_mod1 → read) guards it.
+
+# canonical MOD1_FILL_MAPPING key → OCR text entity. The PDF field name is taken
+# from MOD1_FILL_MAPPING[key].field, so it never drifts from the fill side.
+_READ_TEXT_ENTITY: dict[str, str] = {
+  "license":            "licenca_fpb",
+  "clube":              "clube",
+  "associacao":         "associacao",
+  "nome":               "nome_completo",
+  "nacionalidade":      "nacionalidade",
+  "pais_nascimento":    "pais_nascimento",
+  "nif":                "nif",
+  "numi":               "num_doc_identificacao",
+  "email":              "email_jogador",
+  "tele":               "telemovel",
+  "morada":             "morada",
+  "localidade_txt":     "localidade",
+  "distrito":           "distrito",
+  "concelho":           "concelho",
+  "guardian_name":      "nome_encarregado",
+  "guardian_id_number": "num_doc_encarregado",
+  "guardian_phone":     "telefone_encarregado",
+  "guardian_email":     "email_encarregado",
+}
+
+# canonical key → OCR date entity (recombined from the dia/mes/ano sub-fields).
+_READ_DATE_ENTITY: dict[str, str] = {
+  "nasc":               "data_nascimento",
+  "dataval":            "validade_doc",
+  "guardian_id_expiry": "validade_doc_encarregado",
+}
+
+# canonical key → OCR boolean-consent entity (SIM/NÃO boxes).
+_READ_CONSENT_ENTITY: dict[str, str] = {
+  "consent_data":           "consentimento_dados",
+  "consent_communications": "consentimento_comunicacoes",
+  "consent_marketing":      "consentimento_marketing",
+}
+
+# PDF checkbox field name → OCR boolean entity. Each mutually-exclusive group on
+# the form maps to one entity per option (exactly how Document AI emits them);
+# the box that is ticked yields its entity = True. Box names mirror the reverse
+# tables above (_GENERO_PDF_FIELD / _INSCRICAO_PDF_FIELD / _ID_TYPE_PDF_FIELD /
+# _GUARDIAN_RELATION_PDF_FIELD / _GUARDIAN_ID_TYPE_PDF_FIELD / _ESCALAO_NAME_FIELD).
+_MOD1_READ_CHECK: dict[str, str] = {
+  # género
+  "Masculino": "genero_masculino",
+  "Feminino":  "genero_feminino",
+  # tipo de inscrição
+  "primeira":    "tipo_inscricao_primeira",
+  "revalidacao": "tipo_inscricao_revalidacao",
+  # documento de identificação (jogador)
+  "Cartão Cidadão": "tipo_doc_cc",
+  "Passaporte":     "tipo_doc_passaporte",
+  "Outro":          "tipo_doc_outro",
+  # parentesco do encarregado
+  "pai":   "parentesco_encarregado_pai",
+  "mae":   "parentesco_encarregado_mae",
+  "Tutor": "parentesco_encarregado_tutor",
+  # documento de identificação (encarregado)
+  "titular do Cartão Cidadão": "tipo_doc_encarregado_cc",
+  "passaporte_2":              "tipo_doc_encarregado_passaporte",
+  "Outro_2":                   "tipo_doc_encarregado_outro",
+  # escalão
+  "BabyBasket": "escalao_baby_basket",
+  "Mini8":      "escalao_mini8",
+  "Mini10":     "escalao_mini10",
+  "Mini12":     "escalao_mini12",
+  "Sub14":      "escalao_sub14",
+  "Sub16":      "escalao_sub16",
+  "Sub18":      "escalao_sub18",
+  "Sénior":     "escalao_senior",
+  "Master":     "escalao_master",
+  "BCR":        "escalao_bcr",
+}
+
+# A handful of field names that only this template carries. Enough of them
+# present means the PDF is (a filled instance of) our Modelo 1 form, not a scan
+# or some unrelated AcroForm — presence of the *structure* is the trigger, the
+# individual values may be blank (the user completes them in preview).
+_MOD1_SIGNATURE_FIELDS: frozenset[str] = frozenset({
+  "Nome Completo", "Nr Contribuinte", "Nacionalidade",
+  "Masculino", "Feminino", "primeira", "revalidacao",
+})
+_MOD1_SIGNATURE_MIN = 5
+
+
+def read_mod1_acroform(pdf_bytes: bytes) -> dict[str, str] | None:
+  """Read a (possibly template-filled) Modelo 1's AcroForm field values.
+
+  Returns ``{field name → value}`` where text fields give their ``/V`` string
+  and checkbox/button fields give their raw on/off state (e.g. ``"/On"``).
+  Returns None when the PDF has no AcroForm at all (a scan/photo) so the caller
+  falls back to OCR. Mirrors the field walk in _tick_checkboxes, reading the
+  top-level ``/T``+``/V`` that render_mod1 writes rather than setting it.
+  """
+  try:
+    with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+      acro = pdf.Root.get("/AcroForm")
+      if acro is None or "/Fields" not in acro:
+        return None
+      raw: dict[str, str] = {}
+      for f in acro.Fields:
+        if "/T" not in f:
+          continue
+        raw[str(f.T)] = str(f.V) if "/V" in f else ""
+      return raw or None
+  except (pikepdf.PdfError, ValueError, OSError):
+    # Any malformed/unreadable input → not a template; fall back to OCR.
+    return None
+
+
+def is_filled_mod1_template(raw: dict[str, str]) -> bool:
+  """True when `raw` (a read_mod1_acroform result) is our Modelo 1 template."""
+  return sum(1 for name in _MOD1_SIGNATURE_FIELDS if name in raw) >= _MOD1_SIGNATURE_MIN
+
+
+def _checkbox_on(value: str | None) -> bool:
+  """Whether an AcroForm button `/V` denotes 'checked'. Our template's on-state
+  is ``/On`` (read back as the string ``"/On"``); ``/Off`` or empty is off."""
+  if not value:
+    return False
+  return value.strip().lstrip("/").lower() not in ("", "off")
+
+
+def _join_iso_date(dia: str | None, mes: str | None, ano: str | None) -> str | None:
+  """(dia, mes, ano) text sub-fields → ISO ``YYYY-MM-DD``, or None if incomplete
+  or not a real date. Matches the ISO shape the OCR date entities carry."""
+  d, m, y = (dia or "").strip(), (mes or "").strip(), (ano or "").strip()
+  if not (d and m and y):
+    return None
+  try:
+    return date(int(y), int(m), int(d)).isoformat()
+  except ValueError:
+    return None
+
+
+def _join_postal(cod4: str | None, cp3: str | None) -> str | None:
+  """Two postal sub-fields → ``XXXX-XXX`` (or just the 4-digit part), like the
+  OCR codigo_postal entity. None when both are blank."""
+  a = "".join(c for c in (cod4 or "") if c.isdigit())
+  b = "".join(c for c in (cp3 or "") if c.isdigit())
+  if not a and not b:
+    return None
+  return f"{a}-{b}" if b else a
+
+
+def mod1_acroform_to_fields(raw: dict[str, str]) -> dict[str, ParsedField]:
+  """Remap a filled Modelo 1 AcroForm to the entity-keyed ParsedField dict that
+  parse_fpb_mod1 returns, at confidence 1.0.
+
+  `raw` is a read_mod1_acroform result. Populated fields become exact
+  ParsedFields (confidence 1.0, no bbox); every remaining schema entity is
+  padded to ``ParsedField(None, 0.0)`` exactly as parse_fpb_mod1 does, so the
+  reconcile/derive layers behave identically to the OCR path.
+  """
+  from sav_parsers.schema import load_schema
+  from sav_parsers.types import DocType, ParsedField
+
+  fields: dict[str, ParsedField] = {}
+
+  def put(entity: str, value: str | bool) -> None:
+    fields[entity] = ParsedField(value=value, confidence=1.0, bbox=None)
+
+  # Text fields — PDF field name comes from the fill mapping so it can't drift.
+  for key, entity in _READ_TEXT_ENTITY.items():
+    value = (raw.get(MOD1_FILL_MAPPING[key].field) or "").strip()  # type: ignore[attr-defined]
+    if value:
+      put(entity, value)
+
+  # Dates — recombine the dia/mes/ano sub-fields into ISO.
+  for key, entity in _READ_DATE_ENTITY.items():
+    spec = MOD1_FILL_MAPPING[key]
+    iso = _join_iso_date(raw.get(spec.dia), raw.get(spec.mes), raw.get(spec.ano))  # type: ignore[attr-defined]
+    if iso:
+      put(entity, iso)
+
+  # Postal code — join the two sub-fields.
+  postal = MOD1_FILL_MAPPING["codpostal"]
+  cp = _join_postal(raw.get(postal.cod4), raw.get(postal.cp3))  # type: ignore[attr-defined]
+  if cp:
+    put("codigo_postal", cp)
+
+  # Checkboxes — the ticked box of each group yields its boolean entity = True.
+  for box, entity in _MOD1_READ_CHECK.items():
+    if _checkbox_on(raw.get(box)):
+      put(entity, True)
+
+  # Consents — SIM → True, NÃO → False, neither → leave unset (padded below).
+  for key, entity in _READ_CONSENT_ENTITY.items():
+    consent = MOD1_FILL_MAPPING[key]
+    if _checkbox_on(raw.get(consent.yes)):      # type: ignore[attr-defined]
+      put(entity, True)
+    elif _checkbox_on(raw.get(consent.no)):     # type: ignore[attr-defined]
+      put(entity, False)
+
+  for entity in load_schema(DocType.FPB_MODELO_1.value):
+    fields.setdefault(entity, ParsedField(value=None, confidence=0.0))
+  return fields

@@ -155,6 +155,53 @@ def test_update_enrollment_returns_structured_error_when_not_enrolled(monkeypatc
   assert result["open_batches"] == [{"number": "2025/1", "tier": "Sub 14", "gender": "F"}]
 
 
+def test_parse_enrollment_forms_reads_template_and_skips_ocr(monkeypatch):
+  """A Modelo 1 filled from the template is read from its AcroForm — no
+  classify, no Document AI OCR — and still yields the enrollment params."""
+  import base64
+
+  import sav_parsers
+  from sav_shared.fpb_mod1 import render_mod1
+
+  values = {
+    "tipo_inscricao": 1, "clube": "CT", "associacao": "AB Lisboa",
+    "genero": "Masculino", "escalao": "Senior", "nome": "Joao Adulto",
+    "nacionalidade": "Portuguesa", "pais_nascimento": "Portugal",
+    "nif": "234567890", "nasc": "1990-01-01", "tipo": 1, "numi": "22334455",
+    "dataval": "2030-01-01", "email": "j@x.pt", "tele": "911111111",
+    "morada": "Rua A", "localidade_txt": "Lisboa", "codpostal": "1000-001",
+    "distrito": "Lisboa", "concelho": "Lisboa",
+    "consent_data": True, "consent_communications": True, "consent_marketing": False,
+  }
+  pdf_b64 = base64.b64encode(render_mod1(values)).decode()
+
+  class StubClient:
+    def list_player_registration_tiers(self, gender_id):
+      assert gender_id == 1
+      return {9: "Sénior"}
+
+    def find_license_by_nif(self, nif, club_id=None):
+      raise AssertionError("1ª Inscrição box checked → no NIF lookup")
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  def _boom(*a, **k):
+    raise AssertionError("Document AI must not run for a template-filled mod1")
+
+  monkeypatch.setattr(sav_parsers, "classify", _boom)
+  monkeypatch.setattr(sav_parsers, "parse_fpb_mod1", _boom)
+
+  results = server_module.parse_enrollment_forms([pdf_b64])
+  assert len(results) == 1
+  entry = results[0]
+  assert entry["doc_type"] == "fpb_modelo_1"
+  assert entry["reg_type"] == 1          # 1ª Inscrição
+  assert entry["gender_id"] == 1         # Masculino
+  assert entry["tier_name"] == "Sénior"
+  # A form-read doc has no Document AI session to close later.
+  assert server_module._forms[entry["mod1_id"]]["processing_id"] is None
+
+
 def test_mcp_tool_signatures_dropped_batch_number():
   """Existing-enrollment MCP tools must no longer accept batch_number."""
   import inspect

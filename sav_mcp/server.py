@@ -72,8 +72,11 @@ from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import (
     carimbo_overlay,
     inscricao_overlay,
+    is_filled_mod1_template,
+    mod1_acroform_to_fields,
     overlaid_pdf,
     read_carimbo,
+    read_mod1_acroform,
     read_tipo_inscricao,
     reconcile_fpb_mod1,
     render_mod1,
@@ -1122,6 +1125,19 @@ def _replace_player_document_from_bytes(
     return status
 
 
+def _read_mod1_template_fields(pdf_bytes: bytes):
+    """If `pdf_bytes` is a Modelo 1 filled from our fillable template, return its
+    values as the same entity-keyed ParsedField dict parse_fpb_mod1 produces —
+    read straight from the AcroForm, no classification or OCR. Returns None when
+    the PDF isn't a filled template (a scan/photo/other doc), so the caller falls
+    back to the Document AI path.
+    """
+    raw = read_mod1_acroform(pdf_bytes)
+    if raw is None or not is_filled_mod1_template(raw):
+        return None
+    return mod1_acroform_to_fields(raw)
+
+
 @server.tool()
 def parse_enrollment_forms(
     pdfs: list[str],
@@ -1166,7 +1182,21 @@ def parse_enrollment_forms(
         try:
             tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
-            if hint is not None:
+            # Filled-template fast path: a Modelo 1 filled from our fillable
+            # template carries its values in the AcroForm — read them directly
+            # and skip classification + OCR. An explicit non-mod1 hint opts out.
+            mod1_fields = (
+                _read_mod1_template_fields(pdf_bytes)
+                if hint in (None, "fpb_modelo_1") else None
+            )
+            if mod1_fields is not None:
+                doc_type = DocType.FPB_MODELO_1
+                parsed = mod1_fields
+                processing_id = None  # no Document AI session for a form-read doc
+                reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+                tiers = client.list_player_registration_tiers(gender_id=gender_id)
+                tier_name = tiers.get(tier_id, str(tier_id))
+            elif hint is not None:
                 # Type is already known — skip classify and train the classifier.
                 _hint_map = {
                     "fpb_modelo_1": DocType.FPB_MODELO_1,
@@ -1184,7 +1214,9 @@ def parse_enrollment_forms(
             else:
                 doc_type = classify(tmp_path)
 
-            if doc_type == DocType.FPB_MODELO_1:
+            if mod1_fields is not None:
+                pass  # already handled by the fast path above
+            elif doc_type == DocType.FPB_MODELO_1:
                 parse_result = parse_fpb_mod1(tmp_path)
                 parsed = parse_result["fields"]
                 processing_id = parse_result["processing_id"]
@@ -1841,10 +1873,12 @@ def submit_enrollment(
         if entity and val is not None:
             corrections[entity] = str(val)
     corrections.update(retrain_corrections)
-    try:
-        close_processing(form["processing_id"], corrections=corrections or None)
-    except Exception:
-        logger.debug("close_processing failed for form", exc_info=True)
+    # form-read (template-filled) mod1s have no Document AI session to close.
+    if form["processing_id"] is not None:
+        try:
+            close_processing(form["processing_id"], corrections=corrections or None)
+        except Exception:
+            logger.debug("close_processing failed for form", exc_info=True)
     if medical_exam is not None:
         exam_corrections = {}
         if manual_exam_override and kwargs.get("exam_date") is not None:
@@ -2068,8 +2102,17 @@ def update_enrollment_with_document(
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
+        # Filled-template fast path: read the AcroForm and skip classify + OCR
+        # (an explicit non-mod1 doc_type hint opts out).
+        mod1_fields = (
+            _read_mod1_template_fields(pdf_bytes)
+            if doc_type in (None, "fpb_modelo_1") else None
+        )
+
         _hint_map = {"fpb_modelo_1": DocType.FPB_MODELO_1, "exame_medico": DocType.EXAME_MEDICO}
-        if doc_type is not None:
+        if mod1_fields is not None:
+            active_doc_type = DocType.FPB_MODELO_1
+        elif doc_type is not None:
             if doc_type not in _hint_map:
                 raise ValueError(f"Unknown doc_type: {doc_type!r}. Use 'fpb_modelo_1' or 'exame_medico'.")
             active_doc_type = _hint_map[doc_type]
@@ -2097,9 +2140,13 @@ def update_enrollment_with_document(
                 "only fpb_modelo_1 forms are supported. Use file_only=True to upload as-is."
             )
 
-        parse_result = parse_fpb_mod1(tmp_path)
-        parsed = parse_result["fields"]
-        processing_id = parse_result["processing_id"]
+        if mod1_fields is not None:
+            parsed = mod1_fields
+            processing_id = None  # no Document AI session for a form-read doc
+        else:
+            parse_result = parse_fpb_mod1(tmp_path)
+            parsed = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
 
         close_called = False
         try:
@@ -2142,12 +2189,14 @@ def update_enrollment_with_document(
                     corrections[entity] = str(val)
             corrections.update(result.retrain_corrections)
             close_called = True
-            try:
-                close_processing(processing_id, corrections=corrections or None)
-            except Exception:
-                logger.debug("close_processing failed", exc_info=True)
+            # form-read (template-filled) mod1s have no Document AI session.
+            if processing_id is not None:
+                try:
+                    close_processing(processing_id, corrections=corrections or None)
+                except Exception:
+                    logger.debug("close_processing failed", exc_info=True)
         finally:
-            if not close_called:
+            if not close_called and processing_id is not None:
                 try:
                     close_processing(processing_id)
                 except Exception:
