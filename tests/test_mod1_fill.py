@@ -9,7 +9,12 @@ import pikepdf
 import pytest
 from pypdf import PdfReader
 
-from sav_shared.fpb_mod1 import MOD1_FILL_MAPPING, render_mod1
+from sav_shared.fpb_mod1 import (
+  MOD1_FILL_MAPPING,
+  _MOD1_GUARDIAN_KEYS,
+  render_mod1,
+  validate_mod1_values,
+)
 
 SAMPLE = {
   "tipo_inscricao": 1,             # 1ª Inscrição
@@ -28,7 +33,6 @@ SAMPLE = {
   "dataval": "2030-12-31",
   "email": "rita@example.pt",
   "tele": "912345678",
-  "telef": "218000000",
   "morada": "Rua das Flores, 12",
   "localidade_txt": "Benfica",
   "codpostal": "1500-123",
@@ -71,6 +75,20 @@ def _widget_as(pdf_bytes, name):
   return None
 
 
+def _page_xobject_count(pdf_bytes):
+  """Number of XObjects referenced by page 0. overlay_image_on_pdf adds one
+  Form XObject per signature/stamp, so this grows by exactly one per overlay."""
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    return len(pdf.pages[0].get("/Resources", {}).get("/XObject", {}))
+
+
+def _png_bytes():
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGBA", (60, 24), (0, 0, 180, 255)).save(buf, "PNG")
+  return buf.getvalue()
+
+
 def _has_appearance(pdf_bytes, name):
   """True when field `name` carries a normal appearance stream (/AP /N) —
   the thing that makes its value actually render/print (not just NeedAppearances)."""
@@ -102,7 +120,6 @@ class TestRenderMod1:
     assert _v(fields, "nr_identificacao") == "12345678"
     assert _v(fields, "Email") == "rita@example.pt"
     assert _v(fields, "Telemóvel") == "912345678"
-    assert _v(fields, "Telefone") == "218000000"
     assert _v(fields, "Morada") == "Rua das Flores, 12"
     assert _v(fields, "Localidade") == "Benfica"
     assert _v(fields, "Distrito") == "Lisboa"
@@ -177,36 +194,127 @@ class TestRenderMod1:
     assert _has_appearance(pdf_bytes, "Nr Contribuinte")
 
   def test_unmapped_fields_stay_empty(self, fields):
-    # Insurance / estatuto / player-outro-description are intentionally not filled.
-    for name in ("N Apólice", "Companhia", "outro_descricao"):
+    # Insurance / estatuto / player-outro-description, plus the player Telefone
+    # (landline, never a param), are intentionally not filled.
+    for name in ("N Apólice", "Companhia", "outro_descricao", "Telefone"):
       assert _v(fields, name) == ""
 
 
+class TestSignatureOverlays:
+  # These probe only the overlay plumbing, so they render partial forms with
+  # validate=False to skip the mandatory-field rules (covered in TestValidation).
+  def test_default_render_has_no_overlays(self, pdf_bytes):
+    # The module SAMPLE render passes no signatures, so the overlay areas stay
+    # blank — same XObject count as an empty form (just the printed logo).
+    assert _page_xobject_count(pdf_bytes) == _page_xobject_count(render_mod1({}, validate=False))
+
+  def test_each_signature_adds_one_overlay(self):
+    base = _page_xobject_count(render_mod1({}, validate=False))
+    png = _png_bytes()
+    assert _page_xobject_count(render_mod1({}, validate=False, player_signature=png)) == base + 1
+    assert _page_xobject_count(render_mod1({}, validate=False, guardian_signature=png)) == base + 1
+    assert _page_xobject_count(render_mod1({}, validate=False, club_stamp=png)) == base + 1
+    three = render_mod1({}, validate=False,
+                        player_signature=png, guardian_signature=png, club_stamp=png)
+    assert _page_xobject_count(three) == base + 3
+    assert three[:5] == b"%PDF-"
+    assert len(PdfReader(io.BytesIO(three)).pages) == 1
+
+  def test_signatures_compose_with_field_values(self):
+    # Overlays don't disturb the filled fields — text/checkboxes still land.
+    out = render_mod1(SAMPLE, player_signature=_png_bytes(), club_stamp=_png_bytes())
+    f = _fields(out)
+    assert _v(f, "Morada") == "Rua das Flores, 12"
+    assert _v(f, "Feminino") == "/On"
+    assert _page_xobject_count(out) == _page_xobject_count(render_mod1(SAMPLE)) + 2
+
+  def test_signature_accepts_a_file_path(self, tmp_path):
+    p = tmp_path / "stamp.png"
+    p.write_bytes(_png_bytes())
+    base = _page_xobject_count(render_mod1({}, validate=False))
+    assert _page_xobject_count(render_mod1({}, validate=False, club_stamp=str(p))) == base + 1
+
+
 def test_blank_and_unknown_values_are_skipped():
-  f = _fields(render_mod1({"morada": "", "nif": None, "bogus_key": "x"}))
+  f = _fields(render_mod1({"morada": "", "nif": None, "bogus_key": "x"}, validate=False))
   assert _v(f, "Morada") == ""
   assert _v(f, "Nr Contribuinte") == ""
 
 
 def test_eu_date_format_also_splits():
-  f = _fields(render_mod1({"nasc": "07-03-2010"}))
+  f = _fields(render_mod1({"nasc": "07-03-2010"}, validate=False))
   assert (_v(f, "dn_dia"), _v(f, "dn_mes"), _v(f, "dn_ano")) == ("07", "03", "2010")
 
 
 def test_checkgroups_accept_int_or_name():
   # genero by int, escalao aliases resolve to the same boxes.
-  f = _fields(render_mod1({"genero": 2}))
+  f = _fields(render_mod1({"genero": 2}, validate=False))
   assert _v(f, "Feminino") == "/On"
-  f = _fields(render_mod1({"escalao": "Baby-Basket"}))
+  f = _fields(render_mod1({"escalao": "Baby-Basket"}, validate=False))
   assert _v(f, "BabyBasket") == "/On"
-  f = _fields(render_mod1({"escalao": "Masters / Veteranos"}))
+  f = _fields(render_mod1({"escalao": "Masters / Veteranos"}, validate=False))
   assert _v(f, "Master") == "/On"
 
 
 def test_empty_values_render_a_valid_blank_form():
-  out = render_mod1({})
+  out = render_mod1({}, validate=False)
   assert out[:5] == b"%PDF-"
   assert len(PdfReader(io.BytesIO(out)).pages) == 1
+
+
+def _without(values, *keys):
+  return {k: v for k, v in values.items() if k not in keys}
+
+
+# A valid adult sample: born 1990, guardian block omitted. data_assinatura
+# (kept from SAMPLE) pins the age reference so the result doesn't drift with the
+# wall clock.
+ADULT = {**_without(SAMPLE, *_MOD1_GUARDIAN_KEYS), "nasc": "1990-01-01"}
+
+
+class TestValidation:
+  def test_complete_minor_sample_is_valid(self):
+    # SAMPLE: nasc 2010 + data_assinatura 2026 -> age 16, full guardian block.
+    assert validate_mod1_values(SAMPLE) == []
+
+  def test_complete_adult_sample_is_valid(self):
+    assert validate_mod1_values(ADULT) == []
+
+  def test_render_raises_listing_problems(self):
+    with pytest.raises(ValueError, match="required"):
+      render_mod1({})
+
+  def test_render_succeeds_on_valid_sample(self):
+    assert render_mod1(SAMPLE)[:5] == b"%PDF-"  # validate=True by default
+
+  def test_missing_core_field_is_reported(self):
+    assert any("morada" in p for p in validate_mod1_values(_without(SAMPLE, "morada")))
+
+  def test_consent_must_be_present(self):
+    assert any("consent_data" in p for p in validate_mod1_values(_without(SAMPLE, "consent_data")))
+    # False is a valid choice, not "missing".
+    assert validate_mod1_values({**SAMPLE, "consent_data": False}) == []
+
+  def test_license_optional_for_primeira_inscricao(self):
+    # SAMPLE is a 1ª Inscrição (tipo_inscricao=1) — no licence exists yet.
+    assert validate_mod1_values(_without(SAMPLE, "license")) == []
+
+  def test_license_required_for_revalidacao(self):
+    reval = {**_without(SAMPLE, "license"), "tipo_inscricao": 2}
+    assert any("license" in p and "Revalida" in p for p in validate_mod1_values(reval))
+
+  def test_minor_requires_full_guardian_block(self):
+    problems = validate_mod1_values(_without(SAMPLE, "guardian_email"))
+    assert any("minor" in p and "guardian_email" in p for p in problems)
+
+  def test_adult_must_leave_guardian_block_empty(self):
+    problems = validate_mod1_values({**ADULT, "guardian_name": "Someone"})
+    assert any("adult" in p and "guardian_name" in p for p in problems)
+
+  def test_unusable_values_are_flagged(self):
+    problems = validate_mod1_values({**SAMPLE, "escalao": "Sub 99", "dataval": "nope"})
+    assert any("escalao" in p for p in problems)
+    assert any("dataval" in p for p in problems)
 
 
 def test_mapping_targets_exist_in_template():

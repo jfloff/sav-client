@@ -31,7 +31,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 All PDFs cross the MCP boundary as **base64-encoded strings**.
 
 - Inputs: `parse_enrollment_forms(pdfs=[b64, b64, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
-- Outputs: `generate_game_sheet_pdf` returns `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
+- Outputs: `generate_game_sheet_pdf` and `fill_mod1` return `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
 
 ## Enum tables
 
@@ -187,6 +187,9 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 
 ### Manual enrollment (no PDF)
 - `create_enrollment_manual(batch_number, license, fields={...})`.
+
+### Generate a Modelo 1 form (outbound)
+- `fill_mod1(values, player_signature_b64?, guardian_signature_b64?, club_stamp_b64?)` — the reverse of parse/reconcile: fill a blank FPB Modelo 1 from a values dict and return `{filename, size_bytes, pdf_b64}` (a print-ready enrollment form). `values` keys mirror `field_overrides` plus the header/identity fields (`tipo_inscricao`, `license`, `clube`, `associacao`, `genero`, `escalao`, `nome`, `nacionalidade`, `pais_nascimento`, `data_assinatura`). **Every player field is mandatory; the Licença FPB only for a Revalidação; the guardian block in full only for a minor (from `nasc`) and empty otherwise — invalid input raises.** The player Telefone (landline) is never filled. The three `*_b64` params are optional PNG/JPG signature/stamp images overlaid on their areas — omit them for a form to sign offline, pass any subset for the completed form.
 
 ### Ad-hoc documents
 - `list_player_documents(license)` — what's uploaded for this player.

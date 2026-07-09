@@ -1748,17 +1748,33 @@ def mod1_grp():
 @click.option("--values", "values_path", required=True,
               help="JSON file with field values keyed by canonical field keys, or '-' for stdin.")
 @click.option("--out", "out_path", required=True, help="Path to write the filled PDF.")
-def mod1_fill_cmd(values_path, out_path):
+@click.option("--player-signature", "player_signature_path",
+              type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Image (PNG/JPG) to overlay on the player signature line.")
+@click.option("--guardian-signature", "guardian_signature_path",
+              type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Image (PNG/JPG) to overlay on the guardian signature line.")
+@click.option("--club-stamp", "club_stamp_path",
+              type=click.Path(exists=True, dir_okay=False), default=None,
+              help="Image (PNG/JPG) to overlay on the club-stamp area.")
+def mod1_fill_cmd(values_path, out_path, player_signature_path,
+                  guardian_signature_path, club_stamp_path):
   """Fill the Modelo 1 PDF form from a JSON values dict and write it to --out.
 
-  Produces a print-ready form; the player/guardian signature lines and the club
-  stamp are physical (no form fields), so they are left blank for hand
-  completion. VALUES keys (all optional): tipo_inscricao, license, clube,
+  Produces a print-ready form. By default the player/guardian signature lines
+  and the club stamp are left blank for hand completion; pass --player-signature
+  / --guardian-signature / --club-stamp (image files) to stamp any of them onto
+  the form instead. VALUES keys: tipo_inscricao, license, clube,
   associacao, genero, escalao, nome, nacionalidade, pais_nascimento, nif, nasc,
-  tipo, numi, dataval, email, tele, telef, morada, localidade_txt, codpostal,
+  tipo, numi, dataval, email, tele, morada, localidade_txt, codpostal,
   distrito, concelho, guardian_name, guardian_relation, guardian_id_type,
   guardian_id_number, guardian_id_expiry, guardian_phone, guardian_email,
   consent_data, consent_communications, consent_marketing, data_assinatura.
+
+  All player fields are mandatory; the Licença FPB (license) is required only for
+  a Revalidação; and the guardian_* block is required in full only for a minor
+  (derived from nasc) and must be empty otherwise. Invalid input is rejected with
+  the list of problems.
 
   Text fields take strings; dates are YYYY-MM-DD; consent_* take booleans.
   Checkbox groups accept an int code or a name: tipo_inscricao (1=1ª Inscrição,
@@ -1780,7 +1796,15 @@ def mod1_fill_cmd(values_path, out_path):
   if not isinstance(values, dict):
     raise SavCliError("Values JSON must be an object (dict).", code="bad_input")
 
-  pdf = render_mod1(values)
+  try:
+    pdf = render_mod1(
+      values,
+      player_signature=player_signature_path,
+      guardian_signature=guardian_signature_path,
+      club_stamp=club_stamp_path,
+    )
+  except ValueError as e:
+    raise SavCliError(str(e), code="bad_input")
   try:
     Path(out_path).write_bytes(pdf)
   except OSError as e:

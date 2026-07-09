@@ -3,16 +3,39 @@ import base64
 import io
 
 import pikepdf
+import pytest
 
 from sav_mcp import server as server_module
 
+# A complete, valid adult enrollment (guardian block omitted, born 1990). The
+# tool validates by default, so partial dicts would be rejected.
+VALUES = {
+  "tipo_inscricao": 1, "clube": "Clube X", "associacao": "AB Lisboa",
+  "genero": "Masculino", "escalao": "Sénior", "nome": "João Silva",
+  "nacionalidade": "Portuguesa", "pais_nascimento": "Portugal",
+  "nif": "123456789", "nasc": "1990-01-01", "tipo": 1, "numi": "12345678",
+  "dataval": "2030-12-31", "email": "joao@example.pt", "tele": "912345678",
+  "morada": "Rua X, 1", "localidade_txt": "Lisboa",
+  "codpostal": "1500-123", "distrito": "Lisboa", "concelho": "Lisboa",
+  "consent_data": True, "consent_communications": False, "consent_marketing": True,
+  "data_assinatura": "2026-07-08",
+}
+
+
+def _xobject_count(pdf_bytes):
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    return len(pdf.pages[0].get("/Resources", {}).get("/XObject", {}))
+
+
+def _png_b64():
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGBA", (60, 24), (0, 0, 180, 255)).save(buf, "PNG")
+  return base64.b64encode(buf.getvalue()).decode("ascii")
+
 
 def test_fill_mod1_returns_filled_pdf():
-  result = server_module.fill_mod1(values={
-    "morada": "Rua X, 1",
-    "tipo": 2,               # Passaporte
-    "consent_data": True,
-  })
+  result = server_module.fill_mod1(values=VALUES)
 
   assert result["filename"] == "modelo1.pdf"
   pdf_bytes = base64.b64decode(result["pdf_b64"])
@@ -22,6 +45,23 @@ def test_fill_mod1_returns_filled_pdf():
   pdf = pikepdf.open(io.BytesIO(pdf_bytes))
   fields = {str(f.T): f for f in pdf.Root.AcroForm.Fields if "/T" in f}
   assert str(fields["Morada"].get("/V")) == "Rua X, 1"
-  assert str(fields["Passaporte"].get("/V")) == "/On"
+  assert str(fields["Cartão Cidadão"].get("/V")) == "/On"
   assert str(fields["SIM"].get("/V")) == "/On"
   pdf.close()
+
+
+def test_fill_mod1_overlays_base64_signatures():
+  base = base64.b64decode(server_module.fill_mod1(values=VALUES)["pdf_b64"])
+  sig = _png_b64()
+  # An adult has no guardian signature line to fill, so overlay the two that apply.
+  signed = base64.b64decode(server_module.fill_mod1(
+    values=VALUES,
+    player_signature_b64=sig,
+    club_stamp_b64=sig,
+  )["pdf_b64"])
+  assert _xobject_count(signed) == _xobject_count(base) + 2
+
+
+def test_fill_mod1_rejects_invalid_values():
+  with pytest.raises(ValueError, match="required"):
+    server_module.fill_mod1(values={"morada": "Rua X, 1"})

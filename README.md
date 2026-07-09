@@ -138,6 +138,11 @@ sav enrollment read 42                                  # list players in batch
 sav enrollment read 42 301772                           # one player's record
 sav enrollment update 42 301772 form.pdf --file-only    # replace document only
 sav enrollment delete 42 301772
+
+# Generate a filled Modelo 1 enrollment form from values (reverse of the OCR flow)
+sav mod1 fill --values values.json --out mod1.pdf                     # clean form to sign offline
+sav mod1 fill --values values.json --out mod1.pdf \                   # + embed signatures/stamp
+  --player-signature player.png --guardian-signature ee.png --club-stamp carimbo.png
 ```
 
 Run `sav --help` or `sav <command> --help` for full option reference.

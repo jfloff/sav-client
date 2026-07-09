@@ -27,6 +27,7 @@ SAV_BASE_URL        # optional, default https://sav2.fpb.pt
 SAV_USERNAME        # required
 SAV_PASSWORD        # required
 CLUB_STAMP_PATH     # required when OCR-processing a mod1 form (see below)
+MOD1_TEMPLATE_PATH  # optional, override the bundled Modelo 1 template used by `sav mod1 fill`
 ```
 
 `CLUB_STAMP_PATH` is a hard requirement whenever an fpb_modelo_1 form is uploaded to SAV. The invariant is: every mod1 upload must be stamped. Concretely, `_require_env("CLUB_STAMP_PATH")` is called at command entry in:
@@ -273,6 +274,26 @@ sav game-sheet S14M-001 --home --out --coach-pri 44321 --coach-adj 55432
 Defaults: all eligible players / coaches included; OUTROS TREINADORES and ENQUADRAMENTO HUMANO always excluded (no CLI flags). `--out` with no path writes `game_<NUMBER>_<home|away>.pdf` in cwd.
 
 **Coach pool vs PDF slot:** `coaches_pri` and `coaches_adj` are eligibility pools, not exclusive slots. A coach listed only in `coaches_pri` can still be passed as `--coach-adj`. Search **both pools** when matching a name → wallet; only reject when absent from both.
+
+### `sav mod1 fill`
+
+Generate a **filled FPB Modelo 1** (player enrollment) PDF from a JSON values dict — the reverse of the OCR-inbound pipeline. Produces a print-ready form for the player/guardian to sign and the club to stamp.
+
+```sh
+sav mod1 fill --values values.json --out mod1.pdf
+sav mod1 fill --values - --out mod1.pdf < values.json          # values from stdin
+sav mod1 fill --values values.json --out mod1.pdf \            # embed the signatures + stamp too
+  --player-signature player.png --guardian-signature ee.png --club-stamp carimbo.png
+```
+
+`--values` is JSON keyed by canonical enrollment keys: `tipo_inscricao`, `license`, `clube`, `associacao`, `genero`, `escalao`, `nome`, `nacionalidade`, `pais_nascimento`, `nif`, `nasc`, `tipo`, `numi`, `dataval`, `email`, `tele`, `morada`, `localidade_txt`, `codpostal`, `distrito`, `concelho`, `guardian_name`, `guardian_relation`, `guardian_id_type`, `guardian_id_number`, `guardian_id_expiry`, `guardian_phone`, `guardian_email`, `consent_data`, `consent_communications`, `consent_marketing`, `data_assinatura`. Text fields are strings; dates `YYYY-MM-DD`; `consent_*` booleans; checkbox groups take an int code or a name (`tipo_inscricao` 1=1ª Inscrição/2=Revalidação, `genero` 1=M/2=F, `escalao` by name e.g. `"Sub 14"`, `tipo`/`guardian_id_type` 1=Cartão Cidadão/2=Passaporte/3=Outro, `guardian_relation` 1=pai/2=mãe/3=tutor).
+
+**Mandatory-fill rules** (invalid input is rejected, non-zero exit, listing every problem):
+- Every player field is required; the **Licença FPB** only for a Revalidação (`tipo_inscricao=2`).
+- The **guardian block** (`guardian_*`) is required in full for a minor — derived from `nasc` at `data_assinatura` (else today) — and must be empty otherwise.
+- The player **Telefone** (landline) is never filled; only Telemóvel (`tele`) is captured.
+
+The three signature images (`--player-signature`, `--guardian-signature`, `--club-stamp`, PNG/JPG) are optional and overlaid on their printed areas: omit them for a clean form to sign offline, pass any subset for the completed form. The bundled template is resolved module-relative; override with `MOD1_TEMPLATE_PATH`.
 
 ## Workflows
 

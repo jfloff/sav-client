@@ -16,6 +16,7 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -655,6 +656,35 @@ _ESCALAO_NAME_FIELD: dict[str, str] = {
 }
 
 
+# Signature / stamp overlay areas. Unlike the data fields these are *not* form
+# fields — the form has only printed lines here — so they are placed by
+# coordinate, like the inbound club-stamp overlay. Rects are (x0, y0, x1, y1) in
+# PDF points on the A4 template (595.2 × 841.92, origin bottom-left), calibrated
+# against the printed labels: player = the "Jogador(a)" column of the Assinaturas
+# box, club stamp = the "Diretor(a) e Carimbo Clube" column, guardian = the
+# "Assinatura ____" line in the poder-paternal section. overlay_image_on_pdf
+# centers each image inside its rect preserving aspect, so a wide signature sits
+# on the line and a roughly-square stamp fills its column.
+_PLAYER_SIGNATURE_RECT:   tuple[float, float, float, float] = (55.0, 196.0, 245.0, 228.0)
+_GUARDIAN_SIGNATURE_RECT: tuple[float, float, float, float] = (215.0, 72.0, 500.0, 97.0)
+_CLUB_STAMP_RECT:         tuple[float, float, float, float] = (410.0, 193.0, 545.0, 231.0)
+
+
+def _load_image_bytes(arg: bytes | str | os.PathLike[str] | None) -> bytes | None:
+  """Coerce a signature/stamp argument to image bytes.
+
+  Accepts raw image bytes (as MCP passes them after base64-decoding) or a path
+  to an image file (as the CLI passes). None passes through as None so the
+  caller can leave that area blank for hand completion.
+  """
+  if arg is None:
+    return None
+  if isinstance(arg, (bytes, bytearray)):
+    return bytes(arg)
+  with open(os.fspath(arg), "rb") as f:
+    return f.read()
+
+
 def _norm_token(s: str) -> str:
   """Lowercase, strip accents, drop non-alphanumerics — for matching names."""
   n = unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
@@ -726,9 +756,10 @@ MOD1_FILL_MAPPING: dict[str, object] = {
   "dataval":                _Date("val_dia", "val_mes", "val_ano"),
 
   # ── Contact / address ────────────────────────────────────────────────────────
+  # The player's Telefone (landline) is intentionally always left blank — only
+  # Telemóvel (`tele`) is captured — so there is deliberately no `telef` mapping.
   "email":                  _Text("Email"),
   "tele":                   _Text("Telemóvel"),
-  "telef":                  _Text("Telefone"),
   "morada":                 _Text("Morada"),
   "localidade_txt":         _Text("Localidade"),
   "codpostal":              _Postal("codpostal", "cp3"),
@@ -787,6 +818,25 @@ def _is_blank(value: object) -> bool:
   return value is None or (isinstance(value, str) and not value.strip())
 
 
+def _resolve_checkbox(spec: _CheckGroup, value: object) -> str | None:
+  """Resolve a checkbox-group value (int code or name) to its PDF box name.
+
+  Tries the value as an int against `by_int` first, then as a normalized name
+  against `by_name` — so callers may pass ``1`` or ``"Masculino"``. Returns None
+  when it matches neither.
+  """
+  if spec.by_int is not None:
+    try:
+      box = spec.by_int.get(int(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+      box = None
+    if box is not None:
+      return box
+  if spec.by_name is not None:
+    return spec.by_name.get(_norm_token(str(value)))
+  return None
+
+
 def _mod1_field_updates(values: dict) -> tuple[dict[str, str], set[str]]:
   """Resolve canonical `values` into (text_updates, checkbox_names).
 
@@ -813,14 +863,7 @@ def _mod1_field_updates(values: dict) -> tuple[dict[str, str], set[str]]:
       if cp3:
         text[spec.cp3] = cp3
     elif isinstance(spec, _CheckGroup):
-      box = None
-      if spec.by_int is not None:
-        try:
-          box = spec.by_int.get(int(value))
-        except (TypeError, ValueError):
-          box = None
-      if box is None and spec.by_name is not None:
-        box = spec.by_name.get(_norm_token(str(value)))
+      box = _resolve_checkbox(spec, value)
       if box:
         checks.add(box)
     elif isinstance(spec, _Consent):
@@ -859,22 +902,164 @@ def _tick_checkboxes(pdf_bytes: bytes, names: set[str]) -> bytes:
     return out.getvalue()
 
 
-def render_mod1(values: dict, *, template_path: str | os.PathLike[str] | None = None) -> bytes:
+# ── Validation (the form's "Preenchimento obrigatório" rules) ─────────────────
+#
+# The printed form marks every data field mandatory, with two conditionals:
+# the Licença FPB only exists on a Revalidação (a brand-new player doing a 1ª
+# Inscrição has none yet), and the guardian ("Detentor do Poder Paternal") block
+# is filled only for a minor. render_mod1 enforces these by default.
+
+_MOD1_MINOR_AGE = 18
+
+_MOD1_CONSENT_KEYS: tuple[str, ...] = (
+  "consent_data", "consent_communications", "consent_marketing",
+)
+
+# Always required (non-blank). Excludes: `license` (Revalidação-only, checked
+# separately), `data_assinatura` + the three signatures (part of the
+# hand-completed block), and the `guardian_*` block (minor-only, below). The
+# player's Telefone (landline) is not a field at all — always left blank.
+_MOD1_REQUIRED_CORE: tuple[str, ...] = (
+  "tipo_inscricao", "clube", "associacao", "genero", "escalao",
+  "nome", "nacionalidade", "pais_nascimento", "nif", "nasc",
+  "tipo", "numi", "dataval",
+  "email", "tele",
+  "morada", "localidade_txt", "codpostal", "distrito", "concelho",
+  *_MOD1_CONSENT_KEYS,
+)
+
+_MOD1_GUARDIAN_KEYS: tuple[str, ...] = (
+  "guardian_name", "guardian_relation", "guardian_id_type",
+  "guardian_id_number", "guardian_id_expiry", "guardian_phone", "guardian_email",
+)
+
+
+def _to_date(value: object) -> date | None:
+  """Parse an ISO/EU date value to a date, or None when unparseable/blank."""
+  parts = _split_date(str(value)) if not _is_blank(value) else None
+  if not parts:
+    return None
+  dia, mes, ano = parts
+  try:
+    return date(int(ano), int(mes), int(dia))
+  except ValueError:
+    return None
+
+
+def _age_on(born: date, ref: date) -> int:
+  """Whole years from `born` to `ref` (handles the birthday-not-yet-reached case)."""
+  return ref.year - born.year - ((ref.month, ref.day) < (born.month, born.day))
+
+
+def _mod1_unusable_values(values: dict) -> list[str]:
+  """Problems for present-but-unusable values (would silently render blank):
+  checkbox options that don't resolve, dates that don't parse, bad postal codes.
+  """
+  problems: list[str] = []
+  for key, spec in MOD1_FILL_MAPPING.items():
+    value = values.get(key)
+    if _is_blank(value):
+      continue
+    if isinstance(spec, _CheckGroup):
+      if _resolve_checkbox(spec, value) is None:
+        problems.append(f"{key}={value!r} is not a valid option")
+    elif isinstance(spec, _Date):
+      if _to_date(value) is None:
+        problems.append(f"{key}={value!r} is not a valid date (use YYYY-MM-DD)")
+    elif isinstance(spec, _Postal):
+      cod4, cp3 = _split_postal(str(value))
+      if not (cod4 and cp3):
+        problems.append(f"{key}={value!r} is not a valid postal code (NNNN-NNN)")
+  return problems
+
+
+def validate_mod1_values(values: dict) -> list[str]:
+  """Return a list of human-readable problems with `values`; empty when valid.
+
+  Enforces the form's mandatory-fill rules: every player field is required; the
+  Licença FPB is required only for a Revalidação (tipo_inscricao=2); and the
+  guardian block is required in full when — and only when — the player is a
+  minor, derived from `nasc` as of the signature date (`data_assinatura`, else
+  today). Values that are present but unusable (bad option/date/postal) are
+  flagged too. The three signatures and the signature date are never required —
+  they belong to the hand-completed block.
+  """
+  problems: list[str] = []
+
+  for key in _MOD1_REQUIRED_CORE:
+    if key in _MOD1_CONSENT_KEYS:
+      if not isinstance(values.get(key), bool):
+        problems.append(f"{key} is required (true or false)")
+    elif _is_blank(values.get(key)):
+      problems.append(f"{key} is required")
+
+  problems += _mod1_unusable_values(values)
+
+  # Licença FPB — mandatory only for a Revalidação.
+  insc = _resolve_checkbox(MOD1_FILL_MAPPING["tipo_inscricao"], values.get("tipo_inscricao"))
+  if insc == "revalidacao" and _is_blank(values.get("license")):
+    problems.append("license is required for a Revalidação")
+
+  # Guardian block — required in full for a minor, forbidden for an adult.
+  born = _to_date(values.get("nasc"))
+  if born is not None:
+    age = _age_on(born, _to_date(values.get("data_assinatura")) or date.today())
+    if age < _MOD1_MINOR_AGE:
+      missing = [k for k in _MOD1_GUARDIAN_KEYS if _is_blank(values.get(k))]
+      if missing:
+        problems.append(
+          f"player is a minor (age {age}); the guardian block is mandatory — "
+          f"missing: {', '.join(missing)}"
+        )
+    else:
+      present = [k for k in _MOD1_GUARDIAN_KEYS if not _is_blank(values.get(k))]
+      if present:
+        problems.append(
+          f"player is an adult (age {age}); the guardian block must be empty — "
+          f"remove: {', '.join(present)}"
+        )
+  return problems
+
+
+def render_mod1(
+  values: dict,
+  *,
+  template_path: str | os.PathLike[str] | None = None,
+  validate: bool = True,
+  player_signature: bytes | str | os.PathLike[str] | None = None,
+  guardian_signature: bytes | str | os.PathLike[str] | None = None,
+  club_stamp: bytes | str | os.PathLike[str] | None = None,
+) -> bytes:
   """Fill the blank Modelo 1 AcroForm from `values` and return the PDF bytes.
 
   `values` is keyed by the canonical enrollment field keys (see
   MOD1_FILL_MAPPING). Text fields take strings; checkbox groups (`tipo`,
   `guardian_id_type` = 1/2/3; `guardian_relation` = 1/2/3; `genero`, `escalao`,
   `tipo_inscricao` by int or name) select a box; `consent_*` take booleans;
-  dates are ``YYYY-MM-DD``; distrito/concelho/nacionalidade are names. Unknown
-  keys and blank values are skipped.
+  dates are ``YYYY-MM-DD``; distrito/concelho/nacionalidade are names.
+
+  Unless `validate` is False, the form's mandatory-fill rules are enforced (see
+  validate_mod1_values) and a ValueError listing every problem is raised when
+  any fail: all player fields are required; the Licença FPB only for a
+  Revalidação; and the guardian block in full only for a minor (empty otherwise).
+
+  `player_signature`, `guardian_signature` and `club_stamp` are optional images
+  (raw bytes or a path to a PNG/JPG). Each is overlaid on its printed area
+  (there are no form fields there): omit them to get a clean form to sign/stamp
+  offline; pass them to get the completed form. Any subset may be given.
 
   Text is filled with pypdf (which generates appearance streams so it renders
   and prints in every viewer, not only those that honour NeedAppearances);
-  checkboxes are ticked with pikepdf (see _tick_checkboxes). Signatures and the
-  club stamp are left blank (they have no form fields). The template file is
-  never mutated — a filled copy is returned.
+  checkboxes are ticked with pikepdf (see _tick_checkboxes); signatures/stamp
+  are composited with overlay_image_on_pdf. The template file is never mutated —
+  a filled copy is returned.
   """
+  if validate:
+    problems = validate_mod1_values(values)
+    if problems:
+      raise ValueError(
+        "Invalid Modelo 1 values:\n  - " + "\n  - ".join(problems)
+      )
   path = (
     os.fspath(template_path) if template_path
     else (os.environ.get("MOD1_TEMPLATE_PATH") or str(_MOD1_TEMPLATE))
@@ -892,4 +1077,13 @@ def render_mod1(values: dict, *, template_path: str | os.PathLike[str] | None = 
 
   if checkbox_names:
     pdf_bytes = _tick_checkboxes(pdf_bytes, checkbox_names)
+
+  for image, rect in (
+    (player_signature,   _PLAYER_SIGNATURE_RECT),
+    (guardian_signature, _GUARDIAN_SIGNATURE_RECT),
+    (club_stamp,         _CLUB_STAMP_RECT),
+  ):
+    image_bytes = _load_image_bytes(image)
+    if image_bytes:
+      pdf_bytes = overlay_image_on_pdf(pdf_bytes, image_bytes, rect=rect, page_index=0)
   return pdf_bytes
