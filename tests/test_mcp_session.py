@@ -7,6 +7,7 @@ best-effort, so a club with no batches still gets valid (label-less) info.
 import pytest
 
 from sav_client.exceptions import SavResponseError
+from sav_client.models import Season
 from sav_mcp import server as server_module
 
 
@@ -22,10 +23,15 @@ class _StubClient:
     self._season_year = season_year
     self._raises = raises
 
-  def get_current_season_start_year(self) -> int:
+  def get_current_season(self) -> Season:
     if self._raises is not None:
       raise self._raises
-    return self._season_year
+    return Season(
+      id=self.session["epoca_id"],
+      label=f"{self._season_year}/{self._season_year + 1}",
+      start_year=self._season_year,
+      is_active=True,
+    )
 
 
 def test_includes_resolved_season_label(monkeypatch):

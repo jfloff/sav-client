@@ -11,13 +11,14 @@ from .exceptions import (
     SavRecordNotFoundError,
     SavResponseError,
 )
-from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
+from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
 from .sav_client import SavClient
 
 __all__ = [
     "SavClient",
     # models
     "Session",
+    "Season",
     "LoginResult",
     "Player",
     "Coach",

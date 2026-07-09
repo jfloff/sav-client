@@ -102,6 +102,13 @@ class PlayerRegistrationBatch:
 
     @property
     def is_open(self) -> bool: ...   # True iff state_id == 1
+
+@dataclass(frozen=True)
+class Season:
+    id: int          # opaque SAV2 epoch id (epoca_id) — NOT the calendar year
+    label: str       # "YYYY/YYYY+1", e.g. "2025/2026"
+    start_year: int  # starting calendar year parsed from label, e.g. 2025
+    is_active: bool  # True for the season SAV2 marks current (activa == 1)
 ```
 
 `list_associations()` also returns `Club` — only `id` and `name` populated there.
@@ -115,6 +122,17 @@ class PlayerRegistrationBatch:
 ### `login() → LoginResult`
 
 Must be first. Raises `SavAuthError` on bad credentials.
+
+### `get_current_season() → Season`
+
+The current (active) season, read straight from SAV2's dedicated season table (`incricoesdb.php?op=168`) — **not** inferred from any registration batch, so it resolves off-season, before the new época's batches exist. Prefer this over reading the season label off a batch / game / player. The session stores only the opaque `epoca_id`, which is **not** the calendar year — this is the reliable way to map it to one.
+
+```python
+season = client.get_current_season()
+season.start_year   # 2025
+season.label        # "2025/2026"
+season.id           # opaque epoca_id (sequential; not the calendar year)
+```
 
 ### `search_players(**kwargs) → list[Player]`
 

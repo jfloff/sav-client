@@ -55,6 +55,36 @@ class Session:
 
 
 @dataclass(frozen=True)
+class Season:
+    """
+    Represents a SAV2 season ("época").
+
+    SAV2 identifies a season only by an opaque, sequential ``epoca_id`` — it is
+    *not* the calendar year (e.g. id=64 is season "2025/2026"). The human label
+    ``descricao`` ("YYYY/YYYY+1") is the only reliable way to map an id to a
+    calendar year.
+
+    Attributes:
+        id:          Internal SAV2 season id (``epoca_id``).
+        label:       Human label, e.g. "2025/2026".
+        start_year:  Starting calendar year parsed from ``label`` (e.g. 2025).
+        is_active:   True for the season SAV2 marks as current (``activa == 1``).
+    """
+
+    id: int
+    label: str
+    start_year: int
+    is_active: bool = False
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def __repr__(self) -> str:
+        return (
+            f"Season(id={self.id}, label={self.label!r}, "
+            f"active={self.is_active})"
+        )
+
+
+@dataclass(frozen=True)
 class Game:
   """
   Represents a scheduled or played game.

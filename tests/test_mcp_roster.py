@@ -8,7 +8,7 @@ import dataclasses
 
 import pytest
 
-from sav_client.models import Player
+from sav_client.models import Player, Season
 from sav_mcp import server as server_module
 
 
@@ -32,8 +32,13 @@ class _StubClient:
     self._responses = responses or {}
     self.calls: list[dict] = []
 
-  def get_current_season_start_year(self) -> int:
-    return self._season_year
+  def get_current_season(self) -> Season:
+    return Season(
+      id=self.session["epoca_id"],
+      label=f"{self._season_year}/{self._season_year + 1}",
+      start_year=self._season_year,
+      is_active=True,
+    )
 
   def search_players(self, **kwargs):
     self.calls.append(kwargs)

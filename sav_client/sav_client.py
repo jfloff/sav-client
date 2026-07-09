@@ -41,7 +41,7 @@ from .exceptions import (
   SavResponseError,
 )
 from .cache import Cache
-from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Session
+from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
 from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
@@ -76,6 +76,7 @@ _GAME_SHEET_PATH = "php/maindb.php"
 _GAME_SHEET_OP = "29"
 _REGISTRATIONS_PATH = "php/incricoesdb.php"
 _REGISTRATIONS_LIST_OP = "170"
+_REGISTRATIONS_SEASONS_OP = "168"
 _REGISTRATIONS_SUBIDA_TIERS_OP = "21"
 _REGISTRATIONS_CREATE_OP = "4"
 _REGISTRATIONS_DELETE_OP = "9"
@@ -1513,39 +1514,72 @@ class SavClient:
     """
     return player_registration_tiers(gender_id)
 
-  def get_current_season_start_year(self) -> int:
-    """Return the start year of the session's current season (e.g. 2025 for "2025/2026").
+  def get_current_season(self) -> Season:
+    """Return SAV2's current (active) season, straight from the season table.
 
-    SAV2 stores the season as an opaque ``epoca_id`` integer in the session,
-    so the only reliable way to map it to a calendar year is to read it back
-    from any object the server tags with the season string. Registration
-    batches carry ``epoca`` as ``"YYYY/YYYY+1"``; this method picks the first
-    one returned for the session's club + current epoca_id and parses the
-    starting year.
+    Hits ``incricoesdb.php?op=168``, whose ``arrayEpoca`` lists every season as
+    ``{"id", "descricao", "activa"}``; the current one carries ``activa == "1"``.
+    This is the authoritative source for the current season and — unlike the
+    old batch scrape — needs no registration batch to exist, so it resolves
+    off-season, before any batch for the new época has been opened. Prefer this
+    over reading the season off any other object (batches, games, players).
+    MCP/agent callers get the same values via the ``get_session_info`` tool.
+
+    Returns:
+        The active Season (``id`` = epoca_id, ``label`` = "YYYY/YYYY+1",
+        ``start_year`` parsed from the label).
 
     Raises:
-        SavResponseError: If the session has no batches in the current
-        season, or the server returns a malformed season string. Callers
-        that need to work in newly-created clubs should pass the year
-        explicitly to whatever consumer needs it.
+        SavResponseError:   If login() has not run, the response is unparseable,
+            no active season is present, or its label is malformed.
+        SavConnectionError: On network errors.
     """
     if self.session is None:
       raise SavResponseError(
-        "Must call login() before get_current_season_start_year()"
+        "Must call login() before get_current_season()"
       )
-    batches = self.list_player_registration_batches()
-    if not batches:
-      raise SavResponseError(
-        "Cannot resolve current season start year: no registration batches "
-        "exist for the session's epoca_id."
-      )
-    season_str = batches[0].season
+
+    payload = {
+      "perfil": self.session.get("perfil", 0),
+      "user": self.session.get("user", ""),
+      "organizacao": self.session.get("organizacao", 0),
+    }
+    raw = self._post_form(
+      _REGISTRATIONS_PATH,
+      payload,
+      params={"op": _REGISTRATIONS_SEASONS_OP},
+    )
+
     try:
-      return int(season_str.split("/", 1)[0])
-    except (ValueError, IndexError) as exc:
+      data = json.loads(raw)
+    except ValueError as exc:
       raise SavResponseError(
-        f"Could not parse season string {season_str!r} from batch"
+        f"Could not parse seasons response (op=168): {raw[:200]!r}"
       ) from exc
+
+    seasons = data.get("arrayEpoca") or []
+    active = next((e for e in seasons if str(e.get("activa")) == "1"), None)
+    if active is None:
+      raise SavResponseError(
+        "Seasons response (op=168) has no active época (activa=1)."
+      )
+
+    label = str(active.get("descricao", ""))
+    try:
+      start_year = int(label.split("/", 1)[0])
+      epoca_id = int(active.get("id"))
+    except (ValueError, TypeError) as exc:
+      raise SavResponseError(
+        f"Could not parse active época {active!r} from op=168"
+      ) from exc
+
+    return Season(
+      id=epoca_id,
+      label=label,
+      start_year=start_year,
+      is_active=True,
+      raw=active,
+    )
 
   def _list_subida_tier_options(self, internal_id: int) -> list[tuple[int, str]]:
     """Op=21 — return every selectable (tier_id, name) for the player's
