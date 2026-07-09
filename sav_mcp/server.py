@@ -75,6 +75,7 @@ from sav_shared.fpb_mod1 import (
     read_carimbo,
     read_tipo_inscricao,
     reconcile_fpb_mod1,
+    render_mod1,
 )
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
@@ -578,6 +579,39 @@ def generate_game_sheet_pdf(
 
     return {
         "filename": f"game_{game.number}_{team}.pdf",
+        "size_bytes": len(pdf),
+        "pdf_b64": base64.b64encode(pdf).decode("ascii"),
+    }
+
+
+@server.tool()
+def fill_mod1(values: dict) -> dict:
+    """
+    Fill the FPB Modelo 1 enrollment form from field values and return it base64-encoded.
+
+    Produces a print-ready PDF; the player/guardian signature lines and the club
+    stamp are physical (no form fields), so they are left blank for hand completion.
+
+    values: a dict keyed by these (all optional) enrollment field keys —
+    tipo_inscricao, license, clube, associacao, genero, escalao, nome,
+    nacionalidade, pais_nascimento, nif, nasc, tipo, numi, dataval, email, tele,
+    telef, morada, localidade_txt, codpostal, distrito, concelho, guardian_name,
+    guardian_relation, guardian_id_type, guardian_id_number, guardian_id_expiry,
+    guardian_phone, guardian_email, consent_data, consent_communications,
+    consent_marketing, data_assinatura.
+
+    Text fields take strings; dates are "YYYY-MM-DD"; consent_* take booleans;
+    distrito/concelho/nacionalidade/pais_nascimento are names. Checkbox groups
+    accept an int code or a name: tipo_inscricao (1=1ª Inscrição, 2=Revalidação),
+    genero (1=Masculino, 2=Feminino), escalao (name, e.g. "Sub 14"), tipo /
+    guardian_id_type (1=Cartão Cidadão, 2=Passaporte, 3=Outro), guardian_relation
+    (1=pai, 2=mãe, 3=tutor). Unknown keys and blank values are skipped.
+
+    Returns ``{filename, size_bytes, pdf_b64}``. Decode pdf_b64 to obtain the PDF bytes.
+    """
+    pdf = render_mod1(values)
+    return {
+        "filename": "modelo1.pdf",
         "size_bytes": len(pdf),
         "pdf_b64": base64.b64encode(pdf).decode("ascii"),
     }

@@ -28,3 +28,7 @@ credentials.json
 
 # Files
 files/*
+# ...except the bundled mod1 AcroForm template used by render_mod1.
+!files/mod1/
+files/mod1/*
+!files/mod1/fpb-mod1.template.pdf

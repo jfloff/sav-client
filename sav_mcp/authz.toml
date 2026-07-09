@@ -154,6 +154,14 @@ roles = ["coach"]
 roles = ["coach"]
 
 
+# ── Modelo 1 form generation ─────────────────────────────────────────────────
+# Pure renderer: fills the blank Modelo 1 AcroForm from caller-supplied values
+# and returns the PDF. No SAV read/write and no subject param (the caller
+# supplies the data), so it's a plain read-capability coach tool.
+[tools.fill_mod1]
+roles = ["coach"]
+
+
 # ── Enrollment workflow ──────────────────────────────────────────────────────
 [tools.parse_enrollment_forms]
 roles      = ["coach"]

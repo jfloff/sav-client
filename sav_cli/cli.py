@@ -64,6 +64,7 @@ from sav_shared.fpb_mod1 import (
   read_carimbo,
   read_tipo_inscricao,
   reconcile_fpb_mod1,
+  render_mod1,
 )
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
@@ -1736,6 +1737,55 @@ def _print_converted(console: Console, converted: list[str]) -> None:
   console.print("[bold]:arrows_counterclockwise: Converted to PDF:[/]")
   for name in converted:
     console.print(f"  [green]:white_check_mark:[/] {name}", soft_wrap=True)
+
+
+@cli.group("mod1")
+def mod1_grp():
+  """Generate FPB Modelo 1 (player enrollment) forms."""
+
+
+@mod1_grp.command("fill")
+@click.option("--values", "values_path", required=True,
+              help="JSON file with field values keyed by canonical field keys, or '-' for stdin.")
+@click.option("--out", "out_path", required=True, help="Path to write the filled PDF.")
+def mod1_fill_cmd(values_path, out_path):
+  """Fill the Modelo 1 PDF form from a JSON values dict and write it to --out.
+
+  Produces a print-ready form; the player/guardian signature lines and the club
+  stamp are physical (no form fields), so they are left blank for hand
+  completion. VALUES keys (all optional): tipo_inscricao, license, clube,
+  associacao, genero, escalao, nome, nacionalidade, pais_nascimento, nif, nasc,
+  tipo, numi, dataval, email, tele, telef, morada, localidade_txt, codpostal,
+  distrito, concelho, guardian_name, guardian_relation, guardian_id_type,
+  guardian_id_number, guardian_id_expiry, guardian_phone, guardian_email,
+  consent_data, consent_communications, consent_marketing, data_assinatura.
+
+  Text fields take strings; dates are YYYY-MM-DD; consent_* take booleans.
+  Checkbox groups accept an int code or a name: tipo_inscricao (1=1ª Inscrição,
+  2=Revalidação), genero (1=Masculino, 2=Feminino, or the name), escalao (name,
+  e.g. "Sub 14"), tipo / guardian_id_type (1=Cartão Cidadão, 2=Passaporte,
+  3=Outro), guardian_relation (1=pai, 2=mãe, 3=tutor).
+  """
+  if values_path == "-":
+    raw = click.get_text_stream("stdin").read()
+  else:
+    try:
+      raw = Path(values_path).read_text(encoding="utf-8")
+    except OSError as e:
+      raise SavCliError(f"Could not read {values_path!r}: {e}", code="bad_input")
+  try:
+    values = json.loads(raw)
+  except json.JSONDecodeError as e:
+    raise SavCliError(f"Invalid JSON in {values_path!r}: {e}", code="bad_input")
+  if not isinstance(values, dict):
+    raise SavCliError("Values JSON must be an object (dict).", code="bad_input")
+
+  pdf = render_mod1(values)
+  try:
+    Path(out_path).write_bytes(pdf)
+  except OSError as e:
+    raise SavCliError(f"Could not write {out_path!r}: {e}", code="io_error")
+  click.echo(f"Saved Modelo 1 → {out_path}")
 
 
 @cli.group("enrollment")

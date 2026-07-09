@@ -16,7 +16,11 @@ import unicodedata
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+import pikepdf
+from pypdf import PdfReader, PdfWriter
 
 from .files import bbox_to_pdf_rect, overlay_image_on_pdf
 
@@ -578,3 +582,314 @@ def reconcile_fpb_mod1(
     retrain_corrections=retrain_corrections,
     concelhos=concelhos,
   )
+
+
+# ── Modelo 1 form rendering (outbound: values → filled PDF) ───────────────────
+#
+# The reconcile path above is inbound (scanned form → SAV kwargs). This section
+# goes the other way: given a dict of values keyed by the canonical
+# sav_shared.fields.FIELDS keys, it fills the blank Modelo 1 **AcroForm** and
+# returns print-ready PDF bytes.
+#
+# The template is a real fillable PDF form (72 named fields), so filling is done
+# by field *name* — no coordinates, no overlays. pypdf is used (not pikepdf)
+# because it regenerates field appearance streams, so the text renders/prints in
+# every viewer (Quartz/Preview included); pikepdf + NeedAppearances leaves text
+# blank in viewers that don't regenerate appearances. Only data fields are
+# written; the player signature, guardian signature, and club stamp have no form
+# fields (physical lines), so they are naturally left blank for hand completion.
+
+# Bundled blank AcroForm. Resolved relative to the repo root (files/mod1/), with
+# an env override mirroring CLUB_STAMP_PATH so an installed deployment can point
+# elsewhere.
+_MOD1_TEMPLATE = Path(__file__).resolve().parent.parent / "files" / "mod1" / "fpb-mod1.template.pdf"
+
+# Checkbox on-state export value shared by every /Btn field on this form.
+_ON_STATE = "/On"
+
+# int value → PDF checkbox field name. The ints come straight from the inbound
+# maps (_ID_TYPE / _GUARDIAN_RELATION) so a `tipo` / `guardian_relation` value
+# means the same box in both directions.
+_ID_TYPE_PDF_FIELD: dict[int, str] = {
+  _ID_TYPE["tipo_doc_cc"]:         "Cartão Cidadão",
+  _ID_TYPE["tipo_doc_passaporte"]: "Passaporte",
+  _ID_TYPE["tipo_doc_outro"]:      "Outro",
+}
+_GUARDIAN_RELATION_PDF_FIELD: dict[int, str] = {
+  _GUARDIAN_RELATION["parentesco_encarregado_pai"]:   "pai",
+  _GUARDIAN_RELATION["parentesco_encarregado_mae"]:   "mae",
+  _GUARDIAN_RELATION["parentesco_encarregado_tutor"]: "Tutor",
+}
+
+# The guardian id-document checkboxes mirror the player's id-type ints.
+_GUARDIAN_ID_TYPE_PDF_FIELD: dict[int, str] = {
+  _ID_TYPE["tipo_doc_cc"]:         "titular do Cartão Cidadão",
+  _ID_TYPE["tipo_doc_passaporte"]: "passaporte_2",
+  _ID_TYPE["tipo_doc_outro"]:      "Outro_2",
+}
+
+# tipo_inscricao ints match the inbound _INSCRICAO_FIELD map (1=1ª, 2=Revalidação).
+_INSCRICAO_PDF_FIELD: dict[int, str] = {1: "primeira", 2: "revalidacao"}
+_INSCRICAO_NAME_FIELD: dict[str, str] = {
+  "primeira": "primeira", "primeirainscricao": "primeira", "1ainscricao": "primeira",
+  "revalidacao": "revalidacao", "reval": "revalidacao",
+}
+
+# genero ints match sav_shared.lookups.GENERO (1=Masculino, 2=Feminino).
+_GENERO_PDF_FIELD: dict[int, str] = {1: "Masculino", 2: "Feminino"}
+_GENERO_NAME_FIELD: dict[str, str] = {
+  "masculino": "Masculino", "m": "Masculino",
+  "feminino": "Feminino", "f": "Feminino",
+}
+
+# Escalão has one gender-agnostic checkbox per tier, but SAV tier ids are
+# gender-dependent, so this group resolves by *name* only (Player.tier gives it
+# directly). Keys are normalized tokens; several aliases fold onto one box.
+_ESCALAO_NAME_FIELD: dict[str, str] = {
+  "babybasket": "BabyBasket",
+  "mini8": "Mini8", "mini10": "Mini10", "mini12": "Mini12",
+  "sub14": "Sub14", "sub16": "Sub16", "sub18": "Sub18",
+  "senior": "Sénior",
+  "master": "Master", "masters": "Master", "mastersveteranos": "Master", "veteranos": "Master",
+  "bcr": "BCR",
+}
+
+
+def _norm_token(s: str) -> str:
+  """Lowercase, strip accents, drop non-alphanumerics — for matching names."""
+  n = unicodedata.normalize("NFD", s).encode("ascii", "ignore").decode().lower()
+  return "".join(ch for ch in n if ch.isalnum())
+
+
+@dataclass(frozen=True)
+class _Text:
+  """Write the value straight into one text field."""
+  field: str
+
+
+@dataclass(frozen=True)
+class _Date:
+  """Split an ISO/EU date into day / month / year text fields."""
+  dia: str
+  mes: str
+  ano: str
+
+
+@dataclass(frozen=True)
+class _Postal:
+  """Split a Portuguese postal code (XXXX-XXX) into two text fields."""
+  cod4: str
+  cp3: str
+
+
+@dataclass(frozen=True)
+class _CheckGroup:
+  """Tick one box of a mutually-exclusive group.
+
+  The chosen box is resolved from an int code (`by_int`) and/or a name
+  (`by_name`, keyed by normalized token). A value is tried as an int first,
+  then as a normalized name — so callers may pass ``1``/``2``/``3`` or
+  ``"Masculino"``/``"Sub 14"`` interchangeably.
+  """
+  by_int: dict[int, str] | None = None
+  by_name: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
+class _Consent:
+  """Tick SIM or NÃO from a boolean value."""
+  yes: str
+  no: str
+
+
+# Canonical FIELDS key → how to place it on the form. Keys match the vocabulary
+# load_player_profile returns and the reconcile loop uses, so a SAV profile
+# could later be fed in directly. Distrito/Concelho are free-text on this form,
+# so callers pass names (this renderer does no SAV lookup).
+MOD1_FILL_MAPPING: dict[str, object] = {
+  # ── Header: enrollment type / licence / club / association / season ──────────
+  "tipo_inscricao":         _CheckGroup(by_int=_INSCRICAO_PDF_FIELD, by_name=_INSCRICAO_NAME_FIELD),
+  "license":                _Text("nr_licenca"),
+  "clube":                  _Text("Clube"),
+  "associacao":             _Text("associacao"),
+  "genero":                 _CheckGroup(by_int=_GENERO_PDF_FIELD, by_name=_GENERO_NAME_FIELD),
+  "escalao":                _CheckGroup(by_name=_ESCALAO_NAME_FIELD),
+
+  # ── Player identity ──────────────────────────────────────────────────────────
+  "nome":                   _Text("Nome Completo"),
+  "nacionalidade":          _Text("Nacionalidade"),
+  "pais_nascimento":        _Text("País de Nascimento"),
+  "nif":                    _Text("Nr Contribuinte"),
+  "nasc":                   _Date("dn_dia", "dn_mes", "dn_ano"),
+  "tipo":                   _CheckGroup(by_int=_ID_TYPE_PDF_FIELD),
+  "numi":                   _Text("nr_identificacao"),
+  "dataval":                _Date("val_dia", "val_mes", "val_ano"),
+
+  # ── Contact / address ────────────────────────────────────────────────────────
+  "email":                  _Text("Email"),
+  "tele":                   _Text("Telemóvel"),
+  "telef":                  _Text("Telefone"),
+  "morada":                 _Text("Morada"),
+  "localidade_txt":         _Text("Localidade"),
+  "codpostal":              _Postal("codpostal", "cp3"),
+  "distrito":               _Text("Distrito"),
+  "concelho":               _Text("Concelho"),
+
+  # ── Guardian ─────────────────────────────────────────────────────────────────
+  "guardian_name":          _Text("nome_paternal"),
+  "guardian_relation":      _CheckGroup(by_int=_GUARDIAN_RELATION_PDF_FIELD),
+  "guardian_id_type":       _CheckGroup(by_int=_GUARDIAN_ID_TYPE_PDF_FIELD),
+  "guardian_id_number":     _Text("paternal_id"),
+  "guardian_id_expiry":     _Date("paternal_dia", "paternal_mes", "paternal_ano"),
+  "guardian_phone":         _Text("paternal_telefone"),
+  "guardian_email":         _Text("email_paternal"),
+
+  # ── Consents / signature date ────────────────────────────────────────────────
+  "consent_data":           _Consent("SIM", "NÃO"),
+  "consent_communications": _Consent("SIM_2", "NÃO_2"),
+  "consent_marketing":      _Consent("SIM_3", "NÃO_3"),
+  "data_assinatura":        _Date("ass_dia", "ass_mes", "ass_ano"),
+}
+
+
+def _split_date(value: str) -> tuple[str, str, str] | None:
+  """(dia, mes, ano) from an ISO (YYYY-MM-DD) or EU (DD-MM-YYYY) date string.
+
+  Tolerant of ``/`` or ``.`` separators. Returns None when it can't be parsed.
+  """
+  parts = [p for p in re.split(r"[-/.]", value.strip()) if p]
+  if len(parts) != 3:
+    return None
+  a, _, c = parts
+  if len(a) == 4:          # YYYY-MM-DD
+    ano, mes, dia = parts
+  elif len(c) == 4:        # DD-MM-YYYY
+    dia, mes, ano = parts
+  else:
+    return None
+  return dia, mes, ano
+
+
+def _split_postal(value: str) -> tuple[str, str]:
+  """(first-4, last-3) from a Portuguese postal code like ``1234-567``.
+
+  Tolerant of a missing ``-`` (falls back to a 4/3 digit split).
+  """
+  raw = value.strip()
+  if "-" in raw:
+    left, right = raw.split("-", 1)
+    return left.strip(), right.strip()
+  digits = "".join(ch for ch in raw if ch.isdigit())
+  return digits[:4], digits[4:7]
+
+
+def _is_blank(value: object) -> bool:
+  return value is None or (isinstance(value, str) and not value.strip())
+
+
+def _mod1_field_updates(values: dict) -> tuple[dict[str, str], set[str]]:
+  """Resolve canonical `values` into (text_updates, checkbox_names).
+
+  text_updates maps PDF text-field name → string (dates/postals split across
+  sub-fields). checkbox_names is the set of PDF checkbox field names to tick.
+  Blank values and unknown keys are skipped.
+  """
+  text: dict[str, str] = {}
+  checks: set[str] = set()
+  for key, spec in MOD1_FILL_MAPPING.items():
+    value = values.get(key)
+    if _is_blank(value):
+      continue
+    if isinstance(spec, _Text):
+      text[spec.field] = str(value)
+    elif isinstance(spec, _Date):
+      split = _split_date(str(value))
+      if split:
+        text[spec.dia], text[spec.mes], text[spec.ano] = split
+    elif isinstance(spec, _Postal):
+      cod4, cp3 = _split_postal(str(value))
+      if cod4:
+        text[spec.cod4] = cod4
+      if cp3:
+        text[spec.cp3] = cp3
+    elif isinstance(spec, _CheckGroup):
+      box = None
+      if spec.by_int is not None:
+        try:
+          box = spec.by_int.get(int(value))
+        except (TypeError, ValueError):
+          box = None
+      if box is None and spec.by_name is not None:
+        box = spec.by_name.get(_norm_token(str(value)))
+      if box:
+        checks.add(box)
+    elif isinstance(spec, _Consent):
+      checks.add(spec.yes if value else spec.no)
+  return text, checks
+
+
+def _tick_checkboxes(pdf_bytes: bytes, names: set[str]) -> bytes:
+  """Tick the named checkboxes with pikepdf, preserving their original
+  appearance streams.
+
+  Sets the field ``/V`` **and** the on-page widget ``/AS`` to ``/On``. Both
+  matter: Quartz/QuickLook renders off the field ``/V``, but interactive viewers
+  (Preview, Acrobat) render off the widget annotation ``/AS`` — so a checkbox
+  whose original structure had the widget in ``/Kids`` (1ª Inscrição /
+  Revalidação / Estatuto FPB here) shows unchecked unless the widget ``/AS`` is
+  synced. Done in pikepdf, not pypdf, because pypdf rewrites checkbox
+  appearances and leaves that widget ``/AS`` out of sync.
+  """
+  on = pikepdf.Name("/On")
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    for f in pdf.Root.AcroForm.Fields:
+      if "/T" in f and str(f.T) in names:
+        f.V = on
+    for page in pdf.pages:
+      for annot in page.get("/Annots", []):
+        name = None
+        if "/T" in annot:
+          name = str(annot.T)
+        elif "/Parent" in annot and "/T" in annot.Parent:
+          name = str(annot.Parent.T)
+        if name in names:
+          annot.AS = on
+    out = io.BytesIO()
+    pdf.save(out)
+    return out.getvalue()
+
+
+def render_mod1(values: dict, *, template_path: str | os.PathLike[str] | None = None) -> bytes:
+  """Fill the blank Modelo 1 AcroForm from `values` and return the PDF bytes.
+
+  `values` is keyed by the canonical enrollment field keys (see
+  MOD1_FILL_MAPPING). Text fields take strings; checkbox groups (`tipo`,
+  `guardian_id_type` = 1/2/3; `guardian_relation` = 1/2/3; `genero`, `escalao`,
+  `tipo_inscricao` by int or name) select a box; `consent_*` take booleans;
+  dates are ``YYYY-MM-DD``; distrito/concelho/nacionalidade are names. Unknown
+  keys and blank values are skipped.
+
+  Text is filled with pypdf (which generates appearance streams so it renders
+  and prints in every viewer, not only those that honour NeedAppearances);
+  checkboxes are ticked with pikepdf (see _tick_checkboxes). Signatures and the
+  club stamp are left blank (they have no form fields). The template file is
+  never mutated — a filled copy is returned.
+  """
+  path = (
+    os.fspath(template_path) if template_path
+    else (os.environ.get("MOD1_TEMPLATE_PATH") or str(_MOD1_TEMPLATE))
+  )
+  text_updates, checkbox_names = _mod1_field_updates(values)
+
+  reader = PdfReader(path)
+  writer = PdfWriter()
+  writer.append(reader)
+  if text_updates:
+    writer.update_page_form_field_values(writer.pages[0], text_updates, auto_regenerate=False)
+  out = io.BytesIO()
+  writer.write(out)
+  pdf_bytes = out.getvalue()
+
+  if checkbox_names:
+    pdf_bytes = _tick_checkboxes(pdf_bytes, checkbox_names)
+  return pdf_bytes

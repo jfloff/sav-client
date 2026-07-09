@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.67.2"
+version = "0.68.0"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -15,6 +15,7 @@ dependencies = [
     "mcp>=1.0",
     "img2pdf>=0.5",
     "pikepdf>=8",
+    "pypdf>=4",
     "sav-parsers @ git+https://github.com/jfloff/sav-parsers.git@main",
 ]
 
