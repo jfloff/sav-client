@@ -40,6 +40,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
+from sav_client.models import Season
 from sav_client.exceptions import (
     LicenseNotEnrolledError,
     SavConfigError,
@@ -329,6 +330,111 @@ def find_player_by_nif(
     if not results:
         return None
     return player_to_dict(results[0], with_details=with_details)
+
+
+@server.tool()
+def club_roster(
+    club_id: int | None = None,
+    season: int | None = None,
+    tier: str = "",
+    gender: int = 0,
+) -> dict:
+    """
+    Return a club's current-season active roster in a single call.
+
+    Purpose-built for roster and projection work (e.g. grouping a club's players
+    by birth year for a next-season escalão projection): every row is scoped to
+    one club and one season, so the caller relays the roster rather than
+    assembling or re-attributing it.
+
+    Guarantees, so a projection can't drift onto stale or cross-club players:
+      - single club: only players enrolled at club_id — no federation bleed.
+      - current season: season defaults to the current epoch, so a player who
+        lapsed in a prior season has no current-season row and is excluded.
+      - active only: only players whose current-season licence is active.
+
+    Every row carries club_id + club_name and birth_date + birth_year alongside
+    name / licence / escalão, so a multi-club caller groups strictly by the
+    source club without the model re-attributing players.
+
+    Args:
+        club_id: Defaults to the session's own club. Pass an explicit id for
+            another club. club_id=0 is rejected — a roster is single-club.
+        season: SAV2 epoch id. Defaults to the current epoch (recommended). Pass
+            a past epoch to read that season's actual roster.
+        tier: Optional escalão filter (e.g. "Sub 14"). Empty = all tiers.
+        gender: Optional gender filter (1=Masculino, 2=Feminino, 0=any).
+
+    Returns:
+        {
+          "club_id": int,
+          "club_name": str,
+          "season": str,       # label, e.g. "2025/2026" ("" if not the current)
+          "season_id": int,    # the epoch actually queried
+          "count": int,
+          "players": [ {license, name, birth_date, birth_year, tier, tier_id,
+                        gender, gender_id, club_id, club_name}, ... ],
+        }
+    """
+    client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    if not effective_club:
+        raise ValueError(
+            "club_roster requires a club_id (a roster is single-club; the "
+            "session club could not be resolved)."
+        )
+
+    current: Season | None = None
+    try:
+        current = client.get_current_season()
+    except (SavResponseError, ValueError):
+        logger.debug("Could not resolve current season for club_roster", exc_info=True)
+
+    if season is not None:
+        query_season = season
+    elif current is not None:
+        query_season = current.id
+    else:
+        query_season = int(client.session.get("epoca_id") or 0)
+
+    players = client.search_players(
+        club=effective_club, status="active",
+        tier=tier, gender=gender, season=query_season,
+    )
+
+    full_name, code = client._fetch_club_names(effective_club)
+    club_name = full_name or code or ""
+    season_label = current.label if current and query_season == current.id else ""
+
+    def _birth_year(bd: str) -> int | None:
+        head = (bd or "").split("-", 1)[0]
+        return int(head) if head.isdigit() else None
+
+    return {
+        "club_id": effective_club,
+        "club_name": club_name,
+        "season": season_label,
+        "season_id": query_season,
+        "count": len(players),
+        "players": [
+            {
+                "license": p.license,
+                "name": p.name,
+                "birth_date": p.birth_date,
+                "birth_year": _birth_year(p.birth_date),
+                "tier": p.tier,
+                "tier_id": p.tier_id,
+                "gender": p.gender,
+                "gender_id": p.gender_id,
+                "club_id": p.club_id or effective_club,
+                "club_name": club_name,
+            }
+            for p in players
+        ],
+    }
 
 
 @server.tool()

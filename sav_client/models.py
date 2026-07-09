@@ -167,6 +167,11 @@ class Player:
       name:         Full name.
       association:  Association name (e.g. "AB Santarém").
       club:         Club name (e.g. "Rio Maior Basket").
+      club_id:      SAV2 numeric club ID this row belongs to. Stamped from the
+                    club a search was scoped to (search results carry no id
+                    column), so it is authoritative for the source club even in
+                    a multi-club search. 0 when unknown (e.g. a minimal Player
+                    from ``get_player_detail`` without a search).
       tier:         Age/competition tier (escalão), e.g. "Sénior".
       tier_id:      Numeric escalão ID for this (gender, tier), e.g. 5 = Sub 14
                     (Masculino). Resolved in-memory from the tier/gender names
@@ -200,6 +205,8 @@ class Player:
   nationality: str
   status: str
   season: str = ""
+  # SAV2 club id this row was scoped to; 0 when unknown. See class docstring.
+  club_id: int = 0
   active: bool = False
   photo_url: str = ""
   mobile_phone: str = ""

@@ -18,9 +18,12 @@ class _Player:
   license = "301772"
   name = "Jogador Teste"
   club = "Rio Maior Basket"
+  club_id = 7
   association = "AB Santarém"
   tier = "Sub 14"
+  tier_id = 5
   gender = "Masculino"
+  gender_id = 1
   birth_date = "2012-01-01"
   nationality = "Brasil"
   status = "FBP"

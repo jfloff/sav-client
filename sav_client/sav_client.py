@@ -648,6 +648,11 @@ class SavClient:
     logger.info("Searching players club=%s filters: %s", club, payload)
     html = self._post_form(_PLAYERS_PATH, payload, params={"op": _PLAYERS_OP})
     players = self._parse_players_response(html)
+    # Search rows carry the club name but no id column; stamp the club we
+    # scoped to so every row is attributable to its source club (the fan-out
+    # paths — club list, all-clubs — all funnel through here per club).
+    if club:
+      players = [_dc_replace(p, club_id=club) for p in players]
     # Opportunistic license → internal id cache fill (persisted in SQLite).
     pairs: list[tuple[int, int]] = []
     for p in players:

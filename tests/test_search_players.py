@@ -260,6 +260,58 @@ def _player_row(tier: str, gender: str, *, db_id: int = 1, license: str = "100")
   )
 
 
+class TestClubIdStamping:
+  """Search rows carry no id column, so every row is stamped with the club the
+  search was scoped to — authoritative even in a multi-club fan-out."""
+
+  def test_single_search_stamps_scoped_club_id(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', db_id=1)}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+
+    [player] = client._search_players_single(club=789)
+
+    assert player.club_id == 789
+    assert player.club == "Club X"  # display name still parsed from the row
+
+  def test_multi_club_search_attributes_each_row_to_its_source_club(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
+
+    def fake_post_form(path, payload, params=None):
+      cid = payload["nr_clube"]
+      row = _player_row("Sub 14", "Masculino", db_id=cid, license=str(cid))
+      return f"<table><tbody>{row}</tbody></table>"
+
+    monkeypatch.setattr(client, "_post_form", fake_post_form)
+
+    results = client.search_players(club=[10, 11])
+
+    by_id = {p.id: p for p in results}
+    assert by_id[10].club_id == 10
+    assert by_id[11].club_id == 11
+
+
+class TestPlayerSerializer:
+  """player_to_dict surfaces club_id + club_name for unambiguous grouping."""
+
+  def test_emits_club_id_and_club_name(self):
+    from sav_shared.serializers import player_to_dict
+
+    p = Player(
+      id=1, license="100", name="A", association="AB X", club="Club X",
+      tier="Sub 14", gender="Masculino", birth_date="2011-01-01",
+      nationality="Portuguesa", status="FBP", season="2025/2026",
+      active=True, club_id=789,
+    )
+    d = player_to_dict(p)
+
+    assert d["club_id"] == 789
+    assert d["club_name"] == "Club X"
+    assert d["club"] == "Club X"  # back-compat key preserved
+
+
 class TestPlayerTierGenderIds:
   """tier_id/gender_id are resolved in-memory from the row's display names."""
 
