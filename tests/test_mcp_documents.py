@@ -1,5 +1,7 @@
 import base64
 
+import pytest
+
 from sav_parsers.types import DocType, ParsedField
 
 from sav_mcp import server as server_module
@@ -195,6 +197,48 @@ def test_parse_enrollment_forms_returns_raw_medical_exam_date_when_unusable(monk
   assert result[0]["exam_date"] is None
   assert result[0]["raw_exam_date"] == "13/05/2026"
   assert result[0]["needs_review"] is True
+
+
+def test_parse_enrollment_forms_accepts_exam_date_without_ocr(monkeypatch):
+  def _boom(*a, **k):  # neither classification nor OCR must run
+    raise AssertionError("OCR/classify must not run when exam_date is provided")
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr("sav_parsers.classify", _boom)
+  monkeypatch.setattr("sav_parsers.parse_em", _boom)
+  monkeypatch.setattr(server_module, "_forms", {})
+
+  result = server_module.parse_enrollment_forms(
+    [_pdf_b64()], doc_types=["exame_medico"], medical_exam_date="2026-05-01",
+  )
+
+  artifact_id = result[0]["artifact_id"]
+  assert result == [
+    {
+      "index": 0,
+      "artifact_id": artifact_id,
+      "medical_exam_id": artifact_id,
+      "doc_type": DocType.EXAME_MEDICO.value,
+      "exam_date": "2026-05-01",
+      "raw_exam_date": None,
+      "exam_date_confidence": 1.0,
+      "needs_review": False,
+    }
+  ]
+  artifact = server_module._forms[artifact_id]
+  assert artifact["doc_type"] == DocType.EXAME_MEDICO
+  assert artifact["processing_id"] is None  # no Document AI session to close
+  assert artifact["pdf_bytes"]  # bytes cached for upload
+
+
+def test_parse_enrollment_forms_rejects_exam_date_without_em_target(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr(server_module, "_forms", {})
+
+  with pytest.raises(ValueError, match="exactly one PDF marked"):
+    server_module.parse_enrollment_forms(
+      [_pdf_b64()], doc_types=["fpb_modelo_1"], medical_exam_date="2026-05-01",
+    )
 
 
 def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):

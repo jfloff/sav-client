@@ -2111,6 +2111,46 @@ class SavClient:
       batch.type_id, batch.id, internal_id, license, step2_send,
     )
 
+    return self._commit_registration_step3(
+      batch, internal_id, license, step3_prefill,
+      exam_date=exam_date, taxa_id=taxa_id,
+      promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
+      guardian_name=guardian_name, guardian_relation=guardian_relation,
+      guardian_phone=guardian_phone, guardian_email=guardian_email,
+      consent_data=consent_data,
+      consent_communications=consent_communications,
+      consent_marketing=consent_marketing,
+    )
+
+  def _commit_registration_step3(
+    self,
+    batch: PlayerRegistrationBatch,
+    internal_id: int,
+    license: int,
+    step3_prefill: dict[str, Any],
+    *,
+    exam_date: str | None,
+    taxa_id: int | None,
+    promote_to_tier_id: int | None,
+    inline_subida: bool,
+    guardian_name: str | None,
+    guardian_relation: int | None,
+    guardian_phone: str | None,
+    guardian_email: str | None,
+    consent_data: bool,
+    consent_communications: bool,
+    consent_marketing: bool,
+  ) -> int:
+    """Run the Revalidação step-3 commit (op=36) for an item already carried
+    through steps 1-2, returning the internal SAV2 user id.
+
+    Shared by the create path (add_player_to_registration_batch) and the
+    exam-date edit path (_update_existing_player_in_batch). op=36 needs the
+    whole step-3 body, and SAV2 exposes no read-back of an item's saved
+    selections, so taxa/insurance are re-derived here and guardian/consent/
+    subida come from the caller — an edit that omits them re-commits the
+    defaults (consents on, no subida).
+    """
     # ── Validate guardian fields for minors ───────────────────────────────────
     is_minor = bool(step3_prefill.get("menor_idade"))
     if is_minor:
@@ -2192,10 +2232,10 @@ class SavClient:
     result = self._registration_commit(commit_body)
     if result.get("val") != 1:
       raise SavResponseError(
-        f"Add player commit failed: {result.get('msg') or result!r}"
+        f"Registration commit failed: {result.get('msg') or result!r}"
       )
     logger.info(
-      "Added player license=%s (id=%s) to batch %s — validity: %s",
+      "Committed step-3 for license=%s (id=%s) in batch %s — validity: %s",
       license, internal_id, batch.id, result.get("resultfunction"),
     )
     self._cache.record_license_batch(license, batch.id)
@@ -2219,13 +2259,30 @@ class SavClient:
     localidade_txt: str | None,
     distrito_id: int | None,
     concelho_id: int | None,
+    exam_date: str | None = None,
+    taxa_id: int | None = None,
+    promote_to_tier_id: int | None = None,
+    inline_subida: bool = False,
+    guardian_name: str | None = None,
+    guardian_relation: int | None = None,
+    guardian_phone: str | None = None,
+    guardian_email: str | None = None,
+    consent_data: bool = True,
+    consent_communications: bool = True,
+    consent_marketing: bool = False,
   ) -> int:
     """
-    Patch an already-enrolled player's personal data and (optionally)
-    address. Mirrors the wizard's edit flow: op=30 (load) → op=33 (step 1)
-    → op=31 (step 2, only when an address field is overridden). Skips the
-    insurance/taxa cascade and op=36 commit — those are creation-time and
-    the existing inscricao already carries them.
+    Patch an already-enrolled player's personal data, address, and/or exam date.
+    Mirrors the wizard's edit flow: op=30 (load) → op=33 (step 1) → op=31 (step
+    2). Personal/address edits stop there. When ``exam_date`` is supplied the
+    op=36 commit is re-fired to write the new ``dataexame`` — which requires the
+    step-3 prefill returned by op=31, so step 2 is re-saved even when no address
+    changed (idempotent).
+
+    Because SAV2 exposes no read-back of a committed item's step-3 selections,
+    re-firing op=36 re-derives taxa/insurance and takes guardian/consent/subida
+    from the caller: an exam-date edit that omits them re-commits the defaults
+    (consents on, no subida). Pass those through to preserve non-default choices.
     """
     record = self.load_existing_registration_record(batch.id, license)
     internal_id = int(record["id"])
@@ -2238,15 +2295,29 @@ class SavClient:
     )
     step2_prefill = self._save_registration_step1(batch.id, internal_id, step1_send)
 
+    editing_exam = exam_date is not None
     address_fields = (morada, cod_postal, localidade_txt, distrito_id, concelho_id)
-    if any(v is not None for v in address_fields):
+    step3_prefill: dict[str, Any] | None = None
+    if editing_exam or any(v is not None for v in address_fields):
       step2_send = self._build_step2_send(
         step2_prefill,
         morada=morada, cod_postal=cod_postal, localidade_txt=localidade_txt,
         distrito_id=distrito_id, concelho_id=concelho_id,
       )
-      self._save_registration_step2(
+      step3_prefill = self._save_registration_step2(
         batch.type_id, batch.id, internal_id, license, step2_send,
+      )
+
+    if editing_exam:
+      return self._commit_registration_step3(
+        batch, internal_id, license, step3_prefill or {},
+        exam_date=exam_date, taxa_id=taxa_id,
+        promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
+        guardian_name=guardian_name, guardian_relation=guardian_relation,
+        guardian_phone=guardian_phone, guardian_email=guardian_email,
+        consent_data=consent_data,
+        consent_communications=consent_communications,
+        consent_marketing=consent_marketing,
       )
 
     logger.info(
@@ -2273,18 +2344,32 @@ class SavClient:
     localidade_txt: str | None = None,
     distrito_id: int | None = None,
     concelho_id: int | None = None,
+    exam_date: str | None = None,
+    taxa_id: int | None = None,
+    promote_to_tier_id: int | None = None,
+    inline_subida: bool = False,
+    guardian_name: str | None = None,
+    guardian_relation: int | None = None,
+    guardian_phone: str | None = None,
+    guardian_email: str | None = None,
+    consent_data: bool = True,
+    consent_communications: bool = True,
+    consent_marketing: bool = False,
   ) -> int:
     """
     Patch fields on a player already enrolled in an open Revalidação batch.
 
-    Only step-1 (personal data) and step-2 (address) fields are supported;
-    those persist via op=33/op=31 without re-firing the op=36 commit. Pass
-    only the fields you want to change — the rest are loaded from the
-    existing inscricao via op=30 and kept as-is.
+    Step-1 (personal data) and step-2 (address) fields persist via op=33/op=31
+    without re-firing the op=36 commit. Pass only the fields you want to change
+    — the rest are loaded from the existing inscricao via op=30 and kept as-is.
 
-    Guardian, taxa, insurance, and consent fields are commit-time only
-    (op=36) and require a separate edit-flow trace before they can be
-    safely patched on an existing enrolment.
+    ``exam_date`` (YYYY-MM-DD) re-fires the op=36 commit to write the new
+    ``dataexame`` on the enrolment. Because SAV2 exposes no read-back of a
+    committed item's step-3 selections, that re-commit re-derives taxa/insurance
+    and takes guardian/consent/subida from the arguments here: an exam-date edit
+    that omits them re-commits the defaults (consents on, no subida). Pass the
+    guardian_*/consent_*/taxa_id/inline_subida arguments to preserve non-default
+    choices; guardian_* are required when the player is a minor.
 
     Args:
         batch_id: Open Revalidação batch holding the enrolment.
@@ -2293,6 +2378,7 @@ class SavClient:
     Raises:
         ValueError:        Batch unknown, not open, wrong type, or licence
                            not currently enrolled in this batch.
+        SavConfigError:    Missing guardian fields for a minor exam-date edit.
         SavResponseError:  Server returned an error.
         SavConnectionError: Network errors.
     """
@@ -2335,6 +2421,13 @@ class SavClient:
       morada=morada, cod_postal=cod_postal,
       localidade_txt=localidade_txt,
       distrito_id=distrito_id, concelho_id=concelho_id,
+      exam_date=exam_date, taxa_id=taxa_id,
+      promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
+      guardian_name=guardian_name, guardian_relation=guardian_relation,
+      guardian_phone=guardian_phone, guardian_email=guardian_email,
+      consent_data=consent_data,
+      consent_communications=consent_communications,
+      consent_marketing=consent_marketing,
     )
 
   def upload_player_registration_document(

@@ -1602,6 +1602,8 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
   "localidade_txt": ("step2", str),
   "distrito_id":    ("resolve_distrito", int),
   "concelho_id":    ("resolve_concelho", int),
+  # step3 re-fires the op=36 commit; see update_player_in_registration_batch.
+  "exam_date":      ("step3", str),
 }
 # Aliases so users don't have to type the `_id` suffix.
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
@@ -2766,7 +2768,7 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
         f"Unknown field {key!r}. Supported: {', '.join(supported)}."
       )
     kind, _ = _UPDATE_FIELDS[key]
-    if kind == "step1" or kind == "step2":
+    if kind in ("step1", "step2", "step3"):
       coerced: Any = val
       if _UPDATE_FIELDS[key][1] is int:
         try:

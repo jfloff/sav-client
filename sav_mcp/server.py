@@ -100,7 +100,7 @@ from sav_shared.serializers import (
     game_to_dict,
     player_to_dict,
 )
-from sav_parsers.types import DocType
+from sav_parsers.types import DocType, ParsedField
 
 server = FastMCP("FPB SAV")
 
@@ -1141,6 +1141,7 @@ def _read_mod1_template_fields(pdf_bytes: bytes):
 def parse_enrollment_forms(
     pdfs: list[str],
     doc_types: list[str | None] | None = None,
+    medical_exam_date: str | None = None,
 ) -> list[dict]:
     """
     Parse one or more enrollment-related PDFs provided as base64-encoded bytes.
@@ -1157,6 +1158,15 @@ def parse_enrollment_forms(
     is skipped and the classifier is trained with the known label. Use None or
     omit the list to auto-classify every PDF.
 
+    medical_exam_date: optional exam date (YYYY-MM-DD) for the single
+    exame_medico in this call. When set, the PDF marked doc_types="exame_medico"
+    is accepted with the caller-supplied date and no OCR — classification and
+    parse_em are skipped, the bytes are cached for upload, and the returned
+    medical_exam_id carries the trusted date straight into
+    preview_/submit_enrollment. Requires exactly one PDF marked
+    doc_types="exame_medico" (an enrollment has at most one exam). The date
+    must be strict YYYY-MM-DD; a malformed value comes back as needs_review.
+
     Returns one entry per PDF with an artifact_id and canonical doc_type to
     reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
     exame_medico entries also include medical_exam_id; fpb_modelo_4 entries
@@ -1168,6 +1178,22 @@ def parse_enrollment_forms(
     client = _get_client()
     results: list[dict] = []
 
+    # An enrollment has at most one exam, so medical_exam_date is a single value
+    # bound to the one PDF marked doc_types="exame_medico".
+    em_date = str(medical_exam_date).strip() if medical_exam_date not in (None, "") else None
+    em_index: int | None = None
+    if em_date is not None:
+        em_indices = [
+            j for j in range(len(pdfs))
+            if doc_types and j < len(doc_types) and doc_types[j] == "exame_medico"
+        ]
+        if len(em_indices) != 1:
+            raise ValueError(
+                "medical_exam_date requires exactly one PDF marked "
+                f"doc_types=\"exame_medico\"; found {len(em_indices)}."
+            )
+        em_index = em_indices[0]
+
     for i, pdf_b64 in enumerate(pdfs):
         try:
             pdf_bytes = base64.b64decode(pdf_b64)
@@ -1176,19 +1202,27 @@ def parse_enrollment_forms(
             continue
 
         hint: str | None = (doc_types[i] if doc_types and i < len(doc_types) else None)
+        exam_date_hint = em_date if i == em_index else None
 
         tmp_path: str | None = None
         try:
             tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
+            # Date-provided fast path: when the caller already knows the exam
+            # date, trust it and accept the PDF as an exame_medico with no OCR —
+            # cache the bytes for upload and skip classification + parse_em.
             # Filled-template fast path: a Modelo 1 filled from our fillable
             # template carries its values in the AcroForm — read them directly
             # and skip classification + OCR. An explicit non-mod1 hint opts out.
             mod1_fields = (
                 _read_mod1_template_fields(pdf_bytes)
-                if hint in (None, "fpb_modelo_1") else None
+                if (hint in (None, "fpb_modelo_1") and exam_date_hint is None) else None
             )
-            if mod1_fields is not None:
+            if exam_date_hint is not None:
+                doc_type = DocType.EXAME_MEDICO
+                parsed = {"exam_date": ParsedField(value=exam_date_hint, confidence=1.0)}
+                processing_id = None  # no Document AI session for a date-provided exam
+            elif mod1_fields is not None:
                 doc_type = DocType.FPB_MODELO_1
                 parsed = mod1_fields
                 processing_id = None  # no Document AI session for a form-read doc
@@ -1213,8 +1247,8 @@ def parse_enrollment_forms(
             else:
                 doc_type = classify(tmp_path)
 
-            if mod1_fields is not None:
-                pass  # already handled by the fast path above
+            if exam_date_hint is not None or mod1_fields is not None:
+                pass  # already handled by a fast path above
             elif doc_type == DocType.FPB_MODELO_1:
                 parse_result = parse_fpb_mod1(tmp_path)
                 parsed = parse_result["fields"]
@@ -1878,7 +1912,8 @@ def submit_enrollment(
             close_processing(form["processing_id"], corrections=corrections or None)
         except Exception:
             logger.debug("close_processing failed for form", exc_info=True)
-    if medical_exam is not None:
+    # date-provided (no-OCR) exams have no Document AI session to close.
+    if medical_exam is not None and medical_exam["processing_id"] is not None:
         exam_corrections = {}
         if manual_exam_override and kwargs.get("exam_date") is not None:
             exam_corrections["exam_date"] = str(kwargs["exam_date"])
@@ -1990,10 +2025,14 @@ def update_enrollment(
         telefone, email, nome_pai, nome_mae.
       Step 2 (address): morada, cod_postal, localidade_txt,
         distrito_id (int), concelho_id (int).
-
-    Guardian/taxa/exam/consent fields are commit-time only on creation and
-    are not (yet) patchable on existing enrolments — pass them via
-    submit_enrollment when adding a new player.
+      Exam (re-commits step-3): exam_date (YYYY-MM-DD). Setting it re-fires
+        the op=36 commit to write the new exam date. SAV2 has no read-back of
+        the item's saved step-3 selections, so the re-commit re-derives
+        taxa/insurance and takes guardian/consent from the values passed here:
+        an exam_date edit that omits them resets consents on / subida off.
+        Pass guardian_name, guardian_relation (int), guardian_phone,
+        guardian_email (required for minors) and consent_data,
+        consent_communications, consent_marketing (bools) to preserve them.
 
     Returns: {"success": True, "player_id": int} on success, or
     {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
@@ -2004,6 +2043,9 @@ def update_enrollment(
         "email", "nome_pai", "nome_mae",
         "morada", "cod_postal", "localidade_txt",
         "distrito_id", "concelho_id",
+        "exam_date",
+        "guardian_name", "guardian_relation", "guardian_phone", "guardian_email",
+        "consent_data", "consent_communications", "consent_marketing",
     }
     unknown = sorted(set(fields) - allowed)
     if unknown:
@@ -2011,12 +2053,15 @@ def update_enrollment(
             f"Unsupported field(s) for update_enrollment: {unknown}. "
             f"Allowed: {sorted(allowed)}."
         )
-    int_keys = {"id_type", "distrito_id", "concelho_id"}
+    int_keys = {"id_type", "distrito_id", "concelho_id", "guardian_relation"}
+    bool_keys = {"consent_data", "consent_communications", "consent_marketing"}
     coerced: dict[str, Any] = {}
     for k, v in fields.items():
         if v is None:
             continue
-        if k in int_keys and not isinstance(v, int):
+        if k in bool_keys:
+            coerced[k] = bool(v)
+        elif k in int_keys and not isinstance(v, int):
             try:
                 coerced[k] = int(v)
             except (TypeError, ValueError) as exc:
