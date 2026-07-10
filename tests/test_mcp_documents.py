@@ -170,7 +170,6 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
       "exam_date": "2026-05-01",
       "raw_exam_date": None,
       "exam_date_confidence": 0.91,
-      "doctor_validation_present": True,
       "needs_review": False,
     }
   ]
@@ -250,7 +249,6 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
     "exam_date": "2026-05-01",
     "raw_exam_date": None,
     "exam_date_confidence": 0.93,
-    "doctor_validation_present": True,
     "needs_review": False,
   }
 

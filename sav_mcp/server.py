@@ -1056,7 +1056,6 @@ def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> d
         "exam_date": info.exam_date,
         "raw_exam_date": info.raw_exam_date,
         "exam_date_confidence": info.exam_date_confidence,
-        "doctor_validation_present": info.doctor_validation_present,
         "needs_review": info.exam_date is None,
     }
 
