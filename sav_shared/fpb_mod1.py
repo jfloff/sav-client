@@ -23,7 +23,12 @@ from typing import TYPE_CHECKING, Any
 import pikepdf
 from pypdf import PdfReader, PdfWriter
 
-from .files import bbox_to_pdf_rect, overlay_image_on_pdf
+from .files import (
+  bbox_to_pdf_rect,
+  load_image_bytes as _load_image_bytes,
+  overlay_image_on_pdf,
+  scale_rect as _scale_rect,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -194,16 +199,6 @@ def overlay_tipo_inscricao(
 # its scaled height so it sits above the printed slot rather than over it.
 _CLUB_STAMP_SCALE = 5.5
 _CLUB_STAMP_Y_SHIFT = 0.5
-
-
-def _scale_rect(
-  rect: tuple[float, float, float, float], scale: float
-) -> tuple[float, float, float, float]:
-  """Scale a (x0, y0, x1, y1) rect by `scale` about its center."""
-  x0, y0, x1, y1 = rect
-  cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
-  half_w, half_h = (x1 - x0) / 2 * scale, (y1 - y0) / 2 * scale
-  return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
 
 
 def overlay_club_stamp(
@@ -668,21 +663,6 @@ _ESCALAO_NAME_FIELD: dict[str, str] = {
 _PLAYER_SIGNATURE_RECT:   tuple[float, float, float, float] = (55.0, 196.0, 245.0, 228.0)
 _GUARDIAN_SIGNATURE_RECT: tuple[float, float, float, float] = (215.0, 72.0, 500.0, 97.0)
 _CLUB_STAMP_RECT:         tuple[float, float, float, float] = (410.0, 193.0, 545.0, 231.0)
-
-
-def _load_image_bytes(arg: bytes | str | os.PathLike[str] | None) -> bytes | None:
-  """Coerce a signature/stamp argument to image bytes.
-
-  Accepts raw image bytes (as MCP passes them after base64-decoding) or a path
-  to an image file (as the CLI passes). None passes through as None so the
-  caller can leave that area blank for hand completion.
-  """
-  if arg is None:
-    return None
-  if isinstance(arg, (bytes, bytearray)):
-    return bytes(arg)
-  with open(os.fspath(arg), "rb") as f:
-    return f.read()
 
 
 def _norm_token(s: str) -> str:

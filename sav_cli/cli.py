@@ -37,7 +37,7 @@ from sav_client.exceptions import (
   SavResponseError,
 )
 from sav_shared.clubs import find_club_matches
-from sav_shared.files import staged_pdf
+from sav_shared.files import load_image_bytes, staged_pdf
 from sav_shared.enrollment import (
   KWARG_TO_SAV_KEY,
   REGISTRATION_TYPE_SUBIDA,
@@ -65,6 +65,12 @@ from sav_shared.fpb_mod1 import (
   read_tipo_inscricao,
   reconcile_fpb_mod1,
   render_mod1,
+)
+from sav_shared.fpb_mod4 import (
+  club_signature_overlay,
+  detentor_signature_overlay,
+  read_club_signature,
+  read_detentor_signature,
 )
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
@@ -1702,6 +1708,57 @@ def _prepare_club_stamp(
   return upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r
 
 
+def _prepare_mod4_signatures(
+  ctx: click.Context, console: Console, err_console: Console,
+  parsed: dict, pdf_path: str, processing_id: str,
+  *, detentor_signature_path: str | None,
+) -> str:
+  """Overlay the detentor signature and/or club stamp onto the mod4 (when OCR
+  says the slot is empty and an image is available) *before* upload, and return
+  the path to upload.
+
+  The detentor signature comes from `detentor_signature_path` (the appended
+  --detentor-signature); the club stamp from $CLUB_STAMP_PATH, matching the mod1
+  club-stamp-on-upload behaviour. The modified copy is written into the OCR
+  processing dir for `processing_id` and registered on `ctx` so it survives the
+  confirm→submit→upload span. Neither overlay raises — overlaid_pdf catches
+  failures inside each factory and falls back to the original PDF.
+  """
+  from sav_parsers import processing_dir
+
+  det_present, det_bbox = read_detentor_signature(parsed)
+  club_present, club_bbox = read_club_signature(parsed)
+  det_image = load_image_bytes(detentor_signature_path)
+  club_image = load_image_bytes(os.environ.get("CLUB_STAMP_PATH"))
+  upload_path, (det_r, club_r) = ctx.with_resource(
+    overlaid_pdf(
+      pdf_path,
+      detentor_signature_overlay(present=det_present, bbox=det_bbox, image=det_image),
+      club_signature_overlay(present=club_present, bbox=club_bbox, image=club_image),
+      dest_dir=processing_dir(processing_id),
+    )
+  )
+  if det_r.applied is True:
+    console.print(
+      f"[green]:pen:  Applied detentor signature to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
+    )
+  if det_r.error:
+    err_console.print(
+      f"[yellow]:warning: {det_r.error}[/] — will upload WITHOUT the detentor signature; "
+      "please sign the document manually."
+    )
+  if club_r.applied is True:
+    console.print(
+      f"[green]:label:  Applied club stamp to [bold]{_display_name(pdf_path)}[/] at OCR-detected location.[/]"
+    )
+  if club_r.error:
+    err_console.print(
+      f"[yellow]:warning: {club_r.error}[/] — will upload WITHOUT the club stamp; "
+      "please stamp the document manually."
+    )
+  return upload_path
+
+
 # Maps a staged temp-PDF path back to the user's original filename. Image
 # inputs are converted to temp PDFs with random names (tmpXXXX.pdf); without
 # this, every downstream log would show the meaningless temp name.
@@ -1869,11 +1926,15 @@ def _resolve_subida_player_or_prompt(
 
 
 def _run_subida_ocr_mode(
-  ctx, *, mod4_path: str, fields,
+  ctx, *, mod4_path: str, fields, detentor_signature_path: str | None = None,
 ) -> None:
   """OCR-driven standalone Subida (type 4): parse mod4 → resolve player and
   destination tier from its fields → find/create the type-4 batch →
   commit + upload the mod4. No --batch / --license needed.
+
+  When `detentor_signature_path` is given (--detentor-signature) it is overlaid
+  onto the holder signature slot before upload if OCR found it empty; the club
+  stamp ($CLUB_STAMP_PATH) is overlaid onto its slot the same way.
   """
   from sav_parsers import close_processing, parse_fpb_mod4
 
@@ -1963,11 +2024,19 @@ def _run_subida_ocr_mode(
       f"[green]:white_check_mark: Enrolled licence {license} in batch #{batch.number}.[/]"
     )
 
+    # Overlay the detentor signature (if appended) and club stamp onto empty
+    # slots before uploading; upload_path is the stamped copy (or the original
+    # when nothing was applied).
+    upload_path = _prepare_mod4_signatures(
+      ctx, console, err_console, parsed, mod4_path, processing_id,
+      detentor_signature_path=detentor_signature_path,
+    )
+
     with console.status(
       "[bold cyan]:page_facing_up: Uploading mod4 (fpb_modelo_4)...[/]"
     ):
       ok, err = try_replace_document(
-        client, batch_id, license, mod4_path,
+        client, batch_id, license, upload_path,
         tipo_doc=doc_type_to_tipo_doc(DocType.FPB_MODELO_4),
       )
     if ok:
@@ -2108,6 +2177,13 @@ def _run_manual_mode_enrollment(
   help="Player licence for manual enrolment (no PDF).",
 )
 @click.option(
+  "--detentor-signature", "detentor_signature_path",
+  type=click.Path(exists=True, dir_okay=False), default=None,
+  help="Image (PNG/JPG) of the holder (detentor paternal) signature. On a "
+       "standalone Subida it is overlaid onto the mod4's holder-signature slot "
+       "before upload when OCR finds it empty.",
+)
+@click.option(
   "--field", "fields", multiple=True, metavar="KEY=VAL",
   help=(
     "Override a field value (repeatable). Applied on top of OCR in PDF mode or "
@@ -2118,7 +2194,7 @@ def _run_manual_mode_enrollment(
 @click.pass_context
 def enrollment_create_cmd(
   ctx, pdfs, mod1_path, medical_exam, mod4_path, atestado_path, certidao_path,
-  id_doc_paths, outros_paths, batch_number_opt, license_opt, fields,
+  id_doc_paths, outros_paths, batch_number_opt, license_opt, detentor_signature_path, fields,
 ):
   """Enroll one player into SAV from one or more supporting PDFs.
 
@@ -2167,6 +2243,11 @@ def enrollment_create_cmd(
   # in SAV. Reached either via `--batch + --license` (with optional --mod4) or
   # via positional mod4-alone classification (handled later in pdf_mode).
   if manual_mode and not pdf_mode:
+    if detentor_signature_path:
+      _console(err=True).print(
+        "[yellow]:warning: --detentor-signature is ignored in manual mode "
+        "(no OCR to locate the signature slot); the mod4 is uploaded as-is.[/]"
+      )
     _run_manual_mode_enrollment(
       ctx,
       batch_number=batch_number_opt, license_opt=license_opt,
@@ -2279,7 +2360,10 @@ def enrollment_create_cmd(
           mod4_path=mod4_candidates[0], fields=fields,
         )
         return
-      _run_subida_ocr_mode(ctx, mod4_path=mod4_candidates[0], fields=fields)
+      _run_subida_ocr_mode(
+        ctx, mod4_path=mod4_candidates[0], fields=fields,
+        detentor_signature_path=detentor_signature_path,
+      )
       return
     raise click.UsageError(
       "No fpb_modelo_1 form provided. Pass one as a positional PDF or via --mod1."

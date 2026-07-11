@@ -151,6 +151,35 @@ def bbox_to_pdf_rect(
   return (x0, y0, x1, y1)
 
 
+def scale_rect(
+  rect: tuple[float, float, float, float], scale: float
+) -> tuple[float, float, float, float]:
+  """Scale a (x0, y0, x1, y1) rect by `scale` about its center.
+
+  Used to grow an OCR anchor box (sized to a printed label) into the larger
+  area the physical signature/stamp actually occupies before overlaying.
+  """
+  x0, y0, x1, y1 = rect
+  cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+  half_w, half_h = (x1 - x0) / 2 * scale, (y1 - y0) / 2 * scale
+  return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
+def load_image_bytes(arg: bytes | str | os.PathLike[str] | None) -> bytes | None:
+  """Coerce a signature/stamp argument to image bytes.
+
+  Accepts raw image bytes (as MCP passes them after base64-decoding) or a path
+  to an image file (as the CLI passes). None passes through as None so the
+  caller can leave that area blank for hand completion.
+  """
+  if arg is None:
+    return None
+  if isinstance(arg, (bytes, bytearray)):
+    return bytes(arg)
+  with open(os.fspath(arg), "rb") as f:
+    return f.read()
+
+
 def overlay_image_on_pdf(
   pdf_bytes: bytes,
   image_bytes: bytes,
