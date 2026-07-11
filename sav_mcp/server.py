@@ -35,6 +35,7 @@ import os
 import re
 import tempfile
 import uuid
+from contextlib import contextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -50,7 +51,7 @@ from sav_client.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
-from sav_shared.files import ensure_pdf
+from sav_shared.files import ensure_pdf, load_image_bytes
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
@@ -80,6 +81,12 @@ from sav_shared.fpb_mod1 import (
     read_tipo_inscricao,
     reconcile_fpb_mod1,
     render_mod1,
+)
+from sav_shared.fpb_mod4 import (
+    club_signature_overlay,
+    detentor_signature_overlay,
+    read_club_signature,
+    read_detentor_signature,
 )
 from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
@@ -1069,17 +1076,20 @@ def _replace_player_document_from_bytes(
     doc_type: DocType,
     parsed: dict | None = None,
     reg_type: int | None = None,
+    detentor_signature: bytes | None = None,
 ) -> dict[str, Any]:
     """Upload cached PDF bytes as a replacement registration document.
 
-    `parsed` is the fpb_modelo_1 fields dict from parse_fpb_mod1 (when
-    available); used to decide whether to overlay the club stamp and/or
-    the inscription checkbox mark.  `reg_type` (1 or 2) drives the
-    inscription overlay — pass it when known (enrollment create flow).
+    `parsed` is the parse_fpb_mod1 / parse_fpb_mod4 fields dict (when
+    available). For a mod1 it drives the club-stamp and inscription-checkbox
+    overlays (`reg_type` 1 or 2 selects the checkbox). For a mod4 it drives the
+    holder-signature and club-stamp overlays: `detentor_signature` (image bytes)
+    is placed on the empty holder slot and $CLUB_STAMP_PATH on the empty club
+    slot, mirroring the CLI submit path.
     """
-    # has_club_stamp / stamp_warning / has_inscricao_mark / inscricao_warning
-    # describe the uploaded PDF, so they're only added to status when
-    # status == "ok"; on "skipped" / "error" there's no uploaded PDF to describe.
+    # has_club_stamp / *_warning describe the uploaded PDF, so they're only added
+    # to status when status == "ok"; on "skipped" / "error" there's no uploaded
+    # PDF to describe.
     status = {
         "doc_type": doc_type.value,
         "status": "skipped",
@@ -1089,26 +1099,49 @@ def _replace_player_document_from_bytes(
         return status
 
     is_mod1 = doc_type == DocType.FPB_MODELO_1 and parsed
-    carimbo, carimbo_bbox = read_carimbo(parsed) if is_mod1 else (None, None)
-    tipo_checked, tipo_bbox = (
-        read_tipo_inscricao(parsed, reg_type)
-        if (is_mod1 and reg_type is not None) else (None, None)
-    )
+    is_mod4 = doc_type == DocType.FPB_MODELO_4 and parsed
     tmp_path: str | None = None
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
-        with overlaid_pdf(
-            tmp_path,
-            inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
-            carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),
-        ) as (upload_path, (inscricao_r, carimbo_r)):
+        if is_mod4:
+            det_present, det_bbox = read_detentor_signature(parsed)
+            club_present, club_bbox = read_club_signature(parsed)
+            club_image = load_image_bytes(os.environ.get("CLUB_STAMP_PATH"))
+            overlays = (
+                detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
+                club_signature_overlay(present=club_present, bbox=club_bbox, image=club_image),
+            )
+        else:
+            carimbo, carimbo_bbox = read_carimbo(parsed) if is_mod1 else (None, None)
+            tipo_checked, tipo_bbox = (
+                read_tipo_inscricao(parsed, reg_type)
+                if (is_mod1 and reg_type is not None) else (None, None)
+            )
+            overlays = (
+                inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
+                carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),
+            )
+        with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
             ok, error = try_replace_document(
                 client, batch_id, license, upload_path,
                 tipo_doc=doc_type_to_tipo_doc(doc_type),
             )
             status["status"] = "ok" if ok else "error"
             status["error"] = error
-            if ok:
+            if ok and is_mod4:
+                detentor_r, club_r = results
+                status["has_detentor_signature"] = detentor_r.effective
+                status["signature_warning"] = (
+                    f"{detentor_r.error} — document uploaded without the holder "
+                    "signature; please sign it manually."
+                ) if detentor_r.error else None
+                status["has_club_stamp"] = club_r.effective
+                status["stamp_warning"] = (
+                    f"{club_r.error} — document uploaded without the club stamp; "
+                    "please stamp it manually."
+                ) if club_r.error else None
+            elif ok:
+                inscricao_r, carimbo_r = results
                 status["has_club_stamp"] = carimbo_r.effective
                 status["stamp_warning"] = (
                     f"{carimbo_r.error} — document uploaded without the club stamp; "
@@ -1135,6 +1168,99 @@ def _read_mod1_template_fields(pdf_bytes: bytes):
     if raw is None or not is_filled_mod1_template(raw):
         return None
     return mod1_acroform_to_fields(raw)
+
+
+@contextmanager
+def _stamped_upload_path(
+    tmp_path: str, doc_type: DocType | str, *, detentor_signature: bytes | None = None,
+):
+    """Yield ``(upload_path, status)`` for a staged PDF about to be uploaded.
+
+    When the doc is a mod1 or mod4 *and* there is something to apply, OCR it and
+    overlay the club stamp ($CLUB_STAMP_PATH) — plus, for a mod4, the holder
+    signature — onto whichever slot OCR found empty, yielding the stamped copy.
+    Any other doc type (or a mod1/mod4 with nothing to apply) yields `tmp_path`
+    unchanged with an empty status. OCR runs only when an overlay is possible, so
+    a plain attach of an exam/atestado/etc. is untouched. `status` carries
+    has_club_stamp / has_detentor_signature and any *_warning for the response.
+
+    An OCR failure never blocks the upload — the original path is yielded with a
+    warning. This is the stamp-if-missing path shared by upload_player_document,
+    replace_player_document, and update_enrollment_with_document (file_only).
+    """
+    if isinstance(doc_type, str):
+        try:
+            doc_type = DocType(doc_type)
+        except ValueError:
+            doc_type = None
+    club_stamp = load_image_bytes(os.environ.get("CLUB_STAMP_PATH"))
+    is_mod1 = doc_type == DocType.FPB_MODELO_1 and club_stamp
+    is_mod4 = doc_type == DocType.FPB_MODELO_4 and (detentor_signature or club_stamp)
+    if not (is_mod1 or is_mod4):
+        yield tmp_path, {}
+        return
+
+    from sav_parsers import close_processing
+    processing_id = None
+    try:
+        try:
+            if is_mod1:
+                with open(tmp_path, "rb") as f:
+                    fields = _read_mod1_template_fields(f.read())
+                if fields is None:
+                    from sav_parsers import parse_fpb_mod1
+                    parse_result = parse_fpb_mod1(tmp_path)
+                    fields = parse_result["fields"]
+                    processing_id = parse_result["processing_id"]
+                carimbo, carimbo_bbox = read_carimbo(fields)
+                overlays = (carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),)
+            else:
+                from sav_parsers import parse_fpb_mod4
+                parse_result = parse_fpb_mod4(tmp_path)
+                fields = parse_result["fields"]
+                processing_id = parse_result["processing_id"]
+                det_present, det_bbox = read_detentor_signature(fields)
+                club_present, club_bbox = read_club_signature(fields)
+                overlays = (
+                    detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
+                    club_signature_overlay(present=club_present, bbox=club_bbox, image=club_stamp),
+                )
+        except Exception as exc:
+            logger.warning("OCR for stamp overlay failed; uploading as-is", exc_info=True)
+            yield tmp_path, {"stamp_warning": f"OCR failed ({exc}); uploaded without overlays."}
+            return
+
+        with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
+            status: dict[str, Any] = {}
+            if is_mod1:
+                (carimbo_r,) = results
+                status["has_club_stamp"] = carimbo_r.effective
+                if carimbo_r.error:
+                    status["stamp_warning"] = (
+                        f"{carimbo_r.error} — document uploaded without the club "
+                        "stamp; please stamp it manually."
+                    )
+            else:
+                detentor_r, club_r = results
+                status["has_detentor_signature"] = detentor_r.effective
+                status["has_club_stamp"] = club_r.effective
+                if detentor_r.error:
+                    status["signature_warning"] = (
+                        f"{detentor_r.error} — document uploaded without the holder "
+                        "signature; please sign it manually."
+                    )
+                if club_r.error:
+                    status["stamp_warning"] = (
+                        f"{club_r.error} — document uploaded without the club stamp; "
+                        "please stamp it manually."
+                    )
+            yield upload_path, status
+    finally:
+        if processing_id is not None:
+            try:
+                close_processing(processing_id)
+            except Exception:
+                logger.debug("close_processing failed for stamped upload", exc_info=True)
 
 
 @server.tool()
@@ -1691,6 +1817,7 @@ def submit_enrollment(
     medical_exam_id: str | None = None,
     mod4_id: str | None = None,
     nif: str | None = None,
+    detentor_signature_b64: str | None = None,
 ) -> dict:
     """
     Submit the player enrollment using the data prepared by preview_enrollment.
@@ -1717,7 +1844,9 @@ def submit_enrollment(
     this 1ª Inscrição / Revalidação: the target tier is fetched from SAV and
     committed, and the mod4 is uploaded as a supporting document. Submitting
     fails if SAV offers no subida tier for the player. (This is the inline
-    rider, not a standalone type-4 Subida batch.)
+    rider, not a standalone type-4 Subida batch.) When detentor_signature_b64
+    is supplied, it is overlaid onto the mod4's empty holder-signature slot
+    (and $CLUB_STAMP_PATH onto the club slot) before that upload.
 
     nif: optional explicit subject claim — the athlete's NIF that the caller
     asserts this enrollment is for. Used by downstream wrappers to enforce
@@ -1891,6 +2020,10 @@ def submit_enrollment(
         _replace_player_document_from_bytes(
             client, batch_id, upload_license,
             mod4.get("pdf_bytes"), doc_type=mod4["doc_type"],
+            parsed=mod4.get("parsed"),
+            detentor_signature=(
+                base64.b64decode(detentor_signature_b64) if detentor_signature_b64 else None
+            ),
         )
         if (mod4 is not None and upload_license) else None
     )
@@ -1945,6 +2078,7 @@ def submit_subida_enrollment(
     batch_number: str,
     license: int,
     mod4_id: str,
+    detentor_signature_b64: str | None = None,
 ) -> dict:
     """
     Submit a standalone Subida de escalão enrollment (type-4 batch).
@@ -1957,10 +2091,16 @@ def submit_subida_enrollment(
     server's eligible list. The mod4 PDF is uploaded after the commit as
     the supporting document (tipo_doc=6).
 
+    When detentor_signature_b64 is supplied it is overlaid onto the mod4's
+    holder-signature slot (and $CLUB_STAMP_PATH onto the club slot) if OCR found
+    the slot empty, before the upload — mirroring the CLI submit path.
+
     Args:
         batch_number:  Human-visible Subida batch number.
         license:       Player licence (must already exist in SAV).
         mod4_id:       Artifact id of an fpb_modelo_4 from parse_enrollment_forms.
+        detentor_signature_b64: Optional base64 PNG/JPG of the holder (detentor
+                       paternal) signature to overlay onto the empty holder slot.
 
     Returns:
         success=true + license + name + subida_document_upload on success.
@@ -1991,6 +2131,10 @@ def submit_subida_enrollment(
 
     subida_document_upload = _replace_player_document_from_bytes(
         client, batch_id, license, form.get("pdf_bytes"), doc_type=form["doc_type"],
+        parsed=form.get("parsed"),
+        detentor_signature=(
+            base64.b64decode(detentor_signature_b64) if detentor_signature_b64 else None
+        ),
     )
 
     sav_profile: dict[str, Any] = {}
@@ -2116,6 +2260,7 @@ def update_enrollment_with_document(
     doc_type: str | None = None,
     field_overrides: dict[str, Any] | None = None,
     file_only: bool = False,
+    detentor_signature_b64: str | None = None,
 ) -> dict:
     """
     Reconcile a new PDF against an existing enrolment and patch fields / replace document.
@@ -2129,7 +2274,11 @@ def update_enrollment_with_document(
     classification is skipped and the classifier is trained with the known label.
     field_overrides: optional field values applied on top of reconcile result before
     submitting (same keys as update_enrollment). Only valid when file_only=False.
-    file_only: when True, replace the document without touching fields.
+    file_only: when True, replace the document without touching fields. A mod1/mod4
+    still gets the club stamp ($CLUB_STAMP_PATH) — and, for a mod4,
+    detentor_signature_b64 — overlaid onto empty slots before the replace.
+    detentor_signature_b64: base64 PNG/JPG of the holder (detentor paternal)
+    signature to overlay onto an empty mod4 holder slot.
 
     Returns: {"success": True, "fields_updated": bool, "document_uploaded": bool} on
     success, or {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
@@ -2174,9 +2323,16 @@ def update_enrollment_with_document(
             return batch_id
 
         if file_only:
-            # No OCR ran → can't tell if the club stamp is already present, so skip stamping.
-            client.replace_player_registration_document(batch_id, license, tmp_path, tipo_doc=tipo_doc)
-            return {"success": True, "fields_updated": False, "document_uploaded": True}
+            # Replace without touching fields — but for a mod1/mod4 still overlay
+            # the club stamp (and mod4 holder signature) onto empty slots.
+            detentor_signature = (
+                base64.b64decode(detentor_signature_b64) if detentor_signature_b64 else None
+            )
+            with _stamped_upload_path(
+                tmp_path, active_doc_type, detentor_signature=detentor_signature,
+            ) as (upload_path, status):
+                client.replace_player_registration_document(batch_id, license, upload_path, tipo_doc=tipo_doc)
+            return {"success": True, "fields_updated": False, "document_uploaded": True, **status}
 
         if active_doc_type != DocType.FPB_MODELO_1:
             raise ValueError(
@@ -2566,6 +2722,7 @@ def upload_player_document(
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
+    detentor_signature_b64: str | None = None,
 ) -> dict:
     """
     Upload a document (PDF, base64-encoded) attached to a player's registration.
@@ -2578,9 +2735,14 @@ def upload_player_document(
     Types recognized by sav-parsers but without a SAV2 tipo_doc mapping fail
     before the SAV2 call.
 
-    Returns {"success": True} on success, or
-    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
-    if the licence is not enrolled in any open batch.
+    For a mod1 or mod4 the club stamp ($CLUB_STAMP_PATH) is overlaid onto its
+    slot when OCR finds it empty, and detentor_signature_b64 (base64 PNG/JPG) is
+    overlaid onto a mod4's empty holder-signature slot. Other doc types are
+    uploaded as-is with no OCR.
+
+    Returns {"success": True} (plus has_club_stamp / has_detentor_signature for
+    mod1/mod4) on success, or {"error": "license_not_enrolled", "license": int,
+    "open_batches": [...]} if the licence is not enrolled in any open batch.
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
@@ -2590,12 +2752,16 @@ def upload_player_document(
         batch_id = _resolve_license_batch(client, license)
         if isinstance(batch_id, dict):
             return batch_id
-        # classify-only path: no OCR field parse, so we don't know whether the
-        # club stamp is already present → skip stamping to avoid double-stamping.
-        client.upload_player_registration_document(
-            batch_id, license, tmp_path, tipo_doc=tipo_doc,
+        detentor_signature = (
+            base64.b64decode(detentor_signature_b64) if detentor_signature_b64 else None
         )
-        return {"success": True}
+        with _stamped_upload_path(
+            tmp_path, resolved_doc_type, detentor_signature=detentor_signature,
+        ) as (upload_path, status):
+            client.upload_player_registration_document(
+                batch_id, license, upload_path, tipo_doc=tipo_doc,
+            )
+        return {"success": True, **status}
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)
@@ -2633,6 +2799,7 @@ def replace_player_document(
     license: int,
     pdf_base64: str,
     doc_type: str | None = None,
+    detentor_signature_b64: str | None = None,
 ) -> dict:
     """
     Replace any existing documents of `doc_type` for this player with a
@@ -2641,9 +2808,14 @@ def replace_player_document(
 
     The batch is resolved automatically from the license.
 
-    Returns {"success": True} on success, or
-    {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
-    if the licence is not enrolled in any open batch.
+    For a mod1 or mod4 the club stamp ($CLUB_STAMP_PATH) is overlaid onto its
+    slot when OCR finds it empty, and detentor_signature_b64 (base64 PNG/JPG) is
+    overlaid onto a mod4's empty holder-signature slot. Other doc types are
+    replaced as-is with no OCR.
+
+    Returns {"success": True} (plus has_club_stamp / has_detentor_signature for
+    mod1/mod4) on success, or {"error": "license_not_enrolled", "license": int,
+    "open_batches": [...]} if the licence is not enrolled in any open batch.
     """
     tmp_path = _decode_pdf_to_tempfile(pdf_base64)
     try:
@@ -2653,11 +2825,16 @@ def replace_player_document(
         batch_id = _resolve_license_batch(client, license)
         if isinstance(batch_id, dict):
             return batch_id
-        # classify-only path: see comment in upload_player_document. Skip stamping.
-        client.replace_player_registration_document(
-            batch_id, license, tmp_path, tipo_doc=tipo_doc,
+        detentor_signature = (
+            base64.b64decode(detentor_signature_b64) if detentor_signature_b64 else None
         )
-        return {"success": True}
+        with _stamped_upload_path(
+            tmp_path, resolved_doc_type, detentor_signature=detentor_signature,
+        ) as (upload_path, status):
+            client.replace_player_registration_document(
+                batch_id, license, upload_path, tipo_doc=tipo_doc,
+            )
+        return {"success": True, **status}
     finally:
         if os.path.exists(tmp_path):
             os.unlink(tmp_path)

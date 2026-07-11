@@ -228,3 +228,61 @@ class TestCreateSubidaDetentorSignature:
 
     assert result.exit_code == 0, result.output
     assert "--detentor-signature is ignored in manual mode" in result.output
+
+
+class TestUpdateMod4DetentorSignature:
+  """`enrollment update <mod4> --detentor-signature` overlays the holder
+  signature onto the replaced fpb_modelo_4 (single upload/replace path)."""
+
+  def _run(self, monkeypatch, tmp_path, parsed):
+    mod4 = tmp_path / "subida.pdf"
+    mod4.write_bytes(_blank_pdf())
+    sig = tmp_path / "sig.png"
+    sig.write_bytes(_png_bytes())
+
+    captured: dict = {"uploads": []}
+
+    class StubClient:
+      _cache = None
+
+      def resolve_batch_id_by_license(self, license):
+        return 12
+
+      def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
+        captured["uploads"].append((str(pdf), tipo_doc))
+
+    monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+    monkeypatch.setattr(
+      "sav_parsers.parse_fpb_mod4",
+      lambda pdf: {"fields": parsed, "processing_id": "proc-mod4"},
+    )
+    monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
+    monkeypatch.setattr("sav_parsers.processing_dir", lambda pid: str(tmp_path))
+
+    result = CliRunner().invoke(cli_module.cli, [
+      "enrollment", "update", "--license", "301772", str(mod4),
+      "--tipo", "fpb_modelo_4", "--detentor-signature", str(sig),
+    ])
+    return result, captured
+
+  def test_overlays_holder_signature_on_replace(self, monkeypatch, tmp_path):
+    result, captured = self._run(
+      monkeypatch, tmp_path, _parsed(det=False, club=None))
+
+    assert result.exit_code == 0, result.output
+    assert "Applied detentor signature" in result.output
+    assert len(captured["uploads"]) == 1
+    uploaded_path, tipo_doc = captured["uploads"][0]
+    assert tipo_doc == 6
+    with open(uploaded_path, "rb") as f:
+      assert _xobject_count(f.read()) == _xobject_count(_blank_pdf()) + 1
+
+  def test_already_signed_uploads_original(self, monkeypatch, tmp_path):
+    result, captured = self._run(
+      monkeypatch, tmp_path, _parsed(det=True, club=None))
+
+    assert result.exit_code == 0, result.output
+    assert "Applied detentor signature" not in result.output
+    uploaded_path, _ = captured["uploads"][0]
+    with open(uploaded_path, "rb") as f:
+      assert _xobject_count(f.read()) == _xobject_count(_blank_pdf())

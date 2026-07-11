@@ -2,13 +2,40 @@ import base64
 
 import pytest
 
-from sav_parsers.types import DocType, ParsedField
+from sav_parsers.types import BBox, DocType, ParsedField
 
 from sav_mcp import server as server_module
 
 
 def _pdf_b64() -> str:
   return base64.b64encode(b"%PDF-1.4\n").decode("ascii")
+
+
+def _blank_pdf_bytes() -> bytes:
+  import io
+  import img2pdf
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGB", (827, 1169), (255, 255, 255)).save(buf, "PNG")
+  return img2pdf.convert(buf.getvalue())
+
+
+def _png_b64() -> str:
+  import io
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGBA", (120, 40), (0, 0, 180, 255)).save(buf, "PNG")
+  return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _xobjs(pdf_bytes: bytes) -> int:
+  import io
+  import pikepdf
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    return len(pdf.pages[0].get("/Resources", {}).get("/XObject", {}))
+
+
+_DET_BBOX = BBox(page=0, vertices=[(0.71, 0.58), (0.76, 0.58), (0.76, 0.59), (0.71, 0.59)])
 
 
 def test_upload_player_document_translates_doc_type(monkeypatch):
@@ -1017,3 +1044,236 @@ def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypa
   assert result["license"] is None
   assert result["source_document_upload"]["status"] == "skipped"
   assert "type-1 commit" in result["source_document_upload"]["error"]
+
+
+def test_replace_from_bytes_overlays_detentor_signature(monkeypatch):
+  """_replace_player_document_from_bytes overlays the holder signature onto an
+  empty mod4 slot before the replace."""
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+      captured["tipo"] = tipo_doc
+
+  parsed = {"assinatura_detentor_presente": ParsedField(value=False, confidence=0.9, bbox=_DET_BBOX)}
+  base = _blank_pdf_bytes()
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_4, parsed=parsed,
+    detentor_signature=base64.b64decode(_png_b64()),
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_detentor_signature"] is True
+  assert captured["tipo"] == 6
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_replace_from_bytes_skips_signed_mod4(monkeypatch):
+  """An already-signed holder slot is left untouched."""
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  parsed = {"assinatura_detentor_presente": ParsedField(value=True, confidence=1.0, bbox=_DET_BBOX)}
+  base = _blank_pdf_bytes()
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_4, parsed=parsed,
+    detentor_signature=base64.b64decode(_png_b64()),
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_detentor_signature"] is True  # already present in the PDF
+  assert _xobjs(captured["bytes"]) == _xobjs(base)  # nothing overlaid
+
+
+def test_submit_subida_enrollment_signs_mod4(monkeypatch):
+  """submit_subida_enrollment decodes detentor_signature_b64 and overlays it."""
+  captured: dict = {}
+  batch = type("B", (), {"id": 12, "type_id": 4, "type": "Subida"})()
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 12
+
+    def list_player_registration_batches(self):
+      return [batch]
+
+    def add_player_to_registration_batch(self, batch_id, license):
+      pass
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+    def load_player_profile(self, license):
+      return {"nome": "Player A"}
+
+  base = _blank_pdf_bytes()
+  parsed = {"assinatura_detentor_presente": ParsedField(value=False, confidence=0.9, bbox=_DET_BBOX)}
+  forms = {"mod4-1": {
+    "parsed": parsed, "processing_id": None,
+    "pdf_bytes": base, "doc_type": DocType.FPB_MODELO_4,
+  }}
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", forms)
+
+  result = server_module.submit_subida_enrollment(
+    batch_number="12", license=301772, mod4_id="mod4-1",
+    detentor_signature_b64=_png_b64(),
+  )
+
+  assert result["success"] is True
+  assert result["subida_document_upload"]["has_detentor_signature"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def _mod4_parse_stub(monkeypatch):
+  parsed = {"assinatura_detentor_presente": ParsedField(value=False, confidence=0.9, bbox=_DET_BBOX)}
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod4", lambda p: {"fields": parsed, "processing_id": "pm4"})
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+
+
+def test_upload_player_document_signs_mod4(monkeypatch):
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+      captured["tipo"] = tipo_doc
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  _mod4_parse_stub(monkeypatch)
+  base = _blank_pdf_bytes()
+
+  result = server_module.upload_player_document(
+    license=301772, pdf_base64=base64.b64encode(base).decode("ascii"),
+    doc_type="fpb_modelo_4", detentor_signature_b64=_png_b64(),
+  )
+
+  assert result["success"] is True
+  assert result["has_detentor_signature"] is True
+  assert captured["tipo"] == 6
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_replace_player_document_signs_mod4(monkeypatch):
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  _mod4_parse_stub(monkeypatch)
+  base = _blank_pdf_bytes()
+
+  result = server_module.replace_player_document(
+    license=301772, pdf_base64=base64.b64encode(base).decode("ascii"),
+    doc_type="fpb_modelo_4", detentor_signature_b64=_png_b64(),
+  )
+
+  assert result["success"] is True
+  assert result["has_detentor_signature"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_update_enrollment_with_document_file_only_signs_mod4(monkeypatch):
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.classify", lambda p: DocType.FPB_MODELO_4)
+  _mod4_parse_stub(monkeypatch)
+  base = _blank_pdf_bytes()
+
+  result = server_module.update_enrollment_with_document(
+    license=301772, pdf=base64.b64encode(base).decode("ascii"),
+    file_only=True, detentor_signature_b64=_png_b64(),
+  )
+
+  assert result["success"] is True
+  assert result["document_uploaded"] is True
+  assert result["has_detentor_signature"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_replace_player_document_stamps_mod1(monkeypatch, tmp_path):
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  carimbo_bbox = BBox(page=0, vertices=[(0.6, 0.8), (0.9, 0.8), (0.9, 0.85), (0.6, 0.85)])
+  parsed = {"carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox)}
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod1", lambda p: {"fields": parsed, "processing_id": "pm1"})
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+  base = _blank_pdf_bytes()
+
+  result = server_module.replace_player_document(
+    license=301772, pdf_base64=base64.b64encode(base).decode("ascii"),
+    doc_type="fpb_modelo_1",
+  )
+
+  assert result["success"] is True
+  assert result["has_club_stamp"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_upload_player_document_non_mod_is_plain(monkeypatch):
+  """A non-mod1/mod4 doc is uploaded as-is with no OCR and an empty status."""
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod4",
+    lambda p: (_ for _ in ()).throw(AssertionError("no OCR for a plain attach")),
+  )
+  base = _blank_pdf_bytes()
+
+  result = server_module.upload_player_document(
+    license=301772, pdf_base64=base64.b64encode(base).decode("ascii"),
+    doc_type="exame_medico",
+  )
+
+  assert result == {"success": True}
+  assert _xobjs(captured["bytes"]) == _xobjs(base)

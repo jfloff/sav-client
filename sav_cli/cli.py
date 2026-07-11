@@ -3165,9 +3165,16 @@ def enrollment_read_cmd(ctx, batch_number, license_):
     "When omitted with a PDF, sav-parsers classifies it automatically."
   ),
 )
+@click.option(
+  "--detentor-signature", "detentor_signature_path",
+  type=click.Path(exists=True, dir_okay=False), default=None,
+  help="Image (PNG/JPG) of the holder (detentor paternal) signature. When the "
+       "uploaded document is an fpb_modelo_4, it is overlaid onto the empty "
+       "holder-signature slot before the replace.",
+)
 @click.pass_context
 def enrollment_update_cmd(
-  ctx, license_, pdf, mod1_path, medical_exam_path, fields, tipo,
+  ctx, license_, pdf, mod1_path, medical_exam_path, fields, tipo, detentor_signature_path,
 ):
   """Update an existing player enrolment.
 
@@ -3185,6 +3192,9 @@ def enrollment_update_cmd(
     sav enrollment update --license LICENSE FILE --tipo atestado_residencia
         Upload FILE as a supplementary document (classified, or pinned with
         --tipo; no OCR, replaces any existing doc of that type).
+    sav enrollment update --license LICENSE MOD4 --detentor-signature SIG.png
+        Replace an fpb_modelo_4, overlaying the holder signature (and the club
+        stamp from $CLUB_STAMP_PATH) onto empty slots before the replace.
   """
   if pdf and (mod1_path or medical_exam_path):
     raise click.UsageError("Positional pdf and --mod1/--medical-exam are mutually exclusive.")
@@ -3247,6 +3257,12 @@ def enrollment_update_cmd(
         _upload_medical_exam_update(
           batch_id, license_, active_pdf,
           client=client, console=console, err_console=err_console,
+        )
+      elif active_doc_type == DocType.FPB_MODELO_4:
+        _upload_mod4_update(
+          ctx, batch_id, license_, active_pdf,
+          client=client, console=console, err_console=err_console,
+          detentor_signature_path=detentor_signature_path,
         )
       elif is_uploadable_doc_type(active_doc_type):
         tipo_doc = _tipo_doc_for_upload(active_doc_type)
@@ -3445,6 +3461,63 @@ def _upload_medical_exam_update(
       )
     except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
       err_console.print(f"[yellow]:warning: Medical exam upload failed:[/] {exc}")
+
+
+def _upload_mod4_update(
+  ctx: click.Context, batch_id: int, license: int, pdf_path: str,
+  *, client: Any = None, console: Any = None, err_console: Any = None,
+  detentor_signature_path: str | None = None,
+) -> None:
+  """Replace the fpb_modelo_4 for an existing enrolment, overlaying the detentor
+  signature and/or club stamp onto empty slots first — the update-side mirror of
+  the standalone-Subida create path.
+
+  OCR runs only when there is something to overlay (a detentor signature was
+  passed, or $CLUB_STAMP_PATH is set); otherwise the file is uploaded as-is, as
+  before. `pdf_path` is already a staged PDF.
+  """
+  if client is None:
+    client = _make_client()
+  if console is None:
+    console = _console()
+  if err_console is None:
+    err_console = _console(err=True)
+
+  upload_path = pdf_path
+  if detentor_signature_path or os.environ.get("CLUB_STAMP_PATH"):
+    from sav_parsers import close_processing, parse_fpb_mod4
+    processing_id = None
+    try:
+      with console.status("[bold cyan]:mag: Running OCR to place signatures...[/]"):
+        parse_result = parse_fpb_mod4(pdf_path)
+      parsed = parse_result["fields"]
+      processing_id = parse_result["processing_id"]
+    except Exception as exc:
+      err_console.print(
+        f"[yellow]:warning: OCR failed ({exc}); uploading the mod4 without overlays.[/]"
+      )
+      parsed = None
+    if parsed is not None:
+      try:
+        upload_path = _prepare_mod4_signatures(
+          ctx, console, err_console, parsed, pdf_path, processing_id,
+          detentor_signature_path=detentor_signature_path,
+        )
+      finally:
+        try:
+          close_processing(processing_id, corrections=None)
+        except Exception:
+          pass
+
+  tipo_doc = _tipo_doc_for_upload(DocType.FPB_MODELO_4)
+  try:
+    client.replace_player_registration_document(batch_id, license, upload_path, tipo_doc=tipo_doc)
+  except (SavConnectionError, SavResponseError, FileNotFoundError, ValueError) as exc:
+    raise SavCliError(str(exc), code=_exc_code(exc))
+  console.print(
+    f"[green]:white_check_mark: Uploaded fpb_modelo_4[/] [dim]({_display_name(pdf_path)})[/]",
+    soft_wrap=True,
+  )
 
 
 @enrollment_grp.command("delete")
