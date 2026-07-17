@@ -1094,19 +1094,22 @@ def test_replace_from_bytes_skips_signed_mod4(monkeypatch):
 
 
 def test_submit_subida_enrollment_signs_mod4(monkeypatch):
-  """submit_subida_enrollment decodes detentor_signature_b64 and overlays it."""
+  """submit_subida_enrollment decodes detentor_signature_b64 and overlays it.
+
+  Also asserts the double-listing fix: the batch object is found by number in
+  a single list_player_registration_batches() call, no separate
+  resolve_batch_id round-trip."""
   captured: dict = {}
-  batch = type("B", (), {"id": 12, "type_id": 4, "type": "Subida"})()
+  list_calls = {"n": 0}
+  batch = type("B", (), {"id": 12, "number": "12", "type_id": 4, "type": "Subida"})()
 
   class StubClient:
-    def resolve_batch_id(self, number):
-      return 12
-
     def list_player_registration_batches(self):
+      list_calls["n"] += 1
       return [batch]
 
     def add_player_to_registration_batch(self, batch_id, license):
-      pass
+      assert batch_id == 12  # resolved from batch.id, not resolve_batch_id
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       with open(file_path, "rb") as f:
@@ -1132,6 +1135,53 @@ def test_submit_subida_enrollment_signs_mod4(monkeypatch):
   assert result["success"] is True
   assert result["subida_document_upload"]["has_detentor_signature"] is True
   assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+  assert list_calls["n"] == 1  # single listing, no double round-trip
+
+
+def test_submit_subida_enrollment_unknown_batch_raises(monkeypatch):
+  """An unknown batch number raises the same not-found error as before."""
+  import pytest
+
+  class StubClient:
+    def list_player_registration_batches(self):
+      return []
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", {
+    "mod4-1": {
+      "parsed": {}, "processing_id": None,
+      "pdf_bytes": b"%PDF-1.4\n", "doc_type": DocType.FPB_MODELO_4,
+    },
+  })
+
+  with pytest.raises(ValueError, match="Batch '999' not found"):
+    server_module.submit_subida_enrollment(
+      batch_number="999", license=301772, mod4_id="mod4-1",
+    )
+
+
+def test_submit_subida_enrollment_wrong_type_raises(monkeypatch):
+  """A non-type-4 batch raises the existing Subida-required guard message."""
+  import pytest
+
+  batch = type("B", (), {"id": 12, "number": "12", "type_id": 1, "type": "1ª Inscrição"})()
+
+  class StubClient:
+    def list_player_registration_batches(self):
+      return [batch]
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", {
+    "mod4-1": {
+      "parsed": {}, "processing_id": None,
+      "pdf_bytes": b"%PDF-1.4\n", "doc_type": DocType.FPB_MODELO_4,
+    },
+  })
+
+  with pytest.raises(ValueError, match="requires a Subida .type-4. batch"):
+    server_module.submit_subida_enrollment(
+      batch_number="12", license=301772, mod4_id="mod4-1",
+    )
 
 
 def _mod4_parse_stub(monkeypatch):

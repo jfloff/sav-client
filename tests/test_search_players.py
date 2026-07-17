@@ -343,3 +343,63 @@ class TestPlayerTierGenderIds:
     assert SavClient._resolve_tier_gender_ids("Sub 14", "") == (0, 0)
     assert SavClient._resolve_tier_gender_ids("", "Masculino") == (0, 1)
     assert SavClient._resolve_tier_gender_ids("No Such Tier", "Masculino") == (0, 1)
+
+
+class TestWithDetailsParallel:
+  """--with-details issues one detail fetch per row. It must fan those out
+  (like the multi-licence `player` path), not run them serially, and keep the
+  results in id order so callers see a stable list."""
+
+  def test_fans_out_off_the_main_thread_preserving_order(self, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
+    rows = (
+      _player_row("Sub 14", "Masculino", db_id=1, license="1")
+      + _player_row("Sub 14", "Masculino", db_id=2, license="2")
+    )
+    monkeypatch.setattr(
+      client, "_post_form", lambda *a, **k: f"<table><tbody>{rows}</tbody></table>",
+    )
+
+    detail_threads: list[str] = []
+
+    def fake_detail(player_id, *, with_details=False):
+      detail_threads.append(threading.current_thread().name)
+      return SimpleNamespace(
+        photo_url=f"pic-{player_id}",
+        mobile_phone=f"m-{player_id}",
+        nif=f"nif-{player_id}",
+      )
+
+    monkeypatch.setattr(client, "get_player_detail", fake_detail)
+
+    results = client.search_players(club=789, with_details=True)
+
+    assert [p.id for p in results] == [1, 2]           # order preserved
+    assert results[0].photo_url == "pic-1"
+    assert results[1].mobile_phone == "m-2"
+    # >1 row → the pool path ran, so the fetches happened off the main thread.
+    assert detail_threads and all(t != "MainThread" for t in detail_threads)
+
+  def test_single_row_augments_without_a_pool(self, monkeypatch):
+    from types import SimpleNamespace
+
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
+    row = _player_row("Sub 14", "Masculino", db_id=7, license="7")
+    monkeypatch.setattr(
+      client, "_post_form", lambda *a, **k: f"<table><tbody>{row}</tbody></table>",
+    )
+    monkeypatch.setattr(
+      client, "get_player_detail",
+      lambda pid, *, with_details=False: SimpleNamespace(
+        photo_url="p", mobile_phone="m", nif="n",
+      ),
+    )
+
+    [player] = client.search_players(club=789, with_details=True)
+    assert player.photo_url == "p"
+    assert player.mobile_phone == "m"

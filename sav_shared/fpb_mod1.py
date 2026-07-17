@@ -931,6 +931,22 @@ def _age_on(born: date, ref: date) -> int:
   return ref.year - born.year - ((ref.month, ref.day) < (born.month, born.day))
 
 
+def player_is_minor(birth_date: object, ref_date: object = None) -> bool | None:
+  """True when the player is a minor as of `ref_date` (else today).
+
+  Single source of the mod1 minor rule — the same age computation
+  `validate_mod1_values` uses to decide whether the guardian block is
+  mandatory (`age < _MOD1_MINOR_AGE` as of the signature date, else today).
+  `birth_date`/`ref_date` accept ISO/EU date strings or `date` objects.
+  Returns ``None`` when `birth_date` is blank/unparseable — the caller can't
+  determine minority and should treat the guardian block as unknown.
+  """
+  born = _to_date(birth_date)
+  if born is None:
+    return None
+  return _age_on(born, _to_date(ref_date) or date.today()) < _MOD1_MINOR_AGE
+
+
 def _mod1_unusable_values(values: dict) -> list[str]:
   """Problems for present-but-unusable values (would silently render blank):
   checkbox options that don't resolve, dates that don't parse, bad postal codes.

@@ -27,10 +27,16 @@ class _Batch:
 
 
 def _bare_client() -> SavClient:
+  import threading
+
   client = SavClient.__new__(SavClient)
   client.session = {"user": "u"}
   client._timeout = 5
   client._base_url = "https://example.invalid"
+  # The step-3 commit invalidates the batch-listing memo; a bare (no-__init__)
+  # client needs the memo attributes present for that.
+  client._batch_memo = {}
+  client._batch_memo_lock = threading.Lock()
   return client
 
 

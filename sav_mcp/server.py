@@ -9,15 +9,19 @@ loop.
 
 Enrollment workflow:
     1. parse_enrollment_forms  → mod1_id(s) / medical_exam_id(s) / mod4_id(s) + parsed metadata
-    2. find_open_batch / create_batch  → batch_number
-    3. resolve_player  → license (or candidate list if ambiguous)
-    4. preview_enrollment  → full reconciled profile (+ optional medical exam sidecar)
-    5. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
+    2. ensure_open_batch  → batch_number (get-or-create; find_open_batch / create_batch still exist)
+    3. preview_enrollment(license=null)  → full reconciled profile (auto-resolves the
+       player from the form; returns {resolved: false, candidates} when ambiguous, so the
+       user picks and preview is re-called with an explicit license)
+    4. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
+
+    resolve_player still exists for explicit control (show the candidate list before
+    previewing); preview_enrollment folds it in for the unambiguous common case.
 
 Standalone Subida (type-4) uses the mod4 OCR fields (licenca_nr/name/escalao_subida):
     1. parse_enrollment_forms  → mod4_id + parsed metadata
     2. resolve_subida_target   → license + tier_id + gender_id (or candidates)
-    3. find_open_batch(reg_type=4, …) / create_batch  → Subida batch_number
+    3. ensure_open_batch(reg_type=4, …)  → Subida batch_number
     4. submit_subida_enrollment(batch_number, license, mod4_id)
 
 Document tools (post-enrollment, ad-hoc):
@@ -76,6 +80,7 @@ from sav_shared.fpb_mod1 import (
     is_filled_mod1_template,
     mod1_acroform_to_fields,
     overlaid_pdf,
+    player_is_minor,
     read_carimbo,
     read_mod1_acroform,
     read_tipo_inscricao,
@@ -1053,6 +1058,43 @@ def _build_preview_fields(result: Any, sav_profile: dict) -> list[dict]:
     return fields
 
 
+_GUARDIAN_REVIEW_FIELDS: tuple[str, ...] = (
+    "guardian_name", "guardian_relation", "guardian_phone", "guardian_email",
+)
+
+
+def _append_minor_guardian_review(preview: dict, birth_date: object) -> None:
+    """For a minor, surface any absent guardian field in preview's needs_review.
+
+    Reuses the mod1 minor rule (`player_is_minor`, derived from the birth
+    date). When the player is a minor, any of the four guardian fields not
+    already carrying a value in the preview's `fields` is appended as a
+    ``needs_review`` row (sav_value/ocr_value None) and added to the
+    `needs_review` list — so the caller collects them up front instead of
+    hitting submit_enrollment's missing_guardian_fields round-trip. Non-minors
+    (and unknown birth dates) leave the preview untouched.
+    """
+    if not player_is_minor(birth_date):
+        return
+    fields = preview["fields"]
+    needs_review = preview["needs_review"]
+    with_value = {
+        f["kwarg"] for f in fields
+        if f.get("kwarg") in _GUARDIAN_REVIEW_FIELDS
+        and f.get("final_value") not in (None, "")
+    }
+    for kwarg in _GUARDIAN_REVIEW_FIELDS:
+        if kwarg in with_value or kwarg in needs_review:
+            continue
+        label = ENROLLMENT_FIELD_META.get(kwarg, (kwarg, ""))[0]
+        fields.append({
+            "kwarg": kwarg, "label": label,
+            "sav_value": None, "ocr_value": None,
+            "final_value": None, "status": "needs_review",
+        })
+        needs_review.append(kwarg)
+
+
 def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> dict:
     """Serialize a cached EM OCR artifact for MCP callers."""
     info = extract_medical_exam_info(artifact["parsed"])
@@ -1263,6 +1305,156 @@ def _stamped_upload_path(
                 logger.debug("close_processing failed for stamped upload", exc_info=True)
 
 
+def _parse_one_enrollment_pdf(
+    client: SavClient,
+    index: int,
+    pdf_b64: str,
+    hint: str | None,
+    exam_date_hint: str | None,
+) -> tuple[dict, dict[str, Any] | None]:
+    """Parse one enrollment PDF: the per-PDF body of parse_enrollment_forms.
+
+    Runs on a worker thread when several PDFs are parsed at once (each PDF is
+    an independent Document AI round-trip), so it must not touch shared
+    mutable state — it returns ``(result_row, artifact | None)`` and the
+    caller inserts the artifact into ``_forms`` on the main thread. Never
+    raises: every failure comes back as ``{"index": ..., "error": ...}``.
+    """
+    from sav_parsers import classify, parse_em, parse_fpb_mod1, parse_fpb_mod4, train_classifier
+
+    try:
+        pdf_bytes = base64.b64decode(pdf_b64)
+    except (binascii.Error, ValueError) as exc:
+        return {"index": index, "error": f"Invalid base64: {exc}"}, None
+
+    tmp_path: str | None = None
+    try:
+        tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
+
+        # Date-provided fast path: when the caller already knows the exam
+        # date, trust it and accept the PDF as an exame_medico with no OCR —
+        # cache the bytes for upload and skip classification + parse_em.
+        # Filled-template fast path: a Modelo 1 filled from our fillable
+        # template carries its values in the AcroForm — read them directly
+        # and skip classification + OCR. An explicit non-mod1 hint opts out.
+        mod1_fields = (
+            _read_mod1_template_fields(pdf_bytes)
+            if (hint in (None, "fpb_modelo_1") and exam_date_hint is None) else None
+        )
+        if exam_date_hint is not None:
+            doc_type = DocType.EXAME_MEDICO
+            parsed = {"exam_date": ParsedField(value=exam_date_hint, confidence=1.0)}
+            processing_id = None  # no Document AI session for a date-provided exam
+        elif mod1_fields is not None:
+            doc_type = DocType.FPB_MODELO_1
+            parsed = mod1_fields
+            processing_id = None  # no Document AI session for a form-read doc
+            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+            tiers = client.list_player_registration_tiers(gender_id=gender_id)
+            tier_name = tiers.get(tier_id, str(tier_id))
+        elif hint is not None:
+            # Type is already known — skip classify and train the classifier.
+            _hint_map = {
+                "fpb_modelo_1": DocType.FPB_MODELO_1,
+                "exame_medico": DocType.EXAME_MEDICO,
+                "fpb_modelo_4": DocType.FPB_MODELO_4,
+            }
+            if hint not in _hint_map:
+                return {"index": index, "error": f"Unknown doc_type hint: {hint!r}"}, None
+            doc_type = _hint_map[hint]
+            try:
+                train_classifier(tmp_path, doc_type)
+            except Exception:
+                logger.debug("train_classifier failed for hint=%r", hint, exc_info=True)
+        else:
+            doc_type = classify(tmp_path)
+
+        if exam_date_hint is not None or mod1_fields is not None:
+            pass  # already handled by a fast path above
+        elif doc_type == DocType.FPB_MODELO_1:
+            parse_result = parse_fpb_mod1(tmp_path)
+            parsed = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
+            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+            tiers = client.list_player_registration_tiers(gender_id=gender_id)
+            tier_name = tiers.get(tier_id, str(tier_id))
+        elif doc_type == DocType.EXAME_MEDICO:
+            parse_result = parse_em(tmp_path)
+            parsed = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
+            try:
+                train_classifier(tmp_path, DocType.EXAME_MEDICO)
+            except Exception:
+                logger.debug("train_classifier failed for EM", exc_info=True)
+        elif doc_type == DocType.FPB_MODELO_4:
+            # Mod4 carries nome_jogador (mandatory), licenca_nr (optional),
+            # escalao_actual, escalao_subida, and the club-signature signal —
+            # enough to drive a standalone Subida without --batch / --license.
+            parse_result = parse_fpb_mod4(tmp_path)
+            parsed = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
+        else:
+            return {"index": index, "error": f"Unsupported document type: {doc_type.value!r}"}, None
+    except (SavError, ValueError, KeyError, OSError) as exc:
+        return {"index": index, "error": str(exc)}, None
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    artifact_id = str(uuid.uuid4())
+    artifact = {
+        "artifact_id": artifact_id,
+        "parsed": parsed,
+        "processing_id": processing_id,
+        "doc_type": doc_type,
+        "pdf_bytes": pdf_bytes,
+    }
+    if doc_type == DocType.FPB_MODELO_1:
+        artifact.update({
+            "reg_type": reg_type,
+            "tier_id": tier_id,
+            "gender_id": gender_id,
+        })
+
+    if doc_type == DocType.FPB_MODELO_1:
+        row = {
+            "index": index,
+            "artifact_id": artifact_id,
+            "mod1_id": artifact_id,
+            "doc_type": doc_type.value,
+            "reg_type": reg_type,
+            "reg_type_label": REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type)),
+            "tier_id": tier_id,
+            "tier_name": tier_name,
+            "gender_id": gender_id,
+            "gender_label": GENERO.get(gender_id, str(gender_id)),
+        }
+    elif doc_type == DocType.FPB_MODELO_4:
+        def _f(key: str) -> Any:
+            pf = parsed.get(key)
+            return pf.value if pf else None
+        row = {
+            "index": index,
+            "artifact_id": artifact_id,
+            "mod4_id": artifact_id,
+            "doc_type": doc_type.value,
+            "nome_jogador": _f("nome_jogador"),
+            "licenca_nr": _f("licenca_nr"),
+            "escalao_actual": _f("escalao_actual"),
+            "escalao_subida": _f("escalao_subida"),
+        }
+    else:
+        row = _build_medical_exam_payload(artifact_id, artifact)
+        row.update({"index": index})
+    return row, artifact
+
+
+# Bounded fan-out for multi-PDF parses: each PDF is an independent Document AI
+# round-trip (seconds each), so a small pool cuts wall-clock latency without
+# hammering the OCR quota.
+_PARSE_MAX_WORKERS = 4
+
+
 @server.tool()
 def parse_enrollment_forms(
     pdfs: list[str],
@@ -1298,11 +1490,11 @@ def parse_enrollment_forms(
     exame_medico entries also include medical_exam_id; fpb_modelo_4 entries
     also include mod4_id. On error for a given PDF the entry contains an
     "error" key instead.
-    """
-    from sav_parsers import classify, parse_em, parse_fpb_mod1, parse_fpb_mod4, train_classifier
 
+    Multiple PDFs are parsed concurrently (each is an independent Document AI
+    round-trip), so a multi-document call costs roughly one parse, not N.
+    """
     client = _get_client()
-    results: list[dict] = []
 
     # An enrollment has at most one exam, so medical_exam_date is a single value
     # bound to the one PDF marked doc_types="exame_medico".
@@ -1320,140 +1512,38 @@ def parse_enrollment_forms(
             )
         em_index = em_indices[0]
 
-    for i, pdf_b64 in enumerate(pdfs):
-        try:
-            pdf_bytes = base64.b64decode(pdf_b64)
-        except (binascii.Error, ValueError) as exc:
-            results.append({"index": i, "error": f"Invalid base64: {exc}"})
-            continue
+    jobs = [
+        (
+            i,
+            pdf_b64,
+            doc_types[i] if doc_types and i < len(doc_types) else None,
+            em_date if i == em_index else None,
+        )
+        for i, pdf_b64 in enumerate(pdfs)
+    ]
 
-        hint: str | None = (doc_types[i] if doc_types and i < len(doc_types) else None)
-        exam_date_hint = em_date if i == em_index else None
+    # TODO: emit MCP progress per completed PDF. FastMCP's
+    # Context.report_progress is async-only, so that requires converting this
+    # tool to `async def` (and every direct-call test with it) — deferred.
+    if len(jobs) <= 1:
+        outcomes = [
+            _parse_one_enrollment_pdf(client, i, pdf_b64, hint, exam_hint)
+            for i, pdf_b64, hint, exam_hint in jobs
+        ]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=min(_PARSE_MAX_WORKERS, len(jobs))) as pool:
+            outcomes = list(pool.map(
+                lambda job: _parse_one_enrollment_pdf(client, *job), jobs,
+            ))
 
-        tmp_path: str | None = None
-        try:
-            tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
-
-            # Date-provided fast path: when the caller already knows the exam
-            # date, trust it and accept the PDF as an exame_medico with no OCR —
-            # cache the bytes for upload and skip classification + parse_em.
-            # Filled-template fast path: a Modelo 1 filled from our fillable
-            # template carries its values in the AcroForm — read them directly
-            # and skip classification + OCR. An explicit non-mod1 hint opts out.
-            mod1_fields = (
-                _read_mod1_template_fields(pdf_bytes)
-                if (hint in (None, "fpb_modelo_1") and exam_date_hint is None) else None
-            )
-            if exam_date_hint is not None:
-                doc_type = DocType.EXAME_MEDICO
-                parsed = {"exam_date": ParsedField(value=exam_date_hint, confidence=1.0)}
-                processing_id = None  # no Document AI session for a date-provided exam
-            elif mod1_fields is not None:
-                doc_type = DocType.FPB_MODELO_1
-                parsed = mod1_fields
-                processing_id = None  # no Document AI session for a form-read doc
-                reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
-                tiers = client.list_player_registration_tiers(gender_id=gender_id)
-                tier_name = tiers.get(tier_id, str(tier_id))
-            elif hint is not None:
-                # Type is already known — skip classify and train the classifier.
-                _hint_map = {
-                    "fpb_modelo_1": DocType.FPB_MODELO_1,
-                    "exame_medico": DocType.EXAME_MEDICO,
-                    "fpb_modelo_4": DocType.FPB_MODELO_4,
-                }
-                if hint not in _hint_map:
-                    results.append({"index": i, "error": f"Unknown doc_type hint: {hint!r}"})
-                    continue
-                doc_type = _hint_map[hint]
-                try:
-                    train_classifier(tmp_path, doc_type)
-                except Exception:
-                    logger.debug("train_classifier failed for hint=%r", hint, exc_info=True)
-            else:
-                doc_type = classify(tmp_path)
-
-            if exam_date_hint is not None or mod1_fields is not None:
-                pass  # already handled by a fast path above
-            elif doc_type == DocType.FPB_MODELO_1:
-                parse_result = parse_fpb_mod1(tmp_path)
-                parsed = parse_result["fields"]
-                processing_id = parse_result["processing_id"]
-                reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
-                tiers = client.list_player_registration_tiers(gender_id=gender_id)
-                tier_name = tiers.get(tier_id, str(tier_id))
-            elif doc_type == DocType.EXAME_MEDICO:
-                parse_result = parse_em(tmp_path)
-                parsed = parse_result["fields"]
-                processing_id = parse_result["processing_id"]
-                try:
-                    train_classifier(tmp_path, DocType.EXAME_MEDICO)
-                except Exception:
-                    logger.debug("train_classifier failed for EM", exc_info=True)
-            elif doc_type == DocType.FPB_MODELO_4:
-                # Mod4 carries nome_jogador (mandatory), licenca_nr (optional),
-                # escalao_actual, escalao_subida, and the club-signature signal —
-                # enough to drive a standalone Subida without --batch / --license.
-                parse_result = parse_fpb_mod4(tmp_path)
-                parsed = parse_result["fields"]
-                processing_id = parse_result["processing_id"]
-            else:
-                results.append({"index": i, "error": f"Unsupported document type: {doc_type.value!r}"})
-                continue
-        except (SavError, ValueError, KeyError, OSError) as exc:
-            results.append({"index": i, "error": str(exc)})
-            continue
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-
-        artifact_id = str(uuid.uuid4())
-        artifact = {
-            "parsed": parsed,
-            "processing_id": processing_id,
-            "doc_type": doc_type,
-            "pdf_bytes": pdf_bytes,
-        }
-        if doc_type == DocType.FPB_MODELO_1:
-            artifact.update({
-                "reg_type": reg_type,
-                "tier_id": tier_id,
-                "gender_id": gender_id,
-            })
-        _forms[artifact_id] = artifact
-
-        if doc_type == DocType.FPB_MODELO_1:
-            results.append({
-                "index": i,
-                "artifact_id": artifact_id,
-                "mod1_id": artifact_id,
-                "doc_type": doc_type.value,
-                "reg_type": reg_type,
-                "reg_type_label": REGISTRATION_TYPE_LABELS.get(reg_type, str(reg_type)),
-                "tier_id": tier_id,
-                "tier_name": tier_name,
-                "gender_id": gender_id,
-                "gender_label": GENERO.get(gender_id, str(gender_id)),
-            })
-        elif doc_type == DocType.FPB_MODELO_4:
-            def _f(key: str) -> Any:
-                pf = parsed.get(key)
-                return pf.value if pf else None
-            results.append({
-                "index": i,
-                "artifact_id": artifact_id,
-                "mod4_id": artifact_id,
-                "doc_type": doc_type.value,
-                "nome_jogador": _f("nome_jogador"),
-                "licenca_nr": _f("licenca_nr"),
-                "escalao_actual": _f("escalao_actual"),
-                "escalao_subida": _f("escalao_subida"),
-            })
-        else:
-            payload = _build_medical_exam_payload(artifact_id, artifact)
-            payload.update({"index": i})
-            results.append(payload)
-
+    # Artifacts are registered on the main thread, in input order, so _forms
+    # never sees a partially-built entry from a worker.
+    results: list[dict] = []
+    for row, artifact in outcomes:
+        if artifact is not None:
+            _forms[artifact.pop("artifact_id")] = artifact
+        results.append(row)
     return results
 
 
@@ -1498,6 +1588,132 @@ def create_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
 
 
 @server.tool()
+def ensure_open_batch(reg_type: int, tier_id: int, gender_id: int) -> dict:
+    """
+    Get-or-create the open ("Em construção") registration batch for the given
+    type, tier, and gender in a single call.
+
+    Returns the existing open batch if one already matches, otherwise creates a
+    new one — the same dict shape as find_open_batch / create_batch plus a
+    ``created`` flag (true when a fresh batch was created, false when an
+    existing open batch was reused). Prefer this over the find/create pair: it
+    is one round-trip and avoids the create-while-open race.
+    """
+    client = _get_client()
+    batch = client.find_open_player_registration_batch(
+        type=reg_type, tier_id=tier_id, gender_id=gender_id,
+    )
+    created = False
+    if batch is None:
+        _, batch = create_and_fetch_batch(
+            client, batch_type=reg_type, tier_id=tier_id, gender_id=gender_id,
+        )
+        created = True
+    return {
+        "number": batch.number,
+        "type": batch.type,
+        "tier": batch.tier,
+        "gender": batch.gender,
+        "item_count": batch.item_count,
+        "created": created,
+    }
+
+
+def _find_batch_by_number(client: SavClient, batch_number: str):
+    """Return the batch object with `number == batch_number` (one listing call).
+
+    Raises ValueError with the same message resolve_batch_id uses when no batch
+    matches, so callers surface an identical "not found" error.
+    """
+    batch = next(
+        (b for b in client.list_player_registration_batches() if b.number == batch_number),
+        None,
+    )
+    if batch is None:
+        raise ValueError(f"Batch {batch_number!r} not found")
+    return batch
+
+
+def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
+    """Resolve a 1ª Inscrição (type-1) form: OCR echo + pre-emptive dup guard.
+
+    Shared by resolve_player and preview_enrollment. Returns the resolved OCR
+    dict, or the ``player_already_in_sav`` structured error when the op=11
+    duplicate probe hits.
+    """
+    parsed = form["parsed"]
+    name_f = parsed.get("nome_completo")
+    bd_f = parsed.get("data_nascimento")
+    id_f = parsed.get("num_doc_identificacao")
+    ocr_name = str(name_f.value) if name_f and name_f.value else None
+    ocr_birth = str(bd_f.value) if bd_f and bd_f.value else None
+    ocr_id = str(id_f.value) if id_f and id_f.value else None
+    # Default to masculino when neither checkbox parsed (mirrors the
+    # downstream wizard default, so the duplicate probe still works).
+    gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
+
+    # Pre-emptive duplicate guard: only when OCR yielded all three
+    # identifying fields. A miss here is non-fatal — the wizard's own
+    # op=11 call at commit time will catch the case if we let it through.
+    if ocr_birth and ocr_id:
+        try:
+            dup = client._check_primeira_player_duplicate(
+                gender_id=gender_id, birth_date=ocr_birth, id_number=ocr_id,
+            )
+        except (SavError, ValueError):
+            logger.debug("Pre-emptive op=11 failed at resolve time", exc_info=True)
+            dup = {"existe": 0}
+        if int(dup.get("existe", 0)) != 0:
+            return {
+                "resolved": False,
+                "license": None,
+                "reg_type": 1,
+                "error": "player_already_in_sav",
+                "reason": (
+                    "A player matching the OCR'd identifying data already "
+                    "exists in SAV. 1ª Inscrição is for players not yet in "
+                    "the federation — use Revalidação on the existing licence."
+                ),
+                "existing_sav_id": dup.get("id") or dup.get("atleta") or None,
+            }
+
+    return {
+        "resolved": True,
+        "license": None,
+        "reg_type": 1,
+        "ocr_name": ocr_name,
+        "ocr_birth_date": ocr_birth,
+        "ocr_gender_id": gender_id,
+        "candidates": [],
+    }
+
+
+def _resolve_revalidacao_player(client: SavClient, form: dict[str, Any], batch) -> dict:
+    """Resolve a Revalidação (type-2) form against the batch's eligible list.
+
+    Shared by resolve_player and preview_enrollment. Returns
+    ``{resolved: true, license}`` on a single match, else
+    ``{resolved: false, candidates, ocr_name, ocr_license}``.
+    """
+    eligible = client._list_revalidable_licenses(batch)
+    license, candidates, ocr_name, ocr_license = resolve_player_candidates(
+        form["parsed"], eligible, client, batch.club_id,
+    )
+    if license is not None:
+        return {"resolved": True, "license": license, "candidates": []}
+    return {
+        "resolved": False,
+        "license": None,
+        "candidates": [
+            {"license": int(p.license), "name": p.name, "birth_date": p.birth_date}
+            for p in candidates
+        ],
+        "ocr_name": ocr_name,
+        "ocr_license": ocr_license,
+    }
+
+
+@server.tool()
 def resolve_player(batch_number: str, mod1_id: str) -> dict:
     """
     Resolve the player for a parsed form against the batch.
@@ -1518,6 +1734,10 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
     "player_already_in_sav"}`` to short-circuit before the LLM walks the
     create-player wizard.
 
+    preview_enrollment(license=null) folds this resolution in for the common
+    unambiguous case; call resolve_player directly when you need explicit
+    control (e.g. to show the candidate list before previewing).
+
     Returns:
       resolved=true + license  when exactly one revalidação match is found.
       resolved=true + license:null + reg_type:1  for a fresh 1ª Inscrição.
@@ -1532,76 +1752,11 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
         raise ValueError(f"Artifact {mod1_id!r} is not an fpb_modelo_1 enrollment form")
 
     client = _get_client()
-    batches = client.list_player_registration_batches()
-    batch = next((b for b in batches if b.number == batch_number), None)
-    if batch is None:
-        raise ValueError(f"Batch {batch_number!r} not found")
+    batch = _find_batch_by_number(client, batch_number)
 
     if batch.type_id == 1:
-        parsed = form["parsed"]
-        name_f = parsed.get("nome_completo")
-        bd_f = parsed.get("data_nascimento")
-        id_f = parsed.get("num_doc_identificacao")
-        ocr_name = str(name_f.value) if name_f and name_f.value else None
-        ocr_birth = str(bd_f.value) if bd_f and bd_f.value else None
-        ocr_id = str(id_f.value) if id_f and id_f.value else None
-        # Default to masculino when neither checkbox parsed (mirrors the
-        # downstream wizard default, so the duplicate probe still works).
-        gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
-
-        # Pre-emptive duplicate guard: only when OCR yielded all three
-        # identifying fields. A miss here is non-fatal — the wizard's own
-        # op=11 call at commit time will catch the case if we let it through.
-        if ocr_birth and ocr_id:
-            try:
-                dup = client._check_primeira_player_duplicate(
-                    gender_id=gender_id, birth_date=ocr_birth, id_number=ocr_id,
-                )
-            except (SavError, ValueError):
-                logger.debug("Pre-emptive op=11 failed at resolve time", exc_info=True)
-                dup = {"existe": 0}
-            if int(dup.get("existe", 0)) != 0:
-                return {
-                    "resolved": False,
-                    "license": None,
-                    "reg_type": 1,
-                    "error": "player_already_in_sav",
-                    "reason": (
-                        "A player matching the OCR'd identifying data already "
-                        "exists in SAV. 1ª Inscrição is for players not yet in "
-                        "the federation — use Revalidação on the existing licence."
-                    ),
-                    "existing_sav_id": dup.get("id") or dup.get("atleta") or None,
-                }
-
-        return {
-            "resolved": True,
-            "license": None,
-            "reg_type": 1,
-            "ocr_name": ocr_name,
-            "ocr_birth_date": ocr_birth,
-            "ocr_gender_id": gender_id,
-            "candidates": [],
-        }
-
-    eligible = client._list_revalidable_licenses(batch)
-    license, candidates, ocr_name, ocr_license = resolve_player_candidates(
-        form["parsed"], eligible, client, batch.club_id,
-    )
-
-    if license is not None:
-        return {"resolved": True, "license": license, "candidates": []}
-
-    return {
-        "resolved": False,
-        "license": None,
-        "candidates": [
-            {"license": int(p.license), "name": p.name, "birth_date": p.birth_date}
-            for p in candidates
-        ],
-        "ocr_name": ocr_name,
-        "ocr_license": ocr_license,
-    }
+        return _resolve_primeira_player(client, form)
+    return _resolve_revalidacao_player(client, form, batch)
 
 
 @server.tool()
@@ -1715,10 +1870,23 @@ def preview_enrollment(
     defense-in-depth cross-check against the form's OCR'd NIF: if both are
     set and disagree, the call is rejected.
 
-    batch_number is accepted for workflow symmetry; only the form/license are
-    needed at this stage. It is validated when submit_enrollment is called.
+    license: pass null (or 0) to auto-resolve the player from the form —
+    preview folds in resolve_player's logic (the common unambiguous case, no
+    user decision needed between the two steps). For a Revalidação that
+    resolves to exactly one licence the normal preview proceeds and the
+    response's `player.license` carries it plus `resolved: true`. When
+    resolution is ambiguous or fails, preview returns the same
+    ``{resolved: false, candidates, ocr_name, ocr_license}`` shape
+    resolve_player does (Revalidação) or ``{resolved: false, error:
+    "player_already_in_sav", ...}`` (1ª Inscrição duplicate guard) instead of
+    raising — the caller shows the choice to the user and re-calls preview with
+    an explicit licence. Pass an explicit licence to skip auto-resolution
+    entirely (behaviour is identical to before this fold-in).
+
+    batch_number is load-bearing when license is null (it names the batch whose
+    eligible list drives auto-resolution); with an explicit licence it is
+    validated only when submit_enrollment is called.
     """
-    del batch_number
     form = _forms.get(mod1_id)
     if form is None:
         raise ValueError(f"Unknown mod1_id: {mod1_id!r}")
@@ -1737,6 +1905,24 @@ def preview_enrollment(
         if inline_subida
         else f"{reg_type_label} (no subida)"
     )
+
+    # Auto-resolve when no licence was supplied: fold in resolve_player's
+    # logic so the unambiguous common case skips the extra round-trip. The
+    # type-1 duplicate guard runs here regardless of licence-source symmetry;
+    # the type-2 branch below both resolves and short-circuits on ambiguity.
+    resolved_flag = False
+    if license in (None, 0):
+        if reg_type == 1:
+            resolution = _resolve_primeira_player(client, form)
+            if not resolution.get("resolved"):
+                return resolution  # player_already_in_sav
+        else:
+            batch = _find_batch_by_number(client, batch_number)
+            resolution = _resolve_revalidacao_player(client, form, batch)
+            if not resolution.get("resolved"):
+                return resolution  # ambiguous / no match → caller picks
+            license = resolution["license"]
+            resolved_flag = True
 
     if reg_type == 1:
         # No SAV profile, no reconciliation — echo the OCR fields and mark
@@ -1765,10 +1951,13 @@ def preview_enrollment(
             "inline_subida": inline_subida,
             "enrollment_route": enrollment_route,
         }
+        _append_minor_guardian_review(preview, kwargs.get("birth_date"))
     else:
         if license in (None, 0):
             raise ValueError(
-                f"Revalidação preview requires a non-zero license; got {license!r}."
+                f"Preview requires a licence for this registration type; pass "
+                f"license (or license: null to auto-resolve from the form). "
+                f"Got {license!r}."
             )
         # resolve_player runs first in this workflow → search_players already
         # populated the license→id cache, so this is free.
@@ -1786,12 +1975,19 @@ def preview_enrollment(
                 "birth_date": sav_profile.get("nasc", ""),
             },
             "fields": _build_preview_fields(result, sav_profile),
-            "needs_review": result.needs_review,
+            # Copy: _append_minor_guardian_review may extend this list, and the
+            # cached result.needs_review must stay pristine — submit stages OCR
+            # corrections from it, and chat-supplied guardian answers must not
+            # be labeled onto a form whose guardian block may be blank.
+            "needs_review": list(result.needs_review),
             "reg_type": reg_type,
             "reg_type_label": reg_type_label,
             "inline_subida": inline_subida,
             "enrollment_route": enrollment_route,
         }
+        if resolved_flag:
+            preview["resolved"] = True
+        _append_minor_guardian_review(preview, sav_profile.get("nasc"))
     if medical_exam_id is not None:
         artifact = _forms.get(medical_exam_id)
         if artifact is None:
@@ -1838,7 +2034,10 @@ def submit_enrollment(
     (guardian_name, guardian_relation, guardian_phone, guardian_email) and
     must include exam_date (YYYY-MM-DD) when no usable medical exam date is
     available. It may also override any parsed exame_medico date when
-    medical_exam_id is supplied.
+    medical_exam_id is supplied. For minors these guardian fields already
+    surface in preview_enrollment's needs_review list (up front), so answer
+    them there; the missing_guardian_fields response below is a fallback for
+    when they are still absent at submit time.
 
     mod4_id (from parse_enrollment_forms) adds an inline subida de escalão to
     this 1ª Inscrição / Revalidação: the target tier is fetched from SAV and
@@ -1856,9 +2055,10 @@ def submit_enrollment(
 
     Returns:
       success=true + player_id (+ license for 1ª Inscrição) on success.
-      success=false + missing_guardian_fields  when the player is a minor and
-        guardian info is absent — call submit_enrollment again with those fields
-        added to field_overrides.
+      success=false + missing_guardian_fields  fallback for when a minor's
+        guardian info is still absent at submit time (preview_enrollment
+        already lists these in needs_review) — call submit_enrollment again
+        with those fields added to field_overrides.
       success=true also includes source_document_upload and
       medical_exam_upload with {doc_type, status, error}. When status=="ok"
       these also carry has_club_stamp (True/False/None — whether the
@@ -2112,13 +2312,13 @@ def submit_subida_enrollment(
         raise ValueError(f"Artifact {mod4_id!r} is not an fpb_modelo_4 form")
 
     client = _get_client()
-    batch_id = client.resolve_batch_id(batch_number)
-    batch = next(
-        (b for b in client.list_player_registration_batches() if b.id == batch_id),
-        None,
-    )
-    if batch is None:
-        raise ValueError(f"Batch {batch_number!r} not found")
+    # One listing call: find the batch by number and read its id directly.
+    # resolve_batch_id would list too (on cache miss) and we still needed the
+    # batch object for the type guard — folding both into a single lookup.
+    # Unknown number raises the same "Batch {number!r} not found" as
+    # resolve_batch_id did.
+    batch = _find_batch_by_number(client, batch_number)
+    batch_id = batch.id
     if batch.type_id != 4:
         raise ValueError(
             f"Batch {batch_number!r} is type {batch.type_id} ({batch.type!r}); "

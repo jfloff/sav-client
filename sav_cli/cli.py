@@ -1075,7 +1075,9 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
   client = _make_client()
 
   try:
-    games = client.list_games(game_number=game_number)
+    # use_cache: `game-sheet X --home` then `--home --out` issue the identical
+    # number-filtered listing back-to-back; the short-TTL cache serves the second.
+    games = client.list_games(game_number=game_number, use_cache=True)
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 
@@ -1166,7 +1168,8 @@ def game_sheets_cmd(ctx, season, single_date, date_from, date_to, tier, competit
     # date window drops games with an empty date (postponed/cancelled/unscheduled);
     # game sheets only concern dated games so that would be harmless here, but
     # filtering client-side keeps date+competition+status in one consistent pass.
-    results = client.list_games(season=season, tier=tier)
+    # use_cache: repeat game-sheet lookups in a workflow reuse this season fetch.
+    results = client.list_games(season=season, tier=tier, use_cache=True)
   except (SavConnectionError, SavResponseError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 
@@ -1280,12 +1283,30 @@ def _find_enrolled_in_matching_batches(
     and b.tier_id == batch.tier_id
     and b.gender_id == batch.gender_id
   ]
-  for b in candidates:
+  if not candidates:
+    return None
+
+  def _items(b: Any) -> list | None:
+    # Swallow transport/parse errors per candidate: a batch we can't read is
+    # skipped, exactly as the original sequential scan did via `continue`.
     try:
-      items = client.list_player_registration_batch_items(b.id)
+      return client.list_player_registration_batch_items(b.id)
     except (SavConnectionError, SavResponseError):
-      continue
-    if any(item["license"] == license for item in items):
+      return None
+
+  # Read every candidate's items concurrently instead of one round-trip at a
+  # time, then return the first match in the original order. SAV allows a
+  # player in only one open batch, so there's at most one hit — the ordering
+  # just keeps the result deterministic.
+  if len(candidates) == 1:
+    items_by_candidate = [_items(candidates[0])]
+  else:
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(candidates))) as pool:
+      items_by_candidate = list(pool.map(_items, candidates))
+
+  for b, items in zip(candidates, items_by_candidate):
+    if items and any(item["license"] == license for item in items):
       return b
   return None
 
@@ -2912,7 +2933,7 @@ def enrollment_status_cmd(ctx, license_):
   client = _make_client()
 
   try:
-    batch_id = client.resolve_batch_id_by_license(license_)
+    batch = client.resolve_batch_by_license(license_)
   except LicenseNotEnrolledError as exc:
     club_id = int(client.session.get("organizacao") or 0)
     roster_hits = (
@@ -2940,11 +2961,10 @@ def enrollment_status_cmd(ctx, license_):
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
   else:
+    # resolve_batch_by_license already fetched the batch object, so there's no
+    # second listing to rehydrate it from batch_id here.
+    batch_id = batch.id
     try:
-      batch = next(
-        (b for b in client.list_player_registration_batches() if b.id == batch_id),
-        None,
-      )
       record = client.load_existing_registration_record(batch_id, license_)
       raw_docs = client.list_player_registration_documents(batch_id, license_)
     except (SavConnectionError, SavResponseError, ValueError) as e:

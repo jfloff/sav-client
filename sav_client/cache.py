@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
-  from .models import Club
+  from .models import Club, Game
 
 _CACHE_DIR = Path.home() / ".sav"
 _DEFAULT_TTL = 7 * 86_400  # 7 days
@@ -102,6 +102,19 @@ class Cache:
     con.execute(
       "CREATE INDEX IF NOT EXISTS idx_license_to_batch_id_bid ON license_to_batch_id(batch_id)"
     )
+    # Game listings, keyed by a signature of the list_games query (season +
+    # filters). Unlike the tables above, game data is volatile (status, scores),
+    # so this row carries a cached_at and is read under a deliberately short TTL
+    # — just long enough to collapse the back-to-back listings a game-sheet
+    # workflow issues within a minute or two. The payload is the JSON-serialised
+    # list of Game rows.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS games (
+        signature TEXT PRIMARY KEY,
+        payload   TEXT NOT NULL,
+        cached_at REAL NOT NULL
+      )
+    """)
     for col, typedef in [
       ("full_name", "TEXT NOT NULL DEFAULT ''"),
       ("code",      "TEXT NOT NULL DEFAULT ''"),
@@ -201,6 +214,44 @@ class Cache:
       )
       con.commit()
       return concelhos
+    finally:
+      con.close()
+
+  def get_games(
+    self,
+    fetcher: Callable[[], list["Game"]],
+    signature: str,
+    ttl: float,
+  ) -> list["Game"]:
+    """Return games for a query signature, reading from cache when fresh.
+
+    ``signature`` uniquely identifies the list_games query (season + filters);
+    ``ttl`` is intentionally short because game data is volatile. On a miss or
+    expiry the fetcher runs and its result replaces the cached row.
+    """
+    import json
+
+    from dataclasses import asdict
+
+    from .models import Game
+
+    now = time.time()
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT payload, cached_at FROM games WHERE signature = ?",
+        (signature,),
+      ).fetchone()
+      if row and (now - row[1]) < ttl:
+        return [Game(**r) for r in json.loads(row[0])]
+
+      games = fetcher()
+      con.execute(
+        "INSERT OR REPLACE INTO games (signature, payload, cached_at) VALUES (?, ?, ?)",
+        (signature, json.dumps([asdict(g) for g in games]), now),
+      )
+      con.commit()
+      return games
     finally:
       con.close()
 
@@ -345,6 +396,7 @@ class Cache:
       con.execute("DELETE FROM clubs")
       con.execute("DELETE FROM associations")
       con.execute("DELETE FROM concelhos")
+      con.execute("DELETE FROM games")
       con.execute("DELETE FROM license_to_id")
       con.execute("DELETE FROM license_nif")
       con.execute("DELETE FROM batch_number_to_id")

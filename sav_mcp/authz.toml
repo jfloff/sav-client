@@ -182,6 +182,14 @@ capability = "write"
 roles      = ["coach"]
 self_scope = ["parent", "player"]
 
+# Get-or-create: may create a batch, so it mirrors create_batch's write
+# capability and roles/self_scope. The (type, tier, gender) params come from
+# the caller's own enrollment context — no subject leakage.
+[tools.ensure_open_batch]
+capability = "write"
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
 [tools.resolve_player]
 roles      = ["coach"]
 self_scope = ["parent", "player"]

@@ -389,3 +389,73 @@ def test_resolve_batch_id_by_license_raises_when_not_enrolled(monkeypatch, tmp_c
   assert err.license == 301772
   numbers = [b["number"] for b in err.open_batches]
   assert numbers == ["2025/12", "2025/13"]
+
+
+# ─── resolve_batch_by_license (returns the batch object) ─────────────────────
+
+def test_resolve_batch_by_license_returns_batch_on_scan(monkeypatch, tmp_cache):
+  """resolve_batch_by_license returns the whole PlayerRegistrationBatch found by
+  the scan, and resolve_batch_id_by_license is just its .id — one resolution
+  pass, no re-listing to rehydrate the batch object."""
+  from sav_client.sav_client import SavClient
+
+  client = SavClient.__new__(SavClient)
+  client._cache = tmp_cache
+
+  open_a = _batch(12, "2025/12")
+  open_b = _batch(13, "2025/13")
+
+  monkeypatch.setattr(
+    client, "list_player_registration_batches",
+    lambda: [open_a, open_b],
+    raising=False,
+  )
+  monkeypatch.setattr(
+    client, "list_player_registration_batch_items",
+    lambda batch_id: [{"license": 301772}] if batch_id == 13 else [],
+    raising=False,
+  )
+  # The scan caches (301772 → 13); the second call below validates that cache
+  # hit via the record probe, so stub it too.
+  monkeypatch.setattr(
+    client, "load_existing_registration_record",
+    lambda batch_id, license: {"id": 77},
+    raising=False,
+  )
+
+  batch = client.resolve_batch_by_license(301772)
+  assert batch is open_b
+  assert batch.number == "2025/13"
+  # The id-only wrapper agrees with the batch object it delegates to.
+  assert client.resolve_batch_id_by_license(301772) == 13
+
+
+def test_resolve_batch_by_license_returns_batch_on_cache_hit(monkeypatch, tmp_cache):
+  """On a validated cache hit the batch object comes from the (already fetched)
+  listing — no per-batch item scan."""
+  from sav_client.sav_client import SavClient
+
+  client = SavClient.__new__(SavClient)
+  client._cache = tmp_cache
+  tmp_cache.record_license_batch(301772, 42)
+
+  monkeypatch.setattr(
+    client, "load_existing_registration_record",
+    lambda batch_id, license: {"id": 77},
+    raising=False,
+  )
+  open_batch = _batch(42, "2025/42")
+  monkeypatch.setattr(
+    client, "list_player_registration_batches",
+    lambda: [open_batch],
+    raising=False,
+  )
+
+  def _no_scan(batch_id):
+    raise AssertionError("item scan should not run on a valid cache hit")
+
+  monkeypatch.setattr(client, "list_player_registration_batch_items", _no_scan, raising=False)
+
+  batch = client.resolve_batch_by_license(301772)
+  assert batch is open_batch
+  assert batch.number == "2025/42"

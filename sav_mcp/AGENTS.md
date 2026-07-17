@@ -133,37 +133,41 @@ The canonical pipeline. Each step's output feeds the next.
      → [{artifact_id, mod1_id, doc_type, reg_type, tier_id, gender_id, ...}, ...]
        (one entry per PDF; medical exams return medical_exam_id instead of mod1_id)
 
-2. find_open_batch(reg_type, tier_id, gender_id)  → batch | null
-   or create_batch(reg_type, tier_id, gender_id)  → batch
+2. ensure_open_batch(reg_type, tier_id, gender_id)  → {..., created: bool}
      → batch_number
+   (get-or-create in one call. find_open_batch / create_batch still exist for
+    explicit control, but prefer ensure_open_batch — one round-trip, no race.)
 
-3. resolve_player(batch_number, mod1_id)
-     → {resolved: true, license}  ── proceed
-     or {resolved: false, candidates: [...]}  ── ask user to pick
-     or {resolved: false, candidates: []}  ── ask user for licence
-
-4. preview_enrollment(batch_number, license, mod1_id, medical_exam_id?)
-     → {player, fields: [{kwarg, status, sav_value, ocr_value, final_value}, ...], needs_review: [...]}
-       Status values:
+3. preview_enrollment(batch_number, license: null, mod1_id, medical_exam_id?)
+     → {player, resolved?, fields: [{kwarg, status, sav_value, ocr_value, final_value}, ...], needs_review: [...]}
+       license: null auto-resolves the player from the form (folds in resolve_player).
+       On a clean single match the normal preview proceeds (player.license carries the
+       resolved licence, plus resolved: true for a Revalidação). Otherwise it returns:
+         {resolved: false, candidates: [...]}         ── ask user to pick, re-call with explicit license
+         {resolved: false, candidates: []}            ── ask user for licence, re-call
+         {resolved: false, error: "player_already_in_sav"}  ── 1ª Inscrição duplicate → use Revalidação
+       Field status values:
          "updated"      OCR overrides SAV
          "match"        SAV kept (OCR matched)
-         "needs_review" low OCR confidence — user must confirm
+         "needs_review" low OCR confidence, OR (for a minor) an absent guardian field — user must supply
          "ocr"          field not in SAV (id_type, guardian_*, consent_*)
+       For a minor, the four guardian fields not already carrying a value are appended to
+       needs_review here so they're collected before submit. Call resolve_player explicitly
+       first only when you need to show the candidate list before previewing.
 
-5. submit_enrollment(batch_number, license, mod1_id, field_overrides={...}, medical_exam_id?)
+4. submit_enrollment(batch_number, license, mod1_id, field_overrides={...}, medical_exam_id?)
      → {success: true, player_id, source_document_upload, medical_exam_upload}
-     or {success: false, missing_guardian_fields: [...]}  ── retry with guardian fields added
+     or {success: false, missing_guardian_fields: [...]}  ── fallback: retry with guardian fields added
 ```
 
 ### Required overrides for `submit_enrollment`
 
 `field_overrides` must include:
 
-- Every field listed in `preview.needs_review`.
+- Every field listed in `preview.needs_review`. For a minor this already includes any absent guardian field (`guardian_name`, `guardian_relation` (id), `guardian_phone`, `guardian_email`) — answer them from the preview rather than waiting for a submit-time failure.
 - `exam_date: "YYYY-MM-DD"` when no medical exam was parsed (or to override the parsed date).
-- For minors, all four guardian fields when prompted: `guardian_name`, `guardian_relation` (id), `guardian_phone`, `guardian_email`.
 
-Re-call `submit_enrollment` with the added fields after a `missing_guardian_fields` response.
+The `missing_guardian_fields` response from `submit_enrollment` is now a fallback only (for when a minor's guardian fields were still absent at submit time); re-call `submit_enrollment` with the added fields if you hit it.
 
 ### Required documents depend on nationality and reg_type
 
@@ -222,7 +226,8 @@ Two kinds of failure surface:
 
 - **Structured error dicts** (LLM-actionable, no exception raised):
   - `{error: "license_not_enrolled", license, open_batches: [...]}` — from `read_enrollment`, `update_enrollment`, `update_enrollment_with_document`, `delete_enrollment`, `list_player_documents`, `upload_player_document`, `replace_player_document`.
-  - `{success: false, missing_guardian_fields: [...]}` — from `submit_enrollment` when the player is a minor.
+  - `{resolved: false, candidates: [...]}` / `{resolved: false, error: "player_already_in_sav"}` — from `resolve_player` **and** from `preview_enrollment` when called with `license: null` and the player doesn't resolve to one licence. Ask the user to pick / switch to Revalidação, then re-call `preview_enrollment` with an explicit `license`.
+  - `{success: false, missing_guardian_fields: [...]}` — fallback from `submit_enrollment` when a minor's guardian fields were still absent at submit time (`preview_enrollment` surfaces them in `needs_review` up front).
 - **Raised exceptions** — programming errors (unknown `mod1_id`, invalid `team`, malformed base64). Surface these to the user; they indicate a bug or a malformed input.
 
 ## Authorization metadata for downstream consumers

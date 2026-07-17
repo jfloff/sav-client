@@ -221,3 +221,54 @@ def test_mcp_tool_signatures_dropped_batch_number():
       f"{tool_name} still accepts batch_number; "
       f"parameters: {list(sig.parameters)}"
     )
+
+
+def test_parse_enrollment_forms_parallel_order_and_error_isolation(monkeypatch):
+  """Multiple PDFs fan out to worker threads: results keep input order, each
+  PDF fails independently, and artifacts land in _forms off the main thread."""
+  import base64
+  import threading
+
+  import sav_parsers
+  from sav_parsers.types import DocType, ParsedField
+
+  classify_threads: list[str] = []
+
+  def fake_classify(tmp_path):
+    classify_threads.append(threading.current_thread().name)
+    with open(tmp_path, "rb") as f:
+      return DocType.EXAME_MEDICO if b"EM" in f.read() else DocType.OUTROS
+
+  def fake_parse_em(tmp_path):
+    return {
+      "fields": {"exam_date": ParsedField(value="2026-01-01", confidence=0.9)},
+      "processing_id": "proc-em",
+    }
+
+  monkeypatch.setattr(sav_parsers, "classify", fake_classify)
+  monkeypatch.setattr(sav_parsers, "parse_em", fake_parse_em)
+  monkeypatch.setattr(sav_parsers, "train_classifier", lambda *a, **k: None)
+  # Junk bytes must not trip the mod1 AcroForm probe.
+  monkeypatch.setattr(server_module, "_read_mod1_template_fields", lambda b: None)
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  forms: dict = {}
+  monkeypatch.setattr(server_module, "_forms", forms)
+
+  pdfs = [
+    base64.b64encode(b"%PDF-1.4\nEM").decode(),   # → exame_medico
+    "!!!not-base64!!!",                            # → per-entry error
+    base64.b64encode(b"%PDF-1.4\nXX").decode(),   # → unsupported type error
+  ]
+  results = server_module.parse_enrollment_forms(pdfs)
+
+  assert [r["index"] for r in results] == [0, 1, 2]
+  assert results[0]["doc_type"] == "exame_medico"
+  assert results[0]["exam_date"] == "2026-01-01"
+  assert "error" in results[1] and "base64" in results[1]["error"].lower()
+  assert "Unsupported document type" in results[2]["error"]
+  # The one successful parse is registered in _forms, sans internal id key.
+  artifact = forms[results[0]["medical_exam_id"]]
+  assert artifact["pdf_bytes"] == b"%PDF-1.4\nEM"
+  assert "artifact_id" not in artifact
+  # >1 PDF → the pool path ran: classification happened off the main thread.
+  assert classify_threads and all(t != "MainThread" for t in classify_threads)

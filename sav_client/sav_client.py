@@ -23,9 +23,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+import time
 from dataclasses import replace as _dc_replace
 from datetime import date
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin
 
 import requests
@@ -55,6 +57,21 @@ logger = logging.getLogger(__name__)
 
 _LOGIN_PATH = "php/logindb.php"
 _LOGIN_OP = "1"
+
+# When the SAV2 server-side session expires, the PHP auth guard intercepts the
+# request *before* the endpoint handler runs and returns the login page (HTML)
+# instead of the endpoint's JSON. That interception is the bulletproof signal
+# that the request was NOT executed — so a re-login + replay is safe even for
+# write endpoints. See ``_looks_like_login_page``.
+_BATCH_MEMO_TTL = 5.0  # seconds — collapses the 3-4× back-to-back re-fetches a
+                       # single enrollment submit triggers, short enough that a
+                       # concurrent server-side state change is picked up quickly.
+_TRANSIENT_RETRY_DELAY = 0.5  # seconds before the single idempotent-GET retry.
+_GAMES_CACHE_TTL = 300.0  # seconds — opt-in cross-invocation cache for game
+                          # listings. Deliberately short: game status/scores are
+                          # volatile, so this only collapses the back-to-back
+                          # listings a game-sheet CLI workflow issues in quick
+                          # succession, without serving stale live data for long.
 _PLAYERS_PATH = "php/jogadoresdb.php"
 _PLAYERS_OP = "1"
 _CLUBS_BY_ORG_PATH = "php/resultadosdb.php"
@@ -198,6 +215,20 @@ class SavClient:
     # license↔NIF map in SavClient.find_license_by_nif.
     self._nif_clubs_built: set[int] = set()
 
+    # Short-TTL in-process memo for list_player_registration_batches(), keyed
+    # by season. A single enrollment submit re-lists batches 3-4× back-to-back;
+    # this collapses those into one HTTP call. Guarded by a lock because the
+    # class fans reads out over a ThreadPoolExecutor elsewhere. Any batch
+    # mutation (create/delete/add/remove) and login()/invalidate_cache() must
+    # clear it — a stale list breaks create-and-refetch callers.
+    self._batch_memo: dict[int, tuple[float, list["PlayerRegistrationBatch"]]] = {}
+    self._batch_memo_lock = threading.Lock()
+
+    # Re-entrancy guard: while a session-expiry re-login + replay is in flight,
+    # a nested expiry detection must not trigger another re-login (avoids loops
+    # when the fresh session is itself immediately rejected).
+    self._reauth_in_progress = False
+
     # Reuse a single requests.Session for connection pooling and automatic
     # cookie handling (the server may set cookies in addition to returning
     # the JSON session object).
@@ -300,6 +331,8 @@ class SavClient:
     logger.info("Attempting login for user %r", self._username)
     raw = self._post(_LOGIN_PATH, payload, params={"op": _LOGIN_OP})
 
+    # A fresh session invalidates any memoised listing tied to the old one.
+    self._invalidate_batch_memo()
     return self._parse_login_response(raw)
 
   def search_players(
@@ -393,13 +426,23 @@ class SavClient:
       results = self._filter_players_status(results, status_filter)
       results = self._filter_players_birth_year(results, birth_years)
       results = results[:limit] if limit is not None else results
-      if with_details:
-        results = [
-          _dc_replace(p, photo_url=d.photo_url, mobile_phone=d.mobile_phone, nif=d.nif)
-          for p, d in (
-            (p, self.get_player_detail(p.id, with_details=True)) for p in results
+      if with_details and results:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _augment(p: Player) -> Player:
+          d = self.get_player_detail(p.id, with_details=True)
+          return _dc_replace(
+            p, photo_url=d.photo_url, mobile_phone=d.mobile_phone, nif=d.nif,
           )
-        ]
+
+        # One detail fetch per row: fan out (order-preserving via pool.map) so a
+        # wide --with-details listing isn't a serial N+1. Mirrors the parallel
+        # detail fetch in the multi-licence `player` path and the NIF-map build.
+        if len(results) == 1:
+          results = [_augment(results[0])]
+        else:
+          with ThreadPoolExecutor(max_workers=min(8, len(results))) as pool:
+            results = list(pool.map(_augment, results))
       return results
 
     if isinstance(tier, list):
@@ -801,6 +844,7 @@ class SavClient:
     tier: str = "",
     venue: int = 0,
     game_number: str = "",
+    use_cache: bool = False,
   ) -> list[Game]:
     """
     Search for games involving the profile's club.
@@ -822,6 +866,10 @@ class SavClient:
         tier:          Tier/escalão text (empty = any).
         venue:         Venue ID (0 = any).
         game_number:   Specific game number string.
+        use_cache:     When True, serve from (and populate) a short-TTL
+                       cross-invocation cache keyed by the full query. Off by
+                       default so live callers always hit the server; the CLI
+                       game-sheet paths opt in to collapse repeat listings.
 
     Returns:
         List of Game objects.
@@ -865,15 +913,24 @@ class SavClient:
       "recinto": venue,
     }
 
-    logger.info("Searching games with filters: %s", payload)
-    text = self._post_form(_GAMES_PATH, payload, params={"op": _GAMES_OP})
-    try:
-      raw = json.loads(text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Games response was not valid JSON: {text[:200]!r}"
-      ) from exc
-    return self._parse_games_response(raw)
+    def _fetch() -> list[Game]:
+      logger.info("Searching games with filters: %s", payload)
+      text = self._post_form(_GAMES_PATH, payload, params={"op": _GAMES_OP})
+      try:
+        raw = json.loads(text)
+      except ValueError as exc:
+        raise SavResponseError(
+          f"Games response was not valid JSON: {text[:200]!r}"
+        ) from exc
+      return self._parse_games_response(raw)
+
+    if not use_cache:
+      return _fetch()
+    # The payload already carries the resolved season, translated date window,
+    # and every filter, scoped to this session's club via user/organizacao — so
+    # it is a complete cache key. Short TTL: see _GAMES_CACHE_TTL.
+    signature = json.dumps(payload, sort_keys=True, default=str)
+    return self._cache.get_games(_fetch, signature, ttl=_GAMES_CACHE_TTL)
 
   def list_coaches(
     self,
@@ -1304,6 +1361,17 @@ class SavClient:
     if season is None:
       season = int(self.session.get("epoca_id") or 0)
 
+    # Serve from the short-TTL memo when fresh. A single enrollment submit
+    # re-lists 3-4× back-to-back; this collapses those into one HTTP call.
+    # ``self._cache.record_batches`` is NOT re-run on a memo hit: the number→id
+    # cache was already recorded on the original fetch that populated the memo.
+    now = time.time()
+    with self._batch_memo_lock:
+      entry = self._batch_memo.get(season)
+      if entry is not None and (now - entry[0]) < _BATCH_MEMO_TTL:
+        # Shallow copy so a caller mutating the list can't corrupt the memo.
+        return list(entry[1])
+
     info = {
       "epoca": str(season),
       "perfil": self.session.get("perfil", 0),
@@ -1329,7 +1397,20 @@ class SavClient:
     rows = data.get("data") or []
     batches = [self._parse_registration_batch(row) for row in rows]
     self._cache.record_batches([(b.number, b.id) for b in batches if b.number])
-    return batches
+    with self._batch_memo_lock:
+      self._batch_memo[season] = (time.time(), batches)
+    return list(batches)
+
+  def _invalidate_batch_memo(self) -> None:
+    """Drop the short-TTL batch listing memo across all seasons.
+
+    Called after any batch mutation (create/delete/add/remove) and on
+    login()/invalidate_cache(). A stale memo here breaks callers such as
+    ``create_and_fetch_batch``, which creates a batch then immediately re-lists
+    expecting to find it.
+    """
+    with self._batch_memo_lock:
+      self._batch_memo.clear()
 
   def resolve_batch_id(self, number: str) -> int:
     """Translate a human-visible batch number (`numero_guia`) to internal batch_id.
@@ -1352,8 +1433,18 @@ class SavClient:
   def resolve_batch_id_by_license(self, license: int) -> int:
     """Find the batch_id for a license's current enrollment in an open batch.
 
+    Thin wrapper over :meth:`resolve_batch_by_license` for callers that only
+    need the id; see that method for the resolution strategy and errors.
+    """
+    return self.resolve_batch_by_license(license).id
+
+  def resolve_batch_by_license(self, license: int) -> PlayerRegistrationBatch:
+    """Find the open batch a license is currently enrolled in.
+
     SAV constrains a player to at most one open batch at a time, so the
-    answer is single-valued.
+    answer is single-valued. Returns the whole ``PlayerRegistrationBatch`` so
+    callers that also need its number/type/state don't have to re-list to
+    rehydrate it (``resolve_batch_id_by_license`` returns just the id).
 
     Strategy:
       1. Fetch the current batch list (single HTTP call) so we know which
@@ -1376,14 +1467,14 @@ class SavClient:
 
     batches = self.list_player_registration_batches()
     open_batches = [b for b in batches if b.is_open]
-    open_ids = {b.id for b in open_batches}
+    open_by_id = {b.id: b for b in open_batches}
 
     cached = self._cache.get_batch_id_by_license(license)
     if cached is not None:
-      if cached in open_ids:
+      if cached in open_by_id:
         try:
           self.load_existing_registration_record(cached, license)
-          return cached
+          return open_by_id[cached]
         except SavRecordNotFoundError:
           # Probe came back well-formed but the player is no longer in
           # this batch — cache is stale. Fall through to a full scan.
@@ -1399,7 +1490,7 @@ class SavClient:
       items = self.list_player_registration_batch_items(batch.id)
       if any(int(item.get("license", 0)) == int(license) for item in items):
         self._cache.record_license_batch(license, batch.id)
-        return batch.id
+        return batch
 
     raise LicenseNotEnrolledError(
       license=license,
@@ -1777,6 +1868,9 @@ class SavClient:
       raise SavResponseError(
         f"Create batch did not return an id: {data!r}"
       )
+    # The memo must not serve a pre-create listing: create_and_fetch_batch
+    # re-lists immediately and raises if the new batch is absent.
+    self._invalidate_batch_memo()
     return new_id
 
   def delete_player_registration_batch(self, batch_id: int) -> None:
@@ -1812,6 +1906,7 @@ class SavClient:
 
     logger.info("Delete batch response: %s", resp.text[:200])
     self._cache.forget_licenses_in_batch(batch_id)
+    self._invalidate_batch_memo()
 
   def remove_player_from_registration_batch(
     self,
@@ -1862,6 +1957,8 @@ class SavClient:
       license, batch.id, resp.text[:200],
     )
     self._cache.forget_license_batch(license)
+    # Row item_count/state changed — drop the memo so the next list re-fetches.
+    self._invalidate_batch_memo()
 
   def find_open_player_registration_batch(
     self,
@@ -2239,6 +2336,8 @@ class SavClient:
       license, internal_id, batch.id, result.get("resultfunction"),
     )
     self._cache.record_license_batch(license, batch.id)
+    # Batch row item_count/state changed — invalidate the listing memo.
+    self._invalidate_batch_memo()
     return internal_id
 
   def _update_existing_player_in_batch(
@@ -2324,6 +2423,8 @@ class SavClient:
       "Updated player license=%s (id=%s) in batch %s",
       license, internal_id, batch.id,
     )
+    # Row state may have changed on the edit — invalidate the listing memo.
+    self._invalidate_batch_memo()
     return internal_id
 
   def update_player_in_registration_batch(
@@ -2655,21 +2756,20 @@ class SavClient:
         onclick handler in the embedded HTML.
     """
     import re
+    resp = self._get(
+      self._url(_REGISTRATIONS_PATH),
+      params={
+        "op": _REGISTRATIONS_DOC_LIST_OP,
+        "guia": batch.id,
+        "licenca": license,
+        "agente": _REGISTRATIONS_AGENTE_PLAYER,
+        "tipo": batch.type_id,
+      },
+      error_prefix=f"Could not list registration documents for license {license}",
+    )
     try:
-      resp = self._http.get(
-        self._url(_REGISTRATIONS_PATH),
-        params={
-          "op": _REGISTRATIONS_DOC_LIST_OP,
-          "guia": batch.id,
-          "licenca": license,
-          "agente": _REGISTRATIONS_AGENTE_PLAYER,
-          "tipo": batch.type_id,
-        },
-        timeout=self._timeout,
-      )
-      resp.raise_for_status()
       data = json.loads(resp.text)
-    except (requests.exceptions.RequestException, ValueError) as exc:
+    except ValueError as exc:
       raise SavConnectionError(
         f"Could not list registration documents for license {license}: {exc}"
       ) from exc
@@ -3036,6 +3136,8 @@ class SavClient:
       license, batch.id, batch.tier, taxa_id, companhia_id,
     )
     self._cache.record_license_batch(license, batch.id)
+    # Batch row item_count/state changed — invalidate the listing memo.
+    self._invalidate_batch_memo()
     return license
 
   def list_player_registration_batch_items(
@@ -3071,24 +3173,18 @@ class SavClient:
       raise ValueError(f"Batch id={batch_id} not found")
     import re
 
-    try:
-      resp = self._http.get(
-        self._url(_REGISTRATIONS_PATH),
-        params={
-          "op": _REGISTRATIONS_BATCH_DETAIL_OP,
-          "id": batch.id,
-          "tipo": batch.type_id,
-          "perfil": self.session.get("perfil", 0),
-          "user": self.session.get("user", ""),
-          "organizacao": self.session.get("organizacao", 0),
-        },
-        timeout=self._timeout,
-      )
-      resp.raise_for_status()
-    except requests.exceptions.RequestException as exc:
-      raise SavConnectionError(
-        f"Could not list items for batch {batch_id}: {exc}"
-      ) from exc
+    resp = self._get(
+      self._url(_REGISTRATIONS_PATH),
+      params={
+        "op": _REGISTRATIONS_BATCH_DETAIL_OP,
+        "id": batch.id,
+        "tipo": batch.type_id,
+        "perfil": self.session.get("perfil", 0),
+        "user": self.session.get("user", ""),
+        "organizacao": self.session.get("organizacao", 0),
+      },
+      error_prefix=f"Could not list items for batch {batch_id}",
+    )
 
     body = resp.text
     try:
@@ -4237,6 +4333,8 @@ class SavClient:
       "result: %s",
       name, userid, batch.id, result.get("resultexame") or "ok",
     )
+    # Batch row item_count/state changed — invalidate the listing memo.
+    self._invalidate_batch_memo()
     return userid
 
   @staticmethod
@@ -4326,6 +4424,7 @@ class SavClient:
   def invalidate_cache(self) -> None:
     """Clear all locally cached data (clubs, associations)."""
     self._cache.invalidate()
+    self._invalidate_batch_memo()
 
   def _fetch_associations(self) -> list[Club]:
     import re
@@ -4371,6 +4470,102 @@ class SavClient:
     """Resolve a relative path against the base URL."""
     return urljoin(self.base_url, path.lstrip("/"))
 
+  @staticmethod
+  def _looks_like_login_page(text: str) -> bool:
+    """Return True when ``text`` is the SAV2 login page, not an endpoint reply.
+
+    This is the conservative session-expiry signature. When the server-side
+    session expires, SAV2's PHP auth guard redirects the request to the login
+    page (returning that HTML) *before* the endpoint handler runs — so a match
+    here proves the request was never executed, which is what makes a
+    re-login + replay safe even for write endpoints.
+
+    A plain JSON ``val != 1`` is deliberately NOT treated as expiry: that comes
+    from the handler having run and rejected the request on business grounds,
+    so replaying it could double-execute a write.
+
+    Heuristic (must be HTML *and* carry a login marker to avoid false hits on
+    ordinary HTML fragments the wizard endpoints return):
+    """
+    if not text:
+      return False
+    head = text[:2000].lower()
+    is_html = ("<html" in head) or ("<!doctype html" in head)
+    if not is_html:
+      return False
+    markers = (
+      "logindb.php",
+      'name="pass"',
+      "name='pass'",
+      'type="password"',
+      "type='password'",
+      "sessão expirou",
+      "sessao expirou",
+      "efetue login",
+    )
+    return any(m in head for m in markers)
+
+  def _reauth_and_replay(self, replay: Callable[[], Any]) -> Any:
+    """Re-login once and replay ``replay`` exactly once.
+
+    Only ever reached after ``_looks_like_login_page`` matched, so the original
+    request was rejected by the auth guard (never executed). The re-entrancy
+    guard prevents an infinite loop if the fresh session is itself immediately
+    rejected — the second detection just surfaces the login-page response to
+    the caller (as a parse/response error) instead of re-logging in forever.
+    """
+    if self._reauth_in_progress:
+      return None
+    logger.warning("Session appears expired — re-authenticating and replaying request")
+    self._reauth_in_progress = True
+    try:
+      self.login()
+      return replay()
+    finally:
+      self._reauth_in_progress = False
+
+  def _get(
+    self,
+    url: str,
+    *,
+    params: dict[str, Any] | None = None,
+    error_prefix: str = "Request failed",
+  ) -> requests.Response:
+    """GET ``url`` with centralized timeout handling for idempotent reads.
+
+    Adds two robustness behaviours writes must NOT have, which is why this is
+    reserved for reads:
+      * ONE transient-network retry (Timeout / ConnectionError) after a short
+        delay — safe only because GETs here are idempotent.
+      * A single session-expiry re-login + replay when the response is the
+        login page (see ``_looks_like_login_page``).
+
+    Raises ``SavConnectionError`` on transport/HTTP failure (after the retry).
+    Returns the raw ``requests.Response`` so callers keep their own parsing.
+    """
+    attempted_transient_retry = False
+    while True:
+      try:
+        resp = self._http.get(url, params=params, timeout=self._timeout)
+        resp.raise_for_status()
+      except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+        if not attempted_transient_retry:
+          attempted_transient_retry = True
+          logger.warning("Transient GET error on %s (%s) — retrying once", url, exc)
+          time.sleep(_TRANSIENT_RETRY_DELAY)
+          continue
+        raise SavConnectionError(f"{error_prefix}: {exc}") from exc
+      except requests.exceptions.RequestException as exc:
+        raise SavConnectionError(f"{error_prefix}: {exc}") from exc
+
+      if self._looks_like_login_page(resp.text) and not self._reauth_in_progress:
+        replayed = self._reauth_and_replay(
+          lambda: self._get(url, params=params, error_prefix=error_prefix)
+        )
+        if replayed is not None:
+          return replayed
+      return resp
+
   def _post(
     self,
     path: str,
@@ -4410,6 +4605,19 @@ class SavClient:
       ) from exc
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Request failed: {exc}") from exc
+
+    # Session-expiry re-login + replay. Skipped for the login call itself (its
+    # own JSON reply is never the login page) and while a re-auth is in flight.
+    if (
+      path != _LOGIN_PATH
+      and not self._reauth_in_progress
+      and self._looks_like_login_page(response.text)
+    ):
+      replayed = self._reauth_and_replay(
+        lambda: self._post(path, payload, params=params)
+      )
+      if replayed is not None:
+        return replayed
 
     try:
       data: dict[str, Any] = response.json()
@@ -4511,6 +4719,21 @@ class SavClient:
       ) from exc
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Request failed: {exc}") from exc
+
+    # Session-expiry re-login + replay (see ``_looks_like_login_page``). The
+    # login page never reaches the endpoint handler, so replaying is safe even
+    # when this form-post is a write. Skipped for the login call and re-entrant
+    # calls to avoid loops.
+    if (
+      path != _LOGIN_PATH
+      and not self._reauth_in_progress
+      and self._looks_like_login_page(response.text)
+    ):
+      replayed = self._reauth_and_replay(
+        lambda: self._post_form(path, payload, params=params)
+      )
+      if replayed is not None:
+        return replayed
 
     logger.debug("Response from %s: %d bytes", url, len(response.text))
     return response.text
