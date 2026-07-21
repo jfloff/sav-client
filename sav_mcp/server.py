@@ -100,6 +100,7 @@ from sav_shared.lookups import (
     TIER_AGE_RANGE_IN_SEASON,
     doc_type_to_tipo_doc,
     player_registration_tiers,
+    reference_data,
     tier_birth_years_for_season,
     tipo_doc_to_doc_type,
 )
@@ -127,6 +128,40 @@ def _get_client() -> SavClient:
         _client = SavClient.from_env()
         _client.login()
     return _client
+
+
+# ── Reference-data resources ──────────────────────────────────────────────────
+# Static SAV lookups (genders, escalões, distritos, id/guardian/doc types, tier
+# eligibility) an app builds its UI/backend around. Exposed as MCP resources
+# rather than tools: reference data a client loads once, not an action. These
+# sit outside authz.toml (its drift check governs @server.tool only) — safe
+# because the data is federation-public and non-sensitive, the same tier already
+# opened to every role via list_associations / list_clubs / list_tiers.
+
+
+@server.resource("sav://lookups", mime_type="application/json")
+def lookups_resource() -> dict:
+    """All federation-public SAV lookups plus tier eligibility.
+
+    Genders, registration types, distritos, ID/guardian/document types, and the
+    per-gender escalão (tier) ids — the dropdown and validation values an app
+    builds its UI/backend around. Tier age windows carry the eligible birth
+    years for the *current* season (resolved server-side). For another season
+    (e.g. next-season planning) read ``sav://lookups/{season_start_year}``.
+    """
+    season = _get_client().get_current_season().start_year
+    return reference_data(season_start_year=season)
+
+
+@server.resource("sav://lookups/{season_start_year}", mime_type="application/json")
+def lookups_for_season_resource(season_start_year: str) -> dict:
+    """Same bundle as ``sav://lookups``, for an explicit season.
+
+    ``season_start_year`` is the season's start year (e.g. ``2025`` → season
+    2025/2026); tier birth years are computed for it. No network call — pure
+    static reference data.
+    """
+    return reference_data(season_start_year=int(season_start_year))
 
 
 def _verify_nif_claim(form: dict[str, Any], claimed_nif: str | None) -> None:

@@ -290,3 +290,76 @@ def doc_type_to_tipo_doc(doc_type: DocType | str) -> int:
 def tipo_doc_to_doc_type(tipo_doc: int) -> DocType | None:
   """Reverse-map a SAV2 tipo_doc integer back to a sav-parsers doc type."""
   return _TIPO_DOC_TO_DOC_TYPE.get(tipo_doc)
+
+
+# ── Reference-data export (for the sav://lookups MCP resource / external apps) ──
+
+def _id_name_list(mapping: dict[int, str]) -> list[dict]:
+  """Emit an int-keyed id→name map as an ordered ``[{id, name}]`` list.
+
+  JSON object keys are always strings, so a raw dump of ``{1: "Masculino"}``
+  stringifies the id and drops its int typing; a list of records keeps both the
+  integer id and insertion order.
+  """
+  return [{"id": key, "name": value} for key, value in mapping.items()]
+
+
+def reference_data(season_start_year: int | None = None) -> dict:
+  """JSON-serializable bundle of every federation-public SAV lookup.
+
+  Built for apps consuming sav-mcp (served via the ``sav://lookups`` resource):
+  the dropdown/validation values an app renders its UI and backend around —
+  genders, escalões, distritos, registration and ID/guardian/document types,
+  plus the tier age windows. Every int-keyed map is emitted as an ordered
+  ``[{id, name}]`` list (JSON stringifies dict keys), and the per-gender tier
+  table stays nested because SAV2 renumbers the tier ids per gender.
+
+  When ``season_start_year`` is given, each tier age range additionally carries
+  the eligible birth years for season ``season_start_year/+1`` (via
+  :func:`tier_birth_years_for_season`) plus its birth-year bounds; open-ended
+  tiers (Sénior) report ``birth_years = None`` with a ``max_birth_year`` bound
+  only. When it is omitted the tier entries carry age windows alone and the
+  top-level ``season_start_year`` key is absent.
+  """
+  doc_types: list[dict] = []
+  for value in DOC_TYPE_CHOICES:
+    entry: dict = {"value": value, "uploadable": is_uploadable_doc_type(value)}
+    if entry["uploadable"]:
+      entry["tipo_doc"] = doc_type_to_tipo_doc(value)
+    doc_types.append(entry)
+
+  tiers_by_gender = [
+    {
+      "gender_id": gender_id,
+      "gender": GENERO.get(gender_id, ""),
+      "tiers": [
+        {"tier_id": tier_id, "tier_name": name}
+        for tier_id, name in tiers.items()
+      ],
+    }
+    for gender_id, tiers in PLAYER_REGISTRATION_TIERS.items()
+  ]
+
+  second_year = season_start_year + 1 if season_start_year is not None else None
+  tier_ages: list[dict] = []
+  for tier_name, (min_age, max_age) in TIER_AGE_RANGE_IN_SEASON.items():
+    entry = {"tier": tier_name, "min_age": min_age, "max_age": max_age}
+    if second_year is not None:
+      entry["birth_years"] = tier_birth_years_for_season(tier_name, season_start_year)
+      entry["min_birth_year"] = None if max_age is None else second_year - max_age
+      entry["max_birth_year"] = second_year - min_age
+    tier_ages.append(entry)
+
+  result = {
+    "genero": _id_name_list(GENERO),
+    "registration_types": _id_name_list(REGISTRATION_TYPE_LABELS),
+    "distritos": _id_name_list(DISTRITOS),
+    "id_types": _id_name_list(ID_TYPES),
+    "guardian_relations": _id_name_list(GUARDIAN_RELATIONS),
+    "doc_types": doc_types,
+    "player_registration_tiers": tiers_by_gender,
+    "tier_ages_in_season": tier_ages,
+  }
+  if season_start_year is not None:
+    result["season_start_year"] = season_start_year
+  return result
