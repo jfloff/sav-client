@@ -146,28 +146,30 @@ def player_registration_tiers(gender_id: int) -> dict[int, str]:
     raise ValueError("gender_id must be 1 (Masculino) or 2 (Feminino)") from None
 
 
-# ── Tier → birth-year window ───────────────────────────────────────────────────
+# ── Tier → age range in season ─────────────────────────────────────────────────
 #
+# Each escalão is a contiguous age range (min_age, max_age): the ages a player
+# reaches during the second calendar year of the season, NOT their current age.
 # For season Y/Y+1, a player born in year B is eligible for escalão E iff
-# (Y+1 - B) ∈ TIER_AGES_IN_SEASON[E]. Sources: FPB Comunicado 057 (Competições
-# Nacionais Escalões de Formação 2025-2026) and Associação de Basquetebol do
-# Porto Regulamento de Provas e Calendarização 2025/26 §3. Stable across
-# seasons; only the season window shifts. Masters/Veteranos and BCR are not
-# modelled — their windows aren't standardised in the FPB formative tables.
+# min_age ≤ (Y+1 - B) ≤ max_age. ``max_age = None`` means open-ended above
+# (Sénior — every player min_age or older qualifies), so its birth-year window
+# can't be enumerated. Sources: FPB Comunicado 057 (Competições Nacionais
+# Escalões de Formação 2025-2026) and Associação de Basquetebol do Porto
+# Regulamento de Provas e Calendarização 2025/26 §3. Stable across seasons; only
+# the season window shifts. Escalões are contiguous by construction (consecutive
+# birth-year cohorts), so a range loses nothing over an explicit age set.
+# Masters/Veteranos and BCR are not modelled — their windows aren't standardised
+# in the FPB formative tables; absence here means "filter by tier name".
 
-TIER_AGES_IN_SEASON: dict[str, frozenset[int]] = {
-  "Baby-Basket": frozenset({4, 5, 6}),
-  "Mini 8":      frozenset({7, 8}),
-  "Mini 10":     frozenset({9, 10}),
-  "Mini 12":     frozenset({11, 12}),
-  "Sub 14":      frozenset({13, 14}),
-  "Sub 16":      frozenset({15, 16}),
-  "Sub 18":      frozenset({17, 18}),
-}
-
-# Open-ended below: every player reaching this age or older in Y+1 qualifies.
-TIER_MIN_AGE_IN_SEASON: dict[str, int] = {
-  "Sénior": 19,
+TIER_AGE_RANGE_IN_SEASON: dict[str, tuple[int, int | None]] = {
+  "Baby-Basket": (4, 6),
+  "Mini 8":      (7, 8),
+  "Mini 10":     (9, 10),
+  "Mini 12":     (11, 12),
+  "Sub 14":      (13, 14),
+  "Sub 16":      (15, 16),
+  "Sub 18":      (17, 18),
+  "Sénior":      (19, None),  # open-ended above → not enumerable
 }
 
 
@@ -178,15 +180,19 @@ def tier_birth_years_for_season(
 
   Returns a list of eligible birth years (most recent first) for the bounded
   formative tiers (Baby-Basket, Mini 8/10/12, Sub 14/16/18). Returns ``None``
-  for tiers that are open-ended below (Sénior — no lower bound to enumerate)
-  or unmodelled (Masters/Veteranos, BCR). Callers should treat ``None`` as
-  "filter by tier name rather than birth year".
+  for tiers that are open-ended above (Sénior — no lower birth-year bound to
+  enumerate) or unmodelled (Masters/Veteranos, BCR). Callers should treat
+  ``None`` as "filter by tier name rather than birth year", and can
+  distinguish the two cases with ``tier_name in TIER_AGE_RANGE_IN_SEASON``.
   """
-  ages = TIER_AGES_IN_SEASON.get(tier_name)
-  if ages is None:
+  age_range = TIER_AGE_RANGE_IN_SEASON.get(tier_name)
+  if age_range is None:
+    return None
+  min_age, max_age = age_range
+  if max_age is None:
     return None
   second_year = season_start_year + 1
-  return sorted((second_year - age for age in ages), reverse=True)
+  return [second_year - age for age in range(min_age, max_age + 1)]
 
 
 # ── ID document types (tipo_identificacao) ─────────────────────────────────────

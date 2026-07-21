@@ -97,7 +97,7 @@ from sav_shared.games import filter_games, game_sort_key
 from sav_shared.lookups import (
     GENERO,
     REGISTRATION_TYPE_LABELS,
-    TIER_MIN_AGE_IN_SEASON,
+    TIER_AGE_RANGE_IN_SEASON,
     doc_type_to_tipo_doc,
     player_registration_tiers,
     tier_birth_years_for_season,
@@ -896,7 +896,7 @@ def roster_for_escalao(
     query_epoca_id = current_epoca_id if is_projection else target_epoca_id
 
     birth_years = tier_birth_years_for_season(tier_name, target_year)
-    if birth_years is None and tier_name not in TIER_MIN_AGE_IN_SEASON:
+    if birth_years is None and tier_name not in TIER_AGE_RANGE_IN_SEASON:
         raise ValueError(
             f"Birth-year window for {tier_name!r} is not modelled. "
             f"Query search_players(tier={tier_name!r}, gender_id={gender_id}, ...) "

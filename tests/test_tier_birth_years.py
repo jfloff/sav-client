@@ -7,8 +7,7 @@ Sources verified against:
 import pytest
 
 from sav_shared.lookups import (
-  TIER_AGES_IN_SEASON,
-  TIER_MIN_AGE_IN_SEASON,
+  TIER_AGE_RANGE_IN_SEASON,
   tier_birth_years_for_season,
 )
 
@@ -46,7 +45,8 @@ class TestOpenEndedAndUnknown:
   def test_senior_is_open_ended_below(self):
     """Sénior has a lower-bound rule (Sub 18+) — not enumerable as a fixed list."""
     assert tier_birth_years_for_season("Sénior", 2025) is None
-    assert "Sénior" in TIER_MIN_AGE_IN_SEASON
+    # Modelled, but open-ended above: present in the table with no max age.
+    assert TIER_AGE_RANGE_IN_SEASON["Sénior"] == (19, None)
 
   def test_masters_returns_none_until_modelled(self):
     assert tier_birth_years_for_season("Masters / Veteranos", 2025) is None
@@ -81,15 +81,18 @@ class TestFormativeTiersAlwaysReturnTwoYears:
 class TestAgeTableContract:
   """Guard against accidental mutation of the published windows."""
 
-  def test_ages_in_season_are_frozensets(self):
-    for tier, ages in TIER_AGES_IN_SEASON.items():
-      assert isinstance(ages, frozenset), tier
+  def test_ranges_are_int_pairs(self):
+    for tier, age_range in TIER_AGE_RANGE_IN_SEASON.items():
+      assert isinstance(age_range, tuple) and len(age_range) == 2, tier
+      min_age, max_age = age_range
+      assert isinstance(min_age, int), tier
+      assert max_age is None or isinstance(max_age, int), tier
 
-  def test_sub_x_ages_are_x_and_x_minus_1(self):
-    """Sub-X / Mini-X eligibility = ages X-1 and X reached during Y+1."""
-    for tier, ages in TIER_AGES_IN_SEASON.items():
-      if tier == "Baby-Basket":
+  def test_sub_x_range_is_x_minus_1_to_x(self):
+    """Sub-X / Mini-X eligibility = ages X-1..X reached during Y+1."""
+    for tier, age_range in TIER_AGE_RANGE_IN_SEASON.items():
+      if tier in ("Baby-Basket", "Sénior"):
         continue
       # Parse X from the tier name ("Sub 14" -> 14, "Mini 8" -> 8).
       x = int(tier.split()[-1])
-      assert ages == frozenset({x - 1, x}), tier
+      assert age_range == (x - 1, x), tier
