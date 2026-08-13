@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.80.0"
+version = "0.80.1"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -12,7 +12,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "click>=8.0",
     "rapidfuzz>=3.9",
-    "mcp>=1.0",
+    "mcp>=1.0,<2",
     "img2pdf>=0.5",
     "pikepdf>=8",
     "pypdf>=4",
