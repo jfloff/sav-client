@@ -4,6 +4,10 @@ Offline and deterministic: the bundled blank template is a fillable PDF form,
 so we assert on the resulting field values (`/V`) rather than rendered pixels.
 """
 import io
+import os
+import subprocess
+import sys
+from pathlib import Path
 
 import pikepdf
 import pytest
@@ -239,6 +243,53 @@ def test_blank_and_unknown_values_are_skipped():
   f = _fields(render_mod1({"morada": "", "nif": None, "bogus_key": "x"}, validate=False))
   assert _v(f, "Morada") == ""
   assert _v(f, "Nr Contribuinte") == ""
+
+
+def test_wheel_install_can_fill_mod1(tmp_path):
+  """The template must be available from a normal, non-editable wheel install.
+
+  Installed with ``pip install --target`` (not a nested venv): a
+  ``--system-site-packages`` venv built from ``sys.executable`` inherits from
+  the *real* base interpreter, not from whatever venv is currently running
+  pytest, so it can silently miss this environment's ``mcp``/``pikepdf``/etc.
+  ``--target`` + a ``PYTHONPATH`` prefix isolates only the package under test
+  (proving the wheel ships its own data) while still resolving the rest of
+  the dependency graph from the environment already running this test.
+
+  Builds with ``--no-build-isolation`` to stay offline, which requires the
+  build backend to already be importable here; a venv without it skips rather
+  than reporting a packaging regression it never actually tested.
+  """
+  pytest.importorskip("setuptools", reason="--no-build-isolation needs the backend installed")
+  root = Path(__file__).resolve().parents[1]
+  dist = tmp_path / "dist"
+  subprocess.run(
+    [sys.executable, "-m", "pip", "wheel", ".", "--no-deps", "--no-build-isolation", "--wheel-dir", str(dist)],
+    cwd=root,
+    check=True,
+    capture_output=True,
+    text=True,
+  )
+  wheel = next(dist.glob("sav_client-*.whl"))
+  target = tmp_path / "site"
+  subprocess.run(
+    [sys.executable, "-m", "pip", "install", "--no-deps", "--target", str(target), str(wheel)],
+    check=True, capture_output=True, text=True,
+  )
+  script = """
+import base64
+from sav_mcp.server import fill_mod1
+values = %r
+result = fill_mod1(values=values)
+pdf = base64.b64decode(result["pdf_b64"])
+assert pdf.startswith(b"%%PDF-")
+print(len(pdf))
+""" % {**{k: v for k, v in SAMPLE.items() if not k.startswith("guardian_")}, "nasc": "1990-03-07"}
+  env = {**os.environ, "PYTHONPATH": str(target)}
+  result = subprocess.run(
+    [sys.executable, "-c", script], cwd=tmp_path, env=env, check=True, capture_output=True, text=True,
+  )
+  assert int(result.stdout.strip()) > 0
 
 
 def test_eu_date_format_also_splits():

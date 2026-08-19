@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import difflib
 import io
+from importlib import resources
 import logging
 import os
 import re
@@ -595,10 +596,9 @@ def reconcile_fpb_mod1(
 # written; the player signature, guardian signature, and club stamp have no form
 # fields (physical lines), so they are naturally left blank for hand completion.
 
-# Bundled blank AcroForm. Resolved relative to the repo root (files/mod1/), with
-# an env override mirroring CLUB_STAMP_PATH so an installed deployment can point
-# elsewhere.
-_MOD1_TEMPLATE = Path(__file__).resolve().parent.parent / "files" / "mod1" / "fpb-mod1.template.pdf"
+# Bundled blank AcroForm. Kept inside sav_shared so it ships in wheels; use
+# importlib.resources so this also works from non-filesystem package loaders.
+_MOD1_TEMPLATE = resources.files("sav_shared").joinpath("files", "mod1", "fpb-mod1.template.pdf")
 
 # Checkbox on-state export value shared by every /Btn field on this form.
 _ON_STATE = "/On"
@@ -1056,13 +1056,13 @@ def render_mod1(
       raise ValueError(
         "Invalid Modelo 1 values:\n  - " + "\n  - ".join(problems)
       )
-  path = (
-    os.fspath(template_path) if template_path
-    else (os.environ.get("MOD1_TEMPLATE_PATH") or str(_MOD1_TEMPLATE))
-  )
   text_updates, checkbox_names = _mod1_field_updates(values)
 
-  reader = PdfReader(path)
+  override_path = os.fspath(template_path) if template_path else os.environ.get("MOD1_TEMPLATE_PATH")
+  # as_file supplies a temporary real path if sav_shared is loaded from a zip;
+  # PdfReader needs a seekable filesystem object rather than a Traversable.
+  with resources.as_file(_MOD1_TEMPLATE) as bundled_template:
+    reader = PdfReader(override_path or bundled_template)
   writer = PdfWriter()
   writer.append(reader)
   if text_updates:

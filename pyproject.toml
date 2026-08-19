@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.82.0"
+version = "0.82.1"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -31,3 +31,4 @@ include = ["sav_client*", "sav_cli*", "sav_mcp*", "sav_shared*"]
 sav_client = ["AGENTS.md"]
 sav_cli = ["AGENTS.md"]
 sav_mcp = ["AGENTS.md", "authz.toml"]
+sav_shared = ["files/mod1/*.pdf"]
