@@ -603,6 +603,15 @@ _MOD1_TEMPLATE = resources.files("sav_shared").joinpath("files", "mod1", "fpb-mo
 # Checkbox on-state export value shared by every /Btn field on this form.
 _ON_STATE = "/On"
 
+# Club policy: every rendered Modelo 1 ships with the "Seguro FPB" (federation
+# insurance) box pre-ticked — the club insures every player through the FPB
+# policy, so this is not a per-player choice and callers never pass it in.
+# "Seguro Clube", "semfpb_com" and "sem_fpb_naocom" belong to the club-insurance
+# branch and stay /Off. Not a MOD1_FILL_MAPPING entry (those map caller-supplied
+# values; this has no input) — kept as its own constant so switching the default,
+# or later making it caller-selectable, is a one-line change.
+_DEFAULT_TICKED_BOX = "Seguro FPB"
+
 # int value → PDF checkbox field name. The ints come straight from the inbound
 # maps (_ID_TYPE / _GUARDIAN_RELATION) so a `tipo` / `guardian_relation` value
 # means the same box in both directions.
@@ -1039,6 +1048,9 @@ def render_mod1(
   any fail: all player fields are required; the Licença FPB only for a
   Revalidação; and the guardian block in full only for a minor (empty otherwise).
 
+  The "Seguro FPB" insurance box is always ticked (see `_DEFAULT_TICKED_BOX`) —
+  club policy, not a caller-settable value.
+
   `player_signature`, `guardian_signature` and `club_stamp` are optional images
   (raw bytes or a path to a PNG/JPG). Each is overlaid on its printed area
   (there are no form fields there): omit them to get a clean form to sign/stamp
@@ -1057,6 +1069,7 @@ def render_mod1(
         "Invalid Modelo 1 values:\n  - " + "\n  - ".join(problems)
       )
   text_updates, checkbox_names = _mod1_field_updates(values)
+  checkbox_names.add(_DEFAULT_TICKED_BOX)
 
   override_path = os.fspath(template_path) if template_path else os.environ.get("MOD1_TEMPLATE_PATH")
   # as_file supplies a temporary real path if sav_shared is loaded from a zip;

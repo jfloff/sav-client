@@ -203,6 +203,22 @@ class TestRenderMod1:
     for name in ("N Apólice", "Companhia", "outro_descricao", "Telefone"):
       assert _v(fields, name) == ""
 
+  def test_seguro_fpb_always_ticked(self, fields, pdf_bytes):
+    # Club policy: every render ships with Seguro FPB pre-ticked (not a
+    # caller-supplied value), so both /V and the widget /AS must be /On.
+    assert _v(fields, "Seguro FPB") == "/On"
+    assert _widget_as(pdf_bytes, "Seguro FPB") == "/On"
+
+  def test_other_insurance_boxes_stay_off(self, fields):
+    for name in ("Seguro Clube", "semfpb_com", "sem_fpb_naocom"):
+      assert _v(fields, name) != "/On"
+
+  def test_seguro_fpb_ticked_on_bare_render(self):
+    # Even a validate=False call with no values gets the default insurance tick.
+    out = render_mod1({}, validate=False)
+    assert _v(_fields(out), "Seguro FPB") == "/On"
+    assert _widget_as(out, "Seguro FPB") == "/On"
+
 
 class TestSignatureOverlays:
   # These probe only the overlay plumbing, so they render partial forms with

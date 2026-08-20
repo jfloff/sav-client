@@ -782,6 +782,9 @@ def fill_mod1(
     guardian_id_type (1=Cartão Cidadão, 2=Passaporte, 3=Outro), guardian_relation
     (1=pai, 2=mãe, 3=tutor).
 
+    Insurance is always "Seguro FPB" — a fixed club policy, not a value in
+    `values`. Do not attempt to pass an insurance field; there is none to set.
+
     Returns ``{filename, size_bytes, pdf_b64}``. Decode pdf_b64 to obtain the PDF bytes.
     """
     pdf = render_mod1(
