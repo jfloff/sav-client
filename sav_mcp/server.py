@@ -272,6 +272,21 @@ def get_session_info() -> dict:
     }
 
 
+def _effective_club(client: SavClient, club_id: int | None) -> int:
+    """Resolve the club a tool call should be scoped to.
+
+    Returns ``club_id`` when the caller supplied one, otherwise the session's
+    own club, read from ``client.session["organizacao"]``. The result is 0 when
+    the caller passed ``club_id=0`` or when there is no session club: for the
+    federation-wide tools that is a legitimate "all clubs" scope, while tools
+    that genuinely need one club (NIF resolution, ``club_roster``,
+    ``warm_nif_index``) reject a falsy result with a ``ValueError``.
+    """
+    if club_id is not None:
+        return club_id
+    return int(client.session.get("organizacao") or 0)
+
+
 # ── Players ───────────────────────────────────────────────────────────────────
 
 def _most_recent(players: list[Player]) -> Player | None:
@@ -362,13 +377,17 @@ def _resolve_rows(
     return _most_recent(search_rung(0))
 
 
-# Both NIF entry points reject a falsy club with the same explanation: the NIF
-# index is built from one club's roster (SavClient.find_license_by_nif), so
-# there is no federation-wide index to fall back on.
+# Both NIF entry points reject a falsy club with the same explanation. This is
+# a SAV2 platform limit, not one of ours: SAV2 only discloses a player's NIF to
+# their own club, so there is no federation-wide NIF data to index in the first
+# place. Our per-club index (SavClient.find_license_by_nif) is shaped by that
+# limit rather than the cause of it — which is why no amount of pre-warming
+# makes club_id=0 work here.
 _NIF_CLUB_REQUIRED = (
-    "NIF resolution is club-scoped: the NIF index is built from a club "
-    "roster, so club_id=0 cannot search federation-wide. Pass an explicit "
-    "club_id, or resolve the player by licence instead."
+    "NIF resolution is club-scoped: SAV2 only exposes a player's NIF to their "
+    "own club, so club_id=0 has nothing to search. Pass an explicit club_id "
+    "for a club whose players you can see, or resolve the player by licence "
+    "instead."
 )
 
 
@@ -417,10 +436,7 @@ def search_players(
         because it is N+1.
     """
     client = _get_client()
-    effective_club: int | list[int] = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int | list[int] = _effective_club(client, club_id)
     players = client.search_players(
         name=name,
         license=license,
@@ -460,10 +476,7 @@ def get_player(
     Returns null if no player is found with that licence.
     """
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     row = _resolve_rows(
         client, license=license, club_id=effective_club, status=status,
         season=season, with_details=with_details,
@@ -483,8 +496,8 @@ def find_player_by_nif(
 
     Returns the same shape as get_player, or null if no player row matches.
     club_id defaults to the session's own club. NIF lookup is club-scoped
-    because the NIF index is built per club, so club_id=0 raises rather than
-    silently returning null. Resolution widens from the current season to the
+    because SAV2 only exposes a player's NIF to their own club, so club_id=0
+    raises rather than silently returning null. Resolution widens from the current season to the
     previous season and finally all seasons, so null no longer means "not
     currently at this club".
     status: "active" (default) | "inactive" | "all"; passed unchanged at
@@ -495,10 +508,7 @@ def find_player_by_nif(
     if len(digits) != 9:
         return None
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     if not effective_club:
         raise ValueError(_NIF_CLUB_REQUIRED)
     row = _resolve_by_nif(
@@ -516,19 +526,23 @@ def warm_nif_index(
 ) -> dict:
     """Build or reuse the club's node-local NIF lookup index.
 
-    club_id defaults to the session's own club. ``scope="full"`` is SLOW and
-    offline-only: it makes one profile POST per not-yet-indexed licence across
-    all seasons at 8-way concurrency. A large club can take minutes, likely
-    beyond a default MCP client timeout. Its purpose is to let an importer or
-    nightly job pay that cost outside a user request.
+    club_id defaults to the session's own club, and a falsy club (an explicit
+    club_id=0, or no resolvable session club) raises ValueError: the index is
+    built from a single club roster, so there is nothing federation-wide to
+    build. ``scope="full"`` is SLOW and offline-only: it makes one profile POST
+    per not-yet-indexed licence across all seasons at 8-way concurrency. A
+    large club can take minutes, likely beyond a default MCP client timeout.
+    Its purpose is to let an importer or nightly job pay that cost outside a
+    user request.
     """
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     if not effective_club:
-        return {"error": "club_id_required"}
+        raise ValueError(
+            "warm_nif_index requires a club_id (SAV2 only exposes NIFs to a "
+            "player's own club, so the index is per-club; the session club "
+            "could not be resolved)."
+        )
     result = client.build_nif_index(
         effective_club, scope=scope, force=force,
     )
@@ -565,8 +579,8 @@ def lookup_player(
     club_id defaults to the session's own club when omitted. club_id=0 searches
     federation-wide, and only for a licence: the session club is probed first at
     each fixed-season rung, so one of our own players still costs one request.
-    A nif requires a real club because the NIF index is built per club, so
-    club_id=0 with a nif raises instead of silently returning null.
+    A nif requires a real club because SAV2 only exposes a player's NIF to
+    their own club, so club_id=0 with a nif raises instead of returning null.
     """
     if (nif is None) == (license is None):
         raise ValueError("exactly one of nif or license must be supplied")
@@ -577,8 +591,8 @@ def lookup_player(
             return None
 
     client = _get_client()
-    session_club = int(client.session.get("organizacao") or 0)
-    effective_club: int = club_id if club_id is not None else session_club
+    session_club = _effective_club(client, None)
+    effective_club: int = _effective_club(client, club_id)
 
     if nif is not None:
         if not effective_club:
@@ -660,10 +674,7 @@ def club_roster(
         }
     """
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     if not effective_club:
         raise ValueError(
             "club_roster requires a club_id (a roster is single-club; the "
@@ -785,10 +796,7 @@ def list_coaches(
         rows. Off by default because it is N+1.
     """
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     coaches = client.list_coaches(
         effective_club,
         season=season,
@@ -848,10 +856,7 @@ def list_games(
         )
 
     client = _get_client()
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
     # Resolve the club's name so each row can be oriented to its perspective;
     # team strings carry suffixes (" - B", "/MVP"), matched on the name.
     full_name, code = client._fetch_club_names(effective_club)
@@ -1174,10 +1179,7 @@ def roster_for_escalao(
             f"directly."
         )
 
-    effective_club: int = (
-        club_id if club_id is not None
-        else int(client.session.get("organizacao") or 0)
-    )
+    effective_club: int = _effective_club(client, club_id)
 
     cascade: list[tuple[str, str, dict[str, Any]]] = []
     if effective_club != 0:

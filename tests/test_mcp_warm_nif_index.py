@@ -1,5 +1,7 @@
 """Offline MCP tests for warm_nif_index."""
 
+import pytest
+
 from sav_mcp import server as server_module
 
 
@@ -33,3 +35,24 @@ def test_warm_nif_index_delegates_and_serializes_built_at(monkeypatch):
     "built_at": "2023-11-14T22:13:20+00:00",
     "from_cache": False,
   }
+
+
+def test_warm_nif_index_raises_without_a_club(monkeypatch):
+  stub = _StubClient()
+  stub.session = {}
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="requires a club_id"):
+    server_module.warm_nif_index()
+
+  assert stub.calls == []
+
+
+def test_warm_nif_index_raises_on_explicit_club_zero(monkeypatch):
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="requires a club_id"):
+    server_module.warm_nif_index(club_id=0)
+
+  assert stub.calls == []
