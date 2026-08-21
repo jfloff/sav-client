@@ -269,7 +269,19 @@ def get_session_info() -> dict:
 # ── Players ───────────────────────────────────────────────────────────────────
 
 def _most_recent(players: list[Player]) -> Player | None:
-    """Return the latest-season row, or None when no rows were found."""
+    """Return the latest-season row, or None when no rows were found.
+
+    A defensive invariant guard, not a fix for an observed bug. It was added on
+    the assumption that a licence search with ``jc_epoca=0`` returns one row per
+    season, making ``results[0]`` arbitrary. Live verification (2026-08-20, club
+    2430) refuted that: a licence-scoped all-seasons search returned a single
+    row, and the club-wide all-seasons search returned 684 rows for 684 distinct
+    licences — no duplicates. SAV2 does not *document* single-row, so this stays
+    as a cheap guard; just don't mistake it for load-bearing.
+
+    ``Player.season`` is a "YYYY/YYYY" string, so lexicographic max is
+    chronological. With one row this is identical to ``results[0]``.
+    """
     if not players:
         return None
     return max(players, key=lambda player: player.season or "")
