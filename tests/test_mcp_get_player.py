@@ -132,3 +132,27 @@ def test_get_player_schema_declares_integer_license():
 
   assert tool is not None
   assert tool.parameters["properties"]["license"]["type"] == "integer"
+
+
+def test_get_player_club_zero_probes_session_club_before_sweeping(monkeypatch):
+  """club_id=0 gets the same own-club fast path lookup_player does.
+
+  Federation-wide is one search request per club, so a licence that belongs to
+  our own club must never trigger the sweep.
+  """
+  calls: list[tuple[int, int | None]] = []
+
+  class _ClubAwareStub(_StubClient):
+    def search_players(self, **kwargs):
+      calls.append((kwargs["club"], kwargs["season"]))
+      if (kwargs["club"], kwargs["season"]) == (200, None):
+        return [_player("2025/2026")]
+      return []
+
+  stub = _ClubAwareStub()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.get_player(301772, club_id=0)
+
+  assert result is not None
+  assert calls == [(200, None)]

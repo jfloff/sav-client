@@ -1,5 +1,7 @@
 """Offline MCP tests for NIF → player resolution across season rungs."""
 
+import pytest
+
 from sav_client.models import Player
 from sav_mcp import server as server_module
 
@@ -102,3 +104,16 @@ def test_invalid_nif_length_returns_none(monkeypatch):
 
   assert server_module.find_player_by_nif("123") is None
   assert stub.calls == []
+
+
+def test_find_player_by_nif_club_zero_raises(monkeypatch):
+  """NIF lookup is club-scoped, so club_id=0 must say so, not return null.
+
+  Mirrors lookup_player(nif=..., club_id=0) — the two NIF entry points signal
+  the same limitation the same way.
+  """
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="club-scoped"):
+    server_module.find_player_by_nif("123456789", club_id=0)
