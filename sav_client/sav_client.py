@@ -395,6 +395,11 @@ class SavClient:
                      request per player to populate ``photo_url``,
                      ``mobile_phone`` and ``nif``. Off by default because it
                      is N+1 and applied after all other filters/limits.
+                     **``nif`` is only populated for your own club's
+                     players.** SAV2 discloses a NIF only to the player's own
+                     club, so a federation-wide or multi-club search returns
+                     real NIFs for your rows and ``""`` for everyone else —
+                     empty means "not visible to you", not "none on file".
 
     Returns:
         List of Player objects parsed from the HTML response.
@@ -751,10 +756,11 @@ class SavClient:
       ) from exc
     return self._parse_player_detail_response(raw, player_id=player_id)
 
-  def find_license_by_nif(
-    self, nif: str, *, club_id: int | None = None, refresh: bool = False,
-  ) -> int | None:
-    """Return the license of the player with the given NIF in a club's roster.
+  def find_license_by_nif(self, nif: str, *, refresh: bool = False) -> int | None:
+    """Return the license of the player with the given NIF in our own roster.
+
+    Always scoped to the session's own club: SAV2 only exposes a player's NIF
+    to their own club, so there is no other roster we could search.
 
     Lookup tiers (cheapest first):
       1. SQLite license↔NIF cache — O(1), survives across processes.
@@ -764,8 +770,8 @@ class SavClient:
     Roster completeness is persisted once per club and scope for the configured
     TTL, so authoritative full-scope misses also survive across processes.
 
-    ``club_id`` defaults to the session's own club. Returns None when the
-    NIF or session club is missing, or when no roster profile matches.
+    Returns None when the NIF or session club is missing, or when no roster
+    profile matches.
     """
     nif = nif.strip() if nif else ""
     if not nif:
@@ -776,13 +782,12 @@ class SavClient:
       if hit is not None:
         return hit
 
-    if club_id is None:
-      club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    club_id = int(self.session.get("organizacao") or 0) if self.session else 0
     if not club_id:
       return None
 
     if refresh:
-      self.build_nif_index(club_id, scope="full", force=True)
+      self.build_nif_index(scope="full", force=True)
       return self._cache.get_license_by_nif(nif)
 
     if self._cache.get_nif_index(
@@ -793,32 +798,28 @@ class SavClient:
     if self._cache.get_nif_index(
       club_id, "recent", self._nif_index_ttl,
     ) is None:
-      self.build_nif_index(club_id, scope="recent")
+      self.build_nif_index(scope="recent")
       hit = self._cache.get_license_by_nif(nif)
       if hit is not None:
         return hit
 
-    self.build_nif_index(club_id, scope="full")
+    self.build_nif_index(scope="full")
     return self._cache.get_license_by_nif(nif)
 
-  def build_nif_index(
-    self,
-    club_id: int | None = None,
-    *,
-    scope: str = "recent",
-    force: bool = False,
-  ) -> dict:
-    """Build or reuse a persisted club NIF index scope.
+  def build_nif_index(self, *, scope: str = "recent", force: bool = False) -> dict:
+    """Build or reuse a persisted NIF index scope for the session's own club.
+
+    Always scoped to the session's own club: SAV2 only exposes a player's NIF
+    to their own club, so no other club's roster can be indexed.
 
     A roster-listing failure returns an uncached result with ``built_at=0.0``;
     no freshness marker is recorded, so the next lookup retries the build.
     """
     if scope not in {"recent", "full"}:
       raise ValueError("scope must be 'recent' or 'full'")
-    if club_id is None:
-      club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    club_id = int(self.session.get("organizacao") or 0) if self.session else 0
     if not club_id:
-      raise ValueError("club_id is required when no session club is available")
+      raise ValueError("a session club is required to build the NIF index")
 
     if not force:
       marker = self._cache.get_nif_index(
@@ -851,9 +852,7 @@ class SavClient:
 
     # A forced refresh must re-read known profiles too, so corrected NIFs can
     # replace immutable-cache rows. Normal staged escalation skips them.
-    built = self._build_club_nif_map(
-      club_id, seasons=seasons, refetch_known=force,
-    )
+    built = self._build_club_nif_map(seasons=seasons, refetch_known=force)
     if built is None:
       return {
         "club_id": club_id, "scope": scope, "players_indexed": 0,
@@ -879,16 +878,20 @@ class SavClient:
     }
 
   def _build_club_nif_map(
-    self, club_id: int, *, seasons: list[int] | None,
-    refetch_known: bool = False,
+    self, *, seasons: list[int] | None, refetch_known: bool = False,
   ) -> tuple[dict[str, int], int] | None:
-    """Build new {nif → license} entries for one club roster scope.
+    """Build new {nif → license} entries for one own-club roster scope.
+
+    Always scoped to the session's own club: SAV2 only exposes a player's NIF
+    to their own club, so a profile fetched for any other club has no NIF.
 
     SAV2 has no NIF-based search, so we pay one profile fetch per unique
     uncached license (parallelised, max 8 workers). ``None`` means the roster
     could not be listed and must not be marked fresh.
     """
     from concurrent.futures import ThreadPoolExecutor
+
+    club_id = int(self.session.get("organizacao") or 0) if self.session else 0
 
     try:
       if seasons is None:
@@ -2286,6 +2289,9 @@ class SavClient:
       )
 
     def _finish(result: int) -> int:
+      # Always the session's own club — batches are only listable for your own
+      # club — but the cache file can outlive the session, so its NIF-index
+      # markers stay keyed by club id rather than assuming a single login.
       club_id = int(
         getattr(batch, "club_id", 0)
         or self.session.get("organizacao")

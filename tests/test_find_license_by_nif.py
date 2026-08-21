@@ -128,7 +128,7 @@ def test_full_build_also_refreshes_recent_marker(monkeypatch, client):
     {101: "111111111", 102: "222222222"},
   )
 
-  result = client.build_nif_index(200, scope="full")
+  result = client.build_nif_index(scope="full")
 
   assert result["players_indexed"] == 2
   assert result["from_cache"] is False

@@ -182,7 +182,7 @@ def test_parse_enrollment_forms_reads_template_and_skips_ocr(monkeypatch):
       assert gender_id == 1
       return {9: "Sénior"}
 
-    def find_license_by_nif(self, nif, club_id=None):
+    def find_license_by_nif(self, nif, *, refresh=False):
       raise AssertionError("1ª Inscrição box checked → no NIF lookup")
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
@@ -222,7 +222,7 @@ def test_parse_enrollment_forms_accepts_trusted_mod1_values_without_ocr(monkeypa
       assert gender_id == 2
       return {7: "Sub 14"}
 
-    def find_license_by_nif(self, nif, club_id=None):
+    def find_license_by_nif(self, nif, *, refresh=False):
       raise AssertionError("1ª Inscrição box checked → no NIF lookup")
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())

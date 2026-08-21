@@ -39,7 +39,7 @@ class _StubClient:
   def _recent_season_ids(self):
     return [100, 99]
 
-  def find_license_by_nif(self, nif, *, club_id=None):
+  def find_license_by_nif(self, nif, *, refresh=False):
     return self._license
 
   def search_players(self, **kwargs):
@@ -106,14 +106,27 @@ def test_invalid_nif_length_returns_none(monkeypatch):
   assert stub.calls == []
 
 
-def test_find_player_by_nif_club_zero_raises(monkeypatch):
-  """NIF lookup is club-scoped, so club_id=0 must say so, not return null.
+def test_find_player_by_nif_without_session_club_raises(monkeypatch):
+  """A session with no club must say so, not return null.
 
-  Mirrors lookup_player(nif=..., club_id=0) — the two NIF entry points signal
-  the same limitation the same way.
+  Mirrors lookup_player(nif=...) — the two NIF entry points signal the same
+  limitation the same way.
   """
+  stub = _StubClient()
+  stub.session = {"epoca_id": 100}  # no "organizacao"
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="scoped to your own club"):
+    server_module.find_player_by_nif("123456789")
+
+  assert stub.calls == []
+
+
+def test_find_player_by_nif_takes_no_club_id(monkeypatch):
+  """SAV2 only exposes a player's NIF to their own club, so there is no
+  club to choose and no club_id to pass."""
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  with pytest.raises(ValueError, match="club-scoped"):
+  with pytest.raises(TypeError):
     server_module.find_player_by_nif("123456789", club_id=0)

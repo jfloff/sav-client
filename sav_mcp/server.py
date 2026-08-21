@@ -377,16 +377,19 @@ def _resolve_rows(
     return _most_recent(search_rung(0))
 
 
-# Both NIF entry points reject a falsy club with the same explanation. This is
-# a SAV2 platform limit, not one of ours: SAV2 only discloses a player's NIF to
-# their own club, so there is no federation-wide NIF data to index in the first
-# place. Our per-club index (SavClient.find_license_by_nif) is shaped by that
-# limit rather than the cause of it — which is why no amount of pre-warming
-# makes club_id=0 work here.
+# Every NIF entry point rejects an unusable club with the same explanation.
+# This is a SAV2 platform limit, not one of ours: SAV2 only exposes a player's
+# NIF to their own club, so there is no federation-wide NIF data to index in
+# the first place, and no other club's roster we could search. Our own-club
+# index (SavClient.find_license_by_nif) is shaped by that limit rather than the
+# cause of it — which is why no amount of pre-warming makes another club work
+# here. Raised both when the session has no club at all and when a caller asks
+# for a club that is not the session's own.
 _NIF_CLUB_REQUIRED = (
-    "NIF resolution is club-scoped: SAV2 only exposes a player's NIF to their "
-    "own club, so club_id=0 has nothing to search. Pass an explicit club_id "
-    "for a club whose players you can see, or resolve the player by licence "
+    "NIF resolution is always scoped to your own club: SAV2 only exposes a "
+    "player's NIF to their own club, so another club's id has nothing to "
+    "search and a session without a club has nothing to search either. Omit "
+    "club_id (or pass your own club's id), or resolve the player by licence "
     "instead."
 )
 
@@ -395,14 +398,19 @@ def _resolve_by_nif(
     client: SavClient,
     *,
     nif: str,
-    club_id: int,
     status: str,
     with_details: bool,
 ) -> Player | None:
+    """Resolve a NIF against the session's own club roster.
+
+    Not parameterised by club: SAV2 only exposes a player's NIF to their own
+    club, so the session club is the only roster a NIF can be resolved in.
+    """
     digits = re.sub(r"\D", "", nif or "")
+    club_id = _effective_club(client, None)
     if len(digits) != 9 or not club_id:
         return None
-    license = client.find_license_by_nif(digits, club_id=club_id)
+    license = client.find_license_by_nif(digits)
     if license is None:
         return None
     return _resolve_rows(
@@ -433,7 +441,9 @@ def search_players(
     status: "active" | "inactive" | "all"
     with_details: when true, issue one extra request per player to fill
         photo_url, mobile_phone and nif in the returned rows. Off by default
-        because it is N+1.
+        because it is N+1. nif is only populated for your own club's players:
+        SAV2 discloses a NIF only to the player's own club, so with club_id=0
+        an empty nif means "not visible to you", not "none on file".
     """
     client = _get_client()
     effective_club: int | list[int] = _effective_club(client, club_id)
@@ -465,7 +475,8 @@ def get_player(
     Return details for a single player by licence number.
 
     club_id defaults to the session's own club when omitted; club_id=0
-    searches federation-wide, with the session club probed first. Without an
+    searches federation-wide, with the session club probed first — but a probe
+    miss costs one request per club in every association, per rung. Without an
     explicit season, resolution widens from the current season to the previous
     season and finally all seasons. Therefore null means the licence has no
     matching row in that search, not "not currently at this club".
@@ -487,7 +498,6 @@ def get_player(
 @server.tool()
 def find_player_by_nif(
     nif: str,
-    club_id: int | None = None,
     status: str = "active",
     with_details: bool = False,
 ) -> dict | None:
@@ -495,11 +505,11 @@ def find_player_by_nif(
     Resolve a player by Portuguese NIF (9 digits) — inverse of get_player.
 
     Returns the same shape as get_player, or null if no player row matches.
-    club_id defaults to the session's own club. NIF lookup is club-scoped
-    because SAV2 only exposes a player's NIF to their own club, so club_id=0
-    raises rather than silently returning null. Resolution widens from the current season to the
-    previous season and finally all seasons, so null no longer means "not
-    currently at this club".
+    Always searches the session's own club: SAV2 only exposes a player's NIF to
+    their own club, so there is no club to choose and a session without a club
+    raises rather than silently returning null. Resolution widens from the
+    current season to the previous season and finally all seasons, so null no
+    longer means "not currently at this club".
     status: "active" (default) | "inactive" | "all"; passed unchanged at
         every season rung.
     with_details: when true, also fetch photo_url, mobile_phone and nif.
@@ -508,44 +518,38 @@ def find_player_by_nif(
     if len(digits) != 9:
         return None
     client = _get_client()
-    effective_club: int = _effective_club(client, club_id)
-    if not effective_club:
+    if not _effective_club(client, None):
         raise ValueError(_NIF_CLUB_REQUIRED)
     row = _resolve_by_nif(
-        client, nif=digits, club_id=effective_club, status=status,
-        with_details=with_details,
+        client, nif=digits, status=status, with_details=with_details,
     )
     return player_to_dict(row, with_details=with_details) if row else None
 
 
 @server.tool()
 def warm_nif_index(
-    club_id: int | None = None,
     scope: str = "recent",
     force: bool = False,
 ) -> dict:
-    """Build or reuse the club's node-local NIF lookup index.
+    """Build or reuse the session club's node-local NIF lookup index.
 
-    club_id defaults to the session's own club, and a falsy club (an explicit
-    club_id=0, or no resolvable session club) raises ValueError: the index is
-    built from a single club roster, so there is nothing federation-wide to
-    build. ``scope="full"`` is SLOW and offline-only: it makes one profile POST
-    per not-yet-indexed licence across all seasons at 8-way concurrency. A
-    large club can take minutes, likely beyond a default MCP client timeout.
-    Its purpose is to let an importer or nightly job pay that cost outside a
-    user request.
+    Always built for the session's own club: SAV2 only exposes a player's NIF
+    to their own club, so there is no club to choose and no federation-wide
+    index to build; a session without a resolvable club raises ValueError.
+    ``scope="full"`` is SLOW and offline-only: it makes one profile POST per
+    not-yet-indexed licence across all seasons at 8-way concurrency. A large
+    club can take minutes, likely beyond a default MCP client timeout. Its
+    purpose is to let an importer or nightly job pay that cost outside a user
+    request.
     """
     client = _get_client()
-    effective_club: int = _effective_club(client, club_id)
-    if not effective_club:
+    if not _effective_club(client, None):
         raise ValueError(
-            "warm_nif_index requires a club_id (SAV2 only exposes NIFs to a "
+            "warm_nif_index needs a session club (SAV2 only exposes NIFs to a "
             "player's own club, so the index is per-club; the session club "
             "could not be resolved)."
         )
-    result = client.build_nif_index(
-        effective_club, scope=scope, force=force,
-    )
+    result = client.build_nif_index(scope=scope, force=force)
     built_at = float(result["built_at"])
     if not built_at:
         # The roster listing failed, so nothing was indexed and no freshness
@@ -579,8 +583,14 @@ def lookup_player(
     club_id defaults to the session's own club when omitted. club_id=0 searches
     federation-wide, and only for a licence: the session club is probed first at
     each fixed-season rung, so one of our own players still costs one request.
-    A nif requires a real club because SAV2 only exposes a player's NIF to
-    their own club, so club_id=0 with a nif raises instead of returning null.
+    A miss is costly — federation-wide is one request per club in every
+    association (~1000 on FPB) per rung — and the probe only helps for a player
+    on the current-season roster, which is empty right after a rollover. Pass an
+    explicit club_id whenever you know it.
+    A nif is always resolved against your own club because SAV2 only exposes a
+    player's NIF to their own club, so a nif with any other club_id (including
+    club_id=0), or with no resolvable session club, raises instead of silently
+    returning null.
     """
     if (nif is None) == (license is None):
         raise ValueError("exactly one of nif or license must be supplied")
@@ -595,11 +605,13 @@ def lookup_player(
     effective_club: int = _effective_club(client, club_id)
 
     if nif is not None:
-        if not effective_club:
+        # An explicit club_id is only accepted as a spelling of "my club": any
+        # other id would silently return null, since SAV2 only exposes a
+        # player's NIF to their own club.
+        if not session_club or effective_club != session_club:
             raise ValueError(_NIF_CLUB_REQUIRED)
         row = _resolve_by_nif(
-            client, nif=digits, club_id=effective_club, status=status,
-            with_details=with_details,
+            client, nif=digits, status=status, with_details=with_details,
         )
     else:
         assert license is not None

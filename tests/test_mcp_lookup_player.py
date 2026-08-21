@@ -22,14 +22,14 @@ class _StubClient:
   def __init__(self):
     self.session = {"epoca_id": 100, "organizacao": 200}
     self.calls: list[dict] = []
-    self.nif_calls: list[tuple[str, int | None]] = []
+    self.nif_calls: list[str] = []
     self.profile_calls: list[tuple[str, int | None]] = []
 
   def _recent_season_ids(self):
     return [100, 99]
 
-  def find_license_by_nif(self, nif, *, club_id=None):
-    self.nif_calls.append((nif, club_id))
+  def find_license_by_nif(self, nif, *, refresh=False):
+    self.nif_calls.append(nif)
     return 301772
 
   def search_players(self, **kwargs):
@@ -49,7 +49,7 @@ def test_lookup_player_by_nif(monkeypatch):
 
   assert result is not None
   assert result["license"] == "301772"
-  assert stub.nif_calls == [("123456789", 200)]
+  assert stub.nif_calls == ["123456789"]
   assert stub.calls[0]["license"] == "301772"
 
 
@@ -187,8 +187,43 @@ def test_lookup_player_nif_with_club_zero_raises(monkeypatch):
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  with pytest.raises(ValueError, match="club-scoped"):
+  with pytest.raises(ValueError, match="scoped to your own club"):
     server_module.lookup_player(nif="123456789", club_id=0)
+
+
+def test_lookup_player_nif_with_another_club_raises(monkeypatch):
+  """SAV2 only exposes a player's NIF to their own club, so another club's
+  id would silently resolve to null — raise instead."""
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="scoped to your own club"):
+    server_module.lookup_player(nif="123456789", club_id=300)
+
+  assert stub.nif_calls == []
+
+
+def test_lookup_player_nif_with_own_club_id_is_accepted(monkeypatch):
+  """club_id=<session club> is just an explicit spelling of "my club"."""
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.lookup_player(nif="123456789", club_id=200)
+
+  assert result is not None
+  assert result["license"] == "301772"
+  assert stub.nif_calls == ["123456789"]
+
+
+def test_lookup_player_nif_without_session_club_raises(monkeypatch):
+  stub = _StubClient()
+  stub.session = {"epoca_id": 100}  # no "organizacao"
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="scoped to your own club"):
+    server_module.lookup_player(nif="123456789")
+
+  assert stub.nif_calls == []
 
 
 def test_lookup_player_license_without_session_club_raises(monkeypatch):

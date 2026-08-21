@@ -207,9 +207,7 @@ def escalao_field_to_name(field_key: str) -> str:
   return suffix.replace("_", " ").title()
 
 
-def find_player_license_by_nif(
-  parsed: dict, client: Any, *, club_id: int | None = None,
-) -> int | None:
+def find_player_license_by_nif(parsed: dict, client: Any) -> int | None:
   """Return the license of the player with the OCR'd NIF in the login's club roster.
 
   Thin wrapper around :meth:`SavClient.find_license_by_nif` that pulls the
@@ -217,10 +215,13 @@ def find_player_license_by_nif(
   tipo_inscricao box is checked (hit → revalidação, miss → primeira) and
   to recover a missing licença on the form when the player is already in
   the roster.
+
+  Always scoped to the session's own club: SAV2 only exposes a player's NIF
+  to their own club, so there is no other roster to search.
   """
   nif_field = parsed.get("nif")
   nif = str(nif_field.value) if (nif_field and nif_field.value) else ""
-  return client.find_license_by_nif(nif, club_id=club_id)
+  return client.find_license_by_nif(nif)
 
 
 def derive_enrollment_params(
@@ -548,10 +549,10 @@ def resolve_player_candidates(
   if ocr_license is not None:
     return None, [], None, ocr_license
 
-  # No OCR licence: try the same NIF-based club roster lookup we use to
+  # No OCR licence: try the same NIF-based own-club roster lookup we use to
   # decide reg_type. The map is cached on the client so this is free if
   # derive_enrollment_params already ran.
-  nif_license = find_player_license_by_nif(parsed, client, club_id=club_id)
+  nif_license = find_player_license_by_nif(parsed, client)
   if nif_license is not None and nif_license in eligible_set:
     return nif_license, [], None, None
 

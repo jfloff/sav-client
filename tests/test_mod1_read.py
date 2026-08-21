@@ -88,7 +88,7 @@ class FakeClient:
   def list_player_registration_tiers(self, gender_id):
     return {7: "Sub 14", 8: "Sub 16"}
 
-  def find_license_by_nif(self, nif, club_id=None):
+  def find_license_by_nif(self, nif, *, refresh=False):
     return None
 
 

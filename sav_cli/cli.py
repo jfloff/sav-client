@@ -1346,7 +1346,7 @@ def _resolve_enroll_player(
   if ocr_license is not None:
     enrolled_license = ocr_license
 
-  nif_license = find_player_license_by_nif(parsed, client, club_id=batch.club_id)
+  nif_license = find_player_license_by_nif(parsed, client)
   if enrolled_license is None and nif_license is not None:
     enrolled_license = nif_license
 
