@@ -110,6 +110,7 @@ PLAYER_REGISTRATION_TIERS: dict[int, dict[int, str]] = {
   1: {  # Masculino
      3: "Sub 16",
      5: "Sub 14",
+     9: "Sub 20",
     10: "Sub 18",
     13: "Mini 8",
     14: "Mini 10",
@@ -127,6 +128,7 @@ PLAYER_REGISTRATION_TIERS: dict[int, dict[int, str]] = {
     11: "Mini 12",
     19: "Sénior",
     21: "Sub 18",
+    22: "Sub 20",
     34: "BCR",
     43: "Masters / Veteranos",
     44: "Baby-Basket",
@@ -160,6 +162,16 @@ def player_registration_tiers(gender_id: int) -> dict[int, str]:
 # birth-year cohorts), so a range loses nothing over an explicit age set.
 # Masters/Veteranos and BCR are not modelled — their windows aren't standardised
 # in the FPB formative tables; absence here means "filter by tier name".
+#
+# "Sub 20" (added by SAV2 to PLAYER_REGISTRATION_TIERS after this table was
+# written) is deliberately left unmodelled too. It sits ambiguously between
+# Sub 18 (17, 18) and the open-ended Sénior (19, None): the only place left
+# for it, (19, 20), would overlap Sénior's window and break the "escalões are
+# contiguous, non-overlapping ranges" invariant this table relies on. No FPB
+# source for its actual bounds was found. Guessing a range risks silently
+# mis-filtering real players by birth year, which is worse than the existing
+# "filter by tier name" fallback — so treat this as absent, same as
+# Masters/Veteranos and BCR, until an authoritative age window is confirmed.
 
 TIER_AGE_RANGE_IN_SEASON: dict[str, tuple[int, int | None]] = {
   "Baby-Basket": (4, 6),
