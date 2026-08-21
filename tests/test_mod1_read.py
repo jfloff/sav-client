@@ -13,12 +13,15 @@ from pypdf import PdfWriter
 from sav_shared.enrollment import derive_enrollment_params
 from sav_shared.fpb_mod1 import (
   _MOD1_READ_CHECK,
+  CLUB_STAMP_RECT,
   MOD1_FILL_MAPPING,
   is_filled_mod1_template,
   mod1_acroform_to_fields,
+  mod1_values_to_fields,
   read_mod1_acroform,
   render_mod1,
 )
+from sav_shared.files import overlay_image_on_pdf
 
 # A minor, 1ª Inscrição — so the guardian block and both checkbox/consent paths
 # are exercised. Mirrors the SAMPLE in test_mod1_fill.
@@ -62,6 +65,13 @@ def _filled_pdf(overrides=None):
   return render_mod1(values)
 
 
+def _png_bytes():
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGBA", (60, 24), (0, 0, 180, 255)).save(buf, "PNG")
+  return buf.getvalue()
+
+
 def _fields(overrides=None):
   raw = read_mod1_acroform(_filled_pdf(overrides))
   assert raw is not None
@@ -86,6 +96,88 @@ def test_detects_filled_template():
   raw = read_mod1_acroform(_filled_pdf())
   assert raw is not None
   assert is_filled_mod1_template(raw) is True
+
+
+def test_values_path_matches_filled_template_fields():
+  raw = read_mod1_acroform(render_mod1(SAMPLE))
+  assert raw is not None
+  assert mod1_values_to_fields(SAMPLE) == mod1_acroform_to_fields(raw)
+
+
+def test_signed_render_is_detected_as_filled_template():
+  png = _png_bytes()
+  signed = render_mod1(
+    SAMPLE,
+    player_signature=png,
+    guardian_signature=png,
+    club_stamp=png,
+  )
+  raw = read_mod1_acroform(signed)
+  assert raw is not None
+  assert is_filled_mod1_template(raw) is True
+
+
+def test_signed_render_fields_match_unsigned_render():
+  png = _png_bytes()
+  signed = render_mod1(
+    SAMPLE,
+    player_signature=png,
+    guardian_signature=png,
+    club_stamp=png,
+  )
+  raw = read_mod1_acroform(signed)
+  assert raw is not None
+  assert mod1_acroform_to_fields(raw) == _fields()
+
+
+def test_signed_render_derived_params_match_unsigned_render():
+  png = _png_bytes()
+  signed = render_mod1(
+    SAMPLE,
+    player_signature=png,
+    guardian_signature=png,
+    club_stamp=png,
+  )
+  raw = read_mod1_acroform(signed)
+  assert raw is not None
+  signed_params = derive_enrollment_params(mod1_acroform_to_fields(raw), FakeClient())
+  unsigned_params = derive_enrollment_params(_fields(), FakeClient())
+  assert signed_params == unsigned_params
+
+
+def test_externally_overlaid_render_is_detected_as_filled_template():
+  overlaid = overlay_image_on_pdf(
+    render_mod1(SAMPLE),
+    _png_bytes(),
+    rect=CLUB_STAMP_RECT,
+  )
+  raw = read_mod1_acroform(overlaid)
+  assert raw is not None
+  assert is_filled_mod1_template(raw) is True
+
+
+def test_externally_overlaid_render_fields_match_unsigned_render():
+  overlaid = overlay_image_on_pdf(
+    render_mod1(SAMPLE),
+    _png_bytes(),
+    rect=CLUB_STAMP_RECT,
+  )
+  raw = read_mod1_acroform(overlaid)
+  assert raw is not None
+  assert mod1_acroform_to_fields(raw) == _fields()
+
+
+def test_externally_overlaid_render_derived_params_match_unsigned_render():
+  overlaid = overlay_image_on_pdf(
+    render_mod1(SAMPLE),
+    _png_bytes(),
+    rect=CLUB_STAMP_RECT,
+  )
+  raw = read_mod1_acroform(overlaid)
+  assert raw is not None
+  overlaid_params = derive_enrollment_params(mod1_acroform_to_fields(raw), FakeClient())
+  unsigned_params = derive_enrollment_params(_fields(), FakeClient())
+  assert overlaid_params == unsigned_params
 
 
 def test_non_form_pdf_is_not_a_template():
@@ -173,10 +265,11 @@ def test_consents_are_booleans():
 
 
 def test_unfilled_field_reads_as_none():
-  # licenca_fpb is empty on a 1ª Inscrição — downstream reads it None-safely,
-  # whether the schema padding ran (CWD-dependent) or the key is just absent.
+  # licenca_fpb is empty on a 1ª Inscrição, so the entity is absent, not
+  # (None, 0.0) — downstream reads it None-safely either way.
   f = _fields()
   assert _v(f, "licenca_fpb") is None
+  assert "licenca_fpb" not in f
 
 
 def test_populated_fields_are_full_confidence():

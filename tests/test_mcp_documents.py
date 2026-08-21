@@ -165,7 +165,7 @@ def test_parse_enrollment_forms_returns_doc_type(monkeypatch):
   monkeypatch.setattr(server_module, "derive_enrollment_params", lambda parsed, client: (2, 7, 1))
   monkeypatch.setattr(server_module, "_forms", {})
 
-  result = server_module.parse_enrollment_forms([_pdf_b64()])
+  result = server_module.parse_enrollment_forms([{"pdf": _pdf_b64()}])
 
   assert len(result) == 1
   assert result[0]["artifact_id"] == result[0]["mod1_id"]
@@ -188,7 +188,7 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
   )
   monkeypatch.setattr(server_module, "_forms", {})
 
-  result = server_module.parse_enrollment_forms([_pdf_b64()])
+  result = server_module.parse_enrollment_forms([{"pdf": _pdf_b64()}])
 
   assert result == [
     {
@@ -219,7 +219,7 @@ def test_parse_enrollment_forms_returns_raw_medical_exam_date_when_unusable(monk
   )
   monkeypatch.setattr(server_module, "_forms", {})
 
-  result = server_module.parse_enrollment_forms([_pdf_b64()])
+  result = server_module.parse_enrollment_forms([{"pdf": _pdf_b64()}])
 
   assert result[0]["exam_date"] is None
   assert result[0]["raw_exam_date"] == "13/05/2026"
@@ -235,9 +235,11 @@ def test_parse_enrollment_forms_accepts_exam_date_without_ocr(monkeypatch):
   monkeypatch.setattr("sav_parsers.parse_em", _boom)
   monkeypatch.setattr(server_module, "_forms", {})
 
-  result = server_module.parse_enrollment_forms(
-    [_pdf_b64()], doc_types=["exame_medico"], medical_exam_date="2026-05-01",
-  )
+  result = server_module.parse_enrollment_forms([{
+    "pdf": _pdf_b64(),
+    "doc_type": "exame_medico",
+    "exam_date": "2026-05-01",
+  }])
 
   artifact_id = result[0]["artifact_id"]
   assert result == [
@@ -258,14 +260,67 @@ def test_parse_enrollment_forms_accepts_exam_date_without_ocr(monkeypatch):
   assert artifact["pdf_bytes"]  # bytes cached for upload
 
 
-def test_parse_enrollment_forms_rejects_exam_date_without_em_target(monkeypatch):
+def test_parse_enrollment_forms_rejects_exam_date_with_contradicting_doc_type(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: object())
   monkeypatch.setattr(server_module, "_forms", {})
 
-  with pytest.raises(ValueError, match="exactly one PDF marked"):
-    server_module.parse_enrollment_forms(
-      [_pdf_b64()], doc_types=["fpb_modelo_1"], medical_exam_date="2026-05-01",
+  result = server_module.parse_enrollment_forms([{
+    "pdf": _pdf_b64(),
+    "doc_type": "fpb_modelo_1",
+    "exam_date": "2026-05-01",
+  }])
+
+  assert "exam_date requires" in result[0]["error"]
+
+
+def test_update_enrollment_with_document_accepts_trusted_mod1_values(monkeypatch):
+  from types import SimpleNamespace
+
+  import sav_parsers
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license):
+      return 12
+
+    def load_player_profile(self, license):
+      return {"nome": "Rita Constança Silva"}
+
+    def update_player_in_registration_batch(self, batch_id, license, **kwargs):
+      captured["update"] = (batch_id, license, kwargs)
+
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      captured["replace"] = (batch_id, license, tipo_doc)
+
+  def _boom(*a, **k):
+    raise AssertionError("classification and OCR must not run for trusted values")
+
+  def fake_reconcile(parsed, sav_profile, client=None):
+    captured["parsed"] = parsed
+    return SimpleNamespace(
+      updated={}, kept={}, needs_review=[], retrain_corrections={},
     )
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "reconcile_fpb_mod1", fake_reconcile)
+  monkeypatch.setattr(sav_parsers, "classify", _boom)
+  monkeypatch.setattr(sav_parsers, "parse_fpb_mod1", _boom)
+  monkeypatch.setattr(sav_parsers, "train_classifier", _boom)
+  base = _blank_pdf_bytes()
+
+  result = server_module.update_enrollment_with_document(
+    license=301772,
+    pdf=base64.b64encode(base).decode("ascii"),
+    mod1_values=SAMPLE,
+  )
+
+  assert result["success"] is True
+  assert result["fields_updated"] is True
+  assert captured["parsed"]["nome_completo"].value == SAMPLE["nome"]
+  assert captured["update"] == (12, 301772, {})
+  assert captured["replace"] == (12, 301772, 1)
 
 
 def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
@@ -648,7 +703,7 @@ def test_parse_enrollment_forms_returns_mod4_id(monkeypatch):
   )
   monkeypatch.setattr(server_module, "_forms", {})
 
-  result = server_module.parse_enrollment_forms([_pdf_b64()])
+  result = server_module.parse_enrollment_forms([{"pdf": _pdf_b64()}])
 
   assert result == [
     {
@@ -1298,6 +1353,124 @@ def test_replace_player_document_stamps_mod1(monkeypatch, tmp_path):
 
   assert result["success"] is True
   assert result["has_club_stamp"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_submit_path_stamps_unstamped_mod1_template_without_ocr(monkeypatch, tmp_path):
+  from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
+  )
+  base = render_mod1(SAMPLE)
+
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_1,
+    parsed=mod1_values_to_fields(SAMPLE),
+    reg_type=1,
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_club_stamp"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
+
+
+def test_submit_path_does_not_double_stamp_mod1_template(monkeypatch, tmp_path):
+  from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp_bytes = base64.b64decode(_png_b64())
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(stamp_bytes)
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
+  )
+  base = render_mod1(SAMPLE, club_stamp=stamp_bytes)
+
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_1,
+    parsed=mod1_values_to_fields(SAMPLE),
+    reg_type=1,
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_club_stamp"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base)
+
+
+def test_submit_path_trusted_values_scan_ocr_checks_carimbo_and_closes(
+  monkeypatch, tmp_path,
+):
+  from sav_shared.fpb_mod1 import mod1_values_to_fields
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {"parse_calls": 0, "closed": []}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  carimbo_bbox = BBox(
+    page=0,
+    vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)],
+  )
+
+  def fake_parse(path):
+    captured["parse_calls"] += 1
+    return {
+      "fields": {
+        "carimbo_clube_presente": ParsedField(
+          value=False, confidence=0.9, bbox=carimbo_bbox,
+        ),
+      },
+      "processing_id": "stamp-session",
+    }
+
+  monkeypatch.setattr("sav_parsers.parse_fpb_mod1", fake_parse)
+  monkeypatch.setattr(
+    "sav_parsers.close_processing",
+    lambda processing_id, **kwargs: captured["closed"].append(processing_id),
+  )
+  base = _blank_pdf_bytes()
+
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_1,
+    parsed=mod1_values_to_fields(SAMPLE),
+    reg_type=1,
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_club_stamp"] is True
+  assert captured["parse_calls"] == 1
+  assert captured["closed"] == ["stamp-session"]
   assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
 
 

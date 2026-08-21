@@ -208,3 +208,77 @@ def overlay_image_on_pdf(
       )
     base_pdf.save(out)
   return out.getvalue()
+
+
+def rect_has_overlay(
+  pdf_bytes: bytes,
+  rect: tuple[float, float, float, float],
+  *,
+  page_index: int = 0,
+) -> bool:
+  """Return whether a drawn XObject overlaps ``rect`` on the requested page.
+
+  The page content stream is interpreted just far enough to follow graphics
+  state saves/restores and affine transforms. Form XObjects use their ``/BBox``
+  (and optional ``/Matrix``); image XObjects occupy the PDF unit square.
+  """
+  Matrix = tuple[float, float, float, float, float, float]
+
+  def compose(left: Matrix, right: Matrix) -> Matrix:
+    """Return the affine transform ``left(right(point))``."""
+    la, lb, lc, ld, le, lf = left
+    ra, rb, rc, rd, re, rf = right
+    return (
+      la * ra + lc * rb,
+      lb * ra + ld * rb,
+      la * rc + lc * rd,
+      lb * rc + ld * rd,
+      la * re + lc * rf + le,
+      lb * re + ld * rf + lf,
+    )
+
+  def placed_box(box: tuple[float, float, float, float], matrix: Matrix) -> tuple[float, float, float, float]:
+    a, b, c, d, e, f = matrix
+    x0, y0, x1, y1 = box
+    points = (
+      (a * x0 + c * y0 + e, b * x0 + d * y0 + f),
+      (a * x0 + c * y1 + e, b * x0 + d * y1 + f),
+      (a * x1 + c * y0 + e, b * x1 + d * y0 + f),
+      (a * x1 + c * y1 + e, b * x1 + d * y1 + f),
+    )
+    xs = [point[0] for point in points]
+    ys = [point[1] for point in points]
+    return min(xs), min(ys), max(xs), max(ys)
+
+  target_x0, target_y0, target_x1, target_y1 = rect
+  identity: Matrix = (1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    page = pdf.pages[page_index]
+    xobjects = page.get("/Resources", {}).get("/XObject", {})
+    ctm = identity
+    stack: list[Matrix] = []
+    for operands, operator in pikepdf.parse_content_stream(page):
+      op = str(operator)
+      if op == "q":
+        stack.append(ctm)
+      elif op == "Q":
+        if stack:
+          ctm = stack.pop()
+      elif op == "cm" and len(operands) == 6:
+        local = tuple(float(value) for value in operands)
+        ctm = compose(ctm, local)  # type: ignore[arg-type]
+      elif op == "Do" and operands:
+        xobject = xobjects.get(operands[0])
+        if xobject is None:
+          continue
+        bbox_obj = xobject.get("/BBox")
+        box = tuple(float(value) for value in bbox_obj) if bbox_obj is not None else (0.0, 0.0, 1.0, 1.0)
+        xobject_matrix_obj = xobject.get("/Matrix")
+        xobject_matrix = (
+          tuple(float(value) for value in xobject_matrix_obj)
+          if xobject_matrix_obj is not None else identity
+        )
+        x0, y0, x1, y1 = placed_box(box, compose(ctm, xobject_matrix))  # type: ignore[arg-type]
+        if x1 > target_x0 and x0 < target_x1 and y1 > target_y0 and y0 < target_y1:
+          return True
+  return False

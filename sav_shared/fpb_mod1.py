@@ -207,9 +207,16 @@ def overlay_club_stamp(
   *,
   carimbo_present: bool | None = None,
   bbox: BBox | None = None,
+  rect: tuple[float, float, float, float] | None = None,
 ) -> bytes:
   """Overlay the club stamp from CLUB_STAMP_PATH onto a mod 1 PDF at the
   location OCR detected for the carimbo_clube_presente entity.
+
+  `rect` is the no-OCR alternative to `bbox`: an explicit page rectangle to
+  stamp, used for a PDF carrying our own template's AcroForm where the slot is
+  at the fixed CLUB_STAMP_RECT and no OCR ran to produce a bbox. When `rect` is
+  given it is used verbatim (no scale/shift — those correct an OCR box) and
+  `bbox` is ignored.
 
   carimbo_present:
     False - OCR ran and found no club stamp → stamp the PDF at `bbox`.
@@ -225,11 +232,13 @@ def overlay_club_stamp(
   stamp_path = os.environ.get("CLUB_STAMP_PATH")
   if not stamp_path:
     return pdf_bytes
-  if bbox is None:
+  if rect is None and bbox is None:
     raise ValueError("OCR did not return a location for carimbo_clube_presente")
 
   with open(stamp_path, "rb") as f:
     stamp_bytes = f.read()
+  if rect is not None:
+    return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=0)
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
   rect = _scale_rect(rect, _CLUB_STAMP_SCALE)
   x0, y0, x1, y1 = rect
@@ -261,13 +270,20 @@ class OverlayResult:
 
 
 def carimbo_overlay(
-  *, carimbo_present: bool | None, bbox: BBox | None,
+  *,
+  carimbo_present: bool | None,
+  bbox: BBox | None,
+  rect: tuple[float, float, float, float] | None = None,
 ) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
-  """Return an overlay callable that applies the club stamp when OCR says it's missing.
+  """Return an overlay callable that applies the club stamp when it's missing.
 
   Skips (applied=None) when carimbo_present is not False or CLUB_STAMP_PATH is
   unset.  effective reflects the final stamp state in the PDF regardless of
   whether *we* applied it.  Captures params via closure.
+
+  `rect` places the stamp at an explicit page rectangle instead of an OCR bbox —
+  the no-OCR path for a PDF carrying our template's AcroForm, where the slot is
+  the fixed CLUB_STAMP_RECT. See overlay_club_stamp.
   """
   def apply(pdf_bytes: bytes) -> tuple[bytes, OverlayResult]:
     if carimbo_present is True:
@@ -279,7 +295,7 @@ def carimbo_overlay(
       return pdf_bytes, OverlayResult(applied=None, effective=False)
     try:
       return (
-        overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox),
+        overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox, rect=rect),
         OverlayResult(applied=True, effective=True),
       )
     except Exception as exc:
@@ -669,9 +685,13 @@ _ESCALAO_NAME_FIELD: dict[str, str] = {
 # "Assinatura ____" line in the poder-paternal section. overlay_image_on_pdf
 # centers each image inside its rect preserving aspect, so a wide signature sits
 # on the line and a roughly-square stamp fills its column.
+#
+# CLUB_STAMP_RECT is public: the no-OCR upload path needs it to both detect an
+# existing stamp (rect_has_overlay) and place a missing one. The two signature
+# rects stay private — nothing outside this module places those.
 _PLAYER_SIGNATURE_RECT:   tuple[float, float, float, float] = (55.0, 196.0, 245.0, 228.0)
 _GUARDIAN_SIGNATURE_RECT: tuple[float, float, float, float] = (215.0, 72.0, 500.0, 97.0)
-_CLUB_STAMP_RECT:         tuple[float, float, float, float] = (410.0, 193.0, 545.0, 231.0)
+CLUB_STAMP_RECT:         tuple[float, float, float, float] = (410.0, 193.0, 545.0, 231.0)
 
 
 def _norm_token(s: str) -> str:
@@ -1090,7 +1110,7 @@ def render_mod1(
   for image, rect in (
     (player_signature,   _PLAYER_SIGNATURE_RECT),
     (guardian_signature, _GUARDIAN_SIGNATURE_RECT),
-    (club_stamp,         _CLUB_STAMP_RECT),
+    (club_stamp,         CLUB_STAMP_RECT),
   ):
     image_bytes = _load_image_bytes(image)
     if image_bytes:
@@ -1106,8 +1126,9 @@ def render_mod1(
 # reshapes them into the exact entity-keyed ParsedField dict parse_fpb_mod1
 # returns from Document AI — letting a template-filled form enter the
 # reconcile/preview/submit flow *without* OCR. Values are exact, so every
-# populated field carries confidence 1.0; unfilled entities pad to (None, 0.0)
-# just like parse_fpb_mod1's schema fill-out.
+# populated field carries confidence 1.0; entities the form has no answer for
+# are left absent (see mod1_acroform_to_fields on why that matches the OCR path
+# for every consumer).
 #
 # The PDF field names are reused from MOD1_FILL_MAPPING (single source of truth
 # for text/date/postal/consent fields); the checkbox map below is the one place
@@ -1264,12 +1285,19 @@ def mod1_acroform_to_fields(raw: dict[str, str]) -> dict[str, ParsedField]:
   parse_fpb_mod1 returns, at confidence 1.0.
 
   `raw` is a read_mod1_acroform result. Populated fields become exact
-  ParsedFields (confidence 1.0, no bbox); every remaining schema entity is
-  padded to ``ParsedField(None, 0.0)`` exactly as parse_fpb_mod1 does, so the
-  reconcile/derive layers behave identically to the OCR path.
+  ParsedFields (confidence 1.0, no bbox). Entities the AcroForm carries no
+  answer for — every unfilled field, plus the visual signals it structurally
+  cannot know (carimbo_clube_presente, assinatura_*_presente) — are simply
+  **absent** from the result rather than present at ``(None, 0.0)``.
+
+  That is indistinguishable to every consumer: each one either indexes the dict
+  (``read_carimbo``, ``_ocr_confidence``, both of which test the value's
+  truthiness) or iterates a fixed field list (``_RECONCILE_TEXT``,
+  ``REQUIRED_PRIMEIRA_KWARGS``), never the dict's keys. What must match the OCR
+  path is the *entity naming*, so a value that is present lands on the same
+  kwarg either way — not the key set.
   """
-  from sav_parsers.schema import load_schema
-  from sav_parsers.types import DocType, ParsedField
+  from sav_parsers.types import ParsedField
 
   fields: dict[str, ParsedField] = {}
 
@@ -1300,7 +1328,7 @@ def mod1_acroform_to_fields(raw: dict[str, str]) -> dict[str, ParsedField]:
     if _checkbox_on(raw.get(box)):
       put(entity, True)
 
-  # Consents — SIM → True, NÃO → False, neither → leave unset (padded below).
+  # Consents — SIM → True, NÃO → False, neither → leave the entity absent.
   for key, entity in _READ_CONSENT_ENTITY.items():
     consent = MOD1_FILL_MAPPING[key]
     if _checkbox_on(raw.get(consent.yes)):      # type: ignore[attr-defined]
@@ -1308,6 +1336,25 @@ def mod1_acroform_to_fields(raw: dict[str, str]) -> dict[str, ParsedField]:
     elif _checkbox_on(raw.get(consent.no)):     # type: ignore[attr-defined]
       put(entity, False)
 
-  for entity in load_schema(DocType.FPB_MODELO_1.value):
-    fields.setdefault(entity, ParsedField(value=None, confidence=0.0))
   return fields
+
+
+def mod1_values_to_fields(values: dict, *, validate: bool = True) -> dict[str, ParsedField]:
+  """Remap a caller-supplied canonical `values` dict to the entity-keyed
+  ParsedField dict parse_fpb_mod1 returns, at confidence 1.0.
+
+  `values` is the same shape render_mod1 takes (see MOD1_FILL_MAPPING). It is
+  resolved with the *fill* side's `_mod1_field_updates` and then read back
+  through `mod1_acroform_to_fields`, so a caller-supplied dict and a form filled
+  from our template can never drift apart — both arrive as the same entities.
+
+  Unless `validate` is False the form's mandatory-fill rules are enforced (see
+  validate_mod1_values) and a ValueError listing every problem is raised, so an
+  unattended caller gets a precise error rather than a malformed batch.
+  """
+  if validate:
+    problems = validate_mod1_values(values)
+    if problems:
+      raise ValueError("Invalid Modelo 1 values:\n  - " + "\n  - ".join(problems))
+  text, checks = _mod1_field_updates(values)
+  return mod1_acroform_to_fields({**text, **{name: "/On" for name in checks}})

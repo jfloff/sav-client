@@ -18,7 +18,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 | **club** (clube / organizacao) | Numeric club ID. `club_id=0` means federation-wide search. |
 | **season** (época) | SAV2 epoch ID. `None` defaults to current season; `0` means all seasons. |
 | **val** | `1` = home team, `2` = away team. Tools expose this as `team: "home" \| "away"`. |
-| **artifact_id** | UUID returned by `parse_enrollment_forms` referencing a cached OCR result. fpb_modelo_1 results expose this also as `mod1_id`; exame_medico results expose it also as `medical_exam_id`. |
+| **artifact_id** | UUID returned by `parse_enrollment_forms` referencing a cached parse result. fpb_modelo_1 results expose this also as `mod1_id`; exame_medico results expose it also as `medical_exam_id`. |
 | **needs_review** | Field-level OCR confidence is too low to trust; the user must confirm or correct. |
 | **player** | Canonical English term — never "athlete". Tool names, parameters, and English responses use `player`. Portuguese user-facing replies may use `jogador` or `atleta` (both natural to coaches). The upstream SAV2 API uses `atleta` as a JSON field name — wire contract, untouched. |
 
@@ -30,7 +30,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 
 All PDFs cross the MCP boundary as **base64-encoded strings**.
 
-- Inputs: `parse_enrollment_forms(pdfs=[b64, b64, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
+- Inputs: `parse_enrollment_forms(documents=[{"pdf": b64}, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
 - Outputs: `generate_game_sheet_pdf` and `fill_mod1` return `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
 
 ## Enum tables
@@ -129,9 +129,9 @@ Report the `players` list, framing it as a projection — "atletas que, pelo ano
 The canonical pipeline. Each step's output feeds the next.
 
 ```
-1. parse_enrollment_forms(pdfs=[b64, ...])
+1. parse_enrollment_forms(documents=[{"pdf": b64, ...}, ...])
      → [{artifact_id, mod1_id, doc_type, reg_type, tier_id, gender_id, ...}, ...]
-       (one entry per PDF; medical exams return medical_exam_id instead of mod1_id)
+       (one entry per document; medical exams return medical_exam_id instead of mod1_id)
 
 2. ensure_open_batch(reg_type, tier_id, gender_id)  → {..., created: bool}
      → batch_number
@@ -160,6 +160,29 @@ The canonical pipeline. Each step's output feeds the next.
      or {success: false, missing_guardian_fields: [...]}  ── fallback: retry with guardian fields added
 ```
 
+### Per-document keys — what each one skips
+
+Every `documents` entry is self-contained. Unknown keys are errors, so misspellings do not silently trigger OCR.
+
+| Key | Required | Meaning |
+| --- | --- | --- |
+| `pdf` | yes | Base64-encoded PDF bytes. |
+| `doc_type` | no | `"fpb_modelo_1"`, `"exame_medico"`, or `"fpb_modelo_4"`; omit to auto-classify. |
+| `values` | no | Canonical Modelo 1 values dict (the `fill_mod1` shape); implies `doc_type="fpb_modelo_1"`. |
+| `exam_date` | no | `"YYYY-MM-DD"`; implies `doc_type="exame_medico"`. |
+
+| Entry | Classification | Document AI extraction | Classifier trained |
+| --- | --- | --- | --- |
+| `pdf` only | runs | runs | — |
+| `pdf` + `doc_type` | skipped | **runs** | yes, with the given label |
+| `pdf` + `values` | skipped | skipped | — |
+| `pdf` + `exam_date` | skipped | skipped | — |
+| `pdf`, filled Modelo 1 template | skipped | skipped (AcroForm probe) | — |
+
+**`doc_type` skips classification only. `values` and `exam_date` are the trusted-value paths that skip Document AI field extraction.** A filled Modelo 1 produced from this repository's template is also read directly from its AcroForm without OCR, including after signature or stamp images have been overlaid.
+
+These fast paths skip parse-time OCR, not every possible OCR call. At `submit_enrollment`, the club-stamp logic must determine whether a stamp is physically present. A non-AcroForm Modelo 1 is therefore sent to `parse_fpb_mod1` at submit time even when `values` supplied its fields. A handwritten scan costs zero Document AI calls during parse and one during submit; a filled template costs zero at both stages.
+
 ### Required overrides for `submit_enrollment`
 
 `field_overrides` must include:
@@ -187,13 +210,13 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 ### Read / update an already-enrolled player
 - `read_enrollment(license)` — show current enrollment.
 - `update_enrollment(license, fields={...})` — patch contact / address / id fields.
-- `update_enrollment_with_document(license, pdf=b64, doc_type?, field_overrides={...}, file_only?)` — re-reconcile from a fresh PDF and optionally upload it.
+- `update_enrollment_with_document(license, pdf=b64, doc_type?, mod1_values?, field_overrides={...}, file_only?)` — re-reconcile from a fresh PDF and optionally upload it. `mod1_values` is the same trusted values shape as `parse_enrollment_forms` and skips classification and field extraction.
 
 ### Manual enrollment (no PDF)
 - `create_enrollment_manual(batch_number, license, fields={...})`.
 
 ### Generate a Modelo 1 form (outbound)
-- `fill_mod1(values, player_signature_b64?, guardian_signature_b64?, club_stamp_b64?)` — the reverse of parse/reconcile: fill a blank FPB Modelo 1 from a values dict and return `{filename, size_bytes, pdf_b64}` (a print-ready enrollment form). `values` keys mirror `field_overrides` plus the header/identity fields (`tipo_inscricao`, `license`, `clube`, `associacao`, `genero`, `escalao`, `nome`, `nacionalidade`, `pais_nascimento`, `data_assinatura`). **Every player field is mandatory; the Licença FPB only for a Revalidação; the guardian block in full only for a minor (from `nasc`) and empty otherwise — invalid input raises.** The player Telefone (landline) is never filled. The three `*_b64` params are optional PNG/JPG signature/stamp images overlaid on their areas — omit them for a form to sign offline, pass any subset for the completed form.
+- `fill_mod1(values, player_signature_b64?, guardian_signature_b64?, club_stamp_b64?)` — the reverse of parse/reconcile: fill a blank FPB Modelo 1 from a values dict and return `{filename, size_bytes, pdf_b64}` (a print-ready enrollment form). `values` keys mirror `field_overrides` plus the header/identity fields (`tipo_inscricao`, `license`, `clube`, `associacao`, `genero`, `escalao`, `nome`, `nacionalidade`, `pais_nascimento`, `data_assinatura`). **Every player field is mandatory; the Licença FPB only for a Revalidação; the guardian block in full only for a minor (from `nasc`) and empty otherwise — invalid input raises.** The player Telefone (landline) is never filled. The three `*_b64` params are optional PNG/JPG signature/stamp images overlaid on their areas — omit them for a form to sign offline, pass any subset for the completed form. Forms produced here are read back through the AcroForm with no OCR, and adding any of the three images does not break that path. A caller holding the authoritative record can skip the PDF round-trip entirely by passing the same dict as a document entry's `values`.
 
 ### Ad-hoc documents
 - `list_player_documents(license)` — what's uploaded for this player.

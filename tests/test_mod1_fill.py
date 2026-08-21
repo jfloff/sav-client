@@ -15,10 +15,12 @@ from pypdf import PdfReader
 
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
+  CLUB_STAMP_RECT,
   _MOD1_GUARDIAN_KEYS,
   render_mod1,
   validate_mod1_values,
 )
+from sav_shared.files import rect_has_overlay
 
 SAMPLE = {
   "tipo_inscricao": 1,             # 1ª Inscrição
@@ -253,6 +255,17 @@ class TestSignatureOverlays:
     p.write_bytes(_png_bytes())
     base = _page_xobject_count(render_mod1({}, validate=False))
     assert _page_xobject_count(render_mod1({}, validate=False, club_stamp=str(p))) == base + 1
+
+  def test_blank_stamp_rect_has_no_overlay(self):
+    assert rect_has_overlay(render_mod1(SAMPLE), CLUB_STAMP_RECT) is False
+
+  def test_club_stamp_overlaps_stamp_rect(self):
+    stamped = render_mod1(SAMPLE, club_stamp=_png_bytes())
+    assert rect_has_overlay(stamped, CLUB_STAMP_RECT) is True
+
+  def test_player_signature_does_not_overlap_stamp_rect(self):
+    signed = render_mod1(SAMPLE, player_signature=_png_bytes())
+    assert rect_has_overlay(signed, CLUB_STAMP_RECT) is False
 
 
 def test_blank_and_unknown_values_are_skipped():

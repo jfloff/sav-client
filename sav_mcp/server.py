@@ -56,7 +56,11 @@ from sav_client.exceptions import (
 )
 
 logger = logging.getLogger(__name__)
-from sav_shared.files import ensure_pdf, load_image_bytes
+from sav_shared.files import (
+    ensure_pdf,
+    load_image_bytes,
+    rect_has_overlay,
+)
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
@@ -76,10 +80,12 @@ from sav_shared.enrollment import (
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import (
+    CLUB_STAMP_RECT,
     carimbo_overlay,
     inscricao_overlay,
     is_filled_mod1_template,
     mod1_acroform_to_fields,
+    mod1_values_to_fields,
     overlaid_pdf,
     player_is_minor,
     read_carimbo,
@@ -1357,6 +1363,7 @@ def _replace_player_document_from_bytes(
     is_mod1 = doc_type == DocType.FPB_MODELO_1 and parsed
     is_mod4 = doc_type == DocType.FPB_MODELO_4 and parsed
     tmp_path: str | None = None
+    overlay_processing_id: str | None = None
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
         if is_mod4:
@@ -1369,13 +1376,22 @@ def _replace_player_document_from_bytes(
             )
         else:
             carimbo, carimbo_bbox = read_carimbo(parsed) if is_mod1 else (None, None)
+            template_carimbo = False
+            if is_mod1 and carimbo is None:
+                overlay_fields, overlay_processing_id = _mod1_overlay_fields(tmp_path)
+                carimbo, carimbo_bbox = read_carimbo(overlay_fields)
+                template_carimbo = overlay_processing_id is None
             tipo_checked, tipo_bbox = (
                 read_tipo_inscricao(parsed, reg_type)
                 if (is_mod1 and reg_type is not None) else (None, None)
             )
             overlays = (
                 inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
-                carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),
+                carimbo_overlay(
+                    carimbo_present=carimbo,
+                    bbox=carimbo_bbox,
+                    rect=CLUB_STAMP_RECT if template_carimbo else None,
+                ),
             )
         with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
             ok, error = try_replace_document(
@@ -1408,6 +1424,12 @@ def _replace_player_document_from_bytes(
                     f"{inscricao_r.error} — please mark the inscription checkbox manually."
                 ) if inscricao_r.error else None
     finally:
+        if overlay_processing_id is not None:
+            from sav_parsers import close_processing
+            try:
+                close_processing(overlay_processing_id)
+            except Exception:
+                logger.debug("close_processing failed for mod1 overlay", exc_info=True)
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
     return status
@@ -1424,6 +1446,30 @@ def _read_mod1_template_fields(pdf_bytes: bytes):
     if raw is None or not is_filled_mod1_template(raw):
         return None
     return mod1_acroform_to_fields(raw)
+
+
+def _mod1_overlay_fields(tmp_path: str) -> tuple[dict, str | None]:
+    """Resolve Modelo 1 fields for overlays, using AcroForm before OCR.
+
+    The carimbo is a visual signal, so a PDF without our AcroForm must be sent
+    to Document AI to locate it. For a PDF carrying our template AcroForm, the
+    fixed stamp rectangle is inspected locally. This cannot distinguish a club
+    stamp from another graphic placed in that rectangle; it is safe here only
+    because the rectangle is otherwise empty on our template.
+    """
+    with open(tmp_path, "rb") as f:
+        pdf_bytes = f.read()
+    fields = _read_mod1_template_fields(pdf_bytes)
+    if fields is not None:
+        fields["carimbo_clube_presente"] = ParsedField(
+            value=rect_has_overlay(pdf_bytes, CLUB_STAMP_RECT),
+            confidence=1.0,
+        )
+        return fields, None
+
+    from sav_parsers import parse_fpb_mod1
+    parse_result = parse_fpb_mod1(tmp_path)
+    return parse_result["fields"], parse_result["processing_id"]
 
 
 @contextmanager
@@ -1461,15 +1507,15 @@ def _stamped_upload_path(
     try:
         try:
             if is_mod1:
-                with open(tmp_path, "rb") as f:
-                    fields = _read_mod1_template_fields(f.read())
-                if fields is None:
-                    from sav_parsers import parse_fpb_mod1
-                    parse_result = parse_fpb_mod1(tmp_path)
-                    fields = parse_result["fields"]
-                    processing_id = parse_result["processing_id"]
+                fields, processing_id = _mod1_overlay_fields(tmp_path)
                 carimbo, carimbo_bbox = read_carimbo(fields)
-                overlays = (carimbo_overlay(carimbo_present=carimbo, bbox=carimbo_bbox),)
+                # No processing_id means the AcroForm answered: no OCR bbox, so
+                # stamp our template's fixed slot instead.
+                overlays = (carimbo_overlay(
+                    carimbo_present=carimbo,
+                    bbox=carimbo_bbox,
+                    rect=CLUB_STAMP_RECT if processing_id is None else None,
+                ),)
             else:
                 from sav_parsers import parse_fpb_mod4
                 parse_result = parse_fpb_mod4(tmp_path)
@@ -1522,19 +1568,50 @@ def _stamped_upload_path(
 def _parse_one_enrollment_pdf(
     client: SavClient,
     index: int,
-    pdf_b64: str,
-    hint: str | None,
-    exam_date_hint: str | None,
+    document: dict,
 ) -> tuple[dict, dict[str, Any] | None]:
-    """Parse one enrollment PDF: the per-PDF body of parse_enrollment_forms.
+    """Parse one enrollment document: the per-entry body of parse_enrollment_forms.
 
-    Runs on a worker thread when several PDFs are parsed at once (each PDF is
+    Runs on a worker thread when several documents are parsed at once (each is
     an independent Document AI round-trip), so it must not touch shared
     mutable state — it returns ``(result_row, artifact | None)`` and the
     caller inserts the artifact into ``_forms`` on the main thread. Never
     raises: every failure comes back as ``{"index": ..., "error": ...}``.
     """
     from sav_parsers import classify, parse_em, parse_fpb_mod1, parse_fpb_mod4, train_classifier
+
+    if not isinstance(document, dict):
+        return {"index": index, "error": "Document entry must be an object."}, None
+    allowed_keys = {"pdf", "doc_type", "values", "exam_date"}
+    unknown_keys = sorted(set(document) - allowed_keys)
+    if unknown_keys:
+        return {
+            "index": index,
+            "error": f"Unknown document keys: {', '.join(unknown_keys)}",
+        }, None
+
+    pdf_b64 = document.get("pdf")
+    if not isinstance(pdf_b64, str) or not pdf_b64.strip():
+        return {"index": index, "error": "Missing or invalid required key: pdf"}, None
+    hint = document.get("doc_type")
+    exam_value = document.get("exam_date")
+    exam_date_hint = str(exam_value).strip() if exam_value not in (None, "") else None
+    values_hint = document.get("values")
+    if values_hint is not None and exam_date_hint is not None:
+        return {
+            "index": index,
+            "error": "A document entry cannot contain both values and exam_date.",
+        }, None
+    if values_hint is not None and hint not in (None, "fpb_modelo_1"):
+        return {
+            "index": index,
+            "error": "values requires doc_type=\"fpb_modelo_1\" when doc_type is provided.",
+        }, None
+    if exam_date_hint is not None and hint not in (None, "exame_medico"):
+        return {
+            "index": index,
+            "error": "exam_date requires doc_type=\"exame_medico\" when doc_type is provided.",
+        }, None
 
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
@@ -1553,12 +1630,25 @@ def _parse_one_enrollment_pdf(
         # and skip classification + OCR. An explicit non-mod1 hint opts out.
         mod1_fields = (
             _read_mod1_template_fields(pdf_bytes)
-            if (hint in (None, "fpb_modelo_1") and exam_date_hint is None) else None
+            if (
+                hint in (None, "fpb_modelo_1")
+                and exam_date_hint is None
+                and values_hint is None
+            ) else None
         )
         if exam_date_hint is not None:
             doc_type = DocType.EXAME_MEDICO
             parsed = {"exam_date": ParsedField(value=exam_date_hint, confidence=1.0)}
             processing_id = None  # no Document AI session for a date-provided exam
+        elif values_hint is not None:
+            if not isinstance(values_hint, dict):
+                raise ValueError("values must be an object containing canonical Modelo 1 values")
+            doc_type = DocType.FPB_MODELO_1
+            parsed = mod1_values_to_fields(values_hint)
+            processing_id = None  # no Document AI session for caller-supplied values
+            reg_type, tier_id, gender_id = derive_enrollment_params(parsed, client)
+            tiers = client.list_player_registration_tiers(gender_id=gender_id)
+            tier_name = tiers.get(tier_id, str(tier_id))
         elif mod1_fields is not None:
             doc_type = DocType.FPB_MODELO_1
             parsed = mod1_fields
@@ -1583,7 +1673,7 @@ def _parse_one_enrollment_pdf(
         else:
             doc_type = classify(tmp_path)
 
-        if exam_date_hint is not None or mod1_fields is not None:
+        if exam_date_hint is not None or values_hint is not None or mod1_fields is not None:
             pass  # already handled by a fast path above
         elif doc_type == DocType.FPB_MODELO_1:
             parse_result = parse_fpb_mod1(tmp_path)
@@ -1670,13 +1760,9 @@ _PARSE_MAX_WORKERS = 4
 
 
 @server.tool()
-def parse_enrollment_forms(
-    pdfs: list[str],
-    doc_types: list[str | None] | None = None,
-    medical_exam_date: str | None = None,
-) -> list[dict]:
+def parse_enrollment_forms(documents: list[dict]) -> list[dict]:
     """
-    Parse one or more enrollment-related PDFs provided as base64-encoded bytes.
+    Parse enrollment-related documents from self-describing entries.
 
     fpb_modelo_1 forms are parsed for the main enrollment workflow and return
     the batch parameters (registration type, tier, gender). exame_medico
@@ -1685,19 +1771,12 @@ def parse_enrollment_forms(
     carry no fields — alongside an fpb_modelo_1 their presence adds an inline
     subida de escalão; they return a mod4_id to pass to preview/submit_enrollment.
 
-    doc_types: optional per-PDF type hint list (same length as pdfs). When an
-    entry is "fpb_modelo_1", "exame_medico", or "fpb_modelo_4", classification
-    is skipped and the classifier is trained with the known label. Use None or
-    omit the list to auto-classify every PDF.
-
-    medical_exam_date: optional exam date (YYYY-MM-DD) for the single
-    exame_medico in this call. When set, the PDF marked doc_types="exame_medico"
-    is accepted with the caller-supplied date and no OCR — classification and
-    parse_em are skipped, the bytes are cached for upload, and the returned
-    medical_exam_id carries the trusted date straight into
-    preview_/submit_enrollment. Requires exactly one PDF marked
-    doc_types="exame_medico" (an enrollment has at most one exam). The date
-    must be strict YYYY-MM-DD; a malformed value comes back as needs_review.
+    Each entry requires ``pdf`` (base64 PDF bytes). ``doc_type`` optionally
+    labels it as fpb_modelo_1, exame_medico, or fpb_modelo_4 and skips
+    classification. ``values`` supplies trusted canonical Modelo 1 values and
+    implies fpb_modelo_1. ``exam_date`` supplies a trusted YYYY-MM-DD date and
+    implies exame_medico. Trusted values skip classification and field
+    extraction; a filled Modelo 1 AcroForm is also read without OCR.
 
     Returns one entry per PDF with an artifact_id and canonical doc_type to
     reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
@@ -1705,44 +1784,19 @@ def parse_enrollment_forms(
     also include mod4_id. On error for a given PDF the entry contains an
     "error" key instead.
 
-    Multiple PDFs are parsed concurrently (each is an independent Document AI
+    Multiple documents are parsed concurrently (each is an independent Document AI
     round-trip), so a multi-document call costs roughly one parse, not N.
     """
     client = _get_client()
-
-    # An enrollment has at most one exam, so medical_exam_date is a single value
-    # bound to the one PDF marked doc_types="exame_medico".
-    em_date = str(medical_exam_date).strip() if medical_exam_date not in (None, "") else None
-    em_index: int | None = None
-    if em_date is not None:
-        em_indices = [
-            j for j in range(len(pdfs))
-            if doc_types and j < len(doc_types) and doc_types[j] == "exame_medico"
-        ]
-        if len(em_indices) != 1:
-            raise ValueError(
-                "medical_exam_date requires exactly one PDF marked "
-                f"doc_types=\"exame_medico\"; found {len(em_indices)}."
-            )
-        em_index = em_indices[0]
-
-    jobs = [
-        (
-            i,
-            pdf_b64,
-            doc_types[i] if doc_types and i < len(doc_types) else None,
-            em_date if i == em_index else None,
-        )
-        for i, pdf_b64 in enumerate(pdfs)
-    ]
+    jobs = list(enumerate(documents))
 
     # TODO: emit MCP progress per completed PDF. FastMCP's
     # Context.report_progress is async-only, so that requires converting this
     # tool to `async def` (and every direct-call test with it) — deferred.
     if len(jobs) <= 1:
         outcomes = [
-            _parse_one_enrollment_pdf(client, i, pdf_b64, hint, exam_hint)
-            for i, pdf_b64, hint, exam_hint in jobs
+            _parse_one_enrollment_pdf(client, index, document)
+            for index, document in jobs
         ]
     else:
         from concurrent.futures import ThreadPoolExecutor
@@ -2672,6 +2726,7 @@ def update_enrollment_with_document(
     license: int,
     pdf: str,
     doc_type: str | None = None,
+    mod1_values: dict | None = None,
     field_overrides: dict[str, Any] | None = None,
     file_only: bool = False,
     detentor_signature_b64: str | None = None,
@@ -2686,6 +2741,9 @@ def update_enrollment_with_document(
     pdf: base64-encoded PDF.
     doc_type: optional type hint — "fpb_modelo_1" or "exame_medico". When given,
     classification is skipped and the classifier is trained with the known label.
+    mod1_values: trusted canonical Modelo 1 values (the fill_mod1 shape). When
+    supplied, the document is treated as fpb_modelo_1 and classification and
+    field extraction are skipped, even when the PDF has no AcroForm.
     field_overrides: optional field values applied on top of reconcile result before
     submitting (same keys as update_enrollment). Only valid when file_only=False.
     file_only: when True, replace the document without touching fields. A mod1/mod4
@@ -2709,11 +2767,20 @@ def update_enrollment_with_document(
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
 
-        # Filled-template fast path: read the AcroForm and skip classify + OCR
-        # (an explicit non-mod1 doc_type hint opts out).
+        if mod1_values is not None and doc_type not in (None, "fpb_modelo_1"):
+            raise ValueError(
+                "mod1_values requires doc_type='fpb_modelo_1' when doc_type is provided."
+            )
+
+        # Caller-values take precedence over the filled-template AcroForm probe;
+        # both skip classification and Document AI field extraction.
         mod1_fields = (
-            _read_mod1_template_fields(pdf_bytes)
-            if doc_type in (None, "fpb_modelo_1") else None
+            mod1_values_to_fields(mod1_values)
+            if mod1_values is not None
+            else (
+                _read_mod1_template_fields(pdf_bytes)
+                if doc_type in (None, "fpb_modelo_1") else None
+            )
         )
 
         _hint_map = {"fpb_modelo_1": DocType.FPB_MODELO_1, "exame_medico": DocType.EXAME_MEDICO}

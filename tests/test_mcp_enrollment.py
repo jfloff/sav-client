@@ -1,5 +1,7 @@
 """MCP server tests for the license-first enrollment surface."""
 
+import base64
+
 from sav_mcp import server as server_module
 
 
@@ -191,7 +193,7 @@ def test_parse_enrollment_forms_reads_template_and_skips_ocr(monkeypatch):
   monkeypatch.setattr(sav_parsers, "classify", _boom)
   monkeypatch.setattr(sav_parsers, "parse_fpb_mod1", _boom)
 
-  results = server_module.parse_enrollment_forms([pdf_b64])
+  results = server_module.parse_enrollment_forms([{"pdf": pdf_b64}])
   assert len(results) == 1
   entry = results[0]
   assert entry["doc_type"] == "fpb_modelo_1"
@@ -200,6 +202,84 @@ def test_parse_enrollment_forms_reads_template_and_skips_ocr(monkeypatch):
   assert entry["tier_name"] == "Sénior"
   # A form-read doc has no Document AI session to close later.
   assert server_module._forms[entry["mod1_id"]]["processing_id"] is None
+
+
+def test_parse_enrollment_forms_accepts_trusted_mod1_values_without_ocr(monkeypatch):
+  import io
+
+  import sav_parsers
+  from pypdf import PdfWriter
+  from test_mod1_read import SAMPLE
+
+  writer = PdfWriter()
+  writer.add_blank_page(width=595, height=842)
+  buf = io.BytesIO()
+  writer.write(buf)
+  pdf_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+  class StubClient:
+    def list_player_registration_tiers(self, gender_id):
+      assert gender_id == 2
+      return {7: "Sub 14"}
+
+    def find_license_by_nif(self, nif, club_id=None):
+      raise AssertionError("1ª Inscrição box checked → no NIF lookup")
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_forms", {})
+
+  def _boom(*a, **k):
+    raise AssertionError("classification and OCR must not run for trusted values")
+
+  monkeypatch.setattr(sav_parsers, "classify", _boom)
+  monkeypatch.setattr(sav_parsers, "parse_fpb_mod1", _boom)
+  monkeypatch.setattr(sav_parsers, "train_classifier", _boom)
+
+  results = server_module.parse_enrollment_forms([{"pdf": pdf_b64, "values": SAMPLE}])
+
+  entry = results[0]
+  assert entry["doc_type"] == "fpb_modelo_1"
+  assert entry["reg_type"] == 1
+  assert entry["gender_id"] == 2
+  assert entry["tier_name"] == "Sub 14"
+  assert server_module._forms[entry["mod1_id"]]["processing_id"] is None
+
+
+def test_parse_enrollment_forms_reports_all_invalid_values(monkeypatch):
+  from sav_shared.fpb_mod1 import validate_mod1_values
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  invalid_values = {}
+  result = server_module.parse_enrollment_forms([{
+    "pdf": base64.b64encode(b"%PDF-1.4\n").decode("ascii"),
+    "values": invalid_values,
+  }])
+
+  error = result[0]["error"]
+  assert error.startswith("Invalid Modelo 1 values:")
+  for problem in validate_mod1_values(invalid_values):
+    assert problem in error
+
+
+def test_parse_enrollment_forms_rejects_values_with_contradicting_doc_type(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  result = server_module.parse_enrollment_forms([{
+    "pdf": base64.b64encode(b"%PDF-1.4\n").decode("ascii"),
+    "doc_type": "exame_medico",
+    "values": {},
+  }])
+
+  assert "values requires" in result[0]["error"]
+
+
+def test_parse_enrollment_forms_rejects_unknown_entry_key(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  result = server_module.parse_enrollment_forms([{
+    "pdf": base64.b64encode(b"%PDF-1.4\n").decode("ascii"),
+    "value": {},
+  }])
+
+  assert "Unknown document keys: value" == result[0]["error"]
 
 
 def test_mcp_tool_signatures_dropped_batch_number():
@@ -259,7 +339,7 @@ def test_parse_enrollment_forms_parallel_order_and_error_isolation(monkeypatch):
     "!!!not-base64!!!",                            # → per-entry error
     base64.b64encode(b"%PDF-1.4\nXX").decode(),   # → unsupported type error
   ]
-  results = server_module.parse_enrollment_forms(pdfs)
+  results = server_module.parse_enrollment_forms([{"pdf": pdf} for pdf in pdfs])
 
   assert [r["index"] for r in results] == [0, 1, 2]
   assert results[0]["doc_type"] == "exame_medico"
