@@ -40,12 +40,13 @@ import re
 import tempfile
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
-from sav_client.models import Season
+from sav_client.models import Player, Season
 from sav_client.exceptions import (
     LicenseNotEnrolledError,
     SavConfigError,
@@ -267,6 +268,79 @@ def get_session_info() -> dict:
 
 # ── Players ───────────────────────────────────────────────────────────────────
 
+def _most_recent(players: list[Player]) -> Player | None:
+    """Return the latest-season row, or None when no rows were found."""
+    if not players:
+        return None
+    return max(players, key=lambda player: player.season or "")
+
+
+def _resolve_rows(
+    client: SavClient,
+    *,
+    license: int,
+    club_id: int,
+    status: str,
+    season: int | None,
+    with_details: bool,
+) -> Player | None:
+    """Resolve one licence using the current → previous → all ladder."""
+    def search(rung: int | None) -> list[Player]:
+        return client.search_players(
+            license=str(license), club=club_id, status=status, season=rung,
+            with_details=with_details,
+        )
+
+    if season is not None:
+        return _most_recent(search(season))
+
+    # Keep the common current-enrollment case to one query. A player last
+    # enrolled in the previous season costs two; the full sweep is deliberately
+    # the last resort.
+    current = search(None)
+    if current:
+        return _most_recent(current)
+
+    previous_season: int | None = None
+    try:
+        recent_seasons = client._recent_season_ids()
+        if len(recent_seasons) > 1:
+            previous_season = recent_seasons[1]
+    except Exception:
+        # Deliberately broad, unlike the SavError handlers elsewhere in this
+        # file: this rung is only an optimisation and the all-seasons query
+        # below returns the correct answer without it. Failing a caller's
+        # lookup because an optional shortcut broke would be the worse trade.
+        logger.debug("Could not resolve the previous SAV season", exc_info=True)
+
+    if previous_season is not None:
+        previous = search(previous_season)
+        if previous:
+            return _most_recent(previous)
+
+    return _most_recent(search(0))
+
+
+def _resolve_by_nif(
+    client: SavClient,
+    *,
+    nif: str,
+    club_id: int,
+    status: str,
+    with_details: bool,
+) -> Player | None:
+    digits = re.sub(r"\D", "", nif or "")
+    if len(digits) != 9 or not club_id:
+        return None
+    license = client.find_license_by_nif(digits, club_id=club_id)
+    if license is None:
+        return None
+    return _resolve_rows(
+        client, license=license, club_id=club_id, status=status,
+        season=None, with_details=with_details,
+    )
+
+
 @server.tool()
 def search_players(
     name: str = "",
@@ -314,14 +388,22 @@ def search_players(
 
 @server.tool()
 def get_player(
-    license: str,
+    license: int,
     club_id: int | None = None,
+    status: str = "active",
+    season: int | None = None,
     with_details: bool = False,
 ) -> dict | None:
     """
     Return details for a single player by licence number.
 
-    club_id defaults to the session's own club when omitted.
+    club_id defaults to the session's own club when omitted. Without an
+    explicit season, resolution widens from the current season to the previous
+    season and finally all seasons. Therefore null means the licence has no
+    matching row in that search, not "not currently at this club".
+    status: "active" (default) | "inactive" | "all"; passed unchanged at
+        every season rung.
+    season: explicit SAV2 epoch id. When supplied, bypasses the widening ladder.
     with_details: when true, also fetch photo_url, mobile_phone and nif.
     Returns null if no player is found with that licence.
     """
@@ -330,12 +412,11 @@ def get_player(
         club_id if club_id is not None
         else int(client.session.get("organizacao") or 0)
     )
-    results = client.search_players(
-        license=license, club=effective_club, with_details=with_details,
+    row = _resolve_rows(
+        client, license=license, club_id=effective_club, status=status,
+        season=season, with_details=with_details,
     )
-    if not results:
-        return None
-    return player_to_dict(results[0], with_details=with_details)
+    return player_to_dict(row, with_details=with_details) if row else None
 
 
 @server.tool()
@@ -348,13 +429,12 @@ def find_player_by_nif(
     """
     Resolve a player by Portuguese NIF (9 digits) — inverse of get_player.
 
-    Returns the same shape as get_player, or null if no player in the club
-    roster matches. club_id defaults to the session's own club.
-    status: "active" (default) | "inactive" | "all". The default restricts
-        to the active current-season roster. Use "all" to also resolve
-        players whose current-season licence isn't active yet (e.g. pending
-        renewals) — it searches across all seasons so their tier still
-        surfaces instead of resolving to null.
+    Returns the same shape as get_player, or null if no player row matches.
+    club_id defaults to the session's own club. Resolution widens from the
+    current season to the previous season and finally all seasons, so null no
+    longer means "not currently at this club".
+    status: "active" (default) | "inactive" | "all"; passed unchanged at
+        every season rung.
     with_details: when true, also fetch photo_url, mobile_phone and nif.
     """
     digits = re.sub(r"\D", "", nif or "")
@@ -367,19 +447,103 @@ def find_player_by_nif(
     )
     if not effective_club:
         return None
-    license = client.find_license_by_nif(digits, club_id=effective_club)
-    if license is None:
-        return None
-    # "active" stays scoped to the current season; anything broader must scan
-    # all seasons or not-yet-renewed players return no rows at all.
-    season = None if status.strip().lower() == "active" else 0
-    results = client.search_players(
-        license=str(license), club=effective_club, status=status,
-        season=season, with_details=with_details,
+    row = _resolve_by_nif(
+        client, nif=digits, club_id=effective_club, status=status,
+        with_details=with_details,
     )
-    if not results:
+    return player_to_dict(row, with_details=with_details) if row else None
+
+
+@server.tool()
+def warm_nif_index(
+    club_id: int | None = None,
+    scope: str = "recent",
+    force: bool = False,
+) -> dict:
+    """Build or reuse the club's node-local NIF lookup index.
+
+    club_id defaults to the session's own club. ``scope="full"`` is SLOW and
+    offline-only: it makes one profile POST per not-yet-indexed licence across
+    all seasons at 8-way concurrency. A large club can take minutes, likely
+    beyond a default MCP client timeout. Its purpose is to let an importer or
+    nightly job pay that cost outside a user request.
+    """
+    client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    if not effective_club:
+        return {"error": "club_id_required"}
+    result = client.build_nif_index(
+        effective_club, scope=scope, force=force,
+    )
+    built_at = float(result["built_at"])
+    if not built_at:
+        # The roster listing failed, so nothing was indexed and no freshness
+        # marker was written. Say so plainly rather than rendering epoch 0 as a
+        # 1970 timestamp that reads like a successful build.
+        return {**result, "built_at": None, "error": "roster_unavailable"}
+    return {
+        **result,
+        "built_at": datetime.fromtimestamp(
+            built_at, tz=timezone.utc,
+        ).isoformat(),
+    }
+
+
+@server.tool()
+def lookup_player(
+    nif: str | None = None,
+    license: int | None = None,
+    club_id: int | None = None,
+    status: str = "active",
+    with_profile: bool = False,
+    with_details: bool = False,
+) -> dict | None:
+    """Resolve exactly one NIF or licence, optionally with its full profile.
+
+    The season ladder widens from current to previous to all seasons. A null
+    result therefore means no matching row was found, not "not currently at
+    this club". ``profile`` remains nested because it has fields such as nif
+    and name whose provenance differs from the roster row.
+    """
+    if (nif is None) == (license is None):
+        raise ValueError("exactly one of nif or license must be supplied")
+
+    if nif is not None:
+        digits = re.sub(r"\D", "", nif or "")
+        if len(digits) != 9:
+            return None
+
+    client = _get_client()
+    effective_club: int = (
+        club_id if club_id is not None
+        else int(client.session.get("organizacao") or 0)
+    )
+    if not effective_club:
         return None
-    return player_to_dict(results[0], with_details=with_details)
+
+    if nif is not None:
+        row = _resolve_by_nif(
+            client, nif=nif, club_id=effective_club, status=status,
+            with_details=with_details,
+        )
+    else:
+        assert license is not None
+        row = _resolve_rows(
+            client, license=license, club_id=effective_club,
+            status=status, season=None, with_details=with_details,
+        )
+    if row is None:
+        return None
+
+    result = player_to_dict(row, with_details=with_details)
+    if with_profile:
+        result["profile"] = client.load_player_profile(
+            row.license, club_id=effective_club,
+        )
+    return result
 
 
 @server.tool()
@@ -488,7 +652,7 @@ def club_roster(
 
 
 @server.tool()
-def get_player_profile(license: str, club_id: int | None = None) -> dict:
+def get_player_profile(license: int, club_id: int | None = None) -> dict:
     """
     Read-only player profile suitable for OCR reconciliation.
 
@@ -497,16 +661,16 @@ def get_player_profile(license: str, club_id: int | None = None) -> dict:
     (morada, codpostal, localidade_txt, distrito, concelho), document IDs
     (numi, dataval, tipo), and contact details (tele, telef, email, nif).
 
-    Distrito and concelho come back as integer ID strings; use
-    list_associations / list_clubs-style consumers if names are needed
-    (the distrito static map and concelho list are exposed elsewhere).
+    Select-backed fields come back as integer ID strings together with
+    human-readable siblings: tipo_label, nacional_label, naturalidade_label,
+    distrito_label, and concelho_label.
 
     club_id, when supplied, scopes the bridge search and avoids the slow
     federation-wide path on cache miss. Omit to use whatever's already
     cached from prior search_players / resolve_player calls.
     """
     client = _get_client()
-    return client.load_player_profile(int(license), club_id=club_id)
+    return client.load_player_profile(license, club_id=club_id)
 
 
 # ── Clubs & associations ──────────────────────────────────────────────────────

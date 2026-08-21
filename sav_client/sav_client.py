@@ -187,6 +187,7 @@ class SavClient:
     password: str,
     *,
     timeout: int = _DEFAULT_TIMEOUT,
+    nif_index_ttl: float = Cache.DEFAULT_TTL,
   ) -> None:
     """
     Args:
@@ -194,6 +195,7 @@ class SavClient:
         username:  Login username.
         password:  Plaintext password — hashed with MD5 before transmission.
         timeout:   Network timeout in seconds applied to every request.
+        nif_index_ttl: Freshness window for persisted club NIF indexes.
     """
     if not base_url:
       raise SavConfigError("base_url must not be empty")
@@ -206,14 +208,13 @@ class SavClient:
     self._username = username
     self._password = password
     self._timeout = timeout
+    self._nif_index_ttl = nif_index_ttl
 
     # Populated after login()
     self.session: Session | None = None
 
     self._cache = Cache()
-    # Tracks which club rosters we've already scanned to build the
-    # license↔NIF map in SavClient.find_license_by_nif.
-    self._nif_clubs_built: set[int] = set()
+    self._seasons: list[Season] | None = None
 
     # Short-TTL in-process memo for list_player_registration_batches(), keyed
     # by season. A single enrollment submit re-lists batches 3-4× back-to-back;
@@ -751,14 +752,17 @@ class SavClient:
     return self._parse_player_detail_response(raw, player_id=player_id)
 
   def find_license_by_nif(
-    self, nif: str, *, club_id: int | None = None,
+    self, nif: str, *, club_id: int | None = None, refresh: bool = False,
   ) -> int | None:
     """Return the license of the player with the given NIF in a club's roster.
 
     Lookup tiers (cheapest first):
       1. SQLite license↔NIF cache — O(1), survives across processes.
-      2. Per-club roster build, persisted into the SQLite cache for
-         future runs. Done at most once per club per process.
+      2. Current + previous season roster build.
+      3. All-season roster build after a recent-scope miss.
+
+    Roster completeness is persisted once per club and scope for the configured
+    TTL, so authoritative full-scope misses also survive across processes.
 
     ``club_id`` defaults to the session's own club. Returns None when the
     NIF or session club is missing, or when no roster profile matches.
@@ -767,51 +771,157 @@ class SavClient:
     if not nif:
       return None
 
-    hit = self._cache.get_license_by_nif(nif)
-    if hit:
-      return hit
+    if not refresh:
+      hit = self._cache.get_license_by_nif(nif)
+      if hit is not None:
+        return hit
 
     if club_id is None:
       club_id = int(self.session.get("organizacao") or 0) if self.session else 0
     if not club_id:
       return None
 
-    if club_id in self._nif_clubs_built:
+    if refresh:
+      self.build_nif_index(club_id, scope="full", force=True)
+      return self._cache.get_license_by_nif(nif)
+
+    if self._cache.get_nif_index(
+      club_id, "full", self._nif_index_ttl,
+    ) is not None:
       return None
 
-    nif_map = self._build_club_nif_map(club_id)
-    self._nif_clubs_built.add(club_id)
-    if nif_map:
-      self._cache.record_player_nifs([(lic, n) for n, lic in nif_map.items()])
-    return nif_map.get(nif)
+    if self._cache.get_nif_index(
+      club_id, "recent", self._nif_index_ttl,
+    ) is None:
+      self.build_nif_index(club_id, scope="recent")
+      hit = self._cache.get_license_by_nif(nif)
+      if hit is not None:
+        return hit
 
-  def _build_club_nif_map(self, club_id: int) -> dict[str, int]:
-    """Build {nif → license} for the given club's roster (all seasons).
+    self.build_nif_index(club_id, scope="full")
+    return self._cache.get_license_by_nif(nif)
+
+  def build_nif_index(
+    self,
+    club_id: int | None = None,
+    *,
+    scope: str = "recent",
+    force: bool = False,
+  ) -> dict:
+    """Build or reuse a persisted club NIF index scope.
+
+    A roster-listing failure returns an uncached result with ``built_at=0.0``;
+    no freshness marker is recorded, so the next lookup retries the build.
+    """
+    if scope not in {"recent", "full"}:
+      raise ValueError("scope must be 'recent' or 'full'")
+    if club_id is None:
+      club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    if not club_id:
+      raise ValueError("club_id is required when no session club is available")
+
+    if not force:
+      marker = self._cache.get_nif_index(
+        club_id, scope, self._nif_index_ttl,
+      )
+      if marker is not None:
+        built_at, player_count = marker
+        return {
+          "club_id": club_id,
+          "scope": scope,
+          "players_indexed": player_count,
+          "built_at": built_at,
+          "from_cache": True,
+        }
+
+    if scope == "recent":
+      try:
+        seasons = self._recent_season_ids()
+      except (SavError, ValueError):
+        logger.debug(
+          "Could not resolve recent seasons for club_id=%s", club_id,
+          exc_info=True,
+        )
+        return {
+          "club_id": club_id, "scope": scope, "players_indexed": 0,
+          "built_at": 0.0, "from_cache": False,
+        }
+    else:
+      seasons = None
+
+    # A forced refresh must re-read known profiles too, so corrected NIFs can
+    # replace immutable-cache rows. Normal staged escalation skips them.
+    built = self._build_club_nif_map(
+      club_id, seasons=seasons, refetch_known=force,
+    )
+    if built is None:
+      return {
+        "club_id": club_id, "scope": scope, "players_indexed": 0,
+        "built_at": 0.0, "from_cache": False,
+      }
+
+    nif_map, player_count = built
+    if nif_map:
+      self._cache.record_player_nifs([
+        (license, nif_value) for nif_value, license in nif_map.items()
+      ])
+    self._cache.record_nif_index(club_id, scope, player_count)
+    if scope == "full":
+      self._cache.record_nif_index(club_id, "recent", player_count)
+    marker = self._cache.get_nif_index(club_id, scope, float("inf"))
+    built_at = marker[0] if marker is not None else time.time()
+    return {
+      "club_id": club_id,
+      "scope": scope,
+      "players_indexed": player_count,
+      "built_at": built_at,
+      "from_cache": False,
+    }
+
+  def _build_club_nif_map(
+    self, club_id: int, *, seasons: list[int] | None,
+    refetch_known: bool = False,
+  ) -> tuple[dict[str, int], int] | None:
+    """Build new {nif → license} entries for one club roster scope.
 
     SAV2 has no NIF-based search, so we pay one profile fetch per unique
-    license (parallelised, max 8 workers). Used internally by
-    find_license_by_nif and cached on the client per club.
+    uncached license (parallelised, max 8 workers). ``None`` means the roster
+    could not be listed and must not be marked fresh.
     """
     from concurrent.futures import ThreadPoolExecutor
 
     try:
-      roster = self.search_players(club=club_id, season=0)
+      if seasons is None:
+        rosters = [self.search_players(club=club_id, season=0)]
+      else:
+        rosters = [
+          self.search_players(club=club_id, season=season)
+          for season in seasons
+        ]
     except (SavError, ValueError):
       logger.debug("Could not list roster for club_id=%s", club_id, exc_info=True)
-      return {}
+      return None
 
     seen: set[int] = set()
     licenses: list[int] = []
-    for p in roster:
-      try:
-        lic = int(p.license)
-      except (ValueError, TypeError):
-        continue
-      if lic not in seen:
-        seen.add(lic)
-        licenses.append(lic)
+    for roster in rosters:
+      for p in roster:
+        try:
+          lic = int(p.license)
+        except (ValueError, TypeError):
+          continue
+        if lic not in seen:
+          seen.add(lic)
+          licenses.append(lic)
+    player_count = len(licenses)
     if not licenses:
-      return {}
+      return {}, 0
+
+    if not refetch_known:
+      known = self._cache.known_nif_licenses(licenses)
+      licenses = [license for license in licenses if license not in known]
+    if not licenses:
+      return {}, player_count
 
     def _fetch(lic: int) -> tuple[str, int]:
       try:
@@ -826,7 +936,7 @@ class SavClient:
       for nif_val, lic in pool.map(_fetch, licenses):
         if nif_val and lic:
           nif_map[nif_val] = lic
-    return nif_map
+    return nif_map, player_count
 
   def list_games(
     self,
@@ -1610,30 +1720,24 @@ class SavClient:
     """
     return player_registration_tiers(gender_id)
 
-  def get_current_season(self) -> Season:
-    """Return SAV2's current (active) season, straight from the season table.
+  def list_seasons(self) -> list[Season]:
+    """Return every valid season from SAV2's season table.
 
-    Hits ``incricoesdb.php?op=168``, whose ``arrayEpoca`` lists every season as
-    ``{"id", "descricao", "activa"}``; the current one carries ``activa == "1"``.
-    This is the authoritative source for the current season and — unlike the
-    old batch scrape — needs no registration batch to exist, so it resolves
-    off-season, before any batch for the new época has been opened. Prefer this
-    over reading the season off any other object (batches, games, players).
-    MCP/agent callers get the same values via the ``get_session_info`` tool.
+    The table is memoised for the lifetime of the client because season rows
+    are static within a run. Malformed rows are skipped individually.
 
     Returns:
-        The active Season (``id`` = epoca_id, ``label`` = "YYYY/YYYY+1",
-        ``start_year`` parsed from the label).
+        Every parsed Season in the order returned by SAV2.
 
     Raises:
         SavResponseError:   If login() has not run, the response is unparseable,
-            no active season is present, or its label is malformed.
+            or no season entry can be parsed.
         SavConnectionError: On network errors.
     """
     if self.session is None:
-      raise SavResponseError(
-        "Must call login() before get_current_season()"
-      )
+      raise SavResponseError("Must call login() before list_seasons()")
+    if self._seasons is not None:
+      return self._seasons
 
     payload = {
       "perfil": self.session.get("perfil", 0),
@@ -1653,29 +1757,87 @@ class SavClient:
         f"Could not parse seasons response (op=168): {raw[:200]!r}"
       ) from exc
 
-    seasons = data.get("arrayEpoca") or []
-    active = next((e for e in seasons if str(e.get("activa")) == "1"), None)
+    entries = data.get("arrayEpoca") if isinstance(data, dict) else []
+    if not isinstance(entries, list):
+      entries = []
+    seasons: list[Season] = []
+    malformed_active = None
+    for entry in entries:
+      try:
+        label = str(entry["descricao"])
+        seasons.append(Season(
+          id=int(entry["id"]),
+          label=label,
+          start_year=int(label.split("/", 1)[0]),
+          is_active=str(entry.get("activa")) == "1",
+          raw=entry,
+        ))
+      except (AttributeError, KeyError, TypeError, ValueError):
+        if isinstance(entry, dict) and str(entry.get("activa")) == "1":
+          malformed_active = entry
+
+    if not seasons:
+      if malformed_active is not None:
+        raise SavResponseError(
+          f"Could not parse active época {malformed_active!r} from op=168; "
+          "no season entries could be parsed."
+        )
+      raise SavResponseError(
+        "Seasons response (op=168) has no active época (activa=1); "
+        "no season entries could be parsed."
+      )
+
+    self._seasons = seasons
+    return self._seasons
+
+  def get_current_season(self) -> Season:
+    """Return SAV2's authoritative current (active) season.
+
+    Delegates to ``list_seasons()``, which reads ``incricoesdb.php?op=168``;
+    the current row carries ``activa == "1"``. Unlike the old batch scrape,
+    this needs no registration batch to exist, so it resolves off-season,
+    before any batch for the new época has been opened. Prefer this over
+    reading the season off any other object (batches, games, players).
+    MCP/agent callers get the same values via the ``get_session_info`` tool.
+
+    Returns:
+        The active Season (``id`` = epoca_id, ``label`` = "YYYY/YYYY+1",
+        ``start_year`` parsed from the label).
+
+    Raises:
+        SavResponseError:   If login() has not run, the response is unparseable,
+            or no active season is present.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before get_current_season()"
+      )
+
+    active = next(
+      (season for season in self.list_seasons() if season.is_active),
+      None,
+    )
     if active is None:
       raise SavResponseError(
         "Seasons response (op=168) has no active época (activa=1)."
       )
+    return active
 
-    label = str(active.get("descricao", ""))
-    try:
-      start_year = int(label.split("/", 1)[0])
-      epoca_id = int(active.get("id"))
-    except (ValueError, TypeError) as exc:
-      raise SavResponseError(
-        f"Could not parse active época {active!r} from op=168"
-      ) from exc
-
-    return Season(
-      id=epoca_id,
-      label=label,
-      start_year=start_year,
-      is_active=True,
-      raw=active,
+  def _recent_season_ids(self) -> list[int]:
+    """Return the active and immediately previous season IDs, newest-first."""
+    active = self.get_current_season()
+    previous = max(
+      (
+        season for season in self.list_seasons()
+        if season.start_year < active.start_year
+      ),
+      key=lambda season: season.start_year,
+      default=None,
     )
+    if previous is None:
+      return [active.id]
+    return [active.id, previous.id]
 
   def _list_subida_tier_options(self, internal_id: int) -> list[tuple[int, str]]:
     """Op=21 — return every selectable (tier_id, name) for the player's
@@ -2122,8 +2284,21 @@ class SavClient:
         f"Batch {batch.id} is not open (state={batch.state!r}); "
         "items can only be added to 'Em construção' batches."
       )
+
+    def _finish(result: int) -> int:
+      club_id = int(
+        getattr(batch, "club_id", 0)
+        or self.session.get("organizacao")
+        or 0
+      )
+      if club_id:
+        self._cache.clear_nif_index(club_id)
+      return result
+
     if batch.type_id == _REGISTRATIONS_TYPE_SUBIDA:
-      return self._add_player_to_subida_batch(batch, license, taxa_id=taxa_id)
+      return _finish(
+        self._add_player_to_subida_batch(batch, license, taxa_id=taxa_id)
+      )
     if batch.type_id == _REGISTRATIONS_TYPE_PRIMEIRA:
       missing = [
         label for label, value in [
@@ -2140,7 +2315,7 @@ class SavClient:
           f"1ª Inscrição (type-1) requires: {', '.join(missing)}. "
           f"Pass them as keyword arguments to add_player_to_registration_batch."
         )
-      return self._add_player_to_primeira_batch(
+      return _finish(self._add_player_to_primeira_batch(
         batch,
         name=name, birth_date=birth_date, gender_id=gender_id, nif=nif,
         id_type=id_type, id_number=id_number, id_expiry=id_expiry,
@@ -2158,7 +2333,7 @@ class SavClient:
         consent_data=consent_data,
         consent_communications=consent_communications,
         consent_marketing=consent_marketing,
-      )
+      ))
     if batch.type_id != _REGISTRATIONS_TYPE_REVALIDACAO:
       raise NotImplementedError(
         f"Transferência (type_id=3) batches are not supported; "
@@ -2171,7 +2346,7 @@ class SavClient:
         item["license"] for item in self.list_player_registration_batch_items(batch.id)
       }
       if license in enrolled:
-        return self._update_existing_player_in_batch(
+        return _finish(self._update_existing_player_in_batch(
           batch, license,
           id_type=id_type, id_number=id_number, id_expiry=id_expiry,
           telemovel=telemovel, telefone=telefone, email=email,
@@ -2179,7 +2354,7 @@ class SavClient:
           morada=morada, cod_postal=cod_postal,
           localidade_txt=localidade_txt,
           distrito_id=distrito_id, concelho_id=concelho_id,
-        )
+        ))
       raise ValueError(
         f"Licence {license} is not eligible for revalidation in batch "
         f"{batch.id} ({batch.tier} {batch.gender}). The server's eligible "
@@ -2208,7 +2383,7 @@ class SavClient:
       batch.type_id, batch.id, internal_id, license, step2_send,
     )
 
-    return self._commit_registration_step3(
+    return _finish(self._commit_registration_step3(
       batch, internal_id, license, step3_prefill,
       exam_date=exam_date, taxa_id=taxa_id,
       promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
@@ -2217,7 +2392,7 @@ class SavClient:
       consent_data=consent_data,
       consent_communications=consent_communications,
       consent_marketing=consent_marketing,
-    )
+    ))
 
   def _commit_registration_step3(
     self,
@@ -3371,30 +3546,43 @@ class SavClient:
       el = soup.find(id=elem_id)
       return (el.get("value", "") or "").strip() if el else ""
 
-    def select_value(elem_id: str) -> str:
+    def select_pair(elem_id: str) -> tuple[str, str]:
       sel = soup.find("select", id=elem_id)
       if not sel:
-        return ""
+        return "", ""
       opt = sel.find("option", selected=True)
-      return ((opt.get("value") or "").strip()) if opt else ""
+      if not opt:
+        return "", ""
+      return (opt.get("value") or "").strip(), opt.get_text(strip=True)
+
+    tipo, tipo_label = select_pair("tipoi")
+    nacional, nacional_label = select_pair("nacionalidade")
+    naturalidade, naturalidade_label = select_pair("paisNascimento")
+    distrito, distrito_label = select_pair("distrito")
+    concelho, concelho_label = select_pair("concelho")
 
     profile = {
       "nome":           raw.get("nome") or text_value("nome"),
       "nasc":           text_value("datenasc"),
-      "tipo":           select_value("tipoi"),
+      "tipo":           tipo,
+      "tipo_label":     tipo_label,
       "numi":           text_value("numid"),
       "dataval":        text_value("dateval"),
       "nif":            text_value("nif"),
       "tele":           text_value("telem"),
       "telef":          text_value("telefo"),
       "email":          text_value("email"),
-      "nacional":       select_value("nacionalidade"),
-      "naturalidade":   select_value("paisNascimento"),
+      "nacional":       nacional,
+      "nacional_label": nacional_label,
+      "naturalidade":   naturalidade,
+      "naturalidade_label": naturalidade_label,
       "morada":         text_value("morada"),
       "codpostal":      text_value("cod2"),
       "localidade_txt": text_value("localidadestring"),
-      "distrito":       select_value("distrito"),
-      "concelho":       select_value("concelho"),
+      "distrito":       distrito,
+      "distrito_label": distrito_label,
+      "concelho":       concelho,
+      "concelho_label": concelho_label,
     }
     # Empty values dropped so they don't shadow op=35's data on merge.
     return {k: v for k, v in profile.items() if v}
@@ -4422,9 +4610,10 @@ class SavClient:
     return self._cache.get_clubs(self._fetch_and_enrich_clubs, association=association)
 
   def invalidate_cache(self) -> None:
-    """Clear all locally cached data (clubs, associations)."""
+    """Clear all locally cached data."""
     self._cache.invalidate()
     self._invalidate_batch_memo()
+    self._seasons = None
 
   def _fetch_associations(self) -> list[Club]:
     import re

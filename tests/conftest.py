@@ -19,7 +19,9 @@ def client():
 @pytest.fixture(scope="session")
 def sample_player(client):
   club_id = int(client.session.get("organizacao") or 0)
-  players = client.search_players(club=club_id)
+  # All seasons: a freshly rolled-over season has no roster yet, and skipping
+  # every sample_player test each August hides real regressions.
+  players = client.search_players(club=club_id, season=0)
   if not players:
     pytest.skip("Live SAV account has no visible players to use as a sample")
   return players[0]

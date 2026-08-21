@@ -19,7 +19,8 @@ class TestSearchPlayers:
 
   def test_returns_players_from_live_search(self, client):
     club_id = int(client.session.get("organizacao") or 0)
-    results = client.search_players(club=club_id)
+    # Search all seasons because a newly rolled-over season may have no roster yet.
+    results = client.search_players(club=club_id, season=0)
 
     assert isinstance(results, list)
     assert results
@@ -31,7 +32,7 @@ class TestSearchPlayers:
     assert first.club
 
   def test_can_find_player_by_license(self, client, sample_player):
-    results = client.search_players(license=sample_player.license, club=0)
+    results = client.search_players(license=sample_player.license, season=0, club=0)
 
     assert results
     assert any(player.id == sample_player.id for player in results)
@@ -67,6 +68,7 @@ class TestSearchPlayers:
 
     results = client.search_players(
       license=sample_player.license,
+      season=0,
       club=0,
       association=association.id,
     )

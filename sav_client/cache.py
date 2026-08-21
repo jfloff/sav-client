@@ -115,6 +115,18 @@ class Cache:
         cached_at REAL NOT NULL
       )
     """)
+    # A license↔NIF pair is immutable, but a club roster's completeness is not:
+    # new enrolments can appear after a scan. Scope markers therefore carry a
+    # TTL even though the license_nif rows themselves do not.
+    con.execute("""
+      CREATE TABLE IF NOT EXISTS nif_index (
+        club_id      INTEGER NOT NULL,
+        scope        TEXT    NOT NULL,
+        built_at     REAL    NOT NULL,
+        player_count INTEGER NOT NULL,
+        PRIMARY KEY (club_id, scope)
+      )
+    """)
     for col, typedef in [
       ("full_name", "TEXT NOT NULL DEFAULT ''"),
       ("code",      "TEXT NOT NULL DEFAULT ''"),
@@ -307,6 +319,77 @@ class Cache:
     finally:
       con.close()
 
+  def known_nif_licenses(self, licenses: list[int]) -> set[int]:
+    """Return the licences that already have a cached NIF row."""
+    if not licenses:
+      return set()
+    known: set[int] = set()
+    con = self._db()
+    try:
+      for start in range(0, len(licenses), 999):
+        chunk = licenses[start:start + 999]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = con.execute(
+          f"SELECT license FROM license_nif WHERE license IN ({placeholders})",
+          chunk,
+        ).fetchall()
+        known.update(row[0] for row in rows)
+      return known
+    finally:
+      con.close()
+
+  def get_nif_index(
+    self, club_id: int, scope: str, ttl: float,
+  ) -> tuple[float, int] | None:
+    """Return a fresh (built_at, player_count) marker, or None."""
+    now = time.time()
+    con = self._db()
+    try:
+      row = con.execute(
+        "SELECT built_at, player_count FROM nif_index "
+        "WHERE club_id = ? AND scope = ?",
+        (club_id, scope),
+      ).fetchone()
+      if row and (now - row[0]) < ttl:
+        return row[0], row[1]
+      return None
+    finally:
+      con.close()
+
+  def record_nif_index(
+    self, club_id: int, scope: str, player_count: int,
+  ) -> None:
+    """Record that a club's NIF index scope was built successfully."""
+    con = self._db()
+    try:
+      con.execute(
+        "INSERT OR REPLACE INTO nif_index "
+        "(club_id, scope, built_at, player_count) VALUES (?, ?, ?, ?)",
+        (club_id, scope, time.time(), player_count),
+      )
+      con.commit()
+    finally:
+      con.close()
+
+  def clear_nif_index(
+    self, club_id: int | None = None, scope: str | None = None,
+  ) -> None:
+    """Clear one scope, every scope for a club, or every NIF index marker."""
+    con = self._db()
+    try:
+      if club_id is None:
+        con.execute("DELETE FROM nif_index")
+      elif scope is None:
+        con.execute("DELETE FROM nif_index WHERE club_id = ?", (club_id,))
+      else:
+        con.execute(
+          "DELETE FROM nif_index WHERE club_id = ? AND scope = ?",
+          (club_id, scope),
+        )
+      con.commit()
+    finally:
+      con.close()
+
   def get_batch_id(self, number: str) -> int | None:
     """Return the internal batch_id for a human-visible batch number, or None."""
     con = self._db()
@@ -397,6 +480,7 @@ class Cache:
       con.execute("DELETE FROM associations")
       con.execute("DELETE FROM concelhos")
       con.execute("DELETE FROM games")
+      con.execute("DELETE FROM nif_index")
       con.execute("DELETE FROM license_to_id")
       con.execute("DELETE FROM license_nif")
       con.execute("DELETE FROM batch_number_to_id")
@@ -404,4 +488,3 @@ class Cache:
       con.commit()
     finally:
       con.close()
-

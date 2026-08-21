@@ -218,7 +218,13 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 
 ### Players
 - `search_players(...)`, `get_player(license, ...)`, and `find_player_by_nif(nif, ...)` accept `with_details=false` (default). Pass `with_details=true` to issue one extra `jogadoresdb.php?op=2` request per player and add `photo_url` and `mobile_phone` (N+1).
-- `find_player_by_nif(nif, club_id?, with_details?)` is the inverse of `get_player(license=...)`: resolves a player by Portuguese NIF (9 digits) against the club roster. `club_id` defaults to the session's own club. Returns null when the NIF is malformed (not 9 digits) or no roster player matches. Useful for external importers (e.g. federation signup form) that key players by NIF.
+- `get_player(license, ...)` and `find_player_by_nif(nif, ...)` use the same season ladder when no explicit season is supplied: current epoch first, previous epoch second, then `season=0` (all seasons) as the last resort. The first non-empty rung wins, and its newest season row is returned. `status` is passed through unchanged on every rung.
+- `status` is a **client-side** filter over a per-player eligibility flag — it is not "was registered in that season". A player can carry `active=true` on a row from many seasons ago, while a genuinely inactive player is filtered out at *every* rung and resolves to null. Pass `status="all"` to reach those. (Measured on one club: 612 of 684 all-time licences are active, 72 are not.)
+- **Widened null semantics:** these tools can now return a player's most recent active row even when their licence lapsed two or more seasons ago. `null` means no matching row was found by the full ladder; it no longer means "not currently at this club." Parent-onboarding code must not treat a non-null result as proof of current enrollment; see the onboarding guidance below.
+- `find_player_by_nif(nif, club_id?, with_details?)` is the inverse of `get_player(license=...)`: resolves a player by Portuguese NIF (9 digits) against the club roster. `club_id` defaults to the session's own club. Returns null when the NIF is malformed or no player matches after the season ladder. Useful for external importers (e.g. federation signup form) that key players by NIF.
+- `lookup_player(nif?, license?, club_id?, status="active", with_profile=false, with_details=false)` accepts exactly one of NIF or licence and uses the same ladder. `with_profile=true` adds the SAV profile under a nested `profile` key, keeping profile and roster field provenance separate.
+- `warm_nif_index(club_id?, scope="recent", force=false)` pre-pays NIF-index work in the node-local SQLite cache. `scope="full"` is offline-only and can take minutes for a large club: it performs one profile POST per not-yet-indexed licence across all seasons, at 8-way concurrency, and will likely outlast a default MCP timeout. Use it from an importer or nightly job, not an interactive request.
+- Any role may call `warm_nif_index`, including with `force=true` / `scope="full"`. `authz.toml` cannot gate individual parameter values, so the downstream wrapper is responsible for rate-limiting expensive scans.
 
 ## Error handling
 
@@ -269,7 +275,7 @@ On a parameter's JSON Schema property inside `inputSchema`:
 
 | Tier | Meaning | Examples |
 |------|---------|----------|
-| `read` | Pure lookups, no SAV2 state change (also covers OCR-only steps that cache nothing in SAV2). | `search_players`, `get_game_sheet`, `parse_enrollment_forms`, `get_artifact_subject_claim`. |
+| `read` | Pure lookups, no SAV2 state change (also covers OCR-only steps that cache nothing in SAV2). | `search_players`, `get_game_sheet`, `parse_enrollment_forms`, `list_player_documents`. |
 | `write` | Mutates SAV2 (create / update). | `submit_enrollment`, `update_enrollment`, `upload_player_document`, `create_batch`. |
 | `delete` | Destructive (removes records or files). Conventionally `roles = []` (admin-only). | `delete_enrollment`, `delete_batch`, `delete_player_document`. |
 
@@ -293,12 +299,14 @@ caller asks to invoke T with args:
   else:                                                 deny
 ```
 
+Every `subject_license` parameter across MCP tools is an `int`, and every `subject_nif` parameter is a string of exactly 9 digits. The wrapper MUST therefore hold `caller.allowed["license"]` as ints and `caller.allowed["nif"]` as strings, and compare like-for-like. A type mismatch silently fails the subject check (`"301772" in {301772}` is `False` in Python), incorrectly denying a parent access to their own dependent.
+
 The `caller.allowed` sets are wrapper-owned state, hydrated at onboarding:
 
 - **Player (≥18 self-enrolling):** `caller.allowed = {"license": [own_license?], "nif": [own_nif]}`. `caller.nif` is captured at onboarding; license appears once known.
 - **Parent:** `caller.allowed = {"license": [dep.license for dep], "nif": [dep.nif for dep]}` over the registered dependents `[{nif, license?, name, birth_date}, ...]`. New dependents have license `None` until 1ª Inscrição succeeds, after which the wrapper writes the assigned license (returned in `submit_enrollment`'s response payload) back into the matching dependent row.
 
-The wrapper SHOULD use `find_player_by_nif` and `get_player_profile` during onboarding to verify a parent's claim (match `nome_pai` / `nome_mae` before adding a dependent row); those calls happen with the wrapper's own SAV session, not on behalf of the end user.
+The wrapper SHOULD use `find_player_by_nif` and `get_player_profile` during onboarding to verify a parent's claim (match `nome_pai` / `nome_mae` before adding a dependent row); those calls happen with the wrapper's own SAV session, not on behalf of the end user. **Do not use a non-null `find_player_by_nif` result as proof that the player is currently at the club:** as warned in “Players” above, its season ladder now returns lapsed players too. Check the returned season/active fields or perform an explicitly current-season search when current enrollment matters.
 
 ### Policy
 

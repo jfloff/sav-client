@@ -1,44 +1,53 @@
-"""MCP tests for find_player_by_nif — NIF → player resolution.
+"""Offline MCP tests for NIF → player resolution across season rungs."""
 
-Focus: the `status` param. The default ("active") stays scoped to the
-current season; "all" broadens to every season so a not-yet-renewed /
-pending player still resolves (and keeps their tier) instead of None.
-"""
 from sav_client.models import Player
 from sav_mcp import server as server_module
 
 
-def _player(license: str, tier: str, active: bool = True) -> Player:
+def _player(
+  license: str,
+  tier: str,
+  *,
+  season: str = "2025/2026",
+  active: bool = True,
+) -> Player:
   return Player(
     id=int(license), license=license, name="Atleta Teste",
-    association="AB Test", club="Test Club",
-    tier=tier, gender="Masculino",
-    birth_date="2014-06-08", nationality="Portuguesa", status="FBP",
-    season="2025/2026", active=active,
+    association="AB Test", club="Test Club", tier=tier,
+    gender="Masculino", birth_date="2014-06-08",
+    nationality="Portuguesa", status="FBP", season=season, active=active,
   )
 
 
 class _StubClient:
-  """Captures search_players calls and resolves a single NIF → licence."""
+  """Capture searches and resolve a single NIF to a licence."""
 
-  def __init__(self, *, club_id: int = 200, license: int | None = 301772,
-               responses: dict[str, list[Player]] | None = None):
+  def __init__(
+    self,
+    *,
+    club_id: int = 200,
+    license: int | None = 301772,
+    responses: dict[int | None, list[Player]] | None = None,
+  ):
     self.session = {"epoca_id": 100, "organizacao": club_id}
     self._license = license
     self._responses = responses or {}
     self.calls: list[dict] = []
+
+  def _recent_season_ids(self):
+    return [100, 99]
 
   def find_license_by_nif(self, nif, *, club_id=None):
     return self._license
 
   def search_players(self, **kwargs):
     self.calls.append(kwargs)
-    return list(self._responses.get(kwargs.get("status"), []))
+    return list(self._responses.get(kwargs.get("season"), []))
 
 
-def test_active_default_scopes_to_current_season(monkeypatch):
-  p = _player("301772", "Sub 14")
-  stub = _StubClient(responses={"active": [p]})
+def test_active_default_checks_current_season_first(monkeypatch):
+  current = _player("301772", "Sub 14")
+  stub = _StubClient(responses={None: [current]})
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   result = server_module.find_player_by_nif("123456789")
@@ -46,25 +55,37 @@ def test_active_default_scopes_to_current_season(monkeypatch):
   assert result is not None
   assert result["license"] == "301772"
   assert result["tier"] == "Sub 14"
-  call = stub.calls[0]
-  assert call["status"] == "active"
-  assert call["season"] is None  # current epoch
+  assert [call["season"] for call in stub.calls] == [None]
+  assert stub.calls[0]["status"] == "active"
 
 
-def test_all_searches_every_season_and_keeps_tier(monkeypatch):
-  # Not-yet-renewed player: absent from the active current-season roster,
-  # present (with their tier) when scanning all seasons.
-  pending = _player("301772", "Sub 16", active=False)
-  stub = _StubClient(responses={"active": [], "all": [pending]})
+def test_status_all_uses_ladder_instead_of_forcing_all_seasons(monkeypatch):
+  pending = _player(
+    "301772", "Sub 16", season="2024/2025", active=False,
+  )
+  stub = _StubClient(responses={99: [pending]})
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  assert server_module.find_player_by_nif("123456789") is None
-
   result = server_module.find_player_by_nif("123456789", status="all")
+
   assert result is not None
   assert result["tier"] == "Sub 16"
-  assert stub.calls[-1]["status"] == "all"
-  assert stub.calls[-1]["season"] == 0  # all seasons
+  assert [call["season"] for call in stub.calls] == [None, 99]
+  assert [call["status"] for call in stub.calls] == ["all", "all"]
+
+
+def test_lapsed_active_player_resolves_on_all_seasons_rung(monkeypatch):
+  lapsed = _player("301772", "Sub 18", season="2022/2023")
+  stub = _StubClient(responses={0: [lapsed]})
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.find_player_by_nif("123456789", status="active")
+
+  assert result is not None
+  assert result["season"] == "2022/2023"
+  assert result["tier"] == "Sub 18"
+  assert [call["season"] for call in stub.calls] == [None, 99, 0]
+  assert all(call["status"] == "active" for call in stub.calls)
 
 
 def test_unresolved_nif_returns_none(monkeypatch):
@@ -72,7 +93,7 @@ def test_unresolved_nif_returns_none(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   assert server_module.find_player_by_nif("123456789", status="all") is None
-  assert stub.calls == []  # never reaches search_players
+  assert stub.calls == []
 
 
 def test_invalid_nif_length_returns_none(monkeypatch):
@@ -80,3 +101,4 @@ def test_invalid_nif_length_returns_none(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   assert server_module.find_player_by_nif("123") is None
+  assert stub.calls == []
