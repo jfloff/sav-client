@@ -62,7 +62,7 @@ SAV_BASE_URL=https://sav2.fpb.pt   # optional, this is the default
 Enrollment flows OCR the mod1 / exame médico PDFs through Google Document AI
 (via [`sav-parsers`](https://github.com/jfloff/sav-parsers)) and stamp every
 mod1 upload with the club stamp. You need a GCP project with Document AI
-processors provisioned plus a service-account key:
+processors provisioned, plus credentials that can reach them:
 
 ```
 DOCAI_PROJECT_ID=<your-gcp-project>
@@ -71,10 +71,21 @@ DOCAI_CLASSIFIER_PROCESSOR_ID=<processor-id>
 DOCAI_EXAME_MEDICO_PROCESSOR_ID=<processor-id>
 DOCAI_FPB_MODELO_1_PROCESSOR_ID=<processor-id>
 DOCAI_FPB_MODELO_4_PROCESSOR_ID=<processor-id>
-GOOGLE_APPLICATION_CREDENTIALS=./credentials.json
 
 CLUB_STAMP_PATH=/path/to/carimbo.png
 ```
+
+Authenticate with Application Default Credentials rather than a checked-out
+service-account key:
+
+```
+gcloud auth application-default login
+```
+
+Leave `GOOGLE_APPLICATION_CREDENTIALS` unset so google-auth picks those up. If
+you do point it at a service-account key, that account needs
+`documentai.processors.processOnline` on `DOCAI_PROJECT_ID` — a key issued for a
+different project fails with a 403 that reads as "or it may not exist".
 
 See the [`sav-parsers` README](https://github.com/jfloff/sav-parsers) for
 how to set up the Document AI processors. `CLUB_STAMP_PATH` is enforced at
