@@ -216,6 +216,10 @@ class SavClient:
     self._cache = Cache()
     self._seasons: list[Season] | None = None
 
+    # Lazily-built, memoized club name->id map used to resolve club_id on
+    # federation-wide player searches (club=0); see _resolve_club_id_by_name.
+    self._club_ids_by_name: dict[str, int] | None = None
+
     # Short-TTL in-process memo for list_player_registration_batches(), keyed
     # by season. A single enrollment submit re-lists batches 3-4× back-to-back;
     # this collapses those into one HTTP call. Guarded by a lock because the
@@ -716,9 +720,18 @@ class SavClient:
     players = self._parse_players_response(html)
     # Search rows carry the club name but no id column; stamp the club we
     # scoped to so every row is attributable to its source club (the fan-out
-    # paths — club list, all-clubs — all funnel through here per club).
+    # paths — club list, all-clubs — all funnel through here per club). A
+    # federation-wide search (club=0, used by the licence short-circuit in
+    # search_players) has no scoped club to stamp, so instead resolve each
+    # row's club name to an id via the cached club list (exact name match).
+    # 0 in club_id then means "unresolved", not "no club".
     if club:
       players = [_dc_replace(p, club_id=club) for p in players]
+    elif players:
+      players = [
+        _dc_replace(p, club_id=self._resolve_club_id_by_name(p.club))
+        for p in players
+      ]
     # Opportunistic license → internal id cache fill (persisted in SQLite).
     pairs: list[tuple[int, int]] = []
     for p in players:
@@ -728,6 +741,30 @@ class SavClient:
         continue
     self._cache.record_player_ids(pairs)
     return players
+
+  def _resolve_club_id_by_name(self, club_name: str) -> int:
+    """Resolve a search row's club name to its id via the full club list.
+
+    Used only for federation-wide searches (club=0), which return the club
+    name but no id column. The name→id map is built lazily from
+    ``list_clubs(all_associations=True)`` (already cached with a 7-day TTL)
+    and memoized on the instance so repeated federation-wide searches in one
+    process don't rebuild it. Fails open: any error, or a name with no exact
+    match, returns 0 ("unresolved") rather than failing the search.
+    """
+    if self._club_ids_by_name is None:
+      try:
+        self._club_ids_by_name = {c.name: c.id for c in self.list_clubs(all_associations=True)}
+      except (SavError, ValueError):
+        # Deliberately not memoized: caching the failure would pin every later
+        # row in this process to "unresolved" over one transient error. The map
+        # is rebuilt on the next federation-wide search instead.
+        logger.debug("Could not build club name->id map; leaving club_id unresolved", exc_info=True)
+        return 0
+    club_id = self._club_ids_by_name.get(club_name, 0)
+    if not club_id:
+      logger.debug("Could not resolve club name %r to a club id", club_name)
+    return club_id
 
   def get_player_detail(self, player_id: int, *, with_details: bool = False) -> Player:
     """

@@ -1,7 +1,7 @@
 import pytest
 
 from sav_client import SavClient
-from sav_client.models import Player
+from sav_client.models import Club, Player
 from sav_client.exceptions import SavResponseError
 
 
@@ -314,13 +314,15 @@ class TestSearchPlayers:
     assert captured["payload"]["jc_associacao"] == ""
 
 
-def _player_row(tier: str, gender: str, *, db_id: int = 1, license: str = "100") -> str:
+def _player_row(
+  tier: str, gender: str, *, db_id: int = 1, license: str = "100", club_name: str = "Club X",
+) -> str:
   """One search-result <tr> with the 12 columns _parse_players_response reads."""
   return (
     "<tr>"
     f"<td><button onclick=\"seeJogador({db_id}, 1)\"></button></td>"
     "<td><i class='fa-color-activo'></i></td>"
-    f"<td>{license}</td><td>Player Name</td><td>AB X</td><td>Club X</td>"
+    f"<td>{license}</td><td>Player Name</td><td>AB X</td><td>{club_name}</td>"
     f"<td>{tier}</td><td>{gender}</td>"
     "<td>2025/2026</td><td>FBP</td><td>2010-01-01</td><td>Portuguesa</td>"
     "</tr>"
@@ -358,6 +360,97 @@ class TestClubIdStamping:
     by_id = {p.id: p for p in results}
     assert by_id[10].club_id == 10
     assert by_id[11].club_id == 11
+
+
+class TestClubZeroClubIdResolution:
+  """A federation-wide search (club=0) carries no scoped club id to stamp, so
+  club_id is resolved by matching the row's club name against the club list."""
+
+  def _client(self):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
+    return client
+
+  def test_club_zero_search_resolves_club_id_from_club_list(self, monkeypatch):
+    client = self._client()
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', club_name='Chamusca')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    monkeypatch.setattr(
+      client, "list_clubs",
+      lambda **kw: [Club(id=42, name="Chamusca"), Club(id=43, name="Other")],
+    )
+
+    [player] = client._search_players_single(club=0)
+
+    assert player.club_id == 42
+    assert player.club == "Chamusca"
+
+  def test_club_scoped_search_never_calls_list_clubs(self, monkeypatch):
+    client = self._client()
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    monkeypatch.setattr(
+      client, "list_clubs",
+      lambda **kw: (_ for _ in ()).throw(AssertionError("club-scoped search must not call list_clubs")),
+    )
+
+    [player] = client._search_players_single(club=789)
+
+    assert player.club_id == 789
+
+  def test_empty_club_zero_result_never_calls_list_clubs(self, monkeypatch):
+    client = self._client()
+    html = "<table><tbody></tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    monkeypatch.setattr(
+      client, "list_clubs",
+      lambda **kw: (_ for _ in ()).throw(AssertionError("empty result must not call list_clubs")),
+    )
+
+    results = client._search_players_single(club=0)
+
+    assert results == []
+
+  def test_unmatched_club_name_leaves_club_id_zero(self, monkeypatch):
+    client = self._client()
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', club_name='Unknown Club')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    monkeypatch.setattr(client, "list_clubs", lambda **kw: [Club(id=42, name="Chamusca")])
+
+    [player] = client._search_players_single(club=0)
+
+    assert player.club_id == 0
+
+  def test_list_clubs_raising_leaves_club_id_zero(self, monkeypatch):
+    client = self._client()
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', club_name='Chamusca')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+
+    def raise_error(**kw):
+      raise SavResponseError("boom")
+
+    monkeypatch.setattr(client, "list_clubs", raise_error)
+
+    [player] = client._search_players_single(club=0)
+
+    assert player.club_id == 0
+
+  def test_club_name_map_is_built_once_across_two_searches(self, monkeypatch):
+    client = self._client()
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', club_name='Chamusca')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    calls = []
+
+    def fake_list_clubs(**kw):
+      calls.append(kw)
+      return [Club(id=42, name="Chamusca")]
+
+    monkeypatch.setattr(client, "list_clubs", fake_list_clubs)
+
+    client._search_players_single(club=0)
+    client._search_players_single(club=0)
+
+    assert len(calls) == 1
 
 
 class TestPlayerSerializer:
