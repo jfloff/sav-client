@@ -484,12 +484,14 @@ class SavClient:
       # row (Chamusca Basket Clube, not the session club 2430), while the same
       # licence with club=2430 returned nothing, so nr_clube is respected and 0
       # really means "all clubs". The fan-out below still exists for broad
-      # searches, where the single-request form is crippled: results are capped
-      # at 48 with numpag ignored (pages 1-3 return the identical rows), and
-      # jc_associacao is ignored when nr_clube=0. Neither limit binds here — a
-      # licence search returns at most one row — but the association one is why
-      # this short-circuit requires association is None: scoping a search to an
-      # association only works via the fan-out.
+      # searches. The verified reason is that jc_associacao is ignored when
+      # nr_clube=0 — an association-scoped probe returned rows from many other
+      # associations — so the fan-out is the only way to honour `association`,
+      # which is why this short-circuit requires association is None. A broad
+      # search may ALSO be result-capped (a name='Silva' probe returned the
+      # same 48 rows on pages 1-3), but `name` is a prefix match so 48 may just
+      # be the true total; treat the cap as unverified. Neither concern binds
+      # here: a licence search returns at most one row.
       if license and association is None:
         results = self._search_players_single(
           association=None, club=0, page=1, **filters,
