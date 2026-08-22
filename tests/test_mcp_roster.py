@@ -81,21 +81,6 @@ class TestNextSeasonSub14Masculinos:
     assert result["step"] == "club + all"
     assert len(stub.calls) == 2  # active failed, all succeeded
 
-  def test_club_empty_falls_back_to_federation(self, monkeypatch):
-    """Club pool is empty; the wider federation pool has the cohort."""
-    p = _player("301774", "Atleta 2014", "Sub 14", "2014-09-01", active=True)
-    stub = _StubClient(responses={(0, "all"): [p]})
-    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
-
-    result = server_module.roster_for_escalao(tier_id=5, gender_id=1, when="next")
-
-    assert result["source"] == "projection_by_birth_year"
-    assert result["step"] == "federation + all"
-    assert len(stub.calls) == 3
-    # Last call must be the federation-wide one.
-    assert stub.calls[-1]["club"] == 0
-    assert stub.calls[-1]["status"] == "all"
-
   def test_all_empty_returns_empty_projection_not_none(self, monkeypatch):
     """No known player projects into the cohort: still a projection, never 'none'."""
     stub = _StubClient(responses={})
@@ -106,7 +91,9 @@ class TestNextSeasonSub14Masculinos:
     assert result["is_projection"] is True
     assert result["source"] == "projection_by_birth_year"
     assert result["players"] == []
-    assert result["step"] == "federation + all"  # last step attempted
+    assert result["step"] == "club + all"  # last step attempted
+    assert len(stub.calls) == 2  # club + active, club + all — never club=0
+    assert all(call["club"] != 0 for call in stub.calls)
 
 
 class TestWhenCurrent:
@@ -122,6 +109,20 @@ class TestWhenCurrent:
     assert result["is_projection"] is False
     assert result["source"] == "club"  # actual enrollment, not a projection
     assert stub.calls[0]["season"] == 100  # epoca_id unchanged
+
+  def test_all_empty_returns_none_source_not_federation(self, monkeypatch):
+    """Current season, both club steps empty: source is 'none', never 'federation'."""
+    stub = _StubClient(responses={})
+    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+    result = server_module.roster_for_escalao(tier_id=5, gender_id=1, when="current")
+
+    assert result["is_projection"] is False
+    assert result["source"] == "none"
+    assert result["players"] == []
+    assert result["step"] == "club + all"
+    assert len(stub.calls) == 2
+    assert all(call["club"] != 0 for call in stub.calls)
 
 
 class TestExplicitSeasonYear:
@@ -225,19 +226,25 @@ class TestInputValidation:
 
 
 class TestExplicitClubId:
-  def test_zero_club_skips_club_cascade(self, monkeypatch):
-    p = _player("301777", "X", "Sub 14", "2014-01-01")
-    stub = _StubClient(responses={(0, "all"): [p]})
+  def test_zero_club_raises_without_searching(self, monkeypatch):
+    stub = _StubClient()
     monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-    result = server_module.roster_for_escalao(
-      tier_id=5, gender_id=1, when="next", club_id=0,
-    )
+    with pytest.raises(ValueError, match="single-club"):
+      server_module.roster_for_escalao(
+        tier_id=5, gender_id=1, when="next", club_id=0,
+      )
 
-    assert result["source"] == "projection_by_birth_year"
-    assert result["step"] == "federation + all"
-    assert len(stub.calls) == 1  # only the federation step
-    assert stub.calls[0]["club"] == 0
+    assert stub.calls == []  # no search issued at all
+
+  def test_no_session_club_and_no_club_id_raises(self, monkeypatch):
+    stub = _StubClient(club_id=0)
+    monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+    with pytest.raises(ValueError, match="single-club"):
+      server_module.roster_for_escalao(tier_id=5, gender_id=1, when="next")
+
+    assert stub.calls == []
 
   def test_explicit_other_club_uses_that_club_in_cascade(self, monkeypatch):
     p = _player("301778", "X", "Sub 14", "2014-01-01")

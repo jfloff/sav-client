@@ -1059,15 +1059,16 @@ def roster_for_escalao(
     próxima época?") so the LLM doesn't have to compute birth-year arithmetic,
     handle the season transition, or override status filters by hand. Birth
     years are resolved deterministically from ``tier_id`` + the target
-    season's start year, and the tool runs a fallback cascade so empty
-    club-scoped results silently expand:
+    season's start year, and the tool runs a fallback cascade over the club's
+    own roster so an empty active-status result silently expands:
 
         (a) session/given club + status="active"
         (b) session/given club + status="all"           ← not-yet-renewed
-        (c) club_id=0 + status="all" (federation)       ← wider fallback
 
     The first non-empty step wins; the ``step`` label tells the caller which
-    path matched.
+    path matched. A roster is single-club, so this tool never widens beyond
+    the club; call ``search_players(club_id=0, ...)`` directly for a
+    federation-wide query.
 
     The target season comes from ``season_year`` when given (an absolute season,
     e.g. ``2020`` for "2020/2021"), otherwise from ``when`` (``"current"`` or
@@ -1075,7 +1076,7 @@ def roster_for_escalao(
 
     - **Past or current season** → actual enrollment. The tool queries that
       season's own SAV2 epoch and reports ``is_projection=False`` with
-      ``source`` in {``"club"``, ``"federation"``, ``"none"``}.
+      ``source`` in {``"club"``, ``"none"``}.
     - **Future season** (``when="next"`` or a ``season_year`` ahead of today)
       → a *projection*, not a query for next-season enrollment: enrollment only
       ever exists for the current season, so there is nothing to fetch. The
@@ -1103,8 +1104,8 @@ def roster_for_escalao(
             actual enrollment; a future year is a birth-year projection just
             like ``when="next"``.
         club_id: Defaults to the session's club. Pass an explicit ID to query
-            another club; the cascade still applies. Pass 0 to skip straight
-            to federation-wide.
+            another club; the cascade still applies. Must resolve to a
+            non-zero club — a roster is single-club.
 
     Returns:
         {
@@ -1115,7 +1116,7 @@ def roster_for_escalao(
           "birth_years": list[int] | None,  # None for open-ended tiers (Sénior)
           "is_projection": bool,    # True for a future season (by birth year)
           "source": str,            # "projection_by_birth_year" (future season)
-                                    #   | "club" | "federation" | "none"
+                                    #   | "club" | "none"
           "step": str,              # short label of the matching cascade step
           "players": list[dict],
         }
@@ -1124,7 +1125,9 @@ def roster_for_escalao(
         ValueError: ``tier_id`` not valid for ``gender_id``; ``when`` not in
             {"current", "next"}; tier's birth-year window not modelled
             (Masters/Veteranos, BCR — query ``search_players`` with ``tier``
-            directly).
+            directly); ``club_id`` resolves to 0 (a roster is single-club;
+            use ``search_players(club_id=0, ...)`` for a federation-wide
+            query).
         SavResponseError: Cannot resolve the current season's start year.
     """
     if when not in ("current", "next"):
@@ -1167,18 +1170,21 @@ def roster_for_escalao(
         )
 
     effective_club: int = _effective_club(client, club_id)
+    if not effective_club:
+        raise ValueError(
+            "roster_for_escalao requires a club_id (a roster is single-club; "
+            "the session club could not be resolved). Use "
+            "search_players(club_id=0, ...) for a federation-wide query."
+        )
 
-    cascade: list[tuple[str, str, dict[str, Any]]] = []
-    if effective_club != 0:
-        cascade.append(("club + active", "club", {
+    cascade: list[tuple[str, str, dict[str, Any]]] = [
+        ("club + active", "club", {
             "club": effective_club, "status": "active",
-        }))
-        cascade.append(("club + all", "club", {
+        }),
+        ("club + all", "club", {
             "club": effective_club, "status": "all",
-        }))
-    cascade.append(("federation + all", "federation", {
-        "club": 0, "status": "all",
-    }))
+        }),
+    ]
 
     common: dict[str, Any] = {
         "gender": gender_id,
