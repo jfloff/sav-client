@@ -308,6 +308,38 @@ def _most_recent(players: list[Player]) -> Player | None:
     return max(players, key=lambda player: player.season or "")
 
 
+# Memoises "does the session club have any current-season roster at all?" so
+# the extra request behind it is paid once per (club, epoch), not per rung or
+# per lookup. Keyed by epoch so a rollover invalidates the answer by itself.
+_SEASON_EMPTY_CACHE: dict[tuple[int, int], bool] = {}
+
+
+def _own_current_season_empty(client: SavClient, own_club: int) -> bool:
+    """Return True when ``own_club`` has no current-season roster at all.
+
+    Deliberately a real roster query (``search_players`` with no licence
+    filter, current season by default) rather than an inference from a licence
+    probe missing: a missing licence says nothing about whether the season has
+    been populated. Fails open — any error answers False ("not empty") so the
+    caller runs its rung normally, the same trade as the broad ``except``
+    around ``_recent_season_ids()`` below: this is only an optimisation.
+    """
+    key = (own_club, int(client.session.get("epoca_id") or 0))
+    cached = _SEASON_EMPTY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        roster = client.search_players(club=own_club)
+    except Exception:
+        logger.debug(
+            "Could not check the own-club current-season roster", exc_info=True,
+        )
+        return False
+    empty = not roster
+    _SEASON_EMPTY_CACHE[key] = empty
+    return empty
+
+
 def _resolve_rows(
     client: SavClient,
     *,
@@ -327,6 +359,10 @@ def _resolve_rows(
     skips the probe — there a stale own-club row from an older season would
     outrank the player's current row at the club they transferred to, which is
     exactly the case federation-wide search exists to answer.
+
+    Post-rollover the current-season rung is skipped entirely for ``club_id=0``
+    when the session club's own current season is still empty — see the comment
+    on that skip for the correctness case this deliberately trades away.
     """
     own_club = (
         int(client.session.get("organizacao") or 0) if club_id == 0 else 0
@@ -353,9 +389,24 @@ def _resolve_rows(
     # Keep the common current-enrollment case to one query. A player last
     # enrolled in the previous season costs two; the full sweep is deliberately
     # the last resort.
-    current = search_rung(None)
-    if current:
-        return _most_recent(current)
+    #
+    # Right after a season rollover the session club's current season is empty,
+    # so the rung-1 probe can never hit and every club_id=0 lookup would pay
+    # the full sweep before rung 2 gets a chance. When the own roster is
+    # measurably empty we skip rung 1 outright — probe and sweep both.
+    #
+    # ACCEPTED REGRESSION, signed off deliberately: skipping the current rung
+    # means a player who left this club last season and enrolled at a
+    # *different* club this season resolves to their stale own-club row at the
+    # previous-season rung, instead of their current row at the new club — the
+    # rung-1 sweep is what would have found it. Accepted trade: post-rollover
+    # that sweep is ~1000 requests that miss for every lookup. An empty own
+    # roster does not prove other clubs are empty.
+    skip_current = bool(own_club) and _own_current_season_empty(client, own_club)
+    if not skip_current:
+        current = search_rung(None)
+        if current:
+            return _most_recent(current)
 
     previous_season: int | None = None
     try:
@@ -476,10 +527,16 @@ def get_player(
 
     club_id defaults to the session's own club when omitted; club_id=0
     searches federation-wide, with the session club probed first — but a probe
-    miss costs one request per club in every association, per rung. Without an
-    explicit season, resolution widens from the current season to the previous
-    season and finally all seasons. Therefore null means the licence has no
-    matching row in that search, not "not currently at this club".
+    miss costs one request per club in every association, per rung. During the
+    post-rollover window, while your own club's current season is still empty,
+    club_id=0 skips the current-season rung to avoid a guaranteed-miss sweep,
+    so a licence that is current at another club may resolve to a stale
+    own-club row from last season.
+
+    Without an explicit season, resolution widens from the current season to
+    the previous season and finally all seasons. Therefore null means the
+    licence has no matching row in that search, not "not currently at this
+    club".
     status: "active" (default) | "inactive" | "all"; passed unchanged at
         every season rung.
     season: explicit SAV2 epoch id. When supplied, bypasses the widening ladder.
@@ -586,7 +643,10 @@ def lookup_player(
     A miss is costly — federation-wide is one request per club in every
     association (~1000 on FPB) per rung — and the probe only helps for a player
     on the current-season roster, which is empty right after a rollover. Pass an
-    explicit club_id whenever you know it.
+    explicit club_id whenever you know it. While that roster is still empty
+    after a rollover, the current-season rung is skipped altogether, so a
+    licence that is current at another club may resolve to a stale own-club row
+    from last season.
     A nif is always resolved against your own club because SAV2 only exposes a
     player's NIF to their own club, so a nif with any other club_id (including
     club_id=0), or with no resolvable session club, raises instead of silently
