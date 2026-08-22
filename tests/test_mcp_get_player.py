@@ -134,18 +134,18 @@ def test_get_player_schema_declares_integer_license():
   assert tool.parameters["properties"]["license"]["type"] == "integer"
 
 
-def test_get_player_club_zero_probes_session_club_before_sweeping(monkeypatch):
-  """club_id=0 gets the same own-club fast path lookup_player does.
+def test_get_player_club_zero_searches_federation_wide_once(monkeypatch):
+  """club_id=0 is passed straight through, like lookup_player.
 
-  Federation-wide is one search request per club, so a licence that belongs to
-  our own club must never trigger the sweep.
+  SAV2 matches a licence federation-wide in a single request, so the ladder
+  never queries the session club separately.
   """
   calls: list[tuple[int, int | None]] = []
 
   class _ClubAwareStub(_StubClient):
     def search_players(self, **kwargs):
       calls.append((kwargs["club"], kwargs["season"]))
-      if (kwargs["club"], kwargs["season"]) == (200, None):
+      if (kwargs["club"], kwargs["season"]) == (0, None):
         return [_player("2025/2026")]
       return []
 
@@ -155,4 +155,4 @@ def test_get_player_club_zero_probes_session_club_before_sweeping(monkeypatch):
   result = server_module.get_player(301772, club_id=0)
 
   assert result is not None
-  assert calls == [(200, None)]
+  assert calls == [(0, None)]

@@ -226,6 +226,71 @@ class TestSearchPlayers:
 
     assert captured["association"] is None
 
+  def test_license_search_with_club_zero_issues_one_request(self, monkeypatch):
+    """SAV2 matches a licence federation-wide on nr_clube=0, so no fan-out."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    singles = []
+
+    def fake_search_single(**kwargs):
+      singles.append(kwargs)
+      return []
+
+    def fail_all_clubs(**kwargs):
+      raise AssertionError("licence search must not fan out over every club")
+
+    monkeypatch.setattr(client, "_search_players_single", fake_search_single)
+    monkeypatch.setattr(client, "_search_all_clubs", fail_all_clubs)
+
+    client.search_players(license="249503", club=0, season=0)
+
+    assert len(singles) == 1
+    assert singles[0]["club"] == 0
+    assert singles[0]["license"] == "249503"
+    assert singles[0]["association"] is None
+
+  def test_license_search_with_association_still_fans_out(self, monkeypatch):
+    """jc_associacao is ignored when nr_clube=0, so scoping needs the fan-out."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    captured = {}
+
+    monkeypatch.setattr(
+      client, "_search_players_single",
+      lambda **kw: (_ for _ in ()).throw(
+        AssertionError("association-scoped search must use the fan-out")
+      ),
+    )
+    monkeypatch.setattr(
+      client, "_search_all_clubs",
+      lambda **kw: captured.update(kw) or [],
+    )
+
+    client.search_players(license="249503", club=0, association=7, season=0)
+
+    assert captured["association"] == 7
+    assert captured["license"] == "249503"
+
+  def test_non_license_search_with_club_zero_still_fans_out(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    captured = {}
+
+    monkeypatch.setattr(
+      client, "_search_players_single",
+      lambda **kw: (_ for _ in ()).throw(
+        AssertionError("a name search must use the fan-out")
+      ),
+    )
+    monkeypatch.setattr(
+      client, "_search_all_clubs",
+      lambda **kw: captured.update(kw) or [],
+    )
+
+    client.search_players(name="Matilde", club=0, season=0)
+
+    assert captured["name"] == "Matilde"
+
   def test_association_zero_is_rejected(self):
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"epoca_id": 123, "organizacao": 456}

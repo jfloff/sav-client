@@ -317,43 +317,20 @@ def _resolve_rows(
     season: int | None,
     with_details: bool,
 ) -> Player | None:
-    """Resolve one licence using the current → previous → all ladder.
-
-    ``club_id=0`` is federation-wide, which SavClient implements as one search
-    request per club in every association (``_search_all_clubs``) — not one
-    query. Since nearly every lookup is for one of our own players, each
-    fixed-season rung probes the session club first and only pays for the sweep
-    on a miss: one request instead of N. The all-seasons rung deliberately
-    skips the probe — there a stale own-club row from an older season would
-    outrank the player's current row at the club they transferred to, which is
-    exactly the case federation-wide search exists to answer.
-    """
-    own_club = (
-        int(client.session.get("organizacao") or 0) if club_id == 0 else 0
-    )
-
-    def search(rung: int | None, club: int) -> list[Player]:
+    """Resolve one licence using the current → previous → all ladder."""
+    def search(rung: int | None) -> list[Player]:
         return client.search_players(
-            license=str(license), club=club, status=status, season=rung,
+            license=str(license), club=club_id, status=status, season=rung,
             with_details=with_details,
         )
 
-    def search_rung(rung: int | None) -> list[Player]:
-        # ``rung != 0`` keeps the all-seasons rung (and an explicit season=0)
-        # federation-only; see the docstring for why the probe is skipped there.
-        if own_club and rung != 0:
-            hit = search(rung, own_club)
-            if hit:
-                return hit
-        return search(rung, club_id)
-
     if season is not None:
-        return _most_recent(search_rung(season))
+        return _most_recent(search(season))
 
     # Keep the common current-enrollment case to one query. A player last
-    # enrolled in the previous season costs two; the full sweep is deliberately
-    # the last resort.
-    current = search_rung(None)
+    # enrolled in the previous season costs two; the all-seasons rung is
+    # deliberately the last resort.
+    current = search(None)
     if current:
         return _most_recent(current)
 
@@ -370,11 +347,11 @@ def _resolve_rows(
         logger.debug("Could not resolve the previous SAV season", exc_info=True)
 
     if previous_season is not None:
-        previous = search_rung(previous_season)
+        previous = search(previous_season)
         if previous:
             return _most_recent(previous)
 
-    return _most_recent(search_rung(0))
+    return _most_recent(search(0))
 
 
 # Every NIF entry point rejects an unusable club with the same explanation.
@@ -475,11 +452,11 @@ def get_player(
     Return details for a single player by licence number.
 
     club_id defaults to the session's own club when omitted; club_id=0
-    searches federation-wide, with the session club probed first — but a probe
-    miss costs one request per club in every association, per rung. Without an
-    explicit season, resolution widens from the current season to the previous
-    season and finally all seasons. Therefore null means the licence has no
-    matching row in that search, not "not currently at this club".
+    searches federation-wide in a single request per rung — SAV2 matches a
+    licence across every club natively. Without an explicit season, resolution
+    widens from the current season to the previous season and finally all
+    seasons. Therefore null means the licence has no matching row in that
+    search, not "not currently at this club".
     status: "active" (default) | "inactive" | "all"; passed unchanged at
         every season rung.
     season: explicit SAV2 epoch id. When supplied, bypasses the widening ladder.
@@ -581,12 +558,9 @@ def lookup_player(
     and name whose provenance differs from the roster row.
 
     club_id defaults to the session's own club when omitted. club_id=0 searches
-    federation-wide, and only for a licence: the session club is probed first at
-    each fixed-season rung, so one of our own players still costs one request.
-    A miss is costly — federation-wide is one request per club in every
-    association (~1000 on FPB) per rung — and the probe only helps for a player
-    on the current-season roster, which is empty right after a rollover. Pass an
-    explicit club_id whenever you know it.
+    federation-wide, and only for a licence: SAV2 matches a licence across every
+    club natively, so this is a single request per ladder rung — no more
+    expensive than a club-scoped lookup.
     A nif is always resolved against your own club because SAV2 only exposes a
     player's NIF to their own club, so a nif with any other club_id (including
     club_id=0), or with no resolvable session club, raises instead of silently
@@ -632,9 +606,10 @@ def lookup_player(
 
     result = player_to_dict(row, with_details=with_details)
     if with_profile:
-        # Scope the profile to the club the row actually came from: rows are
-        # stamped per source club even inside a federation sweep, so this keeps
-        # the licence → id bridge club-scoped instead of sweeping again.
+        # Prefer the club the row came from over the requested one. A row from
+        # a club-scoped search is stamped with its source club; a federation-
+        # wide one is not (club_id stays 0), and 0 is exactly what the bridge
+        # inside load_player_profile wants for its own single-request lookup.
         result["profile"] = client.load_player_profile(
             row.license, club_id=row.club_id or effective_club,
         )

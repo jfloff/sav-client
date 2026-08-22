@@ -474,6 +474,23 @@ class SavClient:
       return _post_filter(results)
 
     if club == 0:
+      # A licence search needs no fan-out: SAV2 searches federation-wide
+      # natively on nr_clube=0, so one request finds the player at any club.
+      # Verified live 2026-08-22 — licence 249503 with club=0 returned its one
+      # row (Chamusca Basket Clube, not the session club 2430), while the same
+      # licence with club=2430 returned nothing, so nr_clube is respected and 0
+      # really means "all clubs". The fan-out below still exists for broad
+      # searches, where the single-request form is crippled: results are capped
+      # at 48 with numpag ignored (pages 1-3 return the identical rows), and
+      # jc_associacao is ignored when nr_clube=0. Neither limit binds here — a
+      # licence search returns at most one row — but the association one is why
+      # this short-circuit requires association is None: scoping a search to an
+      # association only works via the fan-out.
+      if license and association is None:
+        results = self._search_players_single(
+          association=None, club=0, page=1, **filters,
+        )
+        return _post_filter(sorted(results, key=lambda p: p.id))
       results = self._search_all_clubs(association=association, limit=parallel_limit, **filters)
       return _post_filter(results)
 

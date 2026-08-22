@@ -103,8 +103,8 @@ class _ProbeStubClient:
 
   ``hits`` maps ``(club, season)`` to the ``club_id`` a returned row should
   carry; a pair absent from ``hits`` is a miss (empty list). Every call is
-  recorded in order so tests can assert probe order and which rungs/clubs
-  were actually queried.
+  recorded in order so tests can assert which rungs and clubs were actually
+  queried, and in what order.
   """
 
   def __init__(self, hits: dict[tuple[int, int | None], int], organizacao: int = 200):
@@ -130,45 +130,29 @@ class _ProbeStubClient:
     return {"name": "Profile Name"}
 
 
-def test_lookup_player_club_zero_probes_session_club_first(monkeypatch):
-  stub = _ProbeStubClient({(200, None): 200})
-  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+def test_lookup_player_club_zero_searches_federation_wide_once_per_rung(monkeypatch):
+  """club_id=0 goes straight to the federation-wide search.
 
-  result = server_module.lookup_player(license=301772, club_id=0)
-
-  assert result is not None
-  assert stub.calls[0] == (200, None)
-  assert all(club != 0 for club, _ in stub.calls)
-
-
-def test_lookup_player_club_zero_probe_hit_skips_federation_call(monkeypatch):
-  stub = _ProbeStubClient({(200, None): 200})
-  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
-
-  result = server_module.lookup_player(license=301772, club_id=0)
-
-  assert result is not None
-  assert stub.calls == [(200, None)]
-  assert (0, None) not in stub.calls
-
-
-def test_lookup_player_club_zero_probe_miss_falls_back_to_federation(monkeypatch):
+  SAV2 matches a licence across every club natively, so there is nothing to
+  gain from probing the session club first — the ladder issues exactly one
+  club=0 search per rung.
+  """
   stub = _ProbeStubClient({(0, None): 999})
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   result = server_module.lookup_player(license=301772, club_id=0)
 
   assert result is not None
-  assert stub.calls == [(200, None), (0, None)]
+  assert stub.calls == [(0, None)]
   assert result["club_id"] == 999
 
 
-def test_lookup_player_club_zero_all_seasons_rung_skips_own_club_probe(monkeypatch):
-  # Own club (200) would answer at season=0 with a stale row if probed there
-  # (a naive "probe every rung" implementation would return it), but the
-  # all-seasons rung must skip the own-club probe and go straight to the
-  # federation-wide search, which finds the player's current row at another
-  # club (300).
+def test_lookup_player_club_zero_never_queries_the_session_club(monkeypatch):
+  """Every rung is federation-wide, including the all-seasons one.
+
+  Own club (200) holds a stale row a probe would have returned; the player's
+  current row lives at another club (300) and must win.
+  """
   stub = _ProbeStubClient({
     (200, 0): 200,  # stale own-club row; must never be reached
     (0, 0): 300,    # correct current row at the other club
@@ -178,9 +162,19 @@ def test_lookup_player_club_zero_all_seasons_rung_skips_own_club_probe(monkeypat
   result = server_module.lookup_player(license=301772, club_id=0)
 
   assert result is not None
-  assert (200, 0) not in stub.calls
-  assert (0, 0) in stub.calls
+  assert all(club == 0 for club, _ in stub.calls)
+  assert stub.calls == [(0, None), (0, 99), (0, 0)]
   assert result["club_id"] == 300
+
+
+def test_lookup_player_explicit_club_id_is_still_scoped(monkeypatch):
+  stub = _ProbeStubClient({(300, None): 300})
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.lookup_player(license=301772, club_id=300)
+
+  assert result is not None
+  assert stub.calls == [(300, None)]
 
 
 def test_lookup_player_nif_with_club_zero_raises(monkeypatch):
