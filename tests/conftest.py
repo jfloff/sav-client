@@ -9,6 +9,13 @@ def _unset_club_stamp_path(monkeypatch):
   monkeypatch.delenv("CLUB_STAMP_PATH", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def _unset_cache_dir_env(monkeypatch):
+  """Keep cache-dir resolution off the developer's env in every test."""
+  monkeypatch.delenv("SAV_CACHE_DIR", raising=False)
+  monkeypatch.delenv("XDG_CACHE_HOME", raising=False)
+
+
 @pytest.fixture(scope="session")
 def client():
   c = SavClient.from_env()

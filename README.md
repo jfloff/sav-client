@@ -98,7 +98,15 @@ uploads do not require it.
 ```
 SAV_TIMEOUT=30        # request timeout in seconds
 SAV_LOG_LEVEL=WARNING # DEBUG / INFO / WARNING / ERROR
+SAV_CACHE_DIR=~/.sav  # directory holding the SQLite cache (cache.db)
 ```
+
+`SAV_CACHE_DIR` matters for containerised callers: the cache holds the
+NIF-index freshness marker, so losing it on a redeploy re-arms
+`build_nif_index`'s multi-minute inline rebuild on the next cold NIF lookup.
+Point it at a named volume to keep it. Unset, the directory is `~/.sav` when
+that already exists, else `$XDG_CACHE_HOME/sav` when set, else `~/.sav`.
+`SavClient(..., cache_dir=...)` overrides the variable.
 
 ---
 

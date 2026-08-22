@@ -2,12 +2,13 @@
 SQLite-backed cache for slow/static SAV2 data (clubs, associations,
 concelhos).
 
-Cache file: ~/.sav/cache.db
+Cache file: <cache dir>/cache.db  (see `resolve_cache_dir`)
 Default TTL: 7 days
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
 from pathlib import Path
@@ -20,14 +21,57 @@ _CACHE_DIR = Path.home() / ".sav"
 _DEFAULT_TTL = 7 * 86_400  # 7 days
 
 
+def resolve_cache_dir(directory: str | Path | None = None) -> Path:
+  """
+  Pick the directory holding cache.db, in decreasing precedence:
+
+    1. `directory`, when a caller passes one explicitly;
+    2. $SAV_CACHE_DIR — lets a containerised caller put the cache on a
+       named volume instead of the container filesystem, where a redeploy
+       destroys it along with the persisted NIF-index freshness marker and
+       so re-arms build_nif_index's multi-minute inline rebuild;
+    3. ~/.sav, when it already exists — the historical location wins over
+       XDG so an upgrade never silently orphans a warm cache;
+    4. $XDG_CACHE_HOME/sav, when that variable is set;
+    5. ~/.sav.
+
+  Args:
+      directory: Explicit directory, overriding every environment source.
+
+  Returns:
+      The directory that should contain cache.db.  Not created here.
+  """
+  if directory:
+    return Path(directory).expanduser()
+
+  env_dir = os.environ.get("SAV_CACHE_DIR")
+  if env_dir:
+    return Path(env_dir).expanduser()
+
+  if _CACHE_DIR.exists():
+    return _CACHE_DIR
+
+  xdg = os.environ.get("XDG_CACHE_HOME")
+  if xdg:
+    return Path(xdg).expanduser() / "sav"
+
+  return _CACHE_DIR
+
+
 class Cache:
   DEFAULT_TTL = _DEFAULT_TTL
 
-  def __init__(self) -> None:
-    self.path = _CACHE_DIR / "cache.db"
+  def __init__(self, directory: str | Path | None = None) -> None:
+    """
+    Args:
+        directory: Directory to hold cache.db.  Defaults to the location
+            `resolve_cache_dir` derives from the environment.
+    """
+    self.dir = resolve_cache_dir(directory)
+    self.path = self.dir / "cache.db"
 
   def _db(self) -> sqlite3.Connection:
-    _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    self.dir.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(self.path)
     con.execute("""
       CREATE TABLE IF NOT EXISTS clubs (

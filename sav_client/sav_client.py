@@ -16,6 +16,7 @@ Configuration (.env keys)
     SAV_PASSWORD   — plaintext password (hashed with MD5 before sending)
     SAV_TIMEOUT    — optional request timeout in seconds (default: 30)
     SAV_LOG_LEVEL  — optional logging level for this module (default: WARNING)
+    SAV_CACHE_DIR  — optional directory for the SQLite cache (default: ~/.sav)
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ import threading
 import time
 from dataclasses import replace as _dc_replace
 from datetime import date
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin
 
@@ -188,6 +190,7 @@ class SavClient:
     *,
     timeout: int = _DEFAULT_TIMEOUT,
     nif_index_ttl: float = Cache.DEFAULT_TTL,
+    cache_dir: str | Path | None = None,
   ) -> None:
     """
     Args:
@@ -196,6 +199,9 @@ class SavClient:
         password:  Plaintext password — hashed with MD5 before transmission.
         timeout:   Network timeout in seconds applied to every request.
         nif_index_ttl: Freshness window for persisted club NIF indexes.
+        cache_dir: Directory holding the SQLite cache.  Defaults to the
+            location derived from $SAV_CACHE_DIR / $XDG_CACHE_HOME / ~/.sav;
+            see `sav_client.cache.resolve_cache_dir`.
     """
     if not base_url:
       raise SavConfigError("base_url must not be empty")
@@ -213,7 +219,7 @@ class SavClient:
     # Populated after login()
     self.session: Session | None = None
 
-    self._cache = Cache()
+    self._cache = Cache(cache_dir)
     self._seasons: list[Season] | None = None
 
     # Lazily-built, memoized club name->id map used to resolve club_id on
@@ -270,6 +276,7 @@ class SavClient:
         SAV_PASSWORD   — required
         SAV_TIMEOUT    — optional, integer seconds (default 30)
         SAV_LOG_LEVEL  — optional, e.g. DEBUG / INFO / WARNING
+        SAV_CACHE_DIR  — optional, directory for the SQLite cache
 
     Args:
         env_file: Path to the .env file to load.  Pass None to skip file
