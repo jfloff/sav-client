@@ -51,7 +51,7 @@ from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
 from sav_shared.dates import require_iso, to_iso
-from sav_shared.text import iso_date
+from sav_shared.text import iso_date, normalise_text
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +126,24 @@ _REGISTRATIONS_DOC_LIST_OP = "91"
 _REGISTRATIONS_DOC_UPLOAD_OP = "92"
 _REGISTRATIONS_DOC_DELETE_OP = "94"
 _REGISTRATIONS_AGENTE_PLAYER = 1
+# tipo_doc labels as SAV renders them in the op=91 document list. The modal's
+# own <select> overrides this at runtime; it exists so a response without one
+# still resolves the types we know. Keys are normalise_text() output.
+_DOC_TYPE_LABELS: dict[str, int] = {
+  "modelo 1 inscricao jogadores primeira ou revalidacao": 1,
+  "exame medico": 2,
+  "modelo 4 subida de escalao": 6,
+  "atestado residencia": 15,
+  "fiba players self declaration": 16,
+  "fiba national team declaration": 17,
+  "doc identificacao cc passaporte titulo residencia etc": 18,
+  "contrato formacao desportiva": 21,
+  "outros documentos": 22,
+  "visto mi aut residencia": 23,
+  "comprovativo matricula escolar": 24,
+  "boletim de jogo": 25,
+  "declaracao agregado familiar": 26,
+}
 _REGISTRATIONS_STATE_OPEN = 1
 _REGISTRATIONS_TYPE_PRIMEIRA = 1
 _REGISTRATIONS_TYPE_REVALIDACAO = 2
@@ -3071,12 +3089,46 @@ class SavClient:
         f"{license}, batch {batch.id}: {body[:200]!r}"
       )
     inscricao = int(m_check.group(1))
+
+    # The document type is NOT in deleteDoc(...). Its arguments are
+    # (galeria, licenca, guia, agente, tipo_guia) — agente and tipo_guia are the
+    # same for every row, so reading the 4th one as `tipo_doc` reported every
+    # document as a Modelo 1. Confirmed against production 2026-08-27: a record
+    # holding a Modelo 1 *and* an Exame Médico rendered
+    # `deleteDoc(2278594,298352,630304,1, 2)` and
+    # `deleteDoc(2278595,298352,630304,1, 2)` — identical but for the galeria id.
+    #
+    # The type only exists as the rendered label in the row's second cell, so it
+    # is resolved against the modal's own <select>, which is authoritative for
+    # this SAV instance and keeps working when SAV adds a type we don't know.
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(body, "html.parser")
+
+    labels: dict[str, int] = dict(_DOC_TYPE_LABELS)
+    for option in soup.find_all("option"):
+      value = (option.get("value") or "").strip()
+      if value.isdigit():
+        labels[normalise_text(option.get_text())] = int(value)
+
     docs: list[dict[str, int]] = []
-    for m in re.finditer(
-      r"deleteDoc\((\d+)\s*,\s*\d+\s*,\s*\d+\s*,\s*(\d+)",
-      body,
-    ):
-      docs.append({"doc_id": int(m.group(1)), "tipo_doc": int(m.group(2))})
+    for row in soup.find_all("tr"):
+      button = row.find(attrs={"onclick": re.compile(r"deleteDoc\(")})
+      if button is None:
+        continue
+      m_doc = re.search(r"deleteDoc\(\s*(\d+)", button["onclick"])
+      if m_doc is None:
+        continue
+      cell = row.find("td", class_="text-left")
+      label = normalise_text(cell.get_text()) if cell else ""
+      tipo_doc = labels.get(label, 0)
+      if not tipo_doc:
+        # 0 never matches a real type, so replace_* leaves it alone rather than
+        # deleting something it can't identify.
+        logger.warning(
+          "Unrecognised document type %r for license %s in batch %s; "
+          "reporting tipo_doc=0", cell.get_text().strip() if cell else "", license, batch.id,
+        )
+      docs.append({"doc_id": int(m_doc.group(1)), "tipo_doc": tipo_doc})
     return next_slot, inscricao, docs
 
   # ------------------------------------------------------------------

@@ -393,7 +393,7 @@ List currently uploaded documents for this player+batch as `[{"doc_id", "tipo_do
 
 ### `delete_player_registration_document(doc_id) → None`
 
-Delete a previously uploaded document by its `galeria` id (op=94). The id is the first argument of the `deleteDoc(...)` handler in the modal — typically obtained by enumerating existing docs first (the same op=91 round `upload_player_registration_document` already does).
+Delete a previously uploaded document by its `galeria` id (op=94). The id is the first argument of the `deleteDoc(...)` handler in the modal — note that handler carries `(galeria, licenca, guia, agente, tipo_guia)` and **no document type**; the type is read from the row's rendered label instead — typically obtained by enumerating existing docs first (the same op=91 round `upload_player_registration_document` already does).
 
 ### `replace_player_registration_document(batch_id, license, file_path, *, tipo_doc=1) → None`
 
