@@ -56,14 +56,28 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
   home / our_score / opp_score / opponent are relative to ``club_name`` (not the
   sheet's home/away). The club's side is found by matching its name against the
   team strings: SAV2 appends team suffixes (" - B", "/MVP", …), so a normalised
-  containment match is used. When neither side matches (e.g. the name could not
-  be resolved) the home side is treated as the club's — a stable degenerate
-  fallback, since a club-scoped query always has the club on one side.
+  containment match is used. If the club name is blank/unresolvable, neither
+  side matches, or both sides match, ``ValueError`` is raised with the game
+  identifier and both team strings. Guessing in those cases could silently
+  swap the club's score and opponent, so an explicit error is safer than a
+  degenerate home-side fallback.
   """
   club_key = normalise_text(club_name)
   away_is_ours = bool(club_key) and club_key in normalise_text(g.away)
   home_is_ours = bool(club_key) and club_key in normalise_text(g.home)
-  ours_home = home_is_ours or not away_is_ours
+  if not club_key or home_is_ours == away_is_ours:
+    source_id = str(g.id) if g.id else g.number
+    if not club_key:
+      reason = f"club name {club_name!r} is blank or unresolved"
+    elif home_is_ours:
+      reason = f"club name {club_name!r} matches both sides"
+    else:
+      reason = f"club name {club_name!r} matches neither side"
+    raise ValueError(
+      f"Cannot determine club side for game {source_id!r} (number {g.number!r}): "
+      f"{reason}; home={g.home!r}, away={g.away!r}"
+    )
+  ours_home = home_is_ours
 
   home_score = _score_to_int(g.home_score)
   away_score = _score_to_int(g.away_score)

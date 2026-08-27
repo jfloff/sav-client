@@ -7,7 +7,10 @@ guarantee the bounds with a client-side pass (filter_games) and return rows
 sorted chronologically. These tests stub the client to return a deliberately
 out-of-window, out-of-order set.
 """
+import pytest
+
 from sav_client.models import Game
+from sav_shared.serializers import club_game_to_dict
 from sav_mcp import server as server_module
 
 CLUB = "Rio Maior Basket"
@@ -167,6 +170,62 @@ class TestPerspective:
     assert row["our_score"] is None
     assert row["opp_score"] is None
     assert row["starts_at"] == ""
+
+
+class TestClubGameSerializer:
+  def test_home_match_keeps_scores(self):
+    game = _game("10", "20-06-2026", home=CLUB, away="Foes",
+                 home_score="80", away_score="70")
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["home"] is True
+    assert row["our_score"] == 80
+    assert row["opp_score"] == 70
+
+  def test_away_match_swaps_scores(self):
+    game = _game("11", "20-06-2026", home="Foes", away=CLUB,
+                 home_score="60", away_score="65")
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["home"] is False
+    assert row["our_score"] == 65
+    assert row["opp_score"] == 60
+
+  def test_neither_match_raises_with_both_teams(self):
+    game = _game("12", "20-06-2026", home="Home Lions", away="Away Tigers")
+
+    with pytest.raises(ValueError, match="Home Lions.*Away Tigers"):
+      club_game_to_dict(game, club_name="Unknown Club")
+
+  @pytest.mark.parametrize("club_name", ["", "   "])
+  def test_blank_club_name_raises(self, club_name):
+    game = _game("13", "20-06-2026", home="Home Lions", away="Away Tigers")
+
+    with pytest.raises(ValueError, match="Home Lions.*Away Tigers"):
+      club_game_to_dict(game, club_name=club_name)
+
+  def test_both_matches_raise_as_ambiguous(self):
+    game = _game("14", "20-06-2026", home="Club United", away="Club United B")
+
+    with pytest.raises(ValueError, match="matches both sides"):
+      club_game_to_dict(game, club_name="Club United")
+
+  def test_mcp_keeps_unmatchable_fixture_as_error_row(self, monkeypatch):
+    good = _game("15", "20-06-2026", home=CLUB, away="Foes",
+                 home_score="80", away_score="70")
+    bad = _game("16", "21-06-2026", home="Home Lions", away="Away Tigers")
+    _stub(monkeypatch, [good, bad])
+
+    result = server_module.list_games()
+
+    assert result[0]["source_id"] == "15"
+    assert result[0]["home"] is True
+    assert result[1]["source_id"] == "16"
+    assert set(result[1]) == {"source_id", "error"}
+    assert "Home Lions" in result[1]["error"]
+    assert "Away Tigers" in result[1]["error"]
 
 
 class TestOrdering:

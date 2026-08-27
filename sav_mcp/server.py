@@ -860,12 +860,19 @@ def list_games(
         date_from=date_from, date_to=date_to,
     )
     games = filter_games(games, date_from=date_from, date_to=date_to)
-    rows = [
-        club_game_to_dict(g, club_name=club_name)
-        for g in sorted(games, key=game_sort_key)
-    ]
+    rows = []
+    for g in sorted(games, key=game_sort_key):
+        try:
+            rows.append(club_game_to_dict(g, club_name=club_name))
+        except ValueError as exc:
+            # Keep one bad/unresolvable fixture from hiding the rest of a list,
+            # while making the attribution failure explicit to the caller.
+            rows.append({
+                "source_id": str(g.id) if g.id else g.number,
+                "error": str(exc),
+            })
     if status_key != "all":
-        rows = [r for r in rows if r["status"] == status_key]
+        rows = [r for r in rows if "error" in r or r["status"] == status_key]
     return rows
 
 
