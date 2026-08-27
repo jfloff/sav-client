@@ -149,3 +149,66 @@ class TestBatchItemsDoesNotSwallowFatals:
   def test_a_genuinely_empty_batch_still_returns_empty(self, monkeypatch):
     c = self._client(monkeypatch, '{"msg": "<table><tbody></tbody></table>"}')
     assert c.list_player_registration_batch_items(630304) == []
+
+
+class TestIdDocCheckStaysAdvisory:
+  """op=163 must surface SAV's errors without ever blocking creation.
+
+  Probed against production 2026-08-27: four of five real Cartão de Cidadão
+  numbers already on file returned an unhandled PHP fatal
+  (`mysqli_query(): Argument #2 ($query) cannot be empty`), and `"1"` cannot
+  mean "already in use" — an invented 99999999 returns it while every random
+  8-digit number returns an empty body. A hard gate here would reject most
+  legitimate enrollments, so the duplicate defence stays on op=11.
+  """
+
+  FATAL = (
+    "<br />\n<b>Fatal error</b>:  Uncaught ValueError: mysqli_query(): "
+    "Argument #2 ($query) cannot be empty in "
+    "/usr/local/www/apache24/SADEV/php/incricoesdb.php:28003"
+  )
+
+  def _client(self, monkeypatch, body):
+    c = SavClient.__new__(SavClient)
+    c.base_url = "https://sav2.example/"
+    c.session = {"perfil": 1, "user": "u", "organizacao": 1}
+    c._timeout = 10
+
+    class _Http:
+      def post(self, *a, **k):
+        return type("R", (), {"text": body})()
+
+    c._http = _Http()
+    return c
+
+  def test_fatal_does_not_raise(self, monkeypatch):
+    c = self._client(monkeypatch, self.FATAL)
+    c._check_primeira_id_doc("11546873")  # must not raise
+
+  def test_fatal_is_logged_as_a_warning(self, monkeypatch, caplog):
+    import logging
+    c = self._client(monkeypatch, self.FATAL)
+    with caplog.at_level(logging.WARNING, logger="sav_client.sav_client"):
+      c._check_primeira_id_doc("11546873")
+    assert any(r.levelno == logging.WARNING for r in caplog.records), (
+      "a broken SAV endpoint must be visible, not swallowed"
+    )
+
+  def test_warning_does_not_leak_the_body(self, monkeypatch, caplog):
+    import logging
+    c = self._client(monkeypatch, self.FATAL)
+    with caplog.at_level(logging.WARNING, logger="sav_client.sav_client"):
+      c._check_primeira_id_doc("11546873")
+    warnings = " ".join(
+      r.getMessage() for r in caplog.records if r.levelno == logging.WARNING
+    )
+    for leak in ("mysqli_query", "incricoesdb.php", "ValueError"):
+      assert leak not in warnings
+
+  def test_ordinary_replies_are_silent(self, monkeypatch, caplog):
+    import logging
+    for body in ("", "1"):
+      c = self._client(monkeypatch, body)
+      with caplog.at_level(logging.WARNING, logger="sav_client.sav_client"):
+        c._check_primeira_id_doc("31864739")
+    assert not [r for r in caplog.records if r.levelno == logging.WARNING]

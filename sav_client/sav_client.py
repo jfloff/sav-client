@@ -4103,9 +4103,24 @@ class SavClient:
       raise SavConnectionError(f"Duplicate-check op=11 failed: {exc}") from exc
 
   def _check_primeira_id_doc(self, id_number: str) -> None:
-    """Op=163 — fire-and-forget id-doc uniqueness probe; empty body on success."""
+    """Op=163 — advisory id-doc uniqueness probe. Deliberately non-blocking.
+
+    **This cannot gate player creation, and must not be made to.** Probed
+    against production 2026-08-27 with real Cartão de Cidadão numbers already
+    on file: four of five returned an unhandled PHP fatal
+    (``mysqli_query(): Argument #2 ($query) cannot be empty``,
+    ``incricoesdb.php:28003``), and the ``"1"`` reply cannot mean "already in
+    use" because an invented ``99999999`` returns it too while every random
+    8-digit number returns an empty body. Turning this into a hard gate would
+    reject most legitimate enrollments on semantics we cannot pin down.
+
+    So the duplicate defence stays where it works: op=11
+    (``_check_primeira_player_duplicate``), which does raise. What changed here
+    is only that SAV's fatals are no longer swallowed in silence — they are
+    logged at WARNING so a broken endpoint is visible rather than invisible.
+    """
     try:
-      self._http.post(
+      resp = self._http.post(
         self._url(_REGISTRATIONS_PATH),
         params={"op": _REGISTRATIONS_PRIMEIRA_ID_DOC_CHECK_OP},
         data={"numid": id_number, "userid": 0},
@@ -4114,6 +4129,15 @@ class SavClient:
       )
     except requests.exceptions.RequestException:
       logger.debug("op=163 id-doc check failed — non-fatal", exc_info=True)
+      return
+    if self._looks_like_php_fatal(resp.text):
+      # Body withheld for the usual reason — it carries SAV's schema.
+      logger.warning(
+        "op=163 id-doc check returned a server-side error for this id number; "
+        "continuing, since the check is advisory. Enable DEBUG on 'sav_client' "
+        "to see the body."
+      )
+      logger.debug("Raw op=163 error body: %s", resp.text)
 
   def _check_primeira_birthdate_fits_tier(
     self, batch: PlayerRegistrationBatch, birth_date: str,
