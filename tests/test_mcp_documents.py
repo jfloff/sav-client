@@ -998,13 +998,18 @@ def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
     def resolve_batch_id(self, number):
       return 629084
 
+    committed = False
+
     def add_player_to_registration_batch(self, batch_id, license, **kwargs):
       captured["kwargs"] = kwargs
       captured["license_arg"] = license
+      self.committed = True
       return 277534  # the SAV userid
 
     def list_player_registration_batch_items(self, batch_id):
-      return [{"license": 321160, "name": "João Loff"}]
+      # SAV mints the licence at commit time, so the row only exists after it.
+      # The new licence is found by diffing this listing across the commit.
+      return [{"license": 321160, "name": "João Loff"}] if self.committed else []
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
       captured.setdefault("uploads", []).append((license, tipo_doc))
@@ -1040,7 +1045,7 @@ def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
   )
 
   assert result["success"] is True
-  assert result["license"] == 321160  # looked up from the batch listing
+  assert result["license"] == 321160  # the one licence the commit added
   assert result["name"] == "João Loff"
   # The wizard got the licence kwarg as 0 (sentinel for "no licence yet").
   assert captured["license_arg"] == 0
@@ -1098,7 +1103,70 @@ def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypa
   assert result["success"] is True
   assert result["license"] is None
   assert result["source_document_upload"]["status"] == "skipped"
-  assert "type-1 commit" in result["source_document_upload"]["error"]
+  assert "refusing to guess" in result["source_document_upload"]["error"]
+
+
+def test_submit_enrollment_type1_refuses_to_guess_between_namesakes(monkeypatch):
+  """A namesake already in the batch must not receive the new player's documents.
+
+  Resolving the new licence by name matched the *first* row with that name, and
+  the uploads replace documents of the same type — so enrolling a second
+  "João Loff" overwrote the first one's Modelo 1, medical exam and Modelo 4.
+  Diffing the batch across the commit identifies the right row regardless.
+  """
+  class StubClient:
+    committed = False
+
+    def resolve_batch_id(self, number):
+      return 629084
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      self.committed = True
+      return 277534
+
+    def list_player_registration_batch_items(self, batch_id):
+      # A namesake was already enrolled; the commit adds a second one.
+      rows = [{"license": 111111, "name": "João Loff"}]
+      if self.committed:
+        rows.append({"license": 321160, "name": "João Loff"})
+      return rows
+
+    def replace_player_registration_document(self, batch_id, license, path, *, tipo_doc):
+      uploads.append(license)
+
+  uploads: list[int] = []
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
+  monkeypatch.setattr(server_module, "_forms", {
+    "form-1": {
+      "doc_type": DocType.FPB_MODELO_1,
+      "reg_type": 1,
+      "parsed": {},
+      "primeira_kwargs": {
+        "name": "João Loff", "birth_date": "2020-09-26", "gender_id": 1,
+        "nif": "277544319", "id_type": 1, "id_number": "12345699",
+        "id_expiry": "2029-09-26", "email": "x@y.pt",
+        "morada": "x", "cod_postal": "1000-000",
+        "distrito_id": 1, "concelho_id": 5,
+      },
+      "previewed": True,
+      "processing_id": "proc-1",
+      "pdf_bytes": b"%PDF-1.4\n",
+    },
+  })
+
+  result = server_module.submit_enrollment(
+    batch_number="726", license=None, mod1_id="form-1",
+    field_overrides={"exam_date": "2025-09-26"},
+  )
+
+  # The diff is unambiguous even though the name is not, so the upload proceeds
+  # — to the licence the commit created, never to the namesake already there.
+  assert result["success"] is True
+  assert result["license"] == 321160
+  assert result["source_document_upload"]["status"] == "ok"
+  assert uploads == [321160]
+  assert 111111 not in uploads
 
 
 def test_replace_from_bytes_overlays_detentor_signature(monkeypatch):

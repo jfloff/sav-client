@@ -2558,6 +2558,20 @@ def submit_enrollment(
         )
 
     batch_id = client.resolve_batch_id(batch_number)
+    # 1ª Inscrição identifies its new licence by diffing the batch across the
+    # commit, so the "before" side has to be taken first.
+    licences_before: set[int] | None = None
+    if reg_type == 1:
+        try:
+            licences_before = {
+                int(item["license"])
+                for item in client.list_player_registration_batch_items(batch_id)
+            }
+        except (SavError, ValueError, KeyError, TypeError):
+            logger.debug(
+                "Could not snapshot batch %s before the type-1 commit", batch_id,
+                exc_info=True,
+            )
     try:
         player_id = client.add_player_to_registration_batch(
             batch_id, license or 0, inline_subida=inline_subida, **kwargs,
@@ -2573,21 +2587,46 @@ def submit_enrollment(
             "missing_guardian_fields": parse_missing_guardian_fields(exc),
         }
 
-    # For 1ª Inscrição, SAV assigned a brand-new licence at commit time but
-    # op=27 doesn't return it. Look it up by matching the just-created
-    # player's name in the batch listing so the document uploads can target it.
+    # For 1ª Inscrição, SAV assigns a brand-new licence at commit time but op=27
+    # doesn't return it. Identify it by diffing the batch against the pre-commit
+    # snapshot: exactly one new licence is the only safe answer.
+    #
+    # This used to match on the player's name instead, which silently targeted
+    # the wrong row whenever the batch already held a namesake — and because the
+    # uploads below *replace* documents of the same type, that overwrote another
+    # player's Modelo 1, medical exam and Modelo 4. Refusing to guess costs an
+    # upload the caller can retry; guessing wrong corrupts a federation record.
     upload_license: int | None = license if license else None
+    upload_skip_reason = "Could not resolve new licence after type-1 commit"
     if reg_type == 1:
-        name_supplied = (kwargs.get("name") or "").strip().casefold()
-        try:
-            for item in client.list_player_registration_batch_items(batch_id):
-                if item["name"].strip().casefold() == name_supplied:
-                    upload_license = int(item["license"])
-                    break
-        except (SavError, ValueError):
-            logger.debug(
-                "Could not resolve new licence for type-1 upload", exc_info=True,
+        upload_license = None
+        if licences_before is None:
+            upload_skip_reason = (
+                "Could not snapshot the batch before the commit, so the new "
+                "licence cannot be identified safely; upload the documents with "
+                "upload_player_document once you know the licence."
             )
+        else:
+            try:
+                licences_after = {
+                    int(item["license"])
+                    for item in client.list_player_registration_batch_items(batch_id)
+                }
+            except (SavError, ValueError, KeyError, TypeError):
+                licences_after = licences_before
+                logger.debug(
+                    "Could not list batch %s after the type-1 commit", batch_id,
+                    exc_info=True,
+                )
+            new_licences = licences_after - licences_before
+            if len(new_licences) == 1:
+                upload_license = new_licences.pop()
+            else:
+                upload_skip_reason = (
+                    f"Expected exactly one new licence in batch {batch_number} "
+                    f"after the commit, found {len(new_licences)}; refusing to "
+                    f"guess which player to attach the documents to."
+                )
 
     # Auto-upload the source PDF as fpb_modelo_1 (parity with `sav enroll`).
     # Non-fatal: enrollment is already committed, so we just record the
@@ -2596,7 +2635,7 @@ def submit_enrollment(
     # lookup failed we skip the upload and surface a clear status.
     skipped_upload = {
         "doc_type": form["doc_type"].value, "status": "skipped",
-        "error": "Could not resolve new licence after type-1 commit",
+        "error": upload_skip_reason,
     }
     upload_status = (
         _replace_player_document_from_bytes(
