@@ -10,6 +10,7 @@ from .exceptions import (
     SavError,
     SavRecordNotFoundError,
     SavResponseError,
+    SavServerError,
 )
 from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
 from .sav_client import SavClient
@@ -31,6 +32,7 @@ __all__ = [
     "SavConnectionError",
     "SavAuthError",
     "SavResponseError",
+    "SavServerError",
     "SavRecordNotFoundError",
     "LicenseNotEnrolledError",
 ]

@@ -43,6 +43,7 @@ from .exceptions import (
   SavError,
   SavRecordNotFoundError,
   SavResponseError,
+  SavServerError,
 )
 from .cache import Cache
 from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
@@ -811,12 +812,7 @@ class SavClient:
 
     logger.info("Fetching photo for player id=%s", player_id)
     text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
-    try:
-      raw = json.loads(text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Player detail response was not valid JSON: {text[:200]!r}"
-      ) from exc
+    raw = self._parse_json_response(text, "Player detail response was not valid JSON")
     return self._parse_player_detail_response(raw, player_id=player_id)
 
   def find_license_by_nif(self, nif: str, *, refresh: bool = False) -> int | None:
@@ -1092,12 +1088,7 @@ class SavClient:
     def _fetch() -> list[Game]:
       logger.info("Searching games with filters: %s", payload)
       text = self._post_form(_GAMES_PATH, payload, params={"op": _GAMES_OP})
-      try:
-        raw = json.loads(text)
-      except ValueError as exc:
-        raise SavResponseError(
-          f"Games response was not valid JSON: {text[:200]!r}"
-        ) from exc
+      raw = self._parse_json_response(text, "Games response was not valid JSON")
       return self._parse_games_response(raw)
 
     if not use_cache:
@@ -1288,12 +1279,7 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch game sheet info: {exc}") from exc
 
-    try:
-      raw = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Game sheet response was not valid JSON: {resp.text[:200]!r}"
-      ) from exc
+    raw = self._parse_json_response(resp.text, "Game sheet response was not valid JSON")
 
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(raw.get("body", ""), "html.parser")
@@ -1341,12 +1327,9 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch eligible players page: {exc}") from exc
 
-    try:
-      raw = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Eligible players response was not valid JSON: {resp.text[:200]!r}"
-      ) from exc
+    raw = self._parse_json_response(
+      resp.text, "Eligible players response was not valid JSON"
+    )
 
     soup = BeautifulSoup(raw.get("msg", ""), "html.parser")
     tables = soup.find_all("table")
@@ -1429,12 +1412,9 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not fetch eligible players page: {exc}") from exc
 
-    try:
-      raw = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Eligible players response was not valid JSON: {resp.text[:200]!r}"
-      ) from exc
+    raw = self._parse_json_response(
+      resp.text, "Eligible players response was not valid JSON"
+    )
 
     soup = BeautifulSoup(raw.get("msg", ""), "html.parser")
 
@@ -1563,12 +1543,7 @@ class SavClient:
       params={"op": _REGISTRATIONS_LIST_OP},
     )
 
-    try:
-      data = json.loads(raw)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse registration batches response: {raw[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(raw, "Could not parse registration batches response")
 
     rows = data.get("data") or []
     batches = [self._parse_registration_batch(row) for row in rows]
@@ -1816,12 +1791,7 @@ class SavClient:
       params={"op": _REGISTRATIONS_SEASONS_OP},
     )
 
-    try:
-      data = json.loads(raw)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse seasons response (op=168): {raw[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(raw, "Could not parse seasons response (op=168)")
 
     entries = data.get("arrayEpoca") if isinstance(data, dict) else []
     if not isinstance(entries, list):
@@ -2084,12 +2054,7 @@ class SavClient:
     text = resp.text
     logger.info("Create batch response: %s", text[:500])
 
-    try:
-      data = json.loads(text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse create-batch response: {text[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(text, "Could not parse create-batch response")
 
     new_id = data.get("id")
     if not isinstance(new_id, int):
@@ -2865,12 +2830,7 @@ class SavClient:
         resp.raise_for_status()
       except requests.exceptions.RequestException as exc:
         raise SavConnectionError(f"Could not upload document: {exc}") from exc
-    try:
-      data = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse upload response: {resp.text[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(resp.text, "Could not parse upload response")
     if data.get("val") != 1:
       raise SavResponseError(
         f"Document upload failed: {data!r}"
@@ -3150,12 +3110,7 @@ class SavClient:
       raise SavConnectionError(
         f"Could not load subida origin for licence {license}: {exc}"
       ) from exc
-    try:
-      return json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse subida origin: {resp.text[:200]!r}"
-      ) from exc
+    return self._parse_json_response(resp.text, "Could not parse subida origin")
 
   def _resolve_subida_taxa_id(
     self, batch: PlayerRegistrationBatch, license: int,
@@ -3181,12 +3136,9 @@ class SavClient:
       raise SavConnectionError(
         f"Could not load subida taxa options: {exc}"
       ) from exc
-    try:
-      msg = json.loads(r.text).get("taxas", "")
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse subida taxa response: {r.text[:200]!r}"
-      ) from exc
+    msg = self._parse_json_response(
+      r.text, "Could not parse subida taxa response"
+    ).get("taxas", "")
     options = {
       int(val): label.strip()
       for val, label in re.findall(
@@ -3232,12 +3184,9 @@ class SavClient:
       raise SavConnectionError(
         f"Subida insurance op=128 failed: {exc}"
       ) from exc
-    try:
-      msg = json.loads(r.text).get("msg", "")
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse subida seguro response: {r.text[:200]!r}"
-      ) from exc
+    msg = self._parse_json_response(
+      r.text, "Could not parse subida seguro response"
+    ).get("msg", "")
     seguros = {
       int(val): label.strip()
       for val, label in re.findall(
@@ -3271,12 +3220,9 @@ class SavClient:
       raise SavConnectionError(
         f"Subida insurance op=126 failed: {exc}"
       ) from exc
-    try:
-      msg = json.loads(r.text).get("msg", "")
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse subida companhia response: {r.text[:200]!r}"
-      ) from exc
+    msg = self._parse_json_response(
+      r.text, "Could not parse subida companhia response"
+    ).get("msg", "")
     companhias = {
       int(val): label.strip()
       for val, label in re.findall(
@@ -3479,12 +3425,7 @@ class SavClient:
       raise SavConnectionError(
         f"Could not load existing registration record: {exc}"
       ) from exc
-    try:
-      data = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse existing record: {resp.text[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(resp.text, "Could not parse existing record")
     if not isinstance(data, dict):
       # Valid JSON but the wrong top-level shape (e.g. `null`, `[]`, a bare
       # string or number). Raising plainly here keeps callers from
@@ -3597,12 +3538,7 @@ class SavClient:
       "organizacao": self.session.get("organizacao", 0),
     }
     text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
-    try:
-      raw = json.loads(text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Player profile response was not valid JSON: {text[:200]!r}"
-      ) from exc
+    raw = self._parse_json_response(text, "Player profile response was not valid JSON")
     if "msg" not in raw:
       raise SavResponseError(
         f"Player profile response missing 'msg': keys={list(raw.keys())}"
@@ -3671,12 +3607,7 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not load player record: {exc}") from exc
-    try:
-      data = json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse player record: {resp.text[:200]!r}"
-      ) from exc
+    data = self._parse_json_response(resp.text, "Could not parse player record")
     if not data.get("id"):
       raise SavResponseError(
         f"Player record for licence {license!r} not found: {data!r}"
@@ -3740,12 +3671,7 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 1: {exc}") from exc
-    try:
-      return json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse step 1 response: {resp.text[:200]!r}"
-      ) from exc
+    return self._parse_json_response(resp.text, "Could not parse step 1 response")
 
   @staticmethod
   def _build_step2_send(
@@ -3801,12 +3727,7 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 2: {exc}") from exc
-    try:
-      return json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse step 2 response: {resp.text[:200]!r}"
-      ) from exc
+    return self._parse_json_response(resp.text, "Could not parse step 2 response")
 
   def _resolve_insurance_cascade(
     self, internal_id: int, batch: PlayerRegistrationBatch, escalao: int,
@@ -3921,12 +3842,9 @@ class SavClient:
       r.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not load taxa options: {exc}") from exc
-    try:
-      msg = json.loads(r.text).get("msg", "")
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse taxa response: {r.text[:200]!r}"
-      ) from exc
+    msg = self._parse_json_response(
+      r.text, "Could not parse taxa response"
+    ).get("msg", "")
 
     options = {
       int(val): label.strip()
@@ -3975,12 +3893,7 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not commit registration: {exc}") from exc
-    try:
-      return json.loads(resp.text)
-    except ValueError as exc:
-      raise SavResponseError(
-        f"Could not parse commit response: {resp.text[:200]!r}"
-      ) from exc
+    return self._parse_json_response(resp.text, "Could not parse commit response")
 
   # ------------------------------------------------------------------
   # 1ª Inscrição (type-1) wizard helpers
@@ -4763,6 +4676,56 @@ class SavClient:
     )
     return any(m in head for m in markers)
 
+  @staticmethod
+  def _looks_like_php_fatal(text: str) -> bool:
+    """Return True when ``text`` looks like a SAV2 PHP fatal/warning page.
+
+    SAV2 answers unhandled server-side errors (PHP fatals, warnings, notices)
+    with HTTP 200 and the diagnostic rendered in the body. Detection is
+    marker-based — never "the body is HTML": the expired-session login page
+    (see ``_looks_like_login_page``) is also HTML but carries none of these
+    markers, so it must keep flowing to the historical non-JSON handling.
+    """
+    if not text:
+      return False
+    head = text[:2000].lower()
+    markers = (
+      "fatal error",
+      "uncaught ",
+      "stack trace:",
+      "mysqli_sql_exception",
+      "<b>warning</b>",
+      "<b>notice</b>",
+    )
+    return any(m in head for m in markers)
+
+  def _parse_json_response(self, text: str, what: str) -> dict[str, Any]:
+    """Parse ``text`` as JSON, shielding SAV2's PHP-fatal pages from messages.
+
+    SAV2 answers unhandled server-side errors with HTTP 200, so
+    ``raise_for_status`` lets them through and the first sign of trouble is a
+    JSON parse failure. Those bodies carry SAV's internal schema — table and
+    constraint names — so they must never reach exception messages (callers
+    persist those messages in their own logs and databases).
+
+      * A PHP-fatal body (see ``_looks_like_php_fatal``) is logged at DEBUG in
+        full, then raised as ``SavServerError`` with the body withheld.
+      * Anything else keeps today's behaviour exactly: ``SavResponseError``
+        with the call site's historical wording — ``what`` carries that
+        wording verbatim, so non-fatal messages stay byte-identical.
+    """
+    try:
+      return json.loads(text)
+    except ValueError as exc:
+      if self._looks_like_php_fatal(text):
+        logger.debug("SAV2 server-side error body while parsing %s: %s", what, text)
+        raise SavServerError(
+          f"{what}: SAV returned a server-side error (HTTP 200); the response "
+          f"body is withheld because it carries SAV's internal schema — the "
+          f"full body is logged at DEBUG on the 'sav_client' logger"
+        ) from exc
+      raise SavResponseError(f"{what}: {text[:200]!r}") from exc
+
   def _reauth_and_replay(self, replay: Callable[[], Any]) -> Any:
     """Re-login once and replay ``replay`` exactly once.
 
@@ -4877,13 +4840,9 @@ class SavClient:
       if replayed is not None:
         return replayed
 
-    try:
-      data: dict[str, Any] = response.json()
-    except ValueError as exc:
-      snippet = response.text[:200]
-      raise SavResponseError(
-        f"Server returned non-JSON response from {url}: {snippet!r}"
-      ) from exc
+    data: dict[str, Any] = self._parse_json_response(
+      response.text, f"Server returned non-JSON response from {url}"
+    )
 
     logger.debug("Response from %s: %s", url, data)
     return data

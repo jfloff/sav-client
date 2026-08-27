@@ -5,6 +5,8 @@ Unit tests for SavClient robustness features (no live SAV2 server):
   * Single transient-network retry on idempotent GETs.
   * Short-TTL in-process memo for list_player_registration_batches, plus its
     invalidation on create / delete / add / remove / login / invalidate_cache.
+  * PHP-fatal shielding: SAV2's HTTP-200 fatal pages raise SavServerError with
+    the raw body withheld from the message (DEBUG-logged instead).
 
 These mock the HTTP transport (``client._http``) and, where a real DB write
 would otherwise happen, the SQLite ``client._cache`` — following the
@@ -12,12 +14,17 @@ monkeypatch conventions in test_registration_batches.py.
 """
 
 import json
+import logging
 
 import pytest
 import requests
 
 from sav_client import SavClient
-from sav_client.exceptions import SavConnectionError, SavResponseError
+from sav_client.exceptions import (
+  SavConnectionError,
+  SavResponseError,
+  SavServerError,
+)
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
@@ -350,3 +357,74 @@ class TestTransientGetRetry:
     with pytest.raises(SavConnectionError):
       c._get(c._url("php/x.php"), params={"op": "1"})
     assert calls["n"] == 2  # original + one retry, then give up
+
+
+# ─── PHP-fatal shielding on JSON parse ────────────────────────────────────────
+
+# A realistic SAV2 fatal: HTTP 200, PHP diagnostic in the body. The exact
+# table/constraint names are the payload that must never reach a message.
+_PHP_FATAL = (
+  "Fatal error: Uncaught mysqli_sql_exception: Cannot add or update a child "
+  "row: a foreign key constraint fails (`sav2`.`inscricoes`, CONSTRAINT "
+  "`fk_inscricao_guia` FOREIGN KEY (`guia_id`) REFERENCES `guias_inscricao` "
+  "(`id`)) in /var/www/sav2/php/inscricoesdb.php:312\n"
+  "Stack trace:\n#0 {main}\n  thrown in /var/www/sav2/php/inscricoesdb.php "
+  "on line 312"
+)
+
+
+class TestPhpFatalShielding:
+  def _commit_with_response(self, monkeypatch, body):
+    """Client whose commit POST returns ``body`` verbatim."""
+    c = _make_client(monkeypatch)
+
+    class H:
+      def post(self, *a, **k):
+        return _Resp(body)
+
+    monkeypatch.setattr(c, "_http", H())
+    return c
+
+  def test_php_fatal_signature(self):
+    # Marker-based, not "is HTML": the expired-session login page is HTML
+    # too and must NOT be classified as a server-side fatal.
+    assert SavClient._looks_like_php_fatal(_PHP_FATAL) is True
+    assert SavClient._looks_like_php_fatal(_LOGIN_PAGE) is False
+    assert SavClient._looks_like_php_fatal("<html><b>Warning</b>: oops</html>") is True
+    assert SavClient._looks_like_php_fatal("<html><body>ok</body></html>") is False
+    assert SavClient._looks_like_php_fatal("") is False
+
+  def test_commit_php_fatal_raises_sav_server_error_with_body_withheld(
+    self, monkeypatch, caplog,
+  ):
+    c = self._commit_with_response(monkeypatch, _PHP_FATAL)
+
+    with caplog.at_level(logging.DEBUG, logger="sav_client.sav_client"):
+      with pytest.raises(SavServerError) as excinfo:
+        c._registration_commit({"dummy": 1})
+
+    msg = str(excinfo.value)
+    # The whole point: SAV's internal schema must not reach the message.
+    assert "mysqli_sql_exception" not in msg
+    assert "Fatal error" not in msg
+    assert "fk_inscricao_guia" not in msg
+    assert "guias_inscricao" not in msg
+    assert "inscricoes" not in msg
+    # ...but the full body is still available at DEBUG for diagnosis.
+    assert any("mysqli_sql_exception" in r.message for r in caplog.records)
+
+  def test_php_fatal_is_catchable_as_sav_response_error(self, monkeypatch):
+    c = self._commit_with_response(monkeypatch, _PHP_FATAL)
+    with pytest.raises(SavResponseError) as excinfo:
+      c._registration_commit({"dummy": 1})
+    assert isinstance(excinfo.value, SavServerError)
+
+  def test_malformed_json_keeps_plain_response_error_with_snippet(
+    self, monkeypatch,
+  ):
+    c = self._commit_with_response(monkeypatch, "{not json")
+    with pytest.raises(SavResponseError) as excinfo:
+      c._registration_commit({"dummy": 1})
+    assert not isinstance(excinfo.value, SavServerError)
+    # Byte-identical to the historical call-site message, [:200] snippet and all.
+    assert str(excinfo.value) == "Could not parse commit response: '{not json'"

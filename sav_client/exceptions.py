@@ -7,6 +7,9 @@ Hierarchy:
     ├── SavConnectionError    — network / HTTP transport failure
     ├── SavAuthError          — login rejected by the server
     └── SavResponseError      — server returned an unexpected response shape
+        └── SavServerError    — SAV2 returned an unhandled server-side error
+                                (a PHP fatal) with HTTP 200; the raw body is
+                                withheld from the message and logged at DEBUG
 
     LicenseNotEnrolledError   — license is not in any open registration batch
                                 (subclasses ValueError so existing
@@ -34,6 +37,22 @@ class SavAuthError(SavError):
 
 class SavResponseError(SavError):
     """Raised when the server returns a response that cannot be parsed or is missing expected fields."""
+
+
+class SavServerError(SavResponseError):
+    """Raised when SAV2 answers with an unhandled server-side error (a PHP
+    fatal) under HTTP 200.
+
+    SAV2 reports these fatals with a 200 status, so ``raise_for_status``
+    passes and the failure only surfaces when the body cannot be parsed as
+    the expected JSON. The raw body is deliberately withheld from the message
+    because it carries SAV's internal schema (table and constraint names),
+    which must not propagate into callers' logs and databases; the full body
+    is logged at DEBUG instead.
+
+    Subclasses ``SavResponseError`` so every existing
+    ``except SavResponseError`` handler keeps working.
+    """
 
 
 class SavRecordNotFoundError(SavResponseError):
