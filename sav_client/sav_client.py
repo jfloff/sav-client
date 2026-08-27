@@ -2151,7 +2151,8 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not delete batch: {exc}") from exc
 
-    logger.info("Delete batch response: %s", resp.text[:200])
+    self._check_write_response(resp.text, f"Could not delete batch {batch_id}")
+    logger.info("Deleted batch %s", batch_id)
     self._cache.forget_licenses_in_batch(batch_id)
     self._invalidate_batch_memo()
 
@@ -2199,10 +2200,10 @@ class SavClient:
         f"Could not remove player {license} from batch {batch_id}: {exc}"
       ) from exc
 
-    logger.info(
-      "Removed player license=%s from batch %s — response: %s",
-      license, batch.id, resp.text[:200],
+    self._check_write_response(
+      resp.text, f"Could not remove player {license} from batch {batch_id}",
     )
+    logger.info("Removed player license=%s from batch %s", license, batch.id)
     self._cache.forget_license_batch(license)
     # Row item_count/state changed — drop the memo so the next list re-fetches.
     self._invalidate_batch_memo()
@@ -2942,6 +2943,9 @@ class SavClient:
       raise SavConnectionError(
         f"Could not delete document {doc_id}: {exc}"
       ) from exc
+    # replace_player_registration_document() deletes before it uploads, so a
+    # silent failure here would leave the old document alongside the new one.
+    self._check_write_response(resp.text, f"Could not delete document {doc_id}")
     logger.info("Deleted registration document galeria=%s", doc_id)
 
   def list_player_registration_documents(
@@ -3445,6 +3449,18 @@ class SavClient:
     )
 
     body = resp.text
+    # A PHP fatal here parses as HTML containing no rows, so without this the
+    # batch reads back as empty and the caller cannot tell "no players" from
+    # "SAV is broken". Observed live on 2026-08-27: op=169 for a batch with one
+    # item returned an HTTP-200 SQL-syntax fatal, and this method answered [].
+    if self._looks_like_php_fatal(body):
+      logger.debug("Raw SAV error body for batch %s items: %s", batch_id, body)
+      raise SavServerError(
+        f"Could not list items for batch {batch_id}: SAV returned a server-side "
+        f"error (HTTP 200); the response body is withheld because it carries "
+        f"SAV's internal schema — the full body is logged at DEBUG on the "
+        f"'sav_client' logger"
+      )
     try:
       body = json.loads(body).get("msg", body)
     except ValueError:
@@ -4766,6 +4782,34 @@ class SavClient:
       "<b>notice</b>",
     )
     return any(m in head for m in markers)
+
+  def _check_write_response(self, text: str, what: str) -> None:
+    """Raise when a write endpoint's body signals failure despite HTTP 200.
+
+    SAV's delete/remove endpoints have no documented success payload — some
+    answer with an empty body — so we cannot demand a positive acknowledgement
+    without inventing a contract. What we can do is stop treating *every* 2xx as
+    proof the write happened, which is how an HTTP-200 rejection used to come
+    back to callers as ``removed``/``deleted``/``success: true`` while the row
+    was still there and the local cache had already forgotten it.
+
+    Two failure shapes are refused: an unhandled PHP fatal, and the
+    ``{"val": 0, ...}`` rejection every other SAV endpoint uses. An empty or
+    otherwise unparseable body is still treated as success, as before.
+    """
+    if self._looks_like_php_fatal(text):
+      logger.debug("Raw SAV error body for %s: %s", what, text)
+      raise SavServerError(
+        f"{what}: SAV returned a server-side error (HTTP 200); the response "
+        f"body is withheld because it carries SAV's internal schema — the full "
+        f"body is logged at DEBUG on the 'sav_client' logger"
+      )
+    try:
+      data = json.loads(text)
+    except ValueError:
+      return  # empty or non-JSON body — no signal either way, so assume success
+    if isinstance(data, dict) and "val" in data and str(data["val"]) != "1":
+      raise SavResponseError(f"{what}: {data.get('msg') or data!r}")
 
   def _parse_json_response(self, text: str, what: str) -> dict[str, Any]:
     """Parse ``text`` as JSON, shielding SAV2's PHP-fatal pages from messages.
