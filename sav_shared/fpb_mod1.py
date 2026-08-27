@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 import pikepdf
 from pypdf import PdfReader, PdfWriter
 
+from .dates import require_iso, split_date_parts
 from .files import (
   bbox_to_pdf_rect,
   load_image_bytes as _load_image_bytes,
@@ -796,17 +797,21 @@ def _split_date(value: str) -> tuple[str, str, str] | None:
   """(dia, mes, ano) from an ISO (YYYY-MM-DD) or EU (DD-MM-YYYY) date string.
 
   Tolerant of ``/`` or ``.`` separators. Returns None when it can't be parsed.
+
+  **Deliberately tolerant — do not tighten this to ISO-only.** It is the *read*
+  path: OCR'd Modelo 1s and values read back from SAV arrive in EU format, and
+  `player_is_minor` depends on parsing them. Caller-supplied values are held to
+  ISO one level up, in `_mod1_unusable_values` via `require_iso`, which is the
+  boundary where the caller can still be told what they got wrong.
+
+  Thin re-ordering of :func:`sav_shared.dates.split_date_parts`, which owns the
+  parsing; the Modelo 1 fill mapping wants the parts in form order (dia, mes,
+  ano) because that is how the AcroForm splits them across three fields.
   """
-  parts = [p for p in re.split(r"[-/.]", value.strip()) if p]
-  if len(parts) != 3:
+  parts = split_date_parts(value)
+  if parts is None:
     return None
-  a, _, c = parts
-  if len(a) == 4:          # YYYY-MM-DD
-    ano, mes, dia = parts
-  elif len(c) == 4:        # DD-MM-YYYY
-    dia, mes, ano = parts
-  else:
-    return None
+  ano, mes, dia = parts
   return dia, mes, ano
 
 
@@ -978,7 +983,8 @@ def player_is_minor(birth_date: object, ref_date: object = None) -> bool | None:
 
 def _mod1_unusable_values(values: dict) -> list[str]:
   """Problems for present-but-unusable values (would silently render blank):
-  checkbox options that don't resolve, dates that don't parse, bad postal codes.
+  checkbox options that don't resolve, bad postal codes, and dates that are not
+  strictly ``YYYY-MM-DD`` (a DD-MM-YYYY date is rejected, not converted).
   """
   problems: list[str] = []
   for key, spec in MOD1_FILL_MAPPING.items():
@@ -989,8 +995,15 @@ def _mod1_unusable_values(values: dict) -> list[str]:
       if _resolve_checkbox(spec, value) is None:
         problems.append(f"{key}={value!r} is not a valid option")
     elif isinstance(spec, _Date):
-      if _to_date(value) is None:
-        problems.append(f"{key}={value!r} is not a valid date (use YYYY-MM-DD)")
+      try:
+        require_iso(value, field=key)
+      except ValueError:
+        # A DD-MM-YYYY value is a date we *could* parse — we refuse to, because
+        # guessing at the caller's convention is how a wrong date reaches the
+        # federation. Say what to write instead of just rejecting.
+        parsed = _to_date(value)
+        hint = f" — did you mean {parsed.isoformat()}?" if parsed else ""
+        problems.append(f"{key}={value!r} must be YYYY-MM-DD{hint}")
     elif isinstance(spec, _Postal):
       cod4, cp3 = _split_postal(str(value))
       if not (cod4 and cp3):
@@ -1061,7 +1074,8 @@ def render_mod1(
   MOD1_FILL_MAPPING). Text fields take strings; checkbox groups (`tipo`,
   `guardian_id_type` = 1/2/3; `guardian_relation` = 1/2/3; `genero`, `escalao`,
   `tipo_inscricao` by int or name) select a box; `consent_*` take booleans;
-  dates are ``YYYY-MM-DD``; distrito/concelho/nacionalidade are names.
+  dates must be ``YYYY-MM-DD`` (any other format is rejected, not converted);
+  distrito/concelho/nacionalidade are names.
 
   Unless `validate` is False, the form's mandatory-fill rules are enforced (see
   validate_mod1_values) and a ValueError listing every problem is raised when

@@ -33,6 +33,18 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 - Inputs: `parse_enrollment_forms(documents=[{"pdf": b64}, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
 - Outputs: `generate_game_sheet_pdf` and `fill_mod1` return `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
 
+## Date convention
+
+**Every date this server emits is `YYYY-MM-DD`, and every date it accepts should be written that way.** SAV2 itself is not consistent — its wizard and profile endpoints use ISO while its listing endpoints use `DD-MM-YYYY` — and normalising that away is part of what this server is for.
+
+| Direction | Rule |
+| --- | --- |
+| Values that reach a SAV commit (`exam_date`, `id_expiry`, `birth_date`, and every date in a `values` dict) | `YYYY-MM-DD` **enforced**. `13/05/2026` is rejected, not converted — guessing the caller's convention is how a wrong date gets filed with the federation. |
+| Read-only filters (`list_games`, `list_game_sheets` `date_from`/`date_to`) | `YYYY-MM-DD` preferred; `DD-MM-YYYY` still accepted, since nothing is written. |
+| Everything returned | `YYYY-MM-DD`, including `date` on game rows and `tptd_expiry` on coaches. |
+
+`exam_date` additionally has to fall inside SAV's validity window — see [Domain rules](#domain-rules).
+
 ## Enum tables
 
 ### Registration types (`reg_type`)
@@ -175,7 +187,7 @@ Every `documents` entry is self-contained. Unknown keys are errors, so misspelli
 | `pdf` | yes | Base64-encoded PDF bytes. |
 | `doc_type` | no | `"fpb_modelo_1"`, `"exame_medico"`, or `"fpb_modelo_4"`; omit to auto-classify. |
 | `values` | no | Canonical Modelo 1 values dict (the `fill_mod1` shape); implies `doc_type="fpb_modelo_1"`. |
-| `exam_date` | no | `"YYYY-MM-DD"`; implies `doc_type="exame_medico"`. |
+| `exam_date` | no | `"YYYY-MM-DD"`, validated on entry; implies `doc_type="exame_medico"`. |
 
 | Entry | Classification | Document AI extraction | Classifier trained |
 | --- | --- | --- | --- |

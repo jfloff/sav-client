@@ -37,6 +37,7 @@ from sav_client.exceptions import (
   SavResponseError,
 )
 from sav_shared.clubs import find_club_matches
+from sav_shared.dates import require_iso
 from sav_shared.files import load_image_bytes, staged_pdf
 from sav_shared.enrollment import (
   KWARG_TO_SAV_KEY,
@@ -920,8 +921,8 @@ def coaches_cmd(ctx, clubs, season, status, gender, name, wallet, tptd, count, w
 
 @cli.command("games")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current).")
-@click.option("--date-from", default="", help="Start date filter (DD-MM-YYYY).")
-@click.option("--date-to", default="", help="End date filter (DD-MM-YYYY).")
+@click.option("--date-from", default="", help="Start date filter (YYYY-MM-DD; DD-MM-YYYY also accepted).")
+@click.option("--date-to", default="", help="End date filter (YYYY-MM-DD; DD-MM-YYYY also accepted).")
 @click.option("--tier", default="", help="Filter by tier (e.g. 'Sub 14').")
 @click.option("--gender", default=0, type=int, help="Filter by gender code (0 = any).")
 @click.option(
@@ -1148,9 +1149,9 @@ def game_sheet_cmd(ctx, game_number, team, show_players, show_coaches, show_staf
 
 @cli.command("game-sheets")
 @click.option("--season", default=None, type=int, help="Season epoch ID (defaults to current).")
-@click.option("--date", "single_date", default="", help="Filter by a single date (DD-MM-YYYY). Shorthand for --date-from and --date-to.")
-@click.option("--date-from", default="", help="Start date filter (DD-MM-YYYY).")
-@click.option("--date-to", default="", help="End date filter (DD-MM-YYYY).")
+@click.option("--date", "single_date", default="", help="Filter by a single date (YYYY-MM-DD; DD-MM-YYYY also accepted). Shorthand for --date-from and --date-to.")
+@click.option("--date-from", default="", help="Start date filter (YYYY-MM-DD; DD-MM-YYYY also accepted).")
+@click.option("--date-to", default="", help="End date filter (YYYY-MM-DD; DD-MM-YYYY also accepted).")
 @click.option("--tier", default="", help="Filter by tier (e.g. 'Sub 14').")
 @click.option("--competition", default="", help="Filter by competition name fragment (case-insensitive, e.g. 'Ribas').")
 @click.option("--status", default="", help="Filter by game status (e.g. 'Realizado'). Shows all statuses by default.")
@@ -1615,6 +1616,11 @@ def _print_submission_summary(
 
 # Field types accepted by enrollment create/update --field. Defined here (before the
 # enrollment group) so the --field decorator can reference _UPDATE_FIELDS at import time.
+# The third slot marks fields whose value is a date: those reach a SAV commit
+# body verbatim, so `--field` holds them to YYYY-MM-DD rather than letting SAV
+# reject them later without saying why.
+_UPDATE_DATE_FIELDS = frozenset({"id_expiry", "exam_date"})
+
 _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
   "id_type":        ("step1", int),
   "id_number":      ("step1", str),
@@ -1856,7 +1862,8 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   (derived from nasc) and must be empty otherwise. Invalid input is rejected with
   the list of problems.
 
-  Text fields take strings; dates are YYYY-MM-DD; consent_* take booleans.
+  Text fields take strings; dates must be YYYY-MM-DD and any other format is
+  rejected rather than converted; consent_* take booleans.
   Checkbox groups accept an int code or a name: tipo_inscricao (1=1ª Inscrição,
   2=Revalidação), genero (1=Masculino, 2=Feminino, or the name), escalao (name,
   e.g. "Sub 14"), tipo / guardian_id_type (1=Cartão Cidadão, 2=Passaporte,
@@ -2880,6 +2887,11 @@ def _parse_update_fields(field_args: tuple[str, ...]) -> dict[str, Any]:
           coerced = int(val)
         except ValueError:
           raise click.UsageError(f"--field {key} expects an integer; got {val!r}.")
+      elif key in _UPDATE_DATE_FIELDS:
+        try:
+          coerced = require_iso(val, field=key)
+        except ValueError as exc:
+          raise click.UsageError(f"--field {exc}")
       out[key] = coerced
     elif kind == "resolve_distrito":
       resolved = find_distrito_id(val)

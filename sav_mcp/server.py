@@ -821,8 +821,9 @@ def list_games(
         has both scores.
     tier: escalão filter (e.g. "Sub 14"). Omit for all tiers.
     gender: 0 = any, 1 = Masculino, 2 = Feminino.
-    date_from / date_to: inclusive DD-MM-YYYY window. For "games in the last 10
-        days", pass date_from = today-10 days and date_to = today.
+    date_from / date_to: inclusive YYYY-MM-DD window (DD-MM-YYYY is also
+        accepted). For "games in the last 10 days", pass date_from =
+        today-10 days and date_to = today. Returned dates are YYYY-MM-DD.
 
     Each row is relative to the queried club (home / our_score / opp_score /
     opponent are the club's, not the sheet's home/away):
@@ -878,7 +879,7 @@ def list_game_sheets(
     """
     List games that have or may have a game sheet available.
 
-    date_from / date_to: DD-MM-YYYY format.
+    date_from / date_to: YYYY-MM-DD (DD-MM-YYYY is also accepted).
     competition: case-insensitive name fragment filter.
     status: game status filter (e.g. "Realizado"). Omit for all.
     """
@@ -1000,7 +1001,8 @@ def fill_mod1(
     full only for a minor (derived from nasc) and must be empty otherwise.
     Invalid input raises an error listing every problem.
 
-    Text fields take strings; dates are "YYYY-MM-DD"; consent_* take booleans;
+    Text fields take strings; dates must be "YYYY-MM-DD" and any other format
+    is rejected rather than converted; consent_* take booleans;
     distrito/concelho/nacionalidade/pais_nascimento are names. Checkbox groups
     accept an int code or a name: tipo_inscricao (1=1ª Inscrição, 2=Revalidação),
     genero (1=Masculino, 2=Feminino), escalao (name, e.g. "Sub 14"), tipo /

@@ -43,7 +43,8 @@ class TestGetCoachDetail:
     assert result.name == "Test Coach"
     assert result.nif == "223688177"
     assert result.tptd == "166614"
-    assert result.tptd_expiry == "15-09-2028"
+    # SAV sends "15-09-2028" in the HTML (see _SAMPLE_MSG); the client emits ISO.
+    assert result.tptd_expiry == "2028-09-15"
     assert result.mobile_phone == "912345678"
     assert result.email == "coach@example.com"
 

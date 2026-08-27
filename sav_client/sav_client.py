@@ -50,6 +50,7 @@ from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBa
 from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
+from sav_shared.dates import require_iso, to_iso
 from sav_shared.text import iso_date
 
 logger = logging.getLogger(__name__)
@@ -2369,6 +2370,15 @@ class SavClient:
         "items can only be added to 'Em construção' batches."
       )
 
+    # `exam_date` is checked at the commit; these two are written into the same
+    # bodies (datenasc, dataval) and were previously passed through verbatim.
+    # SAV stores them as ISO — confirmed against a live profile read-back — and
+    # rejects a wrong shape without saying so, so they are held to it here.
+    if birth_date not in (None, ""):
+      birth_date = require_iso(birth_date, field="birth_date")
+    if id_expiry not in (None, ""):
+      id_expiry = require_iso(id_expiry, field="id_expiry")
+
     def _finish(result: int) -> int:
       # Always the session's own club — batches are only listable for your own
       # club — but the cache file can outlive the session, so its NIF-index
@@ -2749,6 +2759,11 @@ class SavClient:
       raise SavResponseError(
         "Must call login() before update_player_in_registration_batch()"
       )
+
+    # Written straight into the step-1 body as `data_val_identificacao`; SAV
+    # stores it as ISO, so reject anything else here rather than at the commit.
+    if id_expiry not in (None, ""):
+      id_expiry = require_iso(id_expiry, field="id_expiry")
 
     batch = next(
       (b for b in self.list_player_registration_batches() if b.id == batch_id),
@@ -5206,7 +5221,10 @@ class SavClient:
       active=False,
       nif=_input_value("nif"),
       tptd=_input_value("nrtptd"),
-      tptd_expiry=_input_value("validadetptd"),
+      # SAV renders this listing-side field as DD-MM-YYYY; every date this
+      # package emits is ISO, so it is normalised here rather than in each
+      # serializer (see sav_shared.dates).
+      tptd_expiry=to_iso(_input_value("validadetptd")),
       mobile_phone=_input_value("telem"),
       email=_input_value("email"),
     )
@@ -5271,7 +5289,7 @@ class SavClient:
         competition=cells[1],
         phase=cells[2],
         round=cells[3],
-        date=cells[4],
+        date=to_iso(cells[4]),  # DD-MM-YYYY on the wire; ISO on the way out
         time=cells[5],
         home=cells[6],
         away=cells[7],

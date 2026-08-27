@@ -95,7 +95,9 @@ class Game:
       competition:    Competition/tournament name.
       phase:          Phase name (e.g. "1ª Fase - Série A").
       round:          Round/matchday number string.
-      date:           Game date string as returned by the server (DD-MM-YYYY).
+      date:           Game date, normalised to YYYY-MM-DD. SAV sends this
+                      endpoint's dates as DD-MM-YYYY; the client converts so
+                      every date it emits has one shape.
       time:           Kick-off time string (HH:MM).
       home:           Home team name.
       away:           Away team name.
@@ -244,7 +246,8 @@ class Coach:
       nif:          Portuguese tax number. Empty unless fetched via
                     ``get_coach_detail`` or ``list_coaches(with_details=True)``.
       tptd:         TPTD number (Nr. TPTD). Empty unless detail was fetched.
-      tptd_expiry:  TPTD expiry date (DD-MM-YYYY). Empty unless detail was fetched.
+      tptd_expiry:  TPTD expiry date (YYYY-MM-DD; SAV sends DD-MM-YYYY and the
+                    client converts). Empty unless detail was fetched.
       mobile_phone: Mobile phone number (telemóvel). Empty unless detail
                     was fetched.
       email:        Email address. Empty unless detail was fetched.
