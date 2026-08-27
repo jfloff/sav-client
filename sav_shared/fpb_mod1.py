@@ -25,6 +25,7 @@ import pikepdf
 from pypdf import PdfReader, PdfWriter
 
 from .dates import require_iso, split_date_parts
+from .identifiers import normalise_nif
 from .files import (
   bbox_to_pdf_rect,
   load_image_bytes as _load_image_bytes,
@@ -1048,6 +1049,12 @@ def validate_mod1_values(values: dict) -> list[str]:
       problems.append(f"{key} is required")
 
   problems += _mod1_unusable_values(values)
+
+  # NIF was only checked for presence here, while the MCP lookup tools required
+  # nine digits — so `nif="abc"` passed the form and reached SAV's create-player
+  # call verbatim. One rule now, at every entry point.
+  if not _is_blank(values.get("nif")) and normalise_nif(values.get("nif")) is None:
+    problems.append(f"nif={values.get('nif')!r} must be 9 digits")
 
   # Licença FPB — mandatory only for a Revalidação.
   insc = _resolve_checkbox(MOD1_FILL_MAPPING["tipo_inscricao"], values.get("tipo_inscricao"))

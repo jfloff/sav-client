@@ -62,6 +62,7 @@ from sav_shared.files import (
     rect_has_overlay,
 )
 from sav_shared.dates import require_iso
+from sav_shared.identifiers import normalise_nif, require_nif
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
@@ -384,9 +385,9 @@ def _resolve_by_nif(
     Not parameterised by club: SAV2 only exposes a player's NIF to their own
     club, so the session club is the only roster a NIF can be resolved in.
     """
-    digits = re.sub(r"\D", "", nif or "")
+    digits = normalise_nif(nif)
     club_id = _effective_club(client, None)
-    if len(digits) != 9 or not club_id:
+    if digits is None or not club_id:
         return None
     license = client.find_license_by_nif(digits)
     if license is None:
@@ -492,8 +493,8 @@ def find_player_by_nif(
         every season rung.
     with_details: when true, also fetch photo_url, mobile_phone and nif.
     """
-    digits = re.sub(r"\D", "", nif or "")
-    if len(digits) != 9:
+    digits = normalise_nif(nif)
+    if digits is None:
         return None
     client = _get_client()
     if not _effective_club(client, None):
@@ -571,8 +572,8 @@ def lookup_player(
         raise ValueError("exactly one of nif or license must be supplied")
 
     if nif is not None:
-        digits = re.sub(r"\D", "", nif or "")
-        if len(digits) != 9:
+        digits = normalise_nif(nif)
+        if digits is None:
             return None
 
     client = _get_client()

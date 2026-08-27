@@ -2396,6 +2396,8 @@ class SavClient:
     # rejects a wrong shape without saying so, so they are held to it here.
     if birth_date not in (None, ""):
       birth_date = require_iso(birth_date, field="birth_date")
+    if nif not in (None, ""):
+      nif = require_nif(nif)
     if id_expiry not in (None, ""):
       id_expiry = require_iso(id_expiry, field="id_expiry")
 
