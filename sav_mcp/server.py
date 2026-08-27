@@ -61,6 +61,7 @@ from sav_shared.files import (
     load_image_bytes,
     rect_has_overlay,
 )
+from sav_shared.dates import require_iso
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
@@ -1377,6 +1378,77 @@ def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> d
     }
 
 
+# Consent flags are written to the federation record, so the encodings we accept
+# are enumerated rather than guessed at.
+_TRUE_STRINGS = frozenset({"true", "1", "yes", "y", "on", "sim"})
+_FALSE_STRINGS = frozenset({"false", "0", "no", "n", "off", "nao", "não"})
+
+
+def _require_bool(value: Any, *, field: str) -> bool:
+    """Decode `value` as a boolean, raising on anything ambiguous.
+
+    Python truthiness is the wrong tool here: ``bool("false")`` and ``bool("0")``
+    are both ``True``, so a JSON-ish client sending the string "false" for a GDPR
+    consent would have the opposite recorded against a real person. An explicit
+    vocabulary, and a hard error outside it, is the only safe reading.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().casefold()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise ValueError(
+        f"Field {field!r} expects a boolean; got {value!r}. Pass true/false "
+        f"(JSON booleans preferred)."
+    )
+
+
+# Fields `update_enrollment_with_document` can actually apply. It patches step 1
+# and step 2 only: `exam_date` and the guardian/consent block would need the
+# step-3 re-commit, which re-derives taxa and insurance and resets any selection
+# not passed with it — too much to trigger implicitly behind a document upload.
+# These keys used to be dropped silently while the response still reported
+# `fields_updated: True`, so a caller had no way to tell the patch hadn't landed.
+_UPDATE_WITH_DOC_FIELDS = frozenset({
+    "id_type", "id_number", "id_expiry", "telemovel", "telefone",
+    "email", "nome_pai", "nome_mae", "morada", "cod_postal",
+    "localidade_txt", "distrito_id", "concelho_id",
+})
+
+
+# Enrollment kwargs written into a SAV commit body as dates and as flags.
+_DATE_KWARGS = ("exam_date", "id_expiry", "birth_date")
+_BOOL_KWARGS = ("consent_data", "consent_communications", "consent_marketing")
+
+
+def _validate_overrides(overrides: dict[str, Any]) -> dict[str, Any]:
+    """Return `overrides` with dates normalised to ISO and flags decoded strictly.
+
+    Applied to caller-supplied overrides only — OCR- and SAV-derived values are
+    already canonical by the time they get here. The point is that a bad value
+    fails at the tool boundary, where the caller can still be told which field is
+    wrong, rather than being written into a federation record by a commit that
+    reports no reason at all.
+
+    Consents matter as much as dates: they are recorded against a real person,
+    and the client turns them into ``1``/``0`` on truthiness, so an un-decoded
+    ``"false"`` would file the opposite of what the caller asked for.
+    """
+    out = dict(overrides)
+    for key in _DATE_KWARGS:
+        if out.get(key) not in (None, ""):
+            out[key] = require_iso(out[key], field=key)
+    for key in _BOOL_KWARGS:
+        if out.get(key) is not None:
+            out[key] = _require_bool(out[key], field=key)
+    return out
+
+
 def _replace_player_document_from_bytes(
     client: SavClient,
     batch_id: int,
@@ -1660,6 +1732,16 @@ def _parse_one_enrollment_pdf(
             "index": index,
             "error": "exam_date requires doc_type=\"exame_medico\" when doc_type is provided.",
         }, None
+    if exam_date_hint is not None:
+        # Validate here, at the boundary. Left unchecked, a non-ISO date rides
+        # along as a confidence-1.0 ParsedField, gets dropped much later by
+        # extract_medical_exam_info, and surfaces at submit as "Medical exam OCR
+        # did not yield a usable exam_date" — blaming OCR for a date the caller
+        # typed by hand.
+        try:
+            exam_date_hint = require_iso(exam_date_hint, field="exam_date")
+        except ValueError as exc:
+            return {"index": index, "error": str(exc)}, None
 
     try:
         pdf_bytes = base64.b64decode(pdf_b64)
@@ -2460,7 +2542,7 @@ def submit_enrollment(
                 mod4["parsed"], client, gender_id=gender_for_subida,
             )
     if field_overrides:
-        kwargs.update(field_overrides)
+        kwargs.update(_validate_overrides(field_overrides))
     manual_exam_override = bool(
         field_overrides and field_overrides.get("exam_date") not in (None, "")
     )
@@ -2715,12 +2797,17 @@ def update_enrollment(
         )
     int_keys = {"id_type", "distrito_id", "concelho_id", "guardian_relation"}
     bool_keys = {"consent_data", "consent_communications", "consent_marketing"}
+    # Dates reach a SAV commit body verbatim, so they are held to one shape here
+    # rather than at the far end, where SAV rejects them without saying why.
+    date_keys = {"id_expiry", "exam_date"}
     coerced: dict[str, Any] = {}
     for k, v in fields.items():
         if v is None:
             continue
         if k in bool_keys:
-            coerced[k] = bool(v)
+            coerced[k] = _require_bool(v, field=k)
+        elif k in date_keys:
+            coerced[k] = require_iso(v, field=k)
         elif k in int_keys and not isinstance(v, int):
             try:
                 coerced[k] = int(v)
@@ -2792,8 +2879,13 @@ def update_enrollment_with_document(
     mod1_values: trusted canonical Modelo 1 values (the fill_mod1 shape). When
     supplied, the document is treated as fpb_modelo_1 and classification and
     field extraction are skipped, even when the PDF has no AcroForm.
-    field_overrides: optional field values applied on top of reconcile result before
-    submitting (same keys as update_enrollment). Only valid when file_only=False.
+    field_overrides: optional field values applied on top of the reconcile result
+    before submitting. Step-1/step-2 keys only (id_type, id_number, id_expiry,
+    telemovel, telefone, email, nome_pai, nome_mae, morada, cod_postal,
+    localidade_txt, distrito_id, concelho_id) — exam_date and the
+    guardian/consent block need the step-3 re-commit, so pass those to
+    update_enrollment instead; supplying one here raises. Only valid when
+    file_only=False.
     file_only: when True, replace the document without touching fields. A mod1/mod4
     still gets the club stamp ($CLUB_STAMP_PATH) — and, for a mod4,
     detentor_signature_b64 — overlaid onto empty slots before the replace.
@@ -2805,6 +2897,16 @@ def update_enrollment_with_document(
     if the licence is not enrolled in any open batch.
     """
     from sav_parsers import classify, close_processing, parse_fpb_mod1, train_classifier
+
+    if field_overrides:
+        unsupported = sorted(set(field_overrides) - _UPDATE_WITH_DOC_FIELDS)
+        if unsupported:
+            raise ValueError(
+                f"update_enrollment_with_document cannot apply {unsupported}; it "
+                f"patches step-1/step-2 fields only. Use update_enrollment for "
+                f"exam_date and the guardian/consent block. Allowed here: "
+                f"{sorted(_UPDATE_WITH_DOC_FIELDS)}."
+            )
 
     try:
         pdf_bytes = base64.b64decode(pdf)
@@ -2883,14 +2985,13 @@ def update_enrollment_with_document(
             result = reconcile_fpb_mod1(parsed, sav_profile, client=client)
             kwargs = {k: v for k, v in {**result.updated, **result.kept}.items()}
             if field_overrides:
-                kwargs.update(field_overrides)
+                kwargs.update(_validate_overrides(field_overrides))
 
-            allowed = {
-                "id_type", "id_number", "id_expiry", "telemovel", "telefone",
-                "email", "nome_pai", "nome_mae", "morada", "cod_postal",
-                "localidade_txt", "distrito_id", "concelho_id",
+            # Reconcile output carries more than this path can patch; overrides
+            # were already checked against the same set at entry.
+            patch_kwargs = {
+                k: v for k, v in kwargs.items() if k in _UPDATE_WITH_DOC_FIELDS
             }
-            patch_kwargs = {k: v for k, v in kwargs.items() if k in allowed}
             client.update_player_in_registration_batch(batch_id, license, **patch_kwargs)
             carimbo, carimbo_bbox = read_carimbo(parsed)
             # Derive reg_type from OCR checkboxes only (no NIF lookup in update flow).
