@@ -45,6 +45,14 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 
 `exam_date` additionally has to fall inside SAV's validity window — see [Domain rules](#domain-rules).
 
+## Identifier convention
+
+**Licences are integers everywhere on this surface** — inputs and outputs, search rows and batch rows alike. `Player.license` used to be a string while batch rows were ints, so a wrapper that stored `"301772"` from a search and compared it against `{301772}` silently failed its authorization check.
+
+`0` means "no licence" (e.g. a detail-only row), never a real player.
+
+**NIF is nine digits**, with separators accepted on input and stripped on output. The same rule now applies at every entry point — the Modelo 1 validator previously only checked the field was non-blank, so `nif="abc"` passed the form and reached SAV's create-player call. Digits are never scraped out of surrounding text: `"NIF 289463491"` is rejected rather than silently accepted.
+
 ## Enum tables
 
 ### Registration types (`reg_type`)

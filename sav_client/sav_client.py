@@ -51,6 +51,7 @@ from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
 from sav_shared.dates import require_iso, to_iso
+from sav_shared.identifiers import require_nif, to_license
 from sav_shared.text import iso_date, normalise_text
 
 logger = logging.getLogger(__name__)
@@ -871,7 +872,7 @@ class SavClient:
 
     if not with_details:
       return Player(
-        id=player_id, license="", name="", association="", club="",
+        id=player_id, license=0, name="", association="", club="",
         tier="", gender="", birth_date="", nationality="", status="",
       )
 
@@ -5220,7 +5221,7 @@ class SavClient:
 
       players.append(Player(
         id=db_id,
-        license=cells[2].get_text(strip=True),
+        license=to_license(cells[2].get_text(strip=True)),
         name=cells[3].get_text(strip=True),
         association=cells[4].get_text(strip=True),
         club=cells[5].get_text(strip=True),
@@ -5513,7 +5514,7 @@ class SavClient:
     nif = (nif_el.get("value", "") or "").strip() if nif_el else ""
 
     return Player(
-      id=player_id, license="", name="", association="", club="",
+      id=player_id, license=0, name="", association="", club="",
       tier="", gender="", birth_date="", nationality="", status="",
       photo_url=photo_url,
       mobile_phone=mobile_phone,

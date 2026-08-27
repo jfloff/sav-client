@@ -132,7 +132,7 @@ def test_player_forwards_all_clubs_scope(monkeypatch):
       return [
         Player(
           id=1,
-          license="301772",
+          license=301772,
           name="A",
           association="AB X",
           club="Club X",

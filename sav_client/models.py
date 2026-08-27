@@ -187,6 +187,11 @@ class Player:
       nationality:  Nationality string.
       status:       Registration status string, e.g. "FBP".
       season:       Season string, e.g. "2025/2026" (search only).
+      license:      FPB licence number as an int; 0 when the row carries no
+                    licence (e.g. a detail-only fetch). SAV renders it as
+                    table text — the client normalises so every licence on
+                    the public surface is the same type and comparisons
+                    against batch rows and authz sets can't silently fail.
       active:       True when the status icon indicates "Activo" (search only).
       photo_url:    Photo URL. Empty unless the detail was fetched via
                     ``get_player_detail(with_details=True)`` or
@@ -197,7 +202,7 @@ class Player:
   """
 
   id: int
-  license: str
+  license: int
   name: str
   association: str
   club: str

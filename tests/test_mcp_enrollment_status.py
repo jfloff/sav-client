@@ -15,7 +15,7 @@ class _Player:
   """Minimal Player stand-in for player_to_dict."""
 
   id = 1
-  license = "301772"
+  license = 301772  # int on every surface — see sav_shared.identifiers
   name = "Jogador Teste"
   club = "Rio Maior Basket"
   club_id = 7
