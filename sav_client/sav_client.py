@@ -2522,6 +2522,18 @@ class SavClient:
     defaults (consents on, no subida).
     """
     # ── Validate guardian fields for minors ───────────────────────────────────
+    #
+    # LOAD-BEARING — do not relax this to make a caller pass.
+    #
+    # SAV2 *accepts* a minor with an empty guardian block. Reproduced against
+    # production on 2026-08-27: a ten-year-old committed with nomeEncarregado,
+    # telefoneEncarregado and emailEncarregado all blank returned {"val": 1} and
+    # was filed. The Modelo 1 makes the block mandatory and validate_mod1_values
+    # enforces it on the form side, but the federation itself does not check.
+    #
+    # So this reads like ordinary form validation and is not: it is the last
+    # thing standing between a caller's omission and an unaccompanied child on
+    # the federation's register.
     is_minor = bool(step3_prefill.get("menor_idade"))
     if is_minor:
       missing = [
@@ -4503,6 +4515,19 @@ class SavClient:
       localidade_id=localidade_id, localidade_txt=localidade_txt,
       morada=morada, cod_postal=cod_postal,
     )
+    # ── Validate guardian fields for minors ───────────────────────────────────
+    #
+    # LOAD-BEARING — do not relax this to make a caller pass.
+    #
+    # SAV2 *accepts* a minor with an empty guardian block. Reproduced against
+    # production on 2026-08-27: a ten-year-old committed with nomeEncarregado,
+    # telefoneEncarregado and emailEncarregado all blank returned {"val": 1} and
+    # was filed. The Modelo 1 makes the block mandatory and validate_mod1_values
+    # enforces it on the form side, but the federation itself does not check.
+    #
+    # So this reads like ordinary form validation and is not: it is the last
+    # thing standing between a caller's omission and an unaccompanied child on
+    # the federation's register.
     is_minor = bool(step2.get("menor_idade"))
     if is_minor:
       missing = [

@@ -372,6 +372,8 @@ client.add_player_to_registration_batch(                                      # 
 
 Raises `SavConfigError` for missing minor-guardian fields or non-Revalidação batches; `SavResponseError` if the commit fails. The licence must appear in the batch's server-side eligible list — passing one that doesn't raises `ValueError` with the eligible count for context.
 
+**The minor-guardian check is load-bearing — never relax it.** SAV2 *accepts* a minor with an empty guardian block: on 2026-08-27 a ten-year-old was committed with `nomeEncarregado`, `telefoneEncarregado` and `emailEncarregado` all blank and the commit returned `{"val":1}` and filed him. The Modelo 1 makes that block mandatory; the federation does not enforce it. This `SavConfigError` is therefore the last line of defence against filing an unaccompanied child, not ordinary form validation, and it must not be softened to make a caller pass.
+
 **`exam_date` is bounded, not just shape-checked.** SAV derives licence validity as exam date + 12 months, so the date must be in the past and no more than 12 months old; `ValueError` otherwise. The upper bound is enforced here because SAV's own rejection carries no reason — a future date returns `{"val":0,"msg":"","resultfunction":"-1"}`, which SAV2's web UI cannot explain to its users either. The lower bound is ours: an older exam issues a licence that is already expired.
 
 ### `upload_player_registration_document(batch_id, license, file_path, *, tipo_doc=1) → None`

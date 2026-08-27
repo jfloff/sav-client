@@ -1030,6 +1030,13 @@ def validate_mod1_values(values: dict) -> list[str]:
   today). Values that are present but unusable (bad option/date/postal) are
   flagged too. The three signatures and the signature date are never required —
   they belong to the hand-completed block.
+
+  **The guardian rule is load-bearing.** SAV2 accepts a minor with an empty
+  guardian block — reproduced 2026-08-27, a ten-year-old was committed with all
+  three guardian fields blank and filed. The Modelo 1 requires the block; the
+  federation does not enforce it. This check and the matching one in
+  sav_client's commit paths are the only things preventing an unaccompanied
+  child being registered, so neither may be softened to let a caller through.
   """
   problems: list[str] = []
 
