@@ -815,17 +815,26 @@ def _split_date(value: str) -> tuple[str, str, str] | None:
   return dia, mes, ano
 
 
+_POSTAL_RE = re.compile(r"^(\d{4})\s*-?\s*(\d{3})$")
+
+
 def _split_postal(value: str) -> tuple[str, str]:
   """(first-4, last-3) from a Portuguese postal code like ``1234-567``.
 
-  Tolerant of a missing ``-`` (falls back to a 4/3 digit split).
+  The ``-`` is optional; everything else is strict. Anything that is not
+  exactly four digits then three returns ``("", "")``, which
+  `_mod1_unusable_values` reports as a problem.
+
+  It used to strip non-digits and slice, which failed silently in both
+  directions: ``"12345678"`` came back as ``("1234", "567")`` with the trailing
+  digit dropped and no complaint, and ``"12ab-xyz"`` took the hyphen branch and
+  passed validation as a pair of non-empty strings — then rendered onto the
+  form as-is.
   """
-  raw = value.strip()
-  if "-" in raw:
-    left, right = raw.split("-", 1)
-    return left.strip(), right.strip()
-  digits = "".join(ch for ch in raw if ch.isdigit())
-  return digits[:4], digits[4:7]
+  match = _POSTAL_RE.match(value.strip())
+  if not match:
+    return "", ""
+  return match.group(1), match.group(2)
 
 
 def _is_blank(value: object) -> bool:
