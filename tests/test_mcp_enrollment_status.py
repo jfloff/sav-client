@@ -35,7 +35,8 @@ def test_not_enrolled_returns_projected_foreign_born_checklist(monkeypatch):
   class StubClient:
     session = {"organizacao": 7}
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted, "status must scan every pending state, not only open batches"
       raise LicenseNotEnrolledError(license, open_batches=[{"number": "B1"}])
 
     def search_players(self, license, club, status):
@@ -62,7 +63,8 @@ def test_not_enrolled_portuguese_checklist(monkeypatch):
   class StubClient:
     session = {"organizacao": 7}
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted, "status must scan every pending state, not only open batches"
       raise LicenseNotEnrolledError(license, open_batches=[])
 
     def search_players(self, license, club, status):
@@ -83,7 +85,8 @@ def test_enrolled_player_also_gets_projected_checklist(monkeypatch):
   class StubClient:
     session = {"organizacao": 7}
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted, "status must scan every pending state, not only open batches"
       raise LicenseNotEnrolledError(license, open_batches=[])
 
     def search_players(self, license, club, status):
@@ -97,7 +100,7 @@ def test_enrolled_player_also_gets_projected_checklist(monkeypatch):
   result = server_module.get_enrollment_status(license=301772)
 
   assert result["status"] == "enrolled"
-  assert result["player"]["license"] == "301772"
+  assert result["player"]["license"] == 301772
   assert result["checklist"]["scenario"] == "foreign_born"
 
 
@@ -105,7 +108,8 @@ def test_profile_failure_defaults_to_foreign_born(monkeypatch):
   class StubClient:
     session = {"organizacao": 7}
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted, "status must scan every pending state, not only open batches"
       raise LicenseNotEnrolledError(license, open_batches=[])
 
     def search_players(self, license, club, status):
@@ -126,7 +130,8 @@ def test_reg_type_transferencia_yields_null_checklist(monkeypatch):
   class StubClient:
     session = {"organizacao": 7}
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted, "status must scan every pending state, not only open batches"
       raise LicenseNotEnrolledError(license, open_batches=[])
 
     def search_players(self, license, club, status):

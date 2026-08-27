@@ -332,6 +332,21 @@ class PlayerRegistrationBatch:
     """True when the batch is in 'Em construção' state and accepts items."""
     return self.state_id == 1
 
+  @property
+  def is_pending(self) -> bool:
+    """True while the batch is still in flight, in any of SAV's four states.
+
+    The listing only ever returns 'Em construção', 'Devolvida', 'Em Validação'
+    and 'Em Pagamento' — a batch that has completed drops out of it — so being
+    listed at all is what "pending" means.
+
+    Distinct from :attr:`is_open`, which is the narrower "accepts new items".
+    Mutations must gate on `is_open`; questions about whether a player is
+    already being processed want this one, or they report someone sitting in
+    'Em Validação' as not enrolled.
+    """
+    return True
+
   def __repr__(self) -> str:
     return (
       f"PlayerRegistrationBatch(id={self.id}, number={self.number!r}, "

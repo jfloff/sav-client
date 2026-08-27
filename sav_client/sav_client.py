@@ -1654,16 +1654,28 @@ class SavClient:
       return cached
     raise ValueError(f"Batch {number!r} not found")
 
-  def resolve_batch_id_by_license(self, license: int) -> int:
+  def resolve_batch_id_by_license(
+    self, license: int, *, include_submitted: bool = False,
+  ) -> int:
     """Find the batch_id for a license's current enrollment in an open batch.
 
     Thin wrapper over :meth:`resolve_batch_by_license` for callers that only
-    need the id; see that method for the resolution strategy and errors.
+    need the id; see that method for the resolution strategy, errors, and what
+    ``include_submitted`` widens.
     """
-    return self.resolve_batch_by_license(license).id
+    return self.resolve_batch_by_license(
+      license, include_submitted=include_submitted,
+    ).id
 
-  def resolve_batch_by_license(self, license: int) -> PlayerRegistrationBatch:
+  def resolve_batch_by_license(
+    self, license: int, *, include_submitted: bool = False,
+  ) -> PlayerRegistrationBatch:
     """Find the open batch a license is currently enrolled in.
+
+    ``include_submitted`` widens the scan from open batches to every state the
+    listing returns ('Devolvida', 'Em Validação', 'Em Pagamento' as well as
+    'Em construção'). Read-only status callers want it; anything that writes
+    must leave it False, because only an open batch accepts changes.
 
     SAV constrains a player to at most one open batch at a time, so the
     answer is single-valued. Returns the whole ``PlayerRegistrationBatch`` so
@@ -1690,7 +1702,9 @@ class SavClient:
       raise ValueError("license must not be None")
 
     batches = self.list_player_registration_batches()
-    open_batches = [b for b in batches if b.is_open]
+    open_batches = [
+      b for b in batches if (b.is_pending if include_submitted else b.is_open)
+    ]
     open_by_id = {b.id: b for b in open_batches}
 
     cached = self._cache.get_batch_id_by_license(license)

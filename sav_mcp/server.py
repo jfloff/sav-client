@@ -3155,9 +3155,13 @@ def get_enrollment_status(
     Status values:
       "enrolled"     — license is active in the session's club roster and
                         not in any open batch.
-      "pending"      — license is in an open batch (Em construção /
-                        Devolvida / Em Validação / Em Pagamento); a
-                        document checklist is included.
+      "pending"      — license is in a batch still in flight, in any of
+                        SAV's four states (Em construção / Devolvida /
+                        Em Validação / Em Pagamento); a document checklist
+                        is included. Note this is wider than the batches the
+                        *mutation* tools accept, which are "Em construção"
+                        only — a player in Em Validação reports "pending"
+                        here but cannot be edited.
       "not_enrolled" — license is neither in an open batch nor in the
                         active roster.
 
@@ -3188,7 +3192,11 @@ def get_enrollment_status(
     """
     client = _get_client()
     try:
-        batch_id = client.resolve_batch_id_by_license(license)
+        # Status is a read, so it scans every pending state — not just the open
+        # ones the mutation tools are limited to. Without this a player sitting
+        # in "Devolvida" / "Em Validação" / "Em Pagamento" came back
+        # "not_enrolled", contradicting the contract documented above.
+        batch_id = client.resolve_batch_id_by_license(license, include_submitted=True)
     except LicenseNotEnrolledError as exc:
         club_id = int(client.session.get("organizacao") or 0)
         roster_hits = (
