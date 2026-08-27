@@ -364,13 +364,15 @@ client.add_player_to_registration_batch(                                      # 
 | `morada`, `cod_postal`, `localidade_txt` | `str` | `None` | Step 2 address overrides |
 | `distrito_id`, `concelho_id` | `int` | `None` | Step 2 address overrides |
 | `taxa_id` | `int` | auto | Auto-picked when only one option exists; required when ambiguous |
-| `exam_date` | `str` | required | `YYYY-MM-DD`. Medical exam is always assumed done (`exame=1`) |
+| `exam_date` | `str` | required | `YYYY-MM-DD`, in the past and ≤ 12 months old (see below). Medical exam is always assumed done (`exame=1`) |
 | `promote_to_tier_id` | `int` | `None` | Subida only; usually unset |
 | `guardian_name`, `guardian_relation`, `guardian_phone`, `guardian_email` | mixed | `None` | **Required when player is a minor** |
 | `consent_data`, `consent_communications` | `bool` | `True` | GDPR consents |
 | `consent_marketing` | `bool` | `False` | GDPR consent |
 
 Raises `SavConfigError` for missing minor-guardian fields or non-Revalidação batches; `SavResponseError` if the commit fails. The licence must appear in the batch's server-side eligible list — passing one that doesn't raises `ValueError` with the eligible count for context.
+
+**`exam_date` is bounded, not just shape-checked.** SAV derives licence validity as exam date + 12 months, so the date must be in the past and no more than 12 months old; `ValueError` otherwise. The upper bound is enforced here because SAV's own rejection carries no reason — a future date returns `{"val":0,"msg":"","resultfunction":"-1"}`, which SAV2's web UI cannot explain to its users either. The lower bound is ours: an older exam issues a licence that is already expired.
 
 ### `upload_player_registration_document(batch_id, license, file_path, *, tipo_doc=1) → None`
 

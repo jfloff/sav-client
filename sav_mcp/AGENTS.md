@@ -98,6 +98,12 @@ Knowledge to drive the tool correctly:
 - "Próximo ano / próxima época" advances the season label by one (`season_id + 1`; SAV2 `epoca_id` is sequential), never the calendar year. But there is **no next-season roster to fetch** — enrollment only happens in the current season — so a next-season roster is always a projection of the current pool by birth year. `roster_for_escalao(when="next")` does this; doing it by hand means querying the *current* `epoca_id` and filtering by next season's birth years, never `season_id + 1`.
 - Between May and September the wall clock straddles a season transition: a player listed as inactive in the current season is almost certainly "not yet re-registered", not retired — the tool's `club + all` cascade step (status="all") surfaces them.
 
+### Medical exam validity (`exam_date`)
+
+SAV derives a licence's validity as **exam date + 12 months** (the commit returns it, e.g. `dataexame 2026-08-01` → `2027/08/31`). So `exam_date` must be in the past and no more than 12 months old, and sav-client rejects anything outside that window before the commit runs.
+
+This matters because SAV's own rejection is unreadable: a future date comes back as `{"val":0,"msg":"","resultfunction":"-1"}` — an empty reason, which SAV2's web UI cannot explain to its users either. A client-side `ValueError` naming the bound is the only legible error available, so treat it as the real answer rather than retrying with a different guess.
+
 ### Birth-year windows
 
 For season `Y/Y+1`. Concrete column shows 2025/2026 (`Y = 2025`).

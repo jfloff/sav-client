@@ -158,16 +158,69 @@ _GUARDIAN_RELATION_PAI = 1         # Pai
 _GUARDIAN_RELATION_MAE = 2         # Mãe
 _GUARDIAN_RELATION_TUTOR = 3       # Tutor
 _DEFAULT_TIMEOUT = 30
+# SAV computes a licence's validity as the medical exam date + 12 months
+# (op=36 returns it as `resultfunction`, e.g. dataexame 2026-08-01 -> 2027/08/31).
+_EXAM_VALIDITY_MONTHS = 12
 
 
-def _coerce_exam_date(value: str | None) -> str:
-  """Return a strict ISO exam date, rejecting missing values."""
+def _months_earlier(ref: date, months: int) -> date:
+  """``ref`` shifted back by whole months, clamping onto a shorter target month.
+
+  Only serves the exam-validity window, so the clamp is the simple one:
+  29 February lands on the 28th when the target year isn't a leap year.
+  """
+  year, month = ref.year, ref.month - months
+  while month <= 0:
+    month += 12
+    year -= 1
+  day = ref.day
+  while True:
+    try:
+      return date(year, month, day)
+    except ValueError:
+      day -= 1
+
+
+def _coerce_exam_date(value: str | None, *, today: date | None = None) -> str:
+  """Return a strict ISO exam date, rejecting missing and out-of-range values.
+
+  SAV derives licence validity from the exam date plus
+  ``_EXAM_VALIDITY_MONTHS``, which puts both bounds on the value:
+
+  * **Future dates** are rejected by SAV itself, but as
+    ``{"val": 0, "msg": "", "resultfunction": "-1"}`` — an empty reason its own
+    web UI can't explain to its users either. Rejecting here is the only place
+    the caller can be told what actually went wrong.
+  * **Dates older than the window** are ours to reject: the resulting licence
+    would be issued already expired. Confirmed against the validity formula
+    rather than against a SAV rejection, so the message says who rejected it.
+
+  ``today`` is injectable so tests don't drift out of the window over time.
+  """
   if value is None:
     raise ValueError("exam_date must be YYYY-MM-DD; got None.")
   try:
-    return date.fromisoformat(str(value)).isoformat()
+    parsed = date.fromisoformat(str(value))
   except ValueError as exc:
     raise ValueError(f"exam_date must be YYYY-MM-DD; got {value!r}.") from exc
+
+  ref = today or date.today()
+  if parsed > ref:
+    raise ValueError(
+      f"exam_date {parsed.isoformat()} is in the future (today is {ref.isoformat()}). "
+      f"SAV computes licence validity as the exam date + {_EXAM_VALIDITY_MONTHS} "
+      f"months and rejects a future date with an empty reason, so sav-client "
+      f"rejects it here where the error can still be read."
+    )
+  earliest = _months_earlier(ref, _EXAM_VALIDITY_MONTHS)
+  if parsed < earliest:
+    raise ValueError(
+      f"exam_date {parsed.isoformat()} is more than {_EXAM_VALIDITY_MONTHS} months "
+      f"old; the earliest date accepted today is {earliest.isoformat()}. Licence "
+      f"validity is the exam date + {_EXAM_VALIDITY_MONTHS} months, so this licence "
+      f"would be issued already expired. Rejected by sav-client, not by SAV."
+    )
+  return parsed.isoformat()
 
 
 class SavClient:

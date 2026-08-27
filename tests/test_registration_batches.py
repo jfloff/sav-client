@@ -1,8 +1,17 @@
+from datetime import date, timedelta
+
 import pytest
 
 from sav_client import SavClient
 from sav_client.exceptions import SavConfigError, SavResponseError
 from sav_client.models import PlayerRegistrationBatch
+from sav_client.sav_client import _coerce_exam_date
+
+# SAV rejects an exam date outside its validity window (exam date + 12 months),
+# and `_coerce_exam_date` now enforces both bounds. A literal date would quietly
+# age out of that window and start failing on a date unrelated to any code
+# change, so tests reaching the real commit path anchor to today instead.
+RECENT_EXAM_DATE = (date.today() - timedelta(days=30)).isoformat()
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -173,6 +182,100 @@ class TestPreHttpGuards:
       client.add_player_to_registration_batch(1, 301772)
 
 
+class TestExamDateWindow:
+  """`_coerce_exam_date` bounds the exam date to SAV's validity window.
+
+  SAV derives validity as exam date + 12 months. It rejects a future date
+  itself, but reports it as `{"val":0,"msg":"","resultfunction":"-1"}` — an
+  empty reason, undiagnosable from outside — so the bound is enforced here
+  instead. The lower bound is ours: an older exam issues a licence that is
+  already expired.
+
+  `today` is injected so these never drift out of the window.
+  """
+
+  TODAY = date(2026, 8, 27)
+
+  def test_accepts_today(self):
+    assert _coerce_exam_date("2026-08-27", today=self.TODAY) == "2026-08-27"
+
+  def test_accepts_recent_past(self):
+    assert _coerce_exam_date("2026-08-01", today=self.TODAY) == "2026-08-01"
+
+  def test_accepts_exactly_twelve_months_old(self):
+    assert _coerce_exam_date("2025-08-27", today=self.TODAY) == "2025-08-27"
+
+  def test_rejects_tomorrow(self):
+    with pytest.raises(ValueError, match="is in the future"):
+      _coerce_exam_date("2026-08-28", today=self.TODAY)
+
+  def test_rejects_future_date_from_the_live_run(self):
+    # The date that cost four attempts against the real SAV2.
+    with pytest.raises(ValueError, match="is in the future"):
+      _coerce_exam_date("2026-09-30", today=self.TODAY)
+
+  def test_rejects_one_day_past_the_window(self):
+    with pytest.raises(ValueError, match="more than 12 months old"):
+      _coerce_exam_date("2025-08-26", today=self.TODAY)
+
+  def test_shape_check_still_runs_first(self):
+    with pytest.raises(ValueError, match="exam_date must be YYYY-MM-DD"):
+      _coerce_exam_date("30/09/2026", today=self.TODAY)
+
+  def test_leap_day_window_clamps_to_february_28(self):
+    # 2024-02-29 has no anniversary in 2023; the window clamps rather than raising.
+    assert _coerce_exam_date("2023-02-28", today=date(2024, 2, 29)) == "2023-02-28"
+    with pytest.raises(ValueError, match="more than 12 months old"):
+      _coerce_exam_date("2023-02-27", today=date(2024, 2, 29))
+
+  def test_future_exam_date_stops_before_the_commit(self, monkeypatch):
+    """The whole point: the wizard must not reach op=36 with a doomed date."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    batch = type(
+      "BatchStub",
+      (),
+      {
+        "id": 1,
+        "is_open": True,
+        "type_id": 2,
+        "state": "Em construção",
+        "tier": "Sub 14",
+        "gender": "Masculino",
+        "tier_id": 7,
+      },
+    )()
+
+    monkeypatch.setattr(client, "list_player_registration_batches", lambda season=None: [batch])
+    monkeypatch.setattr(client, "_list_revalidable_licenses", lambda batch_obj: {301772})
+    monkeypatch.setattr(client, "_load_player_record", lambda batch_id, license: {"id": 88})
+    monkeypatch.setattr(client, "_build_step1_send", lambda *args, **kwargs: "step1")
+    monkeypatch.setattr(client, "_save_registration_step1", lambda batch_id, internal_id, send: {})
+    monkeypatch.setattr(client, "_build_step2_send", lambda *args, **kwargs: "step2")
+    monkeypatch.setattr(
+      client,
+      "_save_registration_step2",
+      lambda batch_type, batch_id, internal_id, license, send: {
+        "menor_idade": 0,
+        "escalao": 7,
+        "estatuto": "A",
+      },
+    )
+    monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
+
+    def fail_commit(*args, **kwargs):
+      raise AssertionError("_registration_commit should not run for a future exam_date")
+
+    monkeypatch.setattr(client, "_registration_commit", fail_commit)
+
+    future = (date.today() + timedelta(days=34)).isoformat()
+    with pytest.raises(ValueError, match="is in the future"):
+      client.add_player_to_registration_batch(1, 301772, exam_date=future)
+
+
+
 # ─── subida de escalão (op=21 + commit) ──────────────────────────────────────
 
 class TestSubidaDeEscalao:
@@ -226,7 +329,7 @@ class TestSubidaDeEscalao:
   def test_subida_true_fetches_and_commits_tier(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=(6, "Sub 14"))
     client.add_player_to_registration_batch(
-      1, 301772, exam_date="2026-05-25", inline_subida=True,
+      1, 301772, exam_date=RECENT_EXAM_DATE, inline_subida=True,
     )
     assert captured["body"]["sub"] == "6"
     assert captured["body"]["escalaosubida_txt"] == "Sub 14"
@@ -234,7 +337,7 @@ class TestSubidaDeEscalao:
   def test_no_subida_sends_minus_one(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
     client.add_player_to_registration_batch(
-      1, 301772, exam_date="2026-05-25", inline_subida=False,
+      1, 301772, exam_date=RECENT_EXAM_DATE, inline_subida=False,
     )
     assert captured["body"]["sub"] == "-1"
     assert captured["body"]["escalaosubida_txt"] == "- Não selecionado –"
@@ -243,7 +346,7 @@ class TestSubidaDeEscalao:
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
     with pytest.raises(SavConfigError, match="no subida tier"):
       client.add_player_to_registration_batch(
-        1, 301772, exam_date="2026-05-25", inline_subida=True,
+        1, 301772, exam_date=RECENT_EXAM_DATE, inline_subida=True,
       )
     assert "body" not in captured  # never reached the commit
 
@@ -322,7 +425,7 @@ class TestPrimeiraInscricao:
     name="João Ferreira Loff", birth_date="2020-09-26", gender_id=1,
     nif="277544319", id_type=1, id_number="12345699", id_expiry="2029-09-26",
     email="x@y.pt", morada="Praceta", cod_postal="1300-536",
-    distrito_id=1, concelho_id=5, exam_date="2025-09-26",
+    distrito_id=1, concelho_id=5, exam_date=RECENT_EXAM_DATE,
   )
 
   def _stub_primeira(self, monkeypatch, *, subida_tier=None, minor=False):
@@ -401,7 +504,7 @@ class TestPrimeiraInscricao:
     assert body["apolice"] == "100.268/1-2-16"
     assert body["taxa"] == "1052"
     assert body["estatuto"] == "6"
-    assert body["dataexame"] == "2025-09-26"
+    assert body["dataexame"] == RECENT_EXAM_DATE
 
   def test_inline_subida_populates_tier(self, monkeypatch):
     client, captured = self._stub_primeira(monkeypatch, subida_tier=(3, "Sub 16"))
