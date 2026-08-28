@@ -2878,13 +2878,12 @@ def update_enrollment(
         numeric locality; list_localidades(concelho_id) resolves it. Setting
         localidade_txt alone leaves the numeric reference unset).
       Exam (re-commits step-3): exam_date (YYYY-MM-DD). Setting it re-fires
-        the op=36 commit to write the new exam date. SAV2 has no read-back of
-        the item's saved step-3 selections, so the re-commit re-derives
-        taxa/insurance and takes guardian/consent from the values passed here:
-        an exam_date edit that omits them resets consents on / subida off.
-        Pass guardian_name, guardian_relation (int), guardian_phone,
-        guardian_email (required for minors) and consent_data,
-        consent_communications, consent_marketing (bools) to preserve them.
+        op=36. For taxa_id, inline_subida, guardian_name, guardian_relation
+        (int), guardian_phone, guardian_email, consent_data,
+        consent_communications, and consent_marketing (bools), an omitted or
+        JSON null field preserves the op=31 prefill. Every supplied value,
+        including false, 0, and "", overwrites it. Resolved guardian fields
+        are required for minors.
 
     Returns: {"success": True, "player_id": int} on success, or
     {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
@@ -2896,6 +2895,7 @@ def update_enrollment(
         "morada", "cod_postal", "localidade_txt",
         "distrito_id", "concelho_id", "localidade_id",
         "exam_date",
+        "taxa_id", "inline_subida",
         "guardian_name", "guardian_relation", "guardian_phone", "guardian_email",
         "consent_data", "consent_communications", "consent_marketing",
     }
@@ -2907,9 +2907,12 @@ def update_enrollment(
         )
     int_keys = {
         "id_type", "distrito_id", "concelho_id", "localidade_id",
-        "guardian_relation",
+        "guardian_relation", "taxa_id",
     }
-    bool_keys = {"consent_data", "consent_communications", "consent_marketing"}
+    bool_keys = {
+        "consent_data", "consent_communications", "consent_marketing",
+        "inline_subida",
+    }
     # Dates reach a SAV commit body verbatim, so they are held to one shape here
     # rather than at the far end, where SAV rejects them without saying why.
     date_keys = {"id_expiry", "exam_date"}
@@ -2921,7 +2924,7 @@ def update_enrollment(
             coerced[k] = _require_bool(v, field=k)
         elif k in date_keys:
             coerced[k] = require_iso(v, field=k)
-        elif k in int_keys and not isinstance(v, int):
+        elif k in int_keys and v != "" and not isinstance(v, int):
             try:
                 coerced[k] = int(v)
             except (TypeError, ValueError) as exc:

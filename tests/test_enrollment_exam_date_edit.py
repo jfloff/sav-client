@@ -1,9 +1,8 @@
 """Editing an enrolment's exam date re-fires the op=36 step-3 commit.
 
-SAV2 has no read-back of a committed item's step-3 selections, so the edit
-path rebuilds the commit body: these tests pin that `dataexame` is written,
-that a missing address doesn't stop the re-commit, and that omitting
-`exam_date` leaves the old personal/address-only behaviour untouched.
+op=31 returns the committed step-3 selections. These tests pin that an
+exam-date edit preserves that prefill unless an explicit value, including
+false or an empty string, asks to overwrite it.
 """
 
 from datetime import date, timedelta
@@ -46,6 +45,47 @@ def _bare_client() -> SavClient:
   client._batch_memo = {}
   client._batch_memo_lock = threading.Lock()
   return client
+
+
+def _stub_step3_commit(monkeypatch, client, prefill):
+  captured: dict = {}
+
+  monkeypatch.setattr(
+    client, "_resolve_insurance_cascade",
+    lambda internal_id, batch, escalao: (1, 99),
+  )
+  monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch, internal_id, estatuto: 55)
+  monkeypatch.setattr(client, "_registration_precommit", lambda guia, uid: None)
+  def _capture_commit(body):
+    captured["body"] = body
+    return {"val": 1, "resultfunction": "ok"}
+
+  monkeypatch.setattr(client, "_registration_commit", _capture_commit)
+
+  class _Cache:
+    def record_license_batch(self, license, batch_id):
+      pass
+
+  client._cache = _Cache()
+  return captured
+
+
+def _commit_step3(client, prefill, **overrides):
+  kwargs = {
+    "exam_date": RECENT_EXAM_DATE,
+    "taxa_id": None,
+    "promote_to_tier_id": None,
+    "inline_subida": None,
+    "guardian_name": None,
+    "guardian_relation": None,
+    "guardian_phone": None,
+    "guardian_email": None,
+    "consent_data": None,
+    "consent_communications": None,
+    "consent_marketing": None,
+  }
+  kwargs.update(overrides)
+  return client._commit_registration_step3(_Batch(), 1234, 301772, prefill, **kwargs)
 
 
 def test_commit_step3_sends_exam_date(monkeypatch):
@@ -98,6 +138,103 @@ def test_commit_step3_minor_requires_guardian():
     )
 
 
+def test_exam_date_only_edit_preserves_step3_consents(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "subida": "-1", "escalaosubida": None,
+    "concordo_tratamento_dados": "1",
+    "receber_comunicacoes": "1",
+    "autoriza_utilizacao_dados": None,
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill)
+
+  assert captured["body"]["taxa"] == "1090"
+  assert captured["body"]["consentimentoDados"] == 1
+  assert captured["body"]["comunicacoes"] == 1
+  assert captured["body"]["marketing"] == 0
+
+
+def test_stored_zero_consent_stays_off_on_wire(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "concordo_tratamento_dados": "0",
+    "receber_comunicacoes": "0",
+    "autoriza_utilizacao_dados": "0",
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill)
+
+  assert captured["body"]["consentimentoDados"] == 0
+  assert captured["body"]["comunicacoes"] == 0
+  assert captured["body"]["marketing"] == 0
+
+
+def test_explicit_marketing_false_overwrites_stored_one(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "autoriza_utilizacao_dados": "1",
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill, consent_marketing=False)
+
+  assert captured["body"]["marketing"] == 0
+
+
+def test_explicit_empty_guardian_phone_and_taxa_overwrite_stored_values(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "telefone_menor": "+351912345678",
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill, guardian_phone="", taxa_id="")
+
+  assert captured["body"]["telefoneEncarregado"] == ""
+  assert captured["body"]["taxa"] == ""
+
+
+def test_subida_is_preserved_unless_explicitly_cleared(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "subida": "6", "escalaosubida": "Sub 14",
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill)
+  assert captured["body"]["sub"] == "6"
+  assert captured["body"]["escalaosubida_txt"] == "Sub 14"
+
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill, inline_subida=False)
+  assert captured["body"]["sub"] == "-1"
+
+
+def test_minor_raises_when_preserved_guardian_block_is_empty():
+  client = _bare_client()
+  with pytest.raises(SavConfigError, match="minor"):
+    _commit_step3(
+      client,
+      {"menor_idade": 1, "estatuto": "S", "escalao": 7, "taxa": "1090"},
+    )
+
+
+def test_minor_raises_when_explicit_guardian_phone_is_cleared():
+  client = _bare_client()
+  prefill = {
+    "menor_idade": 1, "estatuto": "S", "escalao": 7, "taxa": "1090",
+    "nome_encarregado_menor": "Marlene Figueiredo",
+    "tipo_regulacao_menor": "2",
+    "telefone_menor": "+351912345678",
+    "email_menor": "marlene.teste@gmail.com",
+  }
+  with pytest.raises(SavConfigError, match="guardian_phone"):
+    _commit_step3(client, prefill, guardian_phone="")
+
+
 def test_update_existing_player_routes_exam_date_to_commit(monkeypatch):
   client = _bare_client()
   calls: dict = {}
@@ -129,6 +266,8 @@ def test_update_existing_player_routes_exam_date_to_commit(monkeypatch):
   assert uid == 1234
   assert "commit" in calls  # op=36 re-fired even with no address change
   assert calls["commit"][1]["exam_date"] == RECENT_EXAM_DATE
+  assert calls["commit"][1]["inline_subida"] is None
+  assert calls["commit"][1]["consent_data"] is None
 
 
 def test_update_existing_player_without_exam_date_skips_commit(monkeypatch):
@@ -183,3 +322,29 @@ def test_update_enrollment_tool_accepts_exam_date(monkeypatch):
   assert captured["exam_date"] == RECENT_EXAM_DATE
   assert captured["guardian_relation"] == 3  # coerced to int
   assert captured["consent_marketing"] is True
+
+
+def test_update_enrollment_keeps_explicit_false_and_empty_values(monkeypatch):
+  captured: dict = {}
+
+  class StubClient:
+    def update_player_in_registration_batch(self, batch_id, license, **kwargs):
+      captured.update(kwargs)
+      return 999
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+  monkeypatch.setattr(server_module, "_resolve_license_batch", lambda client, license: 12)
+
+  server_module.update_enrollment(
+    license=301772,
+    fields={
+      "inline_subida": False, "consent_marketing": False,
+      "guardian_phone": "", "guardian_relation": "", "taxa_id": "",
+    },
+  )
+
+  assert captured["inline_subida"] is False
+  assert captured["consent_marketing"] is False
+  assert captured["guardian_phone"] == ""
+  assert captured["guardian_relation"] == ""
+  assert captured["taxa_id"] == ""

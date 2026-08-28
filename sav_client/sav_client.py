@@ -121,7 +121,8 @@ _REGISTRATIONS_SAVE_STEP2_OP = "31"
 _REGISTRATIONS_STEP1_PREFILL_KEYS = (
   "distrito", "concelho", "localidade", "morada", "codpostal", "localidade_txt",
 )
-# op=31 prefill keys consumed by _commit_registration_step3.
+# Required op=31 prefill keys. _commit_registration_step3 also reads optional
+# step-3 selections from the otherwise unfiltered response for exam-date edits.
 _REGISTRATIONS_STEP2_PREFILL_KEYS = ("menor_idade", "escalao", "estatuto")
 _REGISTRATIONS_LIST_CONCELHOS_OP = "18"
 _REGISTRATIONS_LIST_LOCALIDADES_OP = "19"   # GET conc — localidades under a concelho
@@ -2544,27 +2545,120 @@ class SavClient:
     step3_prefill: dict[str, Any],
     *,
     exam_date: str | None,
-    taxa_id: int | None,
+    taxa_id: int | str | None,
     promote_to_tier_id: int | None,
-    inline_subida: bool,
+    inline_subida: bool | None,
     guardian_name: str | None,
-    guardian_relation: int | None,
+    guardian_relation: int | str | None,
     guardian_phone: str | None,
     guardian_email: str | None,
-    consent_data: bool,
-    consent_communications: bool,
-    consent_marketing: bool,
+    consent_data: bool | None,
+    consent_communications: bool | None,
+    consent_marketing: bool | None,
   ) -> int:
     """Run the Revalidação step-3 commit (op=36) for an item already carried
     through steps 1-2, returning the internal SAV2 user id.
 
     Shared by the create path (add_player_to_registration_batch) and the
-    exam-date edit path (_update_existing_player_in_batch). op=36 needs the
-    whole step-3 body, and SAV2 exposes no read-back of an item's saved
-    selections, so taxa/insurance are re-derived here and guardian/consent/
-    subida come from the caller — an edit that omits them re-commits the
-    defaults (consents on, no subida).
+    exam-date edit path (_update_existing_player_in_batch). op=31 supplies
+    the current step-3 selections as ``step3_prefill``. For an exam-date edit,
+    ``None`` for taxa, guardian fields, consents, or inline_subida preserves
+    that prefill; every explicit value (including ``False``, ``0``, and ``""``)
+    is written.
     """
+    def _preserve(explicit: Any, prefill_key: str, parameter: str) -> Any:
+      if explicit is not None:
+        return explicit
+      preserved.append(parameter)
+      return step3_prefill.get(prefill_key)
+
+    # Keep the list to field names, rather than values, so the audit log does
+    # not duplicate guardian contact details or GDPR choices.
+    preserved: list[str] = []
+    taxa_id = _preserve(taxa_id, "taxa", "taxa_id")
+    guardian_name = _preserve(
+      guardian_name, "nome_encarregado_menor", "guardian_name",
+    )
+    guardian_relation = _preserve(
+      guardian_relation, "tipo_regulacao_menor", "guardian_relation",
+    )
+    guardian_phone = _preserve(
+      guardian_phone, "telefone_menor", "guardian_phone",
+    )
+    guardian_email = _preserve(
+      guardian_email, "email_menor", "guardian_email",
+    )
+
+    def _decode_prefill_consent(value: Any, parameter: str) -> bool:
+      """Decode SAV's string consent flags without Python truthiness."""
+      if value is None:
+        return False
+      if isinstance(value, bool):
+        return value
+      if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+      if isinstance(value, str):
+        normalized = value.strip().casefold()
+        if normalized == "1":
+          return True
+        if normalized == "0" or not normalized:
+          return False
+      raise SavResponseError(
+        f"Registration step 2 returned an invalid {parameter} consent: {value!r}"
+      )
+
+    def _preserve_consent(
+      explicit: bool | None, prefill_key: str, parameter: str,
+    ) -> bool:
+      if explicit is not None:
+        return explicit
+      preserved.append(parameter)
+      return _decode_prefill_consent(step3_prefill.get(prefill_key), parameter)
+
+    consent_data = _preserve_consent(
+      consent_data, "concordo_tratamento_dados", "consent_data",
+    )
+    consent_communications = _preserve_consent(
+      consent_communications, "receber_comunicacoes", "consent_communications",
+    )
+    consent_marketing = _preserve_consent(
+      consent_marketing, "autoriza_utilizacao_dados", "consent_marketing",
+    )
+
+    if inline_subida is None:
+      preserved.append("inline_subida")
+      stored_subida = step3_prefill.get("subida")
+      subida_id = str(stored_subida) if stored_subida is not None else "-1"
+      stored_subida_text = step3_prefill.get("escalaosubida")
+      subida_text = (
+        str(stored_subida_text)
+        if stored_subida_text not in (None, "")
+        else "- Não selecionado –"
+      )
+    else:
+      sub_tier = (
+        self._pick_subida_tier(internal_id, prefer_tier_id=promote_to_tier_id)
+        if inline_subida else None
+      )
+      if inline_subida and sub_tier is None:
+        raise SavConfigError(
+          f"Inline subida requested (mod4 present) but SAV offers no subida tier "
+          f"for licence {license} (op=21 returned only '- Não selecionado –')."
+        )
+      if sub_tier:
+        logger.info(
+          "Subida de escalão for licence %s → %s (id=%s)",
+          license, sub_tier[1], sub_tier[0],
+        )
+      subida_id = str(sub_tier[0]) if sub_tier else "-1"
+      subida_text = sub_tier[1] if sub_tier else "- Não selecionado –"
+
+    if preserved:
+      logger.info(
+        "Preserved step-3 selections from op=31 for licence %s: %s",
+        license, ", ".join(preserved),
+      )
+
     # ── Validate guardian fields for minors ───────────────────────────────────
     #
     # LOAD-BEARING — do not relax this to make a caller pass.
@@ -2603,36 +2697,18 @@ class SavClient:
       internal_id, batch, escalao,
     )
 
-    # ── Taxa (registration fee) cascade — auto-pick when only one option ──────
-    estatuto = step3_prefill.get("estatuto", "")
+    # Old or incomplete op=31 responses have no saved taxa to preserve. Keep
+    # the established cascade as a compatibility fallback; normal exam-date
+    # edits use the prefill's stored ``taxa`` above and do not reach this path.
     if taxa_id is None:
-      taxa_id = self._resolve_taxa_id(batch, internal_id, estatuto)
+      taxa_id = self._resolve_taxa_id(
+        batch, internal_id, step3_prefill.get("estatuto", ""),
+      )
 
     # ── Pre-commit hook + final commit ────────────────────────────────────────
     self._registration_precommit(batch.id, internal_id)
 
     exam_date = _coerce_exam_date(exam_date)
-
-    # ── Inline subida de escalão — fetch the player-specific target tier (op=21) ─
-    # The subida tier is server-computed per player (not the batch tier).
-    # When a mod4 is involved, its escalao_subida text resolves upstream to a
-    # tier_id passed here as promote_to_tier_id; _pick_subida_tier enforces
-    # that the form's stated target is one SAV will accept. With no caller
-    # hint, single-option lists auto-pick and multi-option lists raise.
-    sub_tier = (
-      self._pick_subida_tier(internal_id, prefer_tier_id=promote_to_tier_id)
-      if inline_subida else None
-    )
-    if inline_subida and sub_tier is None:
-      raise SavConfigError(
-        f"Inline subida requested (mod4 present) but SAV offers no subida tier "
-        f"for licence {license} (op=21 returned only '- Não selecionado –')."
-      )
-    if sub_tier:
-      logger.info(
-        "Subida de escalão for licence %s → %s (id=%s)",
-        license, sub_tier[1], sub_tier[0],
-      )
 
     commit_body = {
       "guiaid": batch.id,
@@ -2640,16 +2716,16 @@ class SavClient:
       "transf": 0,
       "estatuto": str(step3_prefill.get("estatuto", "")),
       "exame": "1",
-      "sub": str(sub_tier[0]) if sub_tier else "-1",
+      "sub": subida_id,
       "obs": "",
       "dataexame": exam_date,
-      "escalaosubida_txt": sub_tier[1] if sub_tier else "- Não selecionado –",
+      "escalaosubida_txt": subida_text,
       "taxa": str(taxa_id),
       "comp": str(companhia_id),
-      "nomeEncarregado": guardian_name or "",
-      "tipoRegulacao": str(guardian_relation) if guardian_relation else "0",
-      "telefoneEncarregado": guardian_phone or "",
-      "emailEncarregado": guardian_email or "",
+      "nomeEncarregado": guardian_name if guardian_name is not None else "",
+      "tipoRegulacao": str(guardian_relation) if guardian_relation is not None else "0",
+      "telefoneEncarregado": guardian_phone if guardian_phone is not None else "",
+      "emailEncarregado": guardian_email if guardian_email is not None else "",
       "consentimentoDados": 1 if consent_data else 0,
       "comunicacoes": 1 if consent_communications else 0,
       "marketing": 1 if consent_marketing else 0,
@@ -2689,16 +2765,16 @@ class SavClient:
     concelho_id: int | None,
     localidade_id: int | None = None,
     exam_date: str | None = None,
-    taxa_id: int | None = None,
+    taxa_id: int | str | None = None,
     promote_to_tier_id: int | None = None,
-    inline_subida: bool = False,
+    inline_subida: bool | None = None,
     guardian_name: str | None = None,
-    guardian_relation: int | None = None,
+    guardian_relation: int | str | None = None,
     guardian_phone: str | None = None,
     guardian_email: str | None = None,
-    consent_data: bool = True,
-    consent_communications: bool = True,
-    consent_marketing: bool = False,
+    consent_data: bool | None = None,
+    consent_communications: bool | None = None,
+    consent_marketing: bool | None = None,
   ) -> int:
     """
     Patch an already-enrolled player's personal data, address, and/or exam date.
@@ -2708,10 +2784,10 @@ class SavClient:
     step-3 prefill returned by op=31, so step 2 is re-saved even when no address
     changed (idempotent).
 
-    Because SAV2 exposes no read-back of a committed item's step-3 selections,
-    re-firing op=36 re-derives taxa/insurance and takes guardian/consent/subida
-    from the caller: an exam-date edit that omits them re-commits the defaults
-    (consents on, no subida). Pass those through to preserve non-default choices.
+    op=31 returns the current step-3 selections before the re-commit. For the
+    step-3 fields, ``None`` means preserve that stored value; every explicit
+    value, including ``False``, ``0``, and ``""``, is written. The resolved
+    guardian fields are then checked for minors.
     """
     record = self.load_existing_registration_record(batch.id, license)
     internal_id = int(record["id"])
@@ -2780,16 +2856,16 @@ class SavClient:
     concelho_id: int | None = None,
     localidade_id: int | None = None,
     exam_date: str | None = None,
-    taxa_id: int | None = None,
+    taxa_id: int | str | None = None,
     promote_to_tier_id: int | None = None,
-    inline_subida: bool = False,
+    inline_subida: bool | None = None,
     guardian_name: str | None = None,
-    guardian_relation: int | None = None,
+    guardian_relation: int | str | None = None,
     guardian_phone: str | None = None,
     guardian_email: str | None = None,
-    consent_data: bool = True,
-    consent_communications: bool = True,
-    consent_marketing: bool = False,
+    consent_data: bool | None = None,
+    consent_communications: bool | None = None,
+    consent_marketing: bool | None = None,
   ) -> int:
     """
     Patch fields on a player already enrolled in an open Revalidação batch.
@@ -2799,12 +2875,11 @@ class SavClient:
     — the rest are loaded from the existing inscricao via op=30 and kept as-is.
 
     ``exam_date`` (YYYY-MM-DD) re-fires the op=36 commit to write the new
-    ``dataexame`` on the enrolment. Because SAV2 exposes no read-back of a
-    committed item's step-3 selections, that re-commit re-derives taxa/insurance
-    and takes guardian/consent/subida from the arguments here: an exam-date edit
-    that omits them re-commits the defaults (consents on, no subida). Pass the
-    guardian_*/consent_*/taxa_id/inline_subida arguments to preserve non-default
-    choices; guardian_* are required when the player is a minor.
+    ``dataexame`` on the enrolment. op=31 returns the current step-3 selections
+    for that re-commit: ``None`` for taxa_id, inline_subida, guardian_*, or
+    consent_* preserves the stored value, while every explicit value (including
+    ``False``, ``0``, and ``""``) overwrites it. Resolved guardian_* values are
+    required when the player is a minor.
 
     Args:
         batch_id: Open Revalidação batch holding the enrolment.
