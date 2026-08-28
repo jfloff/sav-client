@@ -123,3 +123,46 @@ class TestGetGameSheetPdf:
     result = client.get_game_sheet_pdf(sample_game.id)
 
     assert result is None or isinstance(result, bytes)
+
+
+class TestEligiblePlayersResponseShape:
+  """A response without `msg` is malformed, not "nobody is eligible".
+
+  Defaulting the payload to "" parses to zero tables and returns empty rosters,
+  which reads as a real answer. The same shape made a registration batch holding
+  one player read back as empty for a whole session. An *empty* msg is a
+  different thing and stays valid — a game with no eligible players is real.
+  """
+
+  def _client(self, payload):
+    import json
+    c = SavClient.__new__(SavClient)
+    c.base_url = "https://sav2.example/"
+    c._username = "u"
+    c.session = {"perfil": 1, "user": "u", "organizacao": 1}
+    c._timeout = 10
+    resp = type("R", (), {"text": json.dumps(payload), "raise_for_status": lambda self: None})()
+    # Assigned directly: the instance is a throwaway, and monkeypatch.setattr
+    # requires the attribute to already exist on a __new__-built client.
+    c._http = type("H", (), {"get": lambda self, *a, **k: resp})()
+    return c
+
+  def test_missing_msg_raises(self):
+    c = self._client({"val": 1})
+    with pytest.raises(SavResponseError, match="no 'msg' payload"):
+      c.get_eligible_players(123)
+
+  def test_empty_msg_is_a_valid_empty_result(self):
+    c = self._client({"msg": ""})
+    out = c.get_eligible_players(123)
+    assert out["players"] == []
+
+  def test_msg_with_rows_still_parses(self):
+    table = (
+      "<table><tr><th>h</th></tr>"
+      "<tr><td>_</td><td>_</td><td>301772</td><td>Player A</td>"
+      "<td>ok</td><td>_</td><td>_</td></tr></table>"
+    )
+    c = self._client({"msg": table})
+    out = c.get_eligible_players(123)
+    assert out["players"] and out["players"][0]["licence"] == "301772"

@@ -1468,7 +1468,15 @@ class SavClient:
       resp.text, "Eligible players response was not valid JSON"
     )
 
-    soup = BeautifulSoup(raw.get("msg", ""), "html.parser")
+    # A PHP fatal is already caught by _parse_json_response above. What is left
+    # is valid JSON that simply has no `msg`: defaulting that to "" parses to
+    # zero tables and reports "nobody is eligible", which is a wrong answer
+    # rather than an error. An *empty* msg is fine — that is a real state.
+    if "msg" not in raw:
+      raise SavResponseError(
+        f"Eligible players response for game {game_id} carried no 'msg' payload"
+      )
+    soup = BeautifulSoup(raw.get("msg") or "", "html.parser")
     tables = soup.find_all("table")
 
     # Tables 0-3 = home; 4-7 = away
