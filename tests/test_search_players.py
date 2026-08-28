@@ -17,6 +17,7 @@ class TestSearchPlayers:
     with pytest.raises(ValueError, match="club is required"):
       c.search_players()
 
+  @pytest.mark.live
   def test_returns_players_from_live_search(self, client):
     club_id = int(client.session.get("organizacao") or 0)
     # Search all seasons because a newly rolled-over season may have no roster yet.
@@ -31,18 +32,21 @@ class TestSearchPlayers:
     assert first.name
     assert first.club
 
+  @pytest.mark.live
   def test_can_find_player_by_license(self, client, sample_player):
     results = client.search_players(license=sample_player.license, season=0, club=0)
 
     assert results
     assert any(player.id == sample_player.id for player in results)
 
+  @pytest.mark.live
   def test_can_search_all_seasons_for_sample_player(self, client, sample_player):
     results = client.search_players(license=sample_player.license, season=0, club=0)
 
     assert results
     assert any(player.license == sample_player.license for player in results)
 
+  @pytest.mark.live
   def test_can_search_players_across_multiple_clubs(self, client):
     clubs = []
     for association in client.list_associations():
@@ -57,6 +61,7 @@ class TestSearchPlayers:
 
     assert isinstance(results, list)
 
+  @pytest.mark.live
   def test_can_search_all_clubs_in_association(self, client, sample_player):
     associations = client.list_associations()
     association = next(

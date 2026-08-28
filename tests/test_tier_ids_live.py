@@ -15,6 +15,8 @@ from sav_shared.lookups import PLAYER_REGISTRATION_TIERS
 _REGISTRATIONS_PATH = "php/incricoesdb.php"
 _TIERS_OP = "3"
 
+pytestmark = pytest.mark.live
+
 
 def _fetch_live_tiers(client, gender_id: int) -> dict[int, str]:
   resp = client._http.get(

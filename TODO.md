@@ -5,7 +5,7 @@ fixed there, to keep that change reviewable.
 
 ---
 
-## 1. `--ignore-glob='*_live.py'` does not exclude all live tests
+## 1. `-m "not live"` keeps the offline suite offline
 
 **Problem.** Several tests outside `*_live.py` hit production SAV through the
 session-scoped `client` / `sample_player` fixtures in `tests/conftest.py` —
@@ -19,9 +19,8 @@ isolation. This makes the suite untrustworthy at exactly the moment it is most
 needed — immediately before a merge — and it has already produced one false
 regression alarm this session.
 
-**Suggested fix.** Mark them (`@pytest.mark.live`, registered in
-`pyproject.toml`) and deselect with `-m "not live"`. Update the command in
-`AGENTS.md` / `CLAUDE.md` wherever the current glob is documented.
+**Resolution.** Live tests are marked with `@pytest.mark.live`, registered in
+`pyproject.toml`, and the offline suite runs with `pytest tests/ -q -m "not live"`.
 
 ---
 

@@ -32,6 +32,7 @@ class TestGetEligiblePlayers:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.get_eligible_players(1)
 
+  @pytest.mark.live
   def test_returns_dict_with_expected_keys(self, client, sample_game):
     data = client.get_eligible_players(sample_game.id, val=1)
 
@@ -42,6 +43,7 @@ class TestGetEligiblePlayers:
     assert "coaches_adj" in data
     assert "staff" in data
 
+  @pytest.mark.live
   def test_players_have_licence_and_name(self, sample_eligible):
     players = sample_eligible["players"]
     if not players:
@@ -51,6 +53,7 @@ class TestGetEligiblePlayers:
       assert player.get("licence"), f"Player entry missing licence: {player}"
       assert player.get("name"), f"Player entry missing name: {player}"
 
+  @pytest.mark.live
   def test_home_and_away_differ(self, client, sample_game):
     home = client.get_eligible_players(sample_game.id, val=1)
     away = client.get_eligible_players(sample_game.id, val=2)
@@ -68,6 +71,7 @@ class TestGetEligiblePlayersPdf:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.get_eligible_players_pdf(1)
 
+  @pytest.mark.live
   def test_returns_pdf_bytes(self, client, sample_game, sample_eligible):
     if not sample_eligible.get("players"):
       pytest.skip("No eligible players — cannot generate PDF")
@@ -78,6 +82,7 @@ class TestGetEligiblePlayersPdf:
     assert pdf is not None
     assert pdf.startswith(b"%PDF"), f"Expected PDF magic bytes, got: {pdf[:8]!r}"
 
+  @pytest.mark.live
   def test_player_filter_reduces_selection(self, client, sample_game, sample_eligible):
     players = sample_eligible["players"]
     if len(players) < 2:
@@ -95,11 +100,13 @@ class TestGetEligiblePlayersPdf:
     # but a reasonable heuristic for a sanity check
     assert len(pdf_filtered) <= len(pdf_all)
 
+  @pytest.mark.live
   def test_coaches_other_excluded_by_default(self, client, sample_game):
     # Passing coaches_other=() (the default) should not raise and return a PDF
     pdf = client.get_eligible_players_pdf(sample_game.id, val=1, coaches_other=())
     assert pdf is None or pdf.startswith(b"%PDF")
 
+  @pytest.mark.live
   def test_staff_excluded_by_default(self, client, sample_game):
     pdf = client.get_eligible_players_pdf(sample_game.id, val=1, staff=())
     assert pdf is None or pdf.startswith(b"%PDF")
@@ -111,6 +118,7 @@ class TestGetGameSheetPdf:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.get_game_sheet_pdf(1)
 
+  @pytest.mark.live
   def test_returns_bytes_or_none_for_live_game(self, client, sample_game):
     result = client.get_game_sheet_pdf(sample_game.id)
 

@@ -19,6 +19,7 @@ def client():
 # Successful login
 # ---------------------------------------------------------------------------
 
+@pytest.mark.live
 class TestLoginSuccess:
   def test_returns_success(self, client):
     result = client.login()
@@ -42,6 +43,7 @@ class TestLoginSuccess:
 # Auth failure — wrong password
 # ---------------------------------------------------------------------------
 
+@pytest.mark.live
 class TestLoginAuthFailure:
   def test_wrong_password_raises_sav_auth_error(self):
     c = SavClient.from_env()
@@ -61,6 +63,7 @@ class TestLoginAuthFailure:
 # Connection error — bad URL
 # ---------------------------------------------------------------------------
 
+@pytest.mark.live
 class TestLoginConnectionError:
   def test_bad_url_raises_sav_connection_error(self):
     c = SavClient("https://doesnotexist.fpb.invalid", "user", "pass", timeout=5)

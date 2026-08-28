@@ -22,6 +22,7 @@ class TestGetPlayerDetail:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.get_player_detail(9, with_details=True)
 
+  @pytest.mark.live
   def test_with_details_false_returns_minimal_player(self, client, sample_player):
     result = client.get_player_detail(sample_player.id, with_details=False)
 
@@ -30,6 +31,7 @@ class TestGetPlayerDetail:
     assert result.mobile_phone == ""
     assert result.name == ""
 
+  @pytest.mark.live
   def test_with_details_true_fetches_live_detail(self, client, sample_player):
     result = client.get_player_detail(sample_player.id, with_details=True)
 

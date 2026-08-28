@@ -10,6 +10,7 @@ class TestListGames:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.list_games()
 
+  @pytest.mark.live
   def test_lists_live_games(self, client):
     results = client.list_games()
 
@@ -22,6 +23,7 @@ class TestListGames:
       assert isinstance(first.date, str)
       assert isinstance(first.time, str)
 
+  @pytest.mark.live
   def test_game_has_internal_id(self, client):
     results = client.list_games()
     if not results:
@@ -30,6 +32,7 @@ class TestListGames:
     first = results[0]
     assert first.id > 0
 
+  @pytest.mark.live
   def test_filters_games_by_number_when_available(self, client):
     results = client.list_games()
     if not results:

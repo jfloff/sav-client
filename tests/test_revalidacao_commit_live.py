@@ -25,6 +25,8 @@ _FAKE_GUARDIAN = dict(
   guardian_email="teste@example.com",
 )
 
+pytestmark = pytest.mark.live
+
 
 def _try_commit(client, batch, license):
   """Attempt one candidate. Retries once with fabricated guardian info if

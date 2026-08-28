@@ -91,10 +91,12 @@ class TestPreHttpGuards:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.add_player_to_registration_batch(1, 1)
 
+  @pytest.mark.live
   def test_tiers_rejects_invalid_gender(self, client):
     with pytest.raises(ValueError, match="gender_id must be 1"):
       client.list_player_registration_tiers(gender_id=0)
 
+  @pytest.mark.live
   def test_add_no_longer_accepts_exam_done_kwarg(self, client):
     """`exam_done` was removed in 0.10.5; passing it must raise TypeError."""
     with pytest.raises(TypeError):
@@ -817,6 +819,7 @@ class TestPrimeiraInscricao:
 
 # ─── live read-only ─────────────────────────────────────────────────────────
 
+@pytest.mark.live
 class TestListPlayerRegistrationBatches:
   def test_returns_well_formed_batches(self, client):
     results = client.list_player_registration_batches()
@@ -832,6 +835,7 @@ class TestListPlayerRegistrationBatches:
       assert batch.is_open == (batch.state_id == 1)
 
 
+@pytest.mark.live
 class TestListPlayerRegistrationTiers:
   def test_male_and_female_tiers_returned(self, client):
     male = client.list_player_registration_tiers(gender_id=1)
@@ -846,6 +850,7 @@ class TestListPlayerRegistrationTiers:
     assert 0 not in female
 
 
+@pytest.mark.live
 class TestFindOpenPlayerRegistrationBatch:
   def test_returned_batch_satisfies_predicate(self, client):
     """Whatever find_open returns, it must match (open, type, tier, gender)."""
@@ -871,6 +876,7 @@ class TestFindOpenPlayerRegistrationBatch:
 
 # ─── create / delete (live, with cleanup) ───────────────────────────────────
 
+@pytest.mark.live
 class TestCreateAndDeletePlayerRegistrationBatch:
   def test_create_appears_in_list_with_expected_shape(self, client, transient_batch):
     batch = next(
@@ -909,6 +915,7 @@ class TestCreateAndDeletePlayerRegistrationBatch:
 # ─── add: validation paths against a real batch ─────────────────────────────
 # Happy path is intentionally not exercised — it would commit a real player.
 
+@pytest.mark.live
 class TestAddPlayerToRegistrationBatchValidation:
   def test_unknown_batch_raises(self, client):
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
@@ -1062,6 +1069,7 @@ class TestRemovePlayerFromRegistrationBatch:
 
     forget_cache.assert_not_called()
 
+  @pytest.mark.live
   def test_unknown_batch_raises(self, client):
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
       client.remove_player_from_registration_batch(999999999, 301772)

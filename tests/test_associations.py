@@ -10,6 +10,7 @@ class TestListAssociations:
     with pytest.raises(SavResponseError, match="Must call login"):
       c.list_associations()
 
+  @pytest.mark.live
   def test_extracts_and_sorts_live_associations(self, client):
     results = client.list_associations()
 

@@ -32,3 +32,8 @@ sav_client = ["AGENTS.md"]
 sav_cli = ["AGENTS.md"]
 sav_mcp = ["AGENTS.md", "authz.toml"]
 sav_shared = ["files/mod1/*.pdf"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: test requires a real SAV account or network access",
+]

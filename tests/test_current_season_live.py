@@ -8,6 +8,11 @@ rollovers too.
 """
 import re
 
+import pytest
+
+
+pytestmark = pytest.mark.live
+
 
 class TestCurrentSeasonLive:
   def test_resolves_active_season(self, client):

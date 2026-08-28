@@ -16,6 +16,7 @@ class TestListClubs:
     with pytest.raises(ValueError, match="association or all_associations=True is required"):
       c.list_clubs()
 
+  @pytest.mark.live
   def test_lists_live_clubs_for_all_associations(self, client):
     results = client.list_clubs(all_associations=True)
 
@@ -23,6 +24,7 @@ class TestListClubs:
     assert all(club.id > 0 for club in results)
     assert all(club.name for club in results)
 
+  @pytest.mark.live
   def test_lists_live_clubs_for_a_specific_association(self, client):
     associations = client.list_associations()
     assert associations
