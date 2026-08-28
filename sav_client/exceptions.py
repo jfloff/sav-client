@@ -10,6 +10,9 @@ Hierarchy:
         └── SavServerError    — SAV2 returned an unhandled server-side error
                                 (a PHP fatal) with HTTP 200; the raw body is
                                 withheld from the message and logged at DEBUG
+        └── SavWriteUnverifiedError
+                             — write request completed but its postcondition
+                               could not be checked
 
     LicenseNotEnrolledError   — license is not in any open registration batch
                                 (subclasses ValueError so existing
@@ -52,6 +55,15 @@ class SavServerError(SavResponseError):
 
     Subclasses ``SavResponseError`` so every existing
     ``except SavResponseError`` handler keeps working.
+    """
+
+
+class SavWriteUnverifiedError(SavResponseError):
+    """Raised when a write may have succeeded but its outcome is unknown.
+
+    SAV2 may accept a write under HTTP 200 while a separate read needed to
+    confirm it fails server-side. Callers must not present this as either a
+    successful write or a failed one, because retrying can duplicate work.
     """
 
 

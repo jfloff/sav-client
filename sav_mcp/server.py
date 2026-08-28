@@ -2796,8 +2796,20 @@ def submit_subida_enrollment(
         detentor_signature_b64: Optional base64 PNG/JPG of the holder (detentor
                        paternal) signature to overlay onto the empty holder slot.
 
+    Success is established by checking that the licence actually appears in
+    the batch afterwards, not by the commit's response body — op=50 has no
+    reliable success contract and SAV can answer HTTP 200 with a PHP fatal.
+
     Returns:
         success=true + license + name + subida_document_upload on success.
+
+    Raises:
+        SavWriteUnverifiedError: the commit was sent and may well have
+            succeeded, but the follow-up read that would confirm it failed
+            server-side. This is neither a success nor a failure — check SAV
+            directly before retrying, because a retry could double-enrol.
+        SavResponseError: the commit was rejected, or the licence is absent
+            from the batch afterwards.
     """
     form = _forms.get(mod4_id)
     if form is None:

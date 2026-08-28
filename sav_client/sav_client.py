@@ -44,6 +44,7 @@ from .exceptions import (
   SavRecordNotFoundError,
   SavResponseError,
   SavServerError,
+  SavWriteUnverifiedError,
 )
 from .cache import Cache
 from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
@@ -3470,16 +3471,25 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Subida commit failed: {exc}") from exc
-    # The SAV2 web UI doesn't inspect op=50's body; it may return JSON
-    # ({"val":1,...}) or a bare success string. Treat HTTP 2xx as success
-    # unless the response is a JSON dict with an explicit val!=1.
+    # op=50 has no reliable success-body contract, so its body alone cannot
+    # establish that the player was added. Reuse the common guard for its two
+    # known failure shapes, then verify the actual postcondition below.
+    self._check_write_response(resp.text, "Subida commit failed")
     try:
-      data = json.loads(resp.text)
-    except ValueError:
-      data = None
-    if isinstance(data, dict) and "val" in data and str(data["val"]) != "1":
+      enrolled = {
+        item["license"]
+        for item in self.list_player_registration_batch_items(batch.id)
+      }
+    except (SavError, ValueError) as exc:
+      raise SavWriteUnverifiedError(
+        f"Subida commit for licence {license} in batch {batch.id} may have "
+        "succeeded, but its outcome could not be verified because SAV could "
+        "not list the batch items. Do not retry without checking SAV first."
+      ) from exc
+    if license not in enrolled:
       raise SavResponseError(
-        f"Subida commit failed: {data.get('msg') or data!r}"
+        f"Subida commit failed: licence {license} is not present in batch "
+        f"{batch.id} after the commit."
       )
     logger.info(
       "Added licence %s to subida batch %s (tier=%s, taxa=%s, companhia=%s).",

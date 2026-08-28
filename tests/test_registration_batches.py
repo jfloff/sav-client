@@ -1,9 +1,15 @@
 from datetime import date, timedelta
+from unittest.mock import Mock
 
 import pytest
 
 from sav_client import SavClient
-from sav_client.exceptions import SavConfigError, SavResponseError
+from sav_client.exceptions import (
+  SavConfigError,
+  SavResponseError,
+  SavServerError,
+  SavWriteUnverifiedError,
+)
 from sav_client.models import PlayerRegistrationBatch
 from sav_client.sav_client import _coerce_exam_date
 
@@ -408,6 +414,106 @@ class TestSubidaDeEscalao:
     self._stub_op21(monkeypatch, client, multi)
     with pytest.raises(SavConfigError, match="multiple subida tiers"):
       client._pick_subida_tier(88)
+
+
+class TestStandaloneSubidaCommit:
+  """op=50 has no success-body contract; verify the batch state instead."""
+
+  LICENSE = 301772
+
+  def _client(self, monkeypatch, commit_body, items):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    batch = type("BatchStub", (), {
+      "id": 12,
+      "tier": "Sub 14",
+      "gender": "Masculino",
+      "season": "2026/2027",
+    })()
+    response = type("Resp", (), {
+      "text": commit_body,
+      "raise_for_status": lambda self: None,
+    })()
+    monkeypatch.setattr(
+      client, "_http", type("Http", (), {"post": lambda self, *a, **k: response})(),
+    )
+    monkeypatch.setattr(client, "_list_subida_licenses", lambda batch: {self.LICENSE})
+    monkeypatch.setattr(client, "_load_subida_origin", lambda license: {})
+    monkeypatch.setattr(
+      client, "_resolve_subida_insurance_cascade", lambda batch, license: (1, 2),
+    )
+    monkeypatch.setattr(client, "_resolve_subida_taxa_id", lambda batch, license: 3)
+    monkeypatch.setattr(client, "list_player_registration_batch_items", items)
+    record_cache = Mock()
+    monkeypatch.setattr(client._cache, "record_license_batch", record_cache)
+    invalidate = Mock()
+    monkeypatch.setattr(client, "_invalidate_batch_memo", invalidate)
+    return client, batch, record_cache, invalidate
+
+  def test_php_fatal_is_rejected_without_caching_or_leaking_body(self, monkeypatch):
+    raw_body = "<html><b>Warning</b>: broken internal_subida_schema</html>"
+    items = Mock()
+    client, batch, record_cache, invalidate = self._client(monkeypatch, raw_body, items)
+
+    with pytest.raises(SavServerError) as excinfo:
+      client._add_player_to_subida_batch(batch, self.LICENSE, taxa_id=None)
+
+    assert raw_body not in str(excinfo.value)
+    items.assert_not_called()
+    record_cache.assert_not_called()
+    invalidate.assert_not_called()
+
+  def test_explicit_rejection_uses_sav_message_without_caching(self, monkeypatch):
+    raw_body = '{"val": 0, "msg": "Guia bloqueada", "debug": "internal_schema"}'
+    items = Mock()
+    client, batch, record_cache, invalidate = self._client(monkeypatch, raw_body, items)
+
+    with pytest.raises(SavResponseError, match="Guia bloqueada") as excinfo:
+      client._add_player_to_subida_batch(batch, self.LICENSE, taxa_id=None)
+
+    assert raw_body not in str(excinfo.value)
+    items.assert_not_called()
+    record_cache.assert_not_called()
+    invalidate.assert_not_called()
+
+  def test_verified_item_reports_success_and_updates_cache(self, monkeypatch):
+    client, batch, record_cache, invalidate = self._client(
+      monkeypatch, "OK", lambda batch_id: [{"license": self.LICENSE, "name": "Ana"}],
+    )
+
+    assert client._add_player_to_subida_batch(batch, self.LICENSE, taxa_id=None) == self.LICENSE
+    record_cache.assert_called_once_with(self.LICENSE, batch.id)
+    invalidate.assert_called_once_with()
+
+  def test_missing_item_after_commit_surfaces_failure_without_caching(self, monkeypatch):
+    client, batch, record_cache, invalidate = self._client(
+      monkeypatch, "OK", lambda batch_id: [],
+    )
+
+    with pytest.raises(SavResponseError, match="not present in batch"):
+      client._add_player_to_subida_batch(batch, self.LICENSE, taxa_id=None)
+
+    record_cache.assert_not_called()
+    invalidate.assert_not_called()
+
+  def test_item_listing_fatal_makes_commit_outcome_unverified(self, monkeypatch):
+    raw_body = "<html>Fatal error: internal_subida_schema</html>"
+
+    def fatal_items(batch_id):
+      raise SavServerError(
+        "Could not list items: SAV returned a server-side error; " + raw_body
+      )
+
+    client, batch, record_cache, invalidate = self._client(
+      monkeypatch, "OK", fatal_items,
+    )
+
+    with pytest.raises(SavWriteUnverifiedError) as excinfo:
+      client._add_player_to_subida_batch(batch, self.LICENSE, taxa_id=None)
+
+    assert raw_body not in str(excinfo.value)
+    record_cache.assert_not_called()
+    invalidate.assert_not_called()
 
 
 # ─── 1ª Inscrição (type-1) wizard ───────────────────────────────────────────
