@@ -198,7 +198,19 @@ def overlay_image_on_pdf(
   Use this for any raster overlay — club stamps, checkbox marks, signatures.
   Use image_size + get_pdf_page_box to compute `rect`.
   """
-  overlay_pdf = img2pdf.convert(image_bytes)
+  try:
+    overlay_pdf = img2pdf.convert(image_bytes)
+  except ValueError as exc:
+    # At img2pdf's default 96 DPI, either dimension below four pixels makes
+    # the intermediate PDF smaller than the library accepts. Translate that
+    # image-input problem without hiding unrelated conversion errors.
+    width, height = image_size(image_bytes)
+    if width < 4 or height < 4:
+      raise ValueError(
+        f"Overlay image is too small ({width}x{height} pixels); "
+        "provide a larger raster image."
+      ) from exc
+    raise
   out = io.BytesIO()
   with pikepdf.open(io.BytesIO(pdf_bytes)) as base_pdf:
     with pikepdf.open(io.BytesIO(overlay_pdf)) as overlay:

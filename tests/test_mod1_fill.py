@@ -88,10 +88,10 @@ def _page_xobject_count(pdf_bytes):
     return len(pdf.pages[0].get("/Resources", {}).get("/XObject", {}))
 
 
-def _png_bytes():
+def _png_bytes(size=(60, 24)):
   from PIL import Image
   buf = io.BytesIO()
-  Image.new("RGBA", (60, 24), (0, 0, 180, 255)).save(buf, "PNG")
+  Image.new("RGBA", size, (0, 0, 180, 255)).save(buf, "PNG")
   return buf.getvalue()
 
 
@@ -241,6 +241,22 @@ class TestSignatureOverlays:
     assert _page_xobject_count(three) == base + 3
     assert three[:5] == b"%PDF-"
     assert len(PdfReader(io.BytesIO(three)).pages) == 1
+
+  @pytest.mark.parametrize("slot", (
+    "player_signature", "guardian_signature", "club_stamp",
+  ))
+  def test_undersized_overlay_reports_image_dimensions(self, slot):
+    with pytest.raises(ValueError, match=r"image is too small \(1x1 pixels\)") as raised:
+      render_mod1({}, validate=False, **{slot: _png_bytes((1, 1))})
+
+    assert "Page size" not in str(raised.value)
+    assert isinstance(raised.value.__cause__, ValueError)
+    assert "Page size" in str(raised.value.__cause__)
+
+  def test_four_pixel_overlay_still_works_at_default_resolution(self):
+    base = _page_xobject_count(render_mod1({}, validate=False))
+    out = render_mod1({}, validate=False, player_signature=_png_bytes((4, 4)))
+    assert _page_xobject_count(out) == base + 1
 
   def test_signatures_compose_with_field_values(self):
     # Overlays don't disturb the filled fields — text/checkboxes still land.
