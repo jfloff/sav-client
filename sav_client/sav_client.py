@@ -116,6 +116,7 @@ _REGISTRATIONS_LOAD_EXISTING_PLAYER_OP = "30"
 _REGISTRATIONS_SAVE_STEP1_OP = "33"
 _REGISTRATIONS_SAVE_STEP2_OP = "31"
 _REGISTRATIONS_LIST_CONCELHOS_OP = "18"
+_REGISTRATIONS_LIST_LOCALIDADES_OP = "19"   # GET conc — localidades under a concelho
 _REGISTRATIONS_LOAD_SEGURO_OP = "87"
 _REGISTRATIONS_LOAD_COMPANHIA_OP = "175"
 _REGISTRATIONS_LOAD_APOLICE_OP = "24"
@@ -2678,6 +2679,7 @@ class SavClient:
     localidade_txt: str | None,
     distrito_id: int | None,
     concelho_id: int | None,
+    localidade_id: int | None = None,
     exam_date: str | None = None,
     taxa_id: int | None = None,
     promote_to_tier_id: int | None = None,
@@ -2715,13 +2717,16 @@ class SavClient:
     step2_prefill = self._save_registration_step1(batch.id, internal_id, step1_send)
 
     editing_exam = exam_date is not None
-    address_fields = (morada, cod_postal, localidade_txt, distrito_id, concelho_id)
+    address_fields = (
+      morada, cod_postal, localidade_txt, distrito_id, concelho_id, localidade_id,
+    )
     step3_prefill: dict[str, Any] | None = None
     if editing_exam or any(v is not None for v in address_fields):
       step2_send = self._build_step2_send(
         step2_prefill,
         morada=morada, cod_postal=cod_postal, localidade_txt=localidade_txt,
         distrito_id=distrito_id, concelho_id=concelho_id,
+        localidade_id=localidade_id,
       )
       step3_prefill = self._save_registration_step2(
         batch.type_id, batch.id, internal_id, license, step2_send,
@@ -2765,6 +2770,7 @@ class SavClient:
     localidade_txt: str | None = None,
     distrito_id: int | None = None,
     concelho_id: int | None = None,
+    localidade_id: int | None = None,
     exam_date: str | None = None,
     taxa_id: int | None = None,
     promote_to_tier_id: int | None = None,
@@ -2847,6 +2853,7 @@ class SavClient:
       morada=morada, cod_postal=cod_postal,
       localidade_txt=localidade_txt,
       distrito_id=distrito_id, concelho_id=concelho_id,
+      localidade_id=localidade_id,
       exam_date=exam_date, taxa_id=taxa_id,
       promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
       guardian_name=guardian_name, guardian_relation=guardian_relation,
@@ -3650,8 +3657,17 @@ class SavClient:
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not load concelhos: {exc}") from exc
 
+    return self._parse_option_map(resp.text)
+
+  @staticmethod
+  def _parse_option_map(html: str) -> dict[int, str]:
+    """``{id: label}`` from a SAV dropdown fragment, skipping the empty option.
+
+    Shared by the distrito/concelho/localidade cascades, which all answer with
+    a bare ``<option>`` list and use ``0`` as the "not selected" placeholder.
+    """
     from bs4 import BeautifulSoup
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     out: dict[int, str] = {}
     for opt in soup.find_all("option"):
       raw = (opt.get("value") or "").strip()
@@ -3662,6 +3678,30 @@ class SavClient:
       except ValueError:
         continue
     return out
+
+  def list_localidades(self, concelho_id: int) -> dict[int, str]:
+    """Op=19 — localidades under a concelho (id → name).
+
+    The third step of SAV's address cascade (distrito → concelho → localidade),
+    hitting the same endpoint the browser does on concelho change. Returns an
+    empty dict for ``concelho_id=0`` (no selection).
+
+    Uncached, unlike :meth:`list_concelhos`: localidades are only needed when
+    *writing* an address, which is rare, so a per-call fetch avoids carrying a
+    fourth lookup table for no benefit.
+    """
+    if not concelho_id:
+      return {}
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_LIST_LOCALIDADES_OP, "conc": concelho_id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(f"Could not load localidades: {exc}") from exc
+    return self._parse_option_map(resp.text)
 
   def load_player_profile(
     self, license: int, *, club_id: int | None = None,
@@ -3847,8 +3887,16 @@ class SavClient:
     localidade_txt: str | None,
     distrito_id: int | None,
     concelho_id: int | None,
+    localidade_id: int | None = None,
   ) -> str:
-    """Build the step-2 `send` payload — pais is locked to Portugal."""
+    """Build the step-2 `send` payload — pais is locked to Portugal.
+
+    ``localidade_id`` is the numeric locality from :meth:`list_localidades`.
+    It used to be carried over from `prefill` with no way to set it, so a
+    Revalidação could only ever keep whatever SAV already had — and once the
+    stored value was lost there was no route to put one back. The 1ª Inscrição
+    path has always accepted one; this brings the update path in line.
+    """
     def _pick(override: Any, stored: Any) -> Any:
       return override if override is not None else stored
 
@@ -3856,7 +3904,7 @@ class SavClient:
       ("pais",           "int", _REGISTRATIONS_PORTUGAL_ID),
       ("distrito",       "int", _pick(distrito_id, prefill.get("distrito"))),
       ("concelho",       "int", _pick(concelho_id, prefill.get("concelho"))),
-      ("localidade",     "int", prefill.get("localidade")),
+      ("localidade",     "int", _pick(localidade_id, prefill.get("localidade"))),
       ("morada",         "str", _pick(morada, prefill.get("morada"))),
       ("cod_postal",     "str", _pick(cod_postal, prefill.get("codpostal"))),
       ("localidade_txt", "str", _pick(localidade_txt, prefill.get("localidade_txt"))),

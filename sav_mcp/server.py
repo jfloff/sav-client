@@ -2813,7 +2813,9 @@ def update_enrollment(
       Step 1 (personal): id_type (int), id_number, id_expiry, telemovel,
         telefone, email, nome_pai, nome_mae.
       Step 2 (address): morada, cod_postal, localidade_txt,
-        distrito_id (int), concelho_id (int).
+        distrito_id (int), concelho_id (int), localidade_id (int — the
+        numeric locality; list_localidades(concelho_id) resolves it. Setting
+        localidade_txt alone leaves the numeric reference unset).
       Exam (re-commits step-3): exam_date (YYYY-MM-DD). Setting it re-fires
         the op=36 commit to write the new exam date. SAV2 has no read-back of
         the item's saved step-3 selections, so the re-commit re-derives
@@ -2831,7 +2833,7 @@ def update_enrollment(
         "id_type", "id_number", "id_expiry", "telemovel", "telefone",
         "email", "nome_pai", "nome_mae",
         "morada", "cod_postal", "localidade_txt",
-        "distrito_id", "concelho_id",
+        "distrito_id", "concelho_id", "localidade_id",
         "exam_date",
         "guardian_name", "guardian_relation", "guardian_phone", "guardian_email",
         "consent_data", "consent_communications", "consent_marketing",
@@ -2842,7 +2844,10 @@ def update_enrollment(
             f"Unsupported field(s) for update_enrollment: {unknown}. "
             f"Allowed: {sorted(allowed)}."
         )
-    int_keys = {"id_type", "distrito_id", "concelho_id", "guardian_relation"}
+    int_keys = {
+        "id_type", "distrito_id", "concelho_id", "localidade_id",
+        "guardian_relation",
+    }
     bool_keys = {"consent_data", "consent_communications", "consent_marketing"}
     # Dates reach a SAV commit body verbatim, so they are held to one shape here
     # rather than at the far end, where SAV rejects them without saying why.
