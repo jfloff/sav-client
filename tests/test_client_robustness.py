@@ -22,6 +22,7 @@ import requests
 from sav_client import SavClient
 from sav_client.exceptions import (
   SavConnectionError,
+  SavRecordNotFoundError,
   SavResponseError,
   SavServerError,
 )
@@ -183,21 +184,28 @@ class TestBatchMemoInvalidation:
 
     def fake_post_form(path, payload, *, params=None):
       calls["n"] += 1
-      return _batches_payload(101, item_count=0 if calls["n"] == 3 else 1)
+      # The count only falls once the removal has actually happened.
+      return _batches_payload(101, item_count=0 if calls["n"] > 1 else 1)
 
     monkeypatch.setattr(c, "_post_form", fake_post_form)
     c.list_player_registration_batches()  # Prime a stale, count-1 memo.
 
-    # Removal re-lists twice around op=29: the fresh baseline and fresh
-    # postcondition. Both must bypass the primed memo.
     monkeypatch.setattr(
       c, "_http",
       type("H", (), {"get": lambda self, *a, **k: _Resp("ok")})(),
     )
+
+    def _gone(batch_id, license):
+      raise SavRecordNotFoundError("no longer in this batch")
+
+    monkeypatch.setattr(c, "load_existing_registration_record", _gone)
     c.remove_player_from_registration_batch(101, 301772)
-    assert calls["n"] == 3
-    # After the real invalidation call, assert the memo is empty.
+
+    # Removal verifies per-licence via op=30, so it no longer re-lists the
+    # batch to compare counts. What must still hold is that it drops the memo,
+    # so the next caller cannot read the pre-removal row.
     assert c._batch_memo == {}
+    assert c.list_player_registration_batches()[0].item_count == 0
 
   def test_add_finalizer_invalidates(self, monkeypatch):
     # Exercise the invalidation hook directly: the subida/revalidação/primeira

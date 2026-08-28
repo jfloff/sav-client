@@ -6,6 +6,7 @@ import pytest
 from sav_client import SavClient
 from sav_client.exceptions import (
   SavConfigError,
+  SavRecordNotFoundError,
   SavResponseError,
   SavServerError,
   SavWriteUnverifiedError,
@@ -947,7 +948,10 @@ class TestRemovePlayerFromRegistrationBatch:
   LICENSE = 301772
   BATCH_ID = 12
 
-  def _client(self, monkeypatch, body, batches):
+  def _client(self, monkeypatch, body, batches, probe=None):
+    """`probe` stands in for the post-removal "is this licence still here?"
+    check — `load_existing_registration_record`. Raising
+    SavRecordNotFoundError means the player is gone."""
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"organizacao": "270"}
     response = type("Resp", (), {
@@ -958,6 +962,9 @@ class TestRemovePlayerFromRegistrationBatch:
       client, "_http", type("Http", (), {"get": lambda self, *a, **k: response})(),
     )
     monkeypatch.setattr(client, "list_player_registration_batches", batches)
+    if probe is None:
+      probe = Mock(side_effect=SavRecordNotFoundError("gone"))
+    monkeypatch.setattr(client, "load_existing_registration_record", probe)
     forget_cache = Mock()
     monkeypatch.setattr(client._cache, "forget_license_batch", forget_cache)
     return client, forget_cache
@@ -970,36 +977,61 @@ class TestRemovePlayerFromRegistrationBatch:
       "item_count": item_count,
     })()
 
-  def test_one_byte_response_with_unchanged_count_raises_without_success_log(
+  def test_one_byte_response_but_player_still_there_raises_without_success_log(
     self, monkeypatch, caplog,
   ):
-    before = self._batch(1)
-    after = self._batch(1)
-    batches = Mock(side_effect=[[before], [after]])
-    client, forget_cache = self._client(monkeypatch, "1", batches)
+    """The reported bug: HTTP 200, 1-byte body, nothing actually removed."""
+    batches = Mock(return_value=[self._batch(1)])
+    still_enrolled = Mock(return_value={"id": 88})
+    client, forget_cache = self._client(monkeypatch, "1", batches, probe=still_enrolled)
 
     with caplog.at_level("INFO", logger="sav_client.sav_client"):
-      with pytest.raises(SavResponseError, match=r"licence 301772.*batch 12"):
+      with pytest.raises(SavResponseError, match=r"licence 301772.*still enrolled"):
         client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
 
-    assert not any("Removed player license=301772" in record.message for record in caplog.records)
+    assert not any("Removed player license=301772" in r.message for r in caplog.records)
     forget_cache.assert_not_called()
 
-  def test_decreased_count_succeeds_and_forgets_cache(self, monkeypatch):
-    before = self._batch(1)
-    after = self._batch(0)
+  def test_player_gone_succeeds_and_forgets_cache(self, monkeypatch):
     client, forget_cache = self._client(
-      monkeypatch, "OK", Mock(side_effect=[[before], [after]]),
+      monkeypatch, "OK", Mock(return_value=[self._batch(1)]),
     )
 
     client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
 
     forget_cache.assert_called_once_with(self.LICENSE)
 
-  def test_batch_listing_failure_is_unverified_and_forgets_cache(self, monkeypatch):
-    before = self._batch(1)
-    batches = Mock(side_effect=[[before], SavServerError("batch listing fatal")])
-    client, forget_cache = self._client(monkeypatch, "OK", batches)
+  def test_a_concurrent_removal_cannot_falsely_confirm_this_one(self, monkeypatch):
+    """Why the check is per-licence and not a batch count.
+
+    An earlier version compared item_count before and after. Someone else
+    removing a *different* player also makes the count fall, which would
+    confirm a removal that never happened. Here the count drops 2 -> 1 while
+    our licence is still enrolled: that must still fail.
+    """
+    batches = Mock(side_effect=[[self._batch(2)], [self._batch(1)]])
+    still_enrolled = Mock(return_value={"id": 88})
+    client, forget_cache = self._client(monkeypatch, "OK", batches, probe=still_enrolled)
+
+    with pytest.raises(SavResponseError, match="still enrolled"):
+      client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+    forget_cache.assert_not_called()
+
+  def test_the_probe_asks_about_this_licence_and_batch(self, monkeypatch):
+    probe = Mock(side_effect=SavRecordNotFoundError("gone"))
+    client, _ = self._client(
+      monkeypatch, "OK", Mock(return_value=[self._batch(1)]), probe=probe,
+    )
+
+    client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    probe.assert_called_once_with(self.BATCH_ID, self.LICENSE)
+
+  def test_probe_failure_is_unverified_and_forgets_cache(self, monkeypatch):
+    broken_probe = Mock(side_effect=SavServerError("op=30 fatal"))
+    client, forget_cache = self._client(
+      monkeypatch, "OK", Mock(return_value=[self._batch(1)]), probe=broken_probe,
+    )
 
     with pytest.raises(SavWriteUnverifiedError, match="Do not retry"):
       client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
