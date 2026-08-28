@@ -4023,9 +4023,10 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 1: {exc}") from exc
-    what = "Registration step 1 failed"
+    # op=33 is not a write-ack endpoint: a successful save returns the next
+    # step's prefill and can legitimately include ``val: 0``. JSON/PHP-fatal
+    # parsing and the required prefill shape are still validated below.
     data = self._parse_json_response(resp.text, "Could not parse step 1 response")
-    self._check_write_response(resp.text, what)
     return self._validate_registration_prefill(
       data, step=1, required_keys=_REGISTRATIONS_STEP1_PREFILL_KEYS,
     )
@@ -4092,9 +4093,11 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 2: {exc}") from exc
-    what = "Registration step 2 failed"
+    # Same as op=33: a prefill endpoint, not a write-ack. `val` is not a
+    # universal success flag in SAV, so it must not gate this response either.
+    # PHP fatals are still caught by _parse_json_response and the shape by
+    # _validate_registration_prefill.
     data = self._parse_json_response(resp.text, "Could not parse step 2 response")
-    self._check_write_response(resp.text, what)
     return self._validate_registration_prefill(
       data, step=2, required_keys=_REGISTRATIONS_STEP2_PREFILL_KEYS,
     )
@@ -4106,7 +4109,15 @@ class SavClient:
     step: int,
     required_keys: tuple[str, ...],
   ) -> dict[str, Any]:
-    """Ensure a saved wizard step can safely prefill the following step."""
+    """Ensure a saved wizard step can safely prefill the following step.
+
+    ``val`` is stripped from the result. It is not a success flag on these
+    endpoints — op=33 returns ``val: 0`` on a *successful* save — but the name
+    reads like a universal one, and that misreading blocked every Revalidação
+    at step 1 until it was caught live on 2026-08-28. Nothing downstream
+    consumes it, so it is better absent than sitting in the prefill inviting
+    the same mistake again. Everything else is returned unchanged.
+    """
     if not isinstance(data, dict):
       raise SavResponseError(
         f"Registration step {step} failed: response must be a JSON object"
@@ -4116,7 +4127,7 @@ class SavClient:
         raise SavResponseError(
           f"Registration step {step} failed: response missing required key {key!r}"
         )
-    return data
+    return {k: v for k, v in data.items() if k != "val"}
 
   def _resolve_insurance_cascade(
     self, internal_id: int, batch: PlayerRegistrationBatch, escalao: int,

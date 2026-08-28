@@ -323,7 +323,15 @@ class TestRegistrationStepPrefillValidation:
       return client._save_registration_step1(1, 88, "step1")
     return client._save_registration_step2(2, 1, 88, 301772, "step2")
 
-  def test_step1_rejection_surfaces_sav_message_and_stops_before_step2(self, monkeypatch):
+  def test_step1_rejection_body_never_becomes_prefill(self, monkeypatch):
+    """A rejection body must not reach step 2 — but not because of `val`.
+
+    This used to assert on the write-ack check rejecting `val != 1`. That
+    check was wrong here: op=33 returns `val: 0` on a *successful* save, so it
+    blocked every real Revalidação. The guard that matters is the shape one —
+    a rejection body carries none of the address keys step 2 consumes, so it
+    is refused as prefill regardless of what `val` says.
+    """
     client = self._client('{"val": 0, "msg": "Morada recusada"}')
     client.session = {"organizacao": "270"}
     batch = type("BatchStub", (), {
@@ -343,7 +351,7 @@ class TestRegistrationStepPrefillValidation:
 
     monkeypatch.setattr(client, "_save_registration_step2", step2_must_not_run)
 
-    with pytest.raises(SavResponseError, match="Registration step 1 failed: Morada recusada"):
+    with pytest.raises(SavResponseError, match="missing required key"):
       client.add_player_to_registration_batch(1, 301772)
     assert reached_step2 is False
 
@@ -377,6 +385,41 @@ class TestRegistrationStepPrefillValidation:
     import json
 
     assert self._save_step(self._client(json.dumps(prefill)), step) == prefill
+
+  def test_step2_rejection_is_caught_by_the_shape_check_not_val(self):
+    """op=31 is a prefill endpoint too, so `val` must not gate it either.
+
+    A real rejection carries none of the keys step 3 consumes, so it is refused
+    on shape — which is the check that actually distinguishes a rejection from
+    the `val: 0` a successful save legitimately returns.
+    """
+    import json
+
+    body = {"val": 0, "msg": "Morada recusada"}  # no menor_idade/escalao/estatuto
+    with pytest.raises(SavResponseError, match="missing required key"):
+      self._save_step(self._client(json.dumps(body)), 2)
+
+  def test_step2_val_zero_with_a_full_prefill_is_accepted(self):
+    import json
+
+    body = {**self.STEP2_PREFILL, "val": 0}
+    prefill = self._save_step(self._client(json.dumps(body)), 2)
+    assert "val" not in prefill
+    assert prefill["menor_idade"] == ""
+
+  def test_validator_strips_val_and_passes_the_rest_through(self):
+    prefill = {
+      **self.STEP1_PREFILL,
+      "val": "0",
+      "endpoint_specific": {"opaque": True},
+    }
+    validated = SavClient._validate_registration_prefill(
+      prefill, step=1, required_keys=tuple(self.STEP1_PREFILL),
+    )
+    # `val` is dropped; nothing else is touched.
+    assert "val" not in validated
+    assert validated["endpoint_specific"] == {"opaque": True}
+    assert {k: v for k, v in prefill.items() if k != "val"} == validated
 
   @pytest.mark.parametrize("step", [1, 2])
   def test_php_fatal_does_not_leak_raw_body(self, step):
@@ -904,3 +947,115 @@ class TestRemovePlayerFromRegistrationBatch:
   def test_unknown_batch_raises(self, client):
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
       client.remove_player_from_registration_batch(999999999, 301772)
+
+
+class TestStep1PrefillIsNotAWriteAck:
+  """`val` is not a universal success flag in SAV.
+
+  op=36 uses val:1 for success; op=33 returns **val:0 on a successful save**,
+  alongside the step-2 prefill. Applying the write-ack check to op=33 rejected
+  every Revalidação at step 1 — reproduced live on licence 298337 (Alexandre
+  Silva Fragoso) on 2026-08-28, where bypassing that one check let the whole
+  flow complete and return internal id 252299.
+
+  A PHP fatal is still caught by `_parse_json_response`, and the response shape
+  by `_validate_registration_prefill`, so dropping the write-ack check here
+  loses no real protection.
+  """
+
+  # The exact op=33 body captured from that run.
+  REAL_STEP1_RESPONSE = (
+    '{"pais":"155","morada":"Rua Professora Carolina Amalia",'
+    '"codpostal":"2040-207","concelho":"210","distrito":"14",'
+    '"localidade":null,"clube":"Rio Maior Basket",'
+    '"nome":"Alexandre Silva Fragoso","val":0,"localidade_txt":"Rio Maior"}'
+  )
+
+  def _client(self, monkeypatch, body):
+    c = SavClient.__new__(SavClient)
+    c.base_url = "https://sav2.example/"
+    c.session = {"perfil": 1, "user": "u", "organizacao": 1}
+    c._timeout = 10
+
+    class _Http:
+      def get(self, *a, **k):
+        return type("R", (), {"text": body, "raise_for_status": lambda self: None})()
+
+    c._http = _Http()
+    return c
+
+  def test_exact_val_zero_prefill_is_accepted_with_val_stripped(self, monkeypatch):
+    c = self._client(monkeypatch, self.REAL_STEP1_RESPONSE)
+    prefill = c._save_registration_step1(630304, 252299, "send")
+    assert prefill == {
+      "pais": "155",
+      "morada": "Rua Professora Carolina Amalia",
+      "codpostal": "2040-207",
+      "concelho": "210",
+      "distrito": "14",
+      "localidade": None,
+      "clube": "Rio Maior Basket",
+      "nome": "Alexandre Silva Fragoso",
+      "localidade_txt": "Rio Maior",
+    }
+    # val:0 meant SUCCESS on op=33; it is stripped so nothing reads it as a
+    # verdict again. Everything else arrives exactly as SAV sent it.
+    assert "val" not in prefill
+
+  def test_prefill_still_reaches_step2_unchanged(self, monkeypatch):
+    c = self._client(monkeypatch, self.REAL_STEP1_RESPONSE)
+    prefill = c._save_registration_step1(630304, 252299, "send")
+    send = SavClient._build_step2_send(
+      prefill, morada=None, cod_postal=None, localidade_txt=None,
+      distrito_id=None, concelho_id=None,
+    )
+    # The address must survive; NULLs here are what wiped a live record before.
+    assert 'morada="Rua Professora Carolina Amalia"' in send
+    assert "distrito=14," in send and "concelho=210," in send
+
+  def test_full_revalidation_flow_reaches_commit_and_returns_internal_id(
+    self, monkeypatch,
+  ):
+    c = self._client(monkeypatch, self.REAL_STEP1_RESPONSE)
+    c._cache = Mock()
+    batch = type("BatchStub", (), {
+      "id": 630304,
+      "is_open": True,
+      "type_id": 2,
+      "state": "Em construção",
+      "tier": "Sub 14",
+      "gender": "Masculino",
+      "tier_id": 7,
+    })()
+    captured = {}
+
+    monkeypatch.setattr(c, "list_player_registration_batches", lambda season=None: [batch])
+    monkeypatch.setattr(c, "_list_revalidable_licenses", lambda batch_obj: {298337})
+    monkeypatch.setattr(c, "_load_player_record", lambda batch_id, license: {"id": 252299})
+    monkeypatch.setattr(c, "_build_step1_send", lambda *args, **kwargs: "step1")
+
+    def capture_step2(prefill, **kwargs):
+      captured["prefill"] = prefill
+      return "step2"
+
+    monkeypatch.setattr(c, "_build_step2_send", capture_step2)
+    monkeypatch.setattr(
+      c, "_save_registration_step2",
+      lambda *args, **kwargs: {"menor_idade": 0, "escalao": 7, "estatuto": "A"},
+    )
+    monkeypatch.setattr(c, "_commit_registration_step3", lambda *args, **kwargs: 252299)
+
+    assert c.add_player_to_registration_batch(630304, 298337) == 252299
+    assert "val" not in captured["prefill"]
+    assert captured["prefill"]["nome"] == "Alexandre Silva Fragoso"
+
+  def test_a_malformed_shape_is_still_rejected(self, monkeypatch):
+    c = self._client(monkeypatch, '{"val":0,"nome":"X"}')  # missing address keys
+    with pytest.raises(SavResponseError, match="missing required key"):
+      c._save_registration_step1(630304, 252299, "send")
+
+  def test_a_php_fatal_is_still_rejected(self, monkeypatch):
+    fatal = "<br /><b>Fatal error</b>:  Uncaught mysqli_sql_exception: boom"
+    c = self._client(monkeypatch, fatal)
+    with pytest.raises(SavServerError):
+      c._save_registration_step1(630304, 252299, "send")
