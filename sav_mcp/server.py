@@ -123,6 +123,7 @@ from sav_shared.serializers import (
     game_to_dict,
     player_to_dict,
 )
+from sav_shared.lookups import GAME_STATUS_VALUES, UNKNOWN_GAME_STATUS
 from sav_parsers.types import DocType, ParsedField
 
 server = FastMCP("FPB SAV")
@@ -820,8 +821,9 @@ def list_games(
     be honored — it only selects which side counts as "ours", and yields no
     rows when it isn't a team in the session club's games.
     season defaults to the current epoch.
-    status: "scheduled" | "played" | "all" (default). A game is "played" once it
-        has both scores.
+    status: "scheduled" | "played" | "not_scheduled" | "postponed" |
+        "cancelled" | "unknown" | "all" (default). This filters SAV's fixture
+        state; ``unknown`` selects an unrecognised SAV status.
     tier: escalão filter (e.g. "Sub 14"). Omit for all tiers.
     gender: 0 = any, 1 = Masculino, 2 = Feminino.
     date_from / date_to: inclusive YYYY-MM-DD window (DD-MM-YYYY is also
@@ -837,13 +839,23 @@ def list_games(
       opponent   — the other team's name
       home       — true when the club plays at home
       venue      — pavilion / location, or null
-      status     — "scheduled" or "played"
-      our_score / opp_score — ints from the club's perspective, null until played
+      status     — canonical fixture state: "scheduled", "played",
+                   "not_scheduled", "postponed", "cancelled", or "unknown"
+                   for an unrecognised SAV state
+      status_raw — SAV's original fixture-status label
+      has_result — true iff both scores are valid integers; independent of status
+      our_score / opp_score — ints from the club's perspective, null when absent
+
+    If the club's side cannot be determined, the fixture is preserved as the
+    explicit error row ``{source_id, error}``; it has no status fields and is
+    retained by every status filter.
     """
     status_key = status.strip().lower()
-    if status_key not in ("scheduled", "played", "all"):
+    if status_key not in (*GAME_STATUS_VALUES, UNKNOWN_GAME_STATUS, "all"):
         raise ValueError(
-            f"status must be 'scheduled', 'played', or 'all'; got {status!r}"
+            "status must be 'scheduled', 'played', 'not_scheduled', "
+            "'postponed', 'cancelled', 'unknown', or 'all'; "
+            f"got {status!r}"
         )
 
     client = _get_client()
@@ -883,7 +895,7 @@ def list_game_sheets(
     date_from: str = "",
     date_to: str = "",
     competition: str = "",
-    status: str = "",
+    status: str = "all",
     season: int | None = None,
 ) -> list[dict]:
     """
@@ -891,15 +903,41 @@ def list_game_sheets(
 
     date_from / date_to: YYYY-MM-DD (DD-MM-YYYY is also accepted).
     competition: case-insensitive name fragment filter.
-    status: game status filter (e.g. "Realizado"). Omit for all.
+    status: "scheduled" | "played" | "not_scheduled" | "postponed" |
+        "cancelled" | "unknown" | "all" (default). This filters SAV's fixture
+        state; ``unknown`` selects an unrecognised SAV status.
+
+    Each row has this shape:
+      id / number — SAV's internal and human-readable game identifiers
+      date / time — SAV's scheduled date and time strings
+      home / away — teams as displayed by SAV
+      home_score / away_score — SAV's score strings
+      competition / tier / gender / venue — SAV game metadata
+      status     — canonical fixture state: "scheduled", "played",
+                   "not_scheduled", "postponed", "cancelled", or "unknown"
+                   for an unrecognised SAV state
+      status_raw — SAV's original fixture-status label
+      has_result — true iff both scores are valid integers; independent of status
     """
+    status_key = status.strip().lower()
+    if status_key == "":
+        status_key = "all"
+    if status_key not in (*GAME_STATUS_VALUES, UNKNOWN_GAME_STATUS, "all"):
+        raise ValueError(
+            "status must be 'scheduled', 'played', 'not_scheduled', "
+            "'postponed', 'cancelled', 'unknown', or 'all'; "
+            f"got {status!r}"
+        )
     client = _get_client()
     results = filter_games(
         client.list_games(season=season, tier=tier),
-        competition=competition, status=status,
+        competition=competition,
         date_from=date_from, date_to=date_to,
     )
-    return [game_to_dict(g) for g in results]
+    rows = [game_to_dict(g) for g in results]
+    if status_key != "all":
+        rows = [row for row in rows if row["status"] == status_key]
+    return rows
 
 
 def _resolve_game(client: SavClient, game_number: str) -> Any:

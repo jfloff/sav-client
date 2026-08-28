@@ -94,18 +94,22 @@ class TestDateFiltering:
 
 
 class TestStatusFiltering:
-  def test_played_requires_both_scores(self, monkeypatch):
+  def test_status_filters_sav_fixture_state(self, monkeypatch):
     games = [
-      _game("1", "20-06-2026", home_score="80", away_score="70"),
-      _game("2", "21-06-2026"),  # no scores yet
+      _game("1", "20-06-2026", status="Realizado",
+            home_score="80", away_score="70"),
+      _game("2", "21-06-2026", status="Marcado"),
+      _game("3", "22-06-2026", status="Adiado"),
     ]
     _stub(monkeypatch, games)
 
     played = server_module.list_games(status="played")
     scheduled = server_module.list_games(status="scheduled")
+    postponed = server_module.list_games(status="postponed")
 
     assert [g["source_id"] for g in played] == ["1"]
     assert [g["source_id"] for g in scheduled] == ["2"]
+    assert [g["source_id"] for g in postponed] == ["3"]
 
   def test_all_keeps_every_game(self, monkeypatch):
     games = [
@@ -130,7 +134,7 @@ class TestPerspective:
   def test_home_game(self, monkeypatch):
     _stub(monkeypatch, [
       _game("1", "20-06-2026", home=CLUB, away="Foes",
-            home_score="80", away_score="70"),
+            home_score="80", away_score="70", status="Realizado"),
     ])
 
     (row,) = server_module.list_games()
@@ -140,6 +144,8 @@ class TestPerspective:
     assert row["our_score"] == 80
     assert row["opp_score"] == 70
     assert row["status"] == "played"
+    assert row["status_raw"] == "Realizado"
+    assert row["has_result"] is True
     assert row["starts_at"] == "2026-06-20T10:00"
     assert row["escalao"] == "Sub 14 M"
     assert row["gender"] == "Masculino"
@@ -166,7 +172,9 @@ class TestPerspective:
 
     (row,) = server_module.list_games()
 
-    assert row["status"] == "scheduled"
+    assert row["status"] == "not_scheduled"
+    assert row["status_raw"] == "Não Marcado"
+    assert row["has_result"] is False
     assert row["our_score"] is None
     assert row["opp_score"] is None
     assert row["starts_at"] == ""
@@ -227,6 +235,59 @@ class TestClubGameSerializer:
     assert "Home Lions" in result[1]["error"]
     assert "Away Tigers" in result[1]["error"]
 
+  def test_error_row_survives_status_filter(self, monkeypatch):
+    good = _game("17", "20-06-2026", home=CLUB, away="Foes",
+                 status="Realizado", home_score="80", away_score="70")
+    bad = _game("18", "21-06-2026", home="Home Lions", away="Away Tigers")
+    _stub(monkeypatch, [good, bad])
+
+    result = server_module.list_games(status="cancelled")
+
+    assert len(result) == 1
+    assert result[0]["source_id"] == "18"
+    assert set(result[0]) == {"source_id", "error"}
+
+
+class TestCanonicalStatuses:
+  def test_scoreless_cancelled_and_postponed_are_not_scheduled(self, monkeypatch):
+    games = [
+      _game("19", "20-06-2026", status="Anulado"),
+      _game("20", "21-06-2026", status="Adiado"),
+    ]
+    _stub(monkeypatch, games)
+
+    club_rows = server_module.list_games()
+    sheet_rows = server_module.list_game_sheets()
+    club_statuses = {row["source_id"]: row["status"] for row in club_rows}
+    sheet_statuses = {str(row["id"]): row["status"] for row in sheet_rows}
+
+    assert club_statuses == {"19": "cancelled", "20": "postponed"}
+    assert sheet_statuses == club_statuses
+    assert "scheduled" not in club_statuses.values()
+    assert "scheduled" not in sheet_statuses.values()
+
+  def test_both_tools_agree_that_a_scored_fixture_is_played(self, monkeypatch):
+    game = _game("21", "20-06-2026", status="Realizado",
+                 home_score="80", away_score="70")
+    _stub(monkeypatch, [game])
+
+    (club_row,) = server_module.list_games()
+    (sheet_row,) = server_module.list_game_sheets()
+
+    assert club_row["status"] == sheet_row["status"] == "played"
+    assert club_row["has_result"] is sheet_row["has_result"] is True
+
+  def test_unmappable_sav_status_is_explicit_and_filterable(self, monkeypatch):
+    game = _game("22", "20-06-2026", status="Em Revisão")
+    _stub(monkeypatch, [game])
+
+    (club_row,) = server_module.list_games(status="unknown")
+    (sheet_row,) = server_module.list_game_sheets(status="unknown")
+
+    assert club_row["status"] == sheet_row["status"] == "unknown"
+    assert club_row["status_raw"] == sheet_row["status_raw"] == "Em Revisão"
+    assert club_row["has_result"] is sheet_row["has_result"] is False
+
 
 class TestOrdering:
   def test_results_sorted_earliest_first(self, monkeypatch):
@@ -244,3 +305,18 @@ class TestOrdering:
 
     assert stub.calls[0]["date_from"] == "12-06-2026"
     assert stub.calls[0]["date_to"] == "30-06-2026"
+
+
+def test_canonical_status_is_case_and_whitespace_tolerant():
+  """SAV renders these labels from HTML; its casing is not our contract."""
+  from sav_shared.lookups import canonical_game_status
+  for raw in ("Marcado", "  marcado ", "MARCADO"):
+    assert canonical_game_status(raw) == "scheduled"
+  assert canonical_game_status("nao marcado") == "unknown"  # accent still matters
+  assert canonical_game_status("Não Marcado") == "not_scheduled"
+
+
+def test_unmapped_status_never_masquerades_as_a_real_state():
+  from sav_shared.lookups import canonical_game_status, GAME_STATUS_VALUES
+  for raw in ("Novo Estado", "", None):
+    assert canonical_game_status(raw) not in GAME_STATUS_VALUES

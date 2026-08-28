@@ -7,6 +7,7 @@ from typing import Any
 
 from .dates import to_iso
 from .identifiers import to_license
+from .lookups import canonical_game_status
 from .text import iso_date, normalise_text
 
 
@@ -81,13 +82,18 @@ def enrollment_record_to_dict(record: Mapping[str, Any], *, license: Any) -> dic
 
 
 def game_to_dict(g: Any) -> dict:
+  home_score = _score_to_int(g.home_score)
+  away_score = _score_to_int(g.away_score)
   return {
     "id": g.id, "number": g.number,
     "date": g.date, "time": g.time,
     "home": g.home, "away": g.away,
     "home_score": g.home_score, "away_score": g.away_score,
     "competition": g.competition, "tier": g.tier, "gender": g.gender,
-    "venue": g.venue, "game_status": g.game_status,
+    "venue": g.venue,
+    "status": canonical_game_status(g.game_status),
+    "status_raw": g.game_status,
+    "has_result": home_score is not None and away_score is not None,
   }
 
 
@@ -137,8 +143,6 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
 
   home_score = _score_to_int(g.home_score)
   away_score = _score_to_int(g.away_score)
-  played = home_score is not None and away_score is not None
-
   return {
     "source_id": str(g.id) if g.id else g.number,
     "escalao": g.level or g.tier,
@@ -147,7 +151,9 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
     "opponent": g.away if ours_home else g.home,
     "home": ours_home,
     "venue": g.venue or None,
-    "status": "played" if played else "scheduled",
+    "status": canonical_game_status(g.game_status),
+    "status_raw": g.game_status,
+    "has_result": home_score is not None and away_score is not None,
     "our_score": (home_score if ours_home else away_score),
     "opp_score": (away_score if ours_home else home_score),
   }

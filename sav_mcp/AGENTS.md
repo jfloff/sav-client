@@ -92,7 +92,12 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 | Em Pagamento | no |
 
 ### Game statuses
-`Marcado` (scheduled), `Realizado` (played), `Não Marcado`, `Adiado`, `Anulado`.
+MCP game tools expose the same canonical `status`: `scheduled` (`Marcado`),
+`played` (`Realizado`), `not_scheduled` (`Não Marcado`), `postponed`
+(`Adiado`), or `cancelled` (`Anulado`). `unknown` is not a SAV state; it is an
+explicit sentinel for an unmappable SAV value, preserved in `status_raw`.
+`has_result` is a separate boolean: true only when both scores are valid
+integers, independent of fixture status.
 
 ### Document types (`doc_type` strings)
 `fpb_modelo_1` — main enrollment form (`tipo_doc=1`). `exame_medico` — medical exam (`tipo_doc=2`). `fpb_modelo_4` — Subida form (`tipo_doc=6`). Supplementary uploads are also wired: `atestado_residencia` (`15`), `documento_identificacao` (`18`), `certidao_matricula` (`24`), and `outros` (`22`).

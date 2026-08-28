@@ -38,6 +38,39 @@ def find_id_by_name(name: str | None, mapping: dict[int, str]) -> int | None:
   return None
 
 
+# ── Game statuses ───────────────────────────────────────────────────────────────
+
+# SAV returns these Portuguese labels in ``Game.game_status``.  Keep the public
+# vocabulary derived directly from that finite upstream set; an unfamiliar SAV
+# value must remain visible to callers rather than being guessed as scheduled.
+GAME_STATUS_BY_SAV: dict[str, str] = {
+  "Marcado": "scheduled",
+  "Realizado": "played",
+  "Não Marcado": "not_scheduled",
+  "Adiado": "postponed",
+  "Anulado": "cancelled",
+}
+GAME_STATUS_VALUES: tuple[str, ...] = tuple(GAME_STATUS_BY_SAV.values())
+_GAME_STATUS_FOLDED: dict[str, str] = {
+  label.casefold(): value for label, value in GAME_STATUS_BY_SAV.items()
+}
+UNKNOWN_GAME_STATUS = "unknown"
+
+
+def canonical_game_status(value: str | None) -> str:
+  """Map a SAV game-status label to its canonical public value.
+
+  ``unknown`` is an explicit sentinel, not a SAV status.  Serializers pair it
+  with the original value so new upstream labels cannot masquerade as a known
+  fixture state.
+  """
+  # Case-folded: SAV renders these from HTML table cells and we do not control
+  # its casing. The five labels stay distinct case-insensitively, so matching
+  # loosely cannot mismap one onto another — it only avoids a spurious
+  # ``unknown`` if SAV ever changes how it capitalises them.
+  return _GAME_STATUS_FOLDED.get((value or "").strip().casefold(), UNKNOWN_GAME_STATUS)
+
+
 # ── Distritos (SAV2 step-2 dropdown) ───────────────────────────────────────────
 
 DISTRITOS: dict[int, str] = {
