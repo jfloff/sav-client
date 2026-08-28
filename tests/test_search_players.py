@@ -454,7 +454,7 @@ class TestClubZeroClubIdResolution:
 
 
 class TestPlayerSerializer:
-  """player_to_dict surfaces club_id + club_name for unambiguous grouping."""
+  """player_to_dict has an explicit opt-in for the internal SAV id."""
 
   def test_emits_club_id_and_club_name(self):
     from sav_shared.serializers import player_to_dict
@@ -470,6 +470,11 @@ class TestPlayerSerializer:
     assert d["club_id"] == 789
     assert d["club_name"] == "Club X"
     assert d["club"] == "Club X"  # back-compat key preserved
+    # SAV's internal id never crosses this boundary — there is no opt-in,
+    # because a bare int alongside a licence is too easy to confuse for one.
+    assert "id" not in d
+    assert "id" not in player_to_dict(p, with_details=True)
+    assert d["license"] == "100"
 
 
 class TestPlayerTierGenderIds:

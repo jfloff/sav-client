@@ -101,6 +101,7 @@ def test_enrolled_player_also_gets_projected_checklist(monkeypatch):
 
   assert result["status"] == "enrolled"
   assert result["player"]["license"] == 301772
+  assert "id" not in result["player"]
   assert result["checklist"]["scenario"] == "foreign_born"
 
 

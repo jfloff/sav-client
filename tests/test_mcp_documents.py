@@ -426,6 +426,8 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
   )
 
   assert result["success"] is True
+  assert result["license"] == 301772
+  assert "player_id" not in result
   assert replace_calls == [1]
   assert result["source_document_upload"] == {
     "doc_type": DocType.FPB_MODELO_1.value,
@@ -968,6 +970,10 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
     def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
       return {"existe": 1, "id": 99}
 
+    def find_license_by_nif(self, nif):
+      assert nif == "277544319"
+      return 301772
+
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
   monkeypatch.setattr(server_module, "_forms", {
     "form-1": {
@@ -976,6 +982,7 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
         "nome_completo": ParsedField(value="João Loff", confidence=0.95),
         "data_nascimento": ParsedField(value="2020-09-26", confidence=0.95),
         "num_doc_identificacao": ParsedField(value="12345699", confidence=0.95),
+        "nif": ParsedField(value="277544319", confidence=0.95),
       },
       "reg_type": 1,
     },
@@ -984,7 +991,8 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
   result = server_module.resolve_player(batch_number="726", mod1_id="form-1")
   assert result["resolved"] is False
   assert result["error"] == "player_already_in_sav"
-  assert result["existing_sav_id"] == 99
+  assert result["existing_license"] == 301772
+  assert "existing_sav_id" not in result
 
 
 def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):

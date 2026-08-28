@@ -160,7 +160,31 @@ def test_update_enrollment_drops_batch_number(monkeypatch):
 
   result = server_module.update_enrollment(license=301772, fields={"email": "x@y.z"})
   assert captured["call"] == (42, 301772, {"email": "x@y.z"})
-  assert result == {"success": True, "player_id": 77}
+  assert result == {"success": True, "license": 301772}
+
+
+def test_create_enrollment_manual_returns_licence_not_internal_id(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      captured["batch_number"] = number
+      return 42
+
+    def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+      captured["call"] = (batch_id, license, kwargs)
+      return 77
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.create_enrollment_manual(
+    batch_number="2025/12", license=301772, fields={"email": "x@y.z"},
+  )
+
+  assert captured["batch_number"] == "2025/12"
+  assert captured["call"] == (42, 301772, {"email": "x@y.z"})
+  assert result == {"success": True, "license": 301772}
+  assert "player_id" not in result
 
 
 def test_update_enrollment_returns_structured_error_when_not_enrolled(monkeypatch):

@@ -1,3 +1,5 @@
+import json
+
 from click.testing import CliRunner
 
 from sav_cli import cli as cli_module
@@ -38,6 +40,7 @@ def test_players_status_option_is_forwarded_to_client(monkeypatch):
   assert result.exit_code == 0
   assert captured["status"] == "active"
   assert '"status": "FBP"' in result.output
+  assert json.loads(result.output)[0]["id"] == 1
 
 
 def test_players_without_association_option_does_not_forward_association_filter(monkeypatch):

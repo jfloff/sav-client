@@ -318,7 +318,7 @@ def test_update_enrollment_tool_accepts_exam_date(monkeypatch):
     fields={"exam_date": RECENT_EXAM_DATE, "guardian_relation": "3", "consent_marketing": True},
   )
 
-  assert out == {"success": True, "player_id": 999}
+  assert out == {"success": True, "license": 301772}
   assert captured["exam_date"] == RECENT_EXAM_DATE
   assert captured["guardian_relation"] == 3  # coerced to int
   assert captured["consent_marketing"] is True

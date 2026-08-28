@@ -10,7 +10,6 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 |------|---------|
 | **licence** (licença) | Player registration number, numeric (e.g. `301772`). Human identifier. |
 | **wallet** (carteira) | Coach registration number. Distinct from licences. |
-| **player_id** | Internal SAV2 numeric ID. Returned by `submit_enrollment`. Not the same as licence. |
 | **batch** (lote / guia) | A "Lote de Inscrição" — group of player registration requests of one type, locked to one tier+gender. |
 | **batch_number** | Human-visible batch identifier (string). All MCP tools accept the number, not the internal id. |
 | **tier** (escalão) | Age category (e.g. "Mini 12", "Sub 14", "Sénior"). `tier_id` is numeric; `tier_name` is free-text. |
@@ -48,6 +47,8 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 ## Identifier convention
 
 **Licences are integers everywhere on this surface** — inputs and outputs, search rows and batch rows alike. `Player.license` used to be a string while batch rows were ints, so a wrapper that stored `"301772"` from a search and compared it against `{301772}` silently failed its authorization check.
+
+**MCP responses identify players by licence and never by SAV's internal player id.** Internal ids remain private workflow state and are not MCP parameters or outputs; use `existing_license` on a 1ª Inscrição duplicate result when it can be resolved.
 
 `0` means "no licence" (e.g. a detail-only row), never a real player.
 
@@ -187,7 +188,7 @@ The canonical pipeline. Each step's output feeds the next.
        first only when you need to show the candidate list before previewing.
 
 4. submit_enrollment(batch_number, license, mod1_id, field_overrides={...}, medical_exam_id?)
-     → {success: true, player_id, source_document_upload, medical_exam_upload}
+     → {success: true, license, source_document_upload, medical_exam_upload}
      or {success: false, missing_guardian_fields: [...]}  ── fallback: retry with guardian fields added
 ```
 

@@ -134,6 +134,8 @@ Exactly one scope is required: `--club`, `--association`, or `--all-clubs`.
 
 Results are sorted by `id` for reproducible `--limit` output across runs. (Note: on `--all-clubs` with `--limit`, the short-circuit stops fetching once N unique players are collected — the *set* may vary across runs due to network timing, but the returned list is always sorted.)
 
+The CLI deliberately retains the internal `id` column for this reproducible ordering and its documented JSON/CSV output. MCP responses identify players by licence and never expose SAV's internal player id.
+
 JSON element:
 ```json
 {"id": 12345, "license": "301772", "name": "João Silva", "club": "Rio Maior Basket",

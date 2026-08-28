@@ -230,11 +230,16 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
       assert (gender_id, birth_date, id_number) == (1, "2015-03-01", "12345678")
       return {"existe": 1, "id": 555}
 
+    def find_license_by_nif(self, nif):
+      assert nif == "277544319"
+      return None
+
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
   parsed = {
     "nome_completo": ParsedField(value="Player B", confidence=0.99),
     "data_nascimento": ParsedField(value="2015-03-01", confidence=0.99),
     "num_doc_identificacao": ParsedField(value="12345678", confidence=0.99),
+    "nif": ParsedField(value="277544319", confidence=0.99),
   }
   monkeypatch.setattr(
     server_module, "_forms", {"m1": _mod1_form(parsed=parsed, reg_type=1)},
@@ -246,7 +251,9 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
 
   assert result["resolved"] is False
   assert result["error"] == "player_already_in_sav"
-  assert result["existing_sav_id"] == 555
+  assert result["existing_license"] is None
+  assert "existing_sav_id" not in result
+  assert "name or NIF search" in result["reason"]
 
 
 def test_preview_explicit_license_skips_resolution(monkeypatch):

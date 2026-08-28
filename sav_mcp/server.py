@@ -13,7 +13,7 @@ Enrollment workflow:
     3. preview_enrollment(license=null)  → full reconciled profile (auto-resolves the
        player from the form; returns {resolved: false, candidates} when ambiguous, so the
        user picks and preview is re-called with an explicit license)
-    4. submit_enrollment  → player_id (auto-uploads fpb_modelo_1 and optional exame_medico)
+    4. submit_enrollment  → license (auto-uploads fpb_modelo_1 and optional exame_medico)
 
     resolve_player still exists for explicit control (show the candidate list before
     previewing); preview_enrollment folds it in for the unambiguous common case.
@@ -2099,6 +2099,8 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
     ocr_name = str(name_f.value) if name_f and name_f.value else None
     ocr_birth = str(bd_f.value) if bd_f and bd_f.value else None
     ocr_id = str(id_f.value) if id_f and id_f.value else None
+    nif_f = parsed.get("nif")
+    ocr_nif = str(nif_f.value) if nif_f and nif_f.value else None
     # Default to masculino when neither checkbox parsed (mirrors the
     # downstream wizard default, so the duplicate probe still works).
     gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
@@ -2115,17 +2117,35 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
             logger.debug("Pre-emptive op=11 failed at resolve time", exc_info=True)
             dup = {"existe": 0}
         if int(dup.get("existe", 0)) != 0:
+            existing_license = None
+            nif = normalise_nif(ocr_nif) if ocr_nif else None
+            if nif is not None:
+                try:
+                    existing_license = client.find_license_by_nif(nif)
+                except (SavError, ValueError):
+                    logger.debug(
+                        "Could not resolve duplicate player's licence by NIF",
+                        exc_info=True,
+                    )
+            reason = (
+                "A player matching the OCR'd identifying data already exists "
+                "in SAV. 1ª Inscrição is for players not yet in the federation "
+                "— use Revalidação on the existing licence."
+                if existing_license is not None
+                else (
+                    "A player matching the OCR'd identifying data already exists "
+                    "in SAV. 1ª Inscrição is for players not yet in the federation. "
+                    "Find the existing licence with a name or NIF search, then use "
+                    "Revalidação."
+                )
+            )
             return {
                 "resolved": False,
                 "license": None,
                 "reg_type": 1,
                 "error": "player_already_in_sav",
-                "reason": (
-                    "A player matching the OCR'd identifying data already "
-                    "exists in SAV. 1ª Inscrição is for players not yet in "
-                    "the federation — use Revalidação on the existing licence."
-                ),
-                "existing_sav_id": dup.get("id") or dup.get("atleta") or None,
+                "reason": reason,
+                "existing_license": existing_license,
             }
 
     return {
@@ -2505,7 +2525,7 @@ def submit_enrollment(
     set and disagree, the call is rejected.
 
     Returns:
-      success=true + player_id (+ license for 1ª Inscrição) on success.
+      success=true + license on success.
       success=false + missing_guardian_fields  fallback for when a minor's
         guardian info is still absent at submit time (preview_enrollment
         already lists these in needs_review) — call submit_enrollment again
@@ -2626,7 +2646,7 @@ def submit_enrollment(
                 exc_info=True,
             )
     try:
-        player_id = client.add_player_to_registration_batch(
+        client.add_player_to_registration_batch(
             batch_id, license or 0, inline_subida=inline_subida, **kwargs,
         )
     except SavConfigError as exc:
@@ -2751,7 +2771,6 @@ def submit_enrollment(
     sav_profile = form.get("sav_profile", {})
     return {
         "success": True,
-        "player_id": player_id,
         "license": upload_license,
         "name": (
             kwargs.get("name") if reg_type == 1 else sav_profile.get("nome", "")
@@ -2885,7 +2904,7 @@ def update_enrollment(
         including false, 0, and "", overwrites it. Resolved guardian fields
         are required for minors.
 
-    Returns: {"success": True, "player_id": int} on success, or
+    Returns: {"success": True, "license": int} on success, or
     {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
     if the licence is not enrolled in any open batch.
     """
@@ -2936,10 +2955,10 @@ def update_enrollment(
     batch_id = _resolve_license_batch(client, license)
     if isinstance(batch_id, dict):
         return batch_id
-    player_id = client.update_player_in_registration_batch(
+    client.update_player_in_registration_batch(
         batch_id, license, **coerced,
     )
-    return {"success": True, "player_id": player_id}
+    return {"success": True, "license": license}
 
 
 @server.tool()
@@ -2962,14 +2981,14 @@ def create_enrollment_manual(
     (exam_date, guardian_name, guardian_relation, guardian_phone, guardian_email,
     consent_data, consent_communications, consent_marketing).
 
-    Returns: {"success": True, "player_id": int} on success.
+    Returns: {"success": True, "license": int} on success.
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
-    player_id = client.add_player_to_registration_batch(
+    client.add_player_to_registration_batch(
         batch_id, license, **(fields or {}),
     )
-    return {"success": True, "player_id": player_id}
+    return {"success": True, "license": license}
 
 
 @server.tool()

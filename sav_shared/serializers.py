@@ -12,8 +12,17 @@ from .text import iso_date, normalise_text
 
 
 def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
+  """Serialize a player for a public surface, keyed by licence.
+
+  SAV's numeric player id is an internal workflow identifier with no supported
+  use for a caller, and it is a bare integer easily mistaken for a licence, so
+  it is never emitted here. There is deliberately no opt-in: the CLI reads
+  ``Player.id`` straight off the dataclass (``asdict``) where it genuinely
+  needs it for display and sort-stability, and nothing on the MCP surface
+  should have it at all.
+  """
   out = {
-    "id": p.id, "license": p.license, "name": p.name,
+    "license": p.license, "name": p.name,
     "club": p.club, "club_name": p.club, "club_id": getattr(p, "club_id", 0),
     "association": p.association,
     "tier": p.tier, "tier_id": p.tier_id,
