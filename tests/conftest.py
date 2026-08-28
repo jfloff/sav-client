@@ -1,6 +1,21 @@
 import pytest
+from click.testing import Result
+from click.utils import strip_ansi
 
 from sav_client import SavClient
+
+
+@pytest.fixture(autouse=True)
+def _strip_ansi_from_cli_output(monkeypatch):
+  """Make plain-text CLI assertions independent of terminal colour support.
+
+  Keep the original bytes on ``Result.output_bytes`` so CLI tests still run
+  through the real Rich rendering path; only the text view used by assertions
+  is normalized.
+  """
+  output = Result.output.fget
+  assert output is not None
+  monkeypatch.setattr(Result, "output", property(lambda result: strip_ansi(output(result))))
 
 
 @pytest.fixture(autouse=True)
