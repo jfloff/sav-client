@@ -49,11 +49,11 @@ def _make_client(monkeypatch):
   return c
 
 
-def _batches_payload(*ids):
+def _batches_payload(*ids, item_count=0):
   rows = [
     {
       "guia_id": i, "numero_guia": f"2025/{i:05d}", "idtipo_guia": 2,
-      "idgenero": 1, "idescalao": 7, "idestado": 1, "num": 0,
+      "idgenero": 1, "idescalao": 7, "idestado": 1, "num": item_count,
     }
     for i in ids
   ]
@@ -179,19 +179,23 @@ class TestBatchMemoInvalidation:
 
   def test_remove_invalidates(self, monkeypatch):
     c = _make_client(monkeypatch)
-    calls = self._prime_and_count(monkeypatch, c)
-    batch = type("B", (), {"id": 101, "type_id": 2})()
-    # remove re-lists once internally to find the batch (call 2), then the
-    # explicit list after invalidation must re-fetch (call 3).
+    calls = {"n": 0}
+
+    def fake_post_form(path, payload, *, params=None):
+      calls["n"] += 1
+      return _batches_payload(101, item_count=0 if calls["n"] == 3 else 1)
+
+    monkeypatch.setattr(c, "_post_form", fake_post_form)
+    c.list_player_registration_batches()  # Prime a stale, count-1 memo.
+
+    # Removal re-lists twice around op=29: the fresh baseline and fresh
+    # postcondition. Both must bypass the primed memo.
     monkeypatch.setattr(
       c, "_http",
       type("H", (), {"get": lambda self, *a, **k: _Resp("ok")})(),
     )
-    monkeypatch.setattr(
-      c, "list_player_registration_batches",
-      lambda season=None: [batch],
-    )
     c.remove_player_from_registration_batch(101, 301772)
+    assert calls["n"] == 3
     # After the real invalidation call, assert the memo is empty.
     assert c._batch_memo == {}
 

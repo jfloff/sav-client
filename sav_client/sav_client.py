@@ -2273,6 +2273,9 @@ class SavClient:
         "Must call login() before remove_player_from_registration_batch()"
       )
 
+    # item_count is the postcondition baseline, so it must not come from the
+    # short-TTL memo either.
+    self._invalidate_batch_memo()
     batch = next(
       (b for b in self.list_player_registration_batches() if b.id == batch_id),
       None,
@@ -2300,9 +2303,45 @@ class SavClient:
     self._check_write_response(
       resp.text, f"Could not remove player {license} from batch {batch_id}",
     )
+    # op=29 has no reliable success-body contract, so a non-rejecting body
+    # cannot establish that the player was actually removed.  Re-list the
+    # batch row and compare its item_count instead.  Drop the memo first so
+    # this read cannot return the pre-remove row.
+    self._invalidate_batch_memo()
+    try:
+      verified_batch = next(
+        (b for b in self.list_player_registration_batches() if b.id == batch_id),
+        None,
+      )
+    except (SavError, ValueError) as exc:
+      # Unlike the Subida commit, forget this mapping when verification is
+      # unavailable: retaining a batch that may no longer hold the player is
+      # a more harmful lie than requiring a later re-lookup.
+      self._cache.forget_license_batch(license)
+      raise SavWriteUnverifiedError(
+        f"Removal of licence {license} from batch {batch_id} may have succeeded, "
+        "but its outcome could not be verified because SAV could not list the "
+        "registration batches. Do not retry without checking SAV first."
+      ) from exc
+
+    if verified_batch is None:
+      self._cache.forget_license_batch(license)
+      raise SavWriteUnverifiedError(
+        f"Removal of licence {license} from batch {batch_id} may have succeeded, "
+        "but its outcome could not be verified because SAV no longer listed the "
+        "batch. Do not retry without checking SAV first."
+      )
+
+    if verified_batch.item_count >= batch.item_count:
+      raise SavResponseError(
+        f"SAV did not remove licence {license} from batch {batch_id}: "
+        f"item_count did not decrease (was {batch.item_count}, now "
+        f"{verified_batch.item_count})."
+      )
+
     logger.info("Removed player license=%s from batch %s", license, batch.id)
     self._cache.forget_license_batch(license)
-    # Row item_count/state changed — drop the memo so the next list re-fetches.
+    # Keep the postcondition read out of the memo for the next caller too.
     self._invalidate_batch_memo()
 
   def find_open_player_registration_batch(

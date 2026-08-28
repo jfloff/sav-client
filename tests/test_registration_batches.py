@@ -941,9 +941,95 @@ class TestAddPlayerToRegistrationBatchValidation:
       client.add_player_to_registration_batch(transient_batch["id"], 999999999)
 
 
-# ─── remove: live ───────────────────────────────────────────────────────────
+# ─── remove ─────────────────────────────────────────────────────────────────
 
 class TestRemovePlayerFromRegistrationBatch:
+  LICENSE = 301772
+  BATCH_ID = 12
+
+  def _client(self, monkeypatch, body, batches):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    response = type("Resp", (), {
+      "text": body,
+      "raise_for_status": lambda self: None,
+    })()
+    monkeypatch.setattr(
+      client, "_http", type("Http", (), {"get": lambda self, *a, **k: response})(),
+    )
+    monkeypatch.setattr(client, "list_player_registration_batches", batches)
+    forget_cache = Mock()
+    monkeypatch.setattr(client._cache, "forget_license_batch", forget_cache)
+    return client, forget_cache
+
+  @staticmethod
+  def _batch(item_count):
+    return type("BatchStub", (), {
+      "id": TestRemovePlayerFromRegistrationBatch.BATCH_ID,
+      "type_id": 2,
+      "item_count": item_count,
+    })()
+
+  def test_one_byte_response_with_unchanged_count_raises_without_success_log(
+    self, monkeypatch, caplog,
+  ):
+    before = self._batch(1)
+    after = self._batch(1)
+    batches = Mock(side_effect=[[before], [after]])
+    client, forget_cache = self._client(monkeypatch, "1", batches)
+
+    with caplog.at_level("INFO", logger="sav_client.sav_client"):
+      with pytest.raises(SavResponseError, match=r"licence 301772.*batch 12"):
+        client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    assert not any("Removed player license=301772" in record.message for record in caplog.records)
+    forget_cache.assert_not_called()
+
+  def test_decreased_count_succeeds_and_forgets_cache(self, monkeypatch):
+    before = self._batch(1)
+    after = self._batch(0)
+    client, forget_cache = self._client(
+      monkeypatch, "OK", Mock(side_effect=[[before], [after]]),
+    )
+
+    client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    forget_cache.assert_called_once_with(self.LICENSE)
+
+  def test_batch_listing_failure_is_unverified_and_forgets_cache(self, monkeypatch):
+    before = self._batch(1)
+    batches = Mock(side_effect=[[before], SavServerError("batch listing fatal")])
+    client, forget_cache = self._client(monkeypatch, "OK", batches)
+
+    with pytest.raises(SavWriteUnverifiedError, match="Do not retry"):
+      client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    forget_cache.assert_called_once_with(self.LICENSE)
+
+  def test_php_fatal_is_rejected_without_leaking_raw_body(self, monkeypatch):
+    raw_body = "<html><b>Warning</b>: remove_internal_schema</html>"
+    client, forget_cache = self._client(
+      monkeypatch, raw_body, Mock(return_value=[self._batch(1)]),
+    )
+
+    with pytest.raises(SavServerError) as excinfo:
+      client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    assert raw_body not in str(excinfo.value)
+    forget_cache.assert_not_called()
+
+  def test_explicit_rejection_uses_sav_message(self, monkeypatch):
+    client, forget_cache = self._client(
+      monkeypatch,
+      '{"val": 0, "msg": "Jogador bloqueado"}',
+      Mock(return_value=[self._batch(1)]),
+    )
+
+    with pytest.raises(SavResponseError, match="Jogador bloqueado"):
+      client.remove_player_from_registration_batch(self.BATCH_ID, self.LICENSE)
+
+    forget_cache.assert_not_called()
+
   def test_unknown_batch_raises(self, client):
     with pytest.raises(ValueError, match=r"Batch id=\d+ not found"):
       client.remove_player_from_registration_batch(999999999, 301772)
