@@ -11,6 +11,11 @@ Consuming this from an AI coding agent? [`CHANGELOG.md`](CHANGELOG.md) is
 written for that audience — it classifies each breaking change by whether it
 raises or changes data silently, and gives a grep to find affected call sites.
 
+Modifying it with an agent? [`AGENTS.md`](AGENTS.md) collects the SAV2 traps
+and verification habits this codebase has learned the hard way. (The
+per-package `AGENTS.md` files are the other audience — references for agents
+*calling* the package.)
+
 ---
 
 ## Features
