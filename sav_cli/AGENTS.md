@@ -26,13 +26,13 @@ Credentials come from env vars or a `.env` file. Every command auto-authenticate
 SAV_BASE_URL        # optional, default https://sav2.fpb.pt
 SAV_USERNAME        # required
 SAV_PASSWORD        # required
-CLUB_STAMP_PATH     # required when OCR-processing a mod1 form (see below)
+CLUB_STAMP_PATH     # required when OCR-processing a mod1 or standalone mod4 form (see below)
 MOD1_TEMPLATE_PATH  # optional, override the bundled Modelo 1 template used by `sav mod1 fill`
 ```
 
-`CLUB_STAMP_PATH` is a hard requirement whenever an fpb_modelo_1 form is uploaded to SAV. The invariant is: every mod1 upload must be stamped. Concretely, `_require_env("CLUB_STAMP_PATH")` is called at command entry in:
+`CLUB_STAMP_PATH` is a hard requirement whenever an fpb_modelo_1 form is uploaded to SAV; a standalone positional fpb_modelo_4 also requires it because `enrollment create` checks the variable before classifying positional PDFs. The invariant is: every mod1 upload must be stamped, and the standalone mod4 path may stamp its club slot. Concretely, `_require_env("CLUB_STAMP_PATH")` is called at command entry in:
 
-- `enrollment create` — when any PDFs are passed (always involves a mod1 form)
+- `enrollment create` — when any PDFs are passed (including a standalone positional mod4)
 - `enrollment update` — when a PDF is passed (OCR runs, stamp applied automatically before upload)
 
 It is **not** required for field-only updates or medical-exam-only uploads — those paths never upload a mod1 form.

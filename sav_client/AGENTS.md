@@ -283,7 +283,13 @@ client.list_coaches(270, tptd="12345")                       # search-only; TPTD
 
 Batches ("Lotes" / "Guias de Inscrição") group player registration requests of one type, locked to a single (tier, gender) combination. Only batches in state `Em construção` (`is_open == True`, `state_id == 1`) accept new items.
 
-> **Currently `add_player_to_registration_batch()` only supports Revalidação (type=2).** 1ª Inscrição, Transferência, and Subida have different field surfaces and aren't implemented yet.
+`add_player_to_registration_batch()` dispatches by registration type:
+
+- **Type 1 — 1ª Inscrição:** requires the new-player demographic, identity-document, and address fields (`name`, `birth_date`, `gender_id`, `nif`, `id_type`, `id_number`, `id_expiry`, `email`, `morada`, `cod_postal`, `distrito_id`, and `concelho_id`). The `license` argument is ignored. It creates the SAV player and returns the new internal SAV `userid`.
+- **Type 2 — Revalidação:** requires an existing `license` eligible for the batch, or a licence already enrolled in it when updating that enrolment. It returns the player's internal SAV2 id.
+- **Type 4 — Subida:** requires an existing `license` eligible for the standalone Subida batch; all kwargs other than `taxa_id` are ignored. It returns the player's licence.
+
+**Type 3 — Transferência is unsupported and raises `NotImplementedError`.**
 
 ### `list_player_registration_batches(*, season=None) → list[PlayerRegistrationBatch]`
 
@@ -311,7 +317,7 @@ Cache hygiene is automatic — `add_player_to_registration_batch` records the ma
 
 ### `list_player_registration_tiers(*, gender_id) → dict[int, str]`
 
-Tier ID → display name (e.g. `{5: "Sub 14", ...}`). The tier set differs by gender — `gender_id` (1 or 2) is required. Used internally by `create_player_registration_batch()` to resolve a tier name string.
+Tier ID → display name (e.g. `{5: "Sub 14", ...}`). Tier names/categories are identical across genders, but numeric IDs differ by gender — `gender_id` (1 or 2) is required. The table is hardcoded and stable across seasons. Used internally by `create_player_registration_batch()` to resolve a tier name string.
 
 ### `create_player_registration_batch(*, type, tier, gender_id, association_id=None, club_id=None, season=None) → int`
 
@@ -356,8 +362,8 @@ client.add_player_to_registration_batch(                                      # 
 
 | Param | Type | Default | Notes |
 |-------|------|---------|-------|
-| `batch_id` | `int` | required | Must be open Revalidação |
-| `license` | `int` | required | Must appear in the batch's eligible-revalidations list |
+| `batch_id` | `int` | required | Must be an open batch of the dispatched type |
+| `license` | `int` | required | Type 2/4: must be eligible (or already enrolled for the type-2 update path); ignored for type 1 |
 | `id_type`, `id_number`, `id_expiry` | `int`/`str`/`str` | `None` | Step 1 ID overrides — `None` = keep stored |
 | `telemovel`, `telefone`, `email` | `str` | `None` | Step 1 contact overrides |
 | `nome_pai`, `nome_mae` | `str` | `None` | Step 1 parent overrides |

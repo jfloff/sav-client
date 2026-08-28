@@ -95,9 +95,9 @@ All PDFs cross the MCP boundary as **base64-encoded strings**.
 `Marcado` (scheduled), `Realizado` (played), `Não Marcado`, `Adiado`, `Anulado`.
 
 ### Document types (`doc_type` strings)
-`fpb_modelo_1` — main enrollment form. `exame_medico` — medical exam. Other types may be returned by parsers but are not yet wired into the enrollment workflow.
+`fpb_modelo_1` — main enrollment form (`tipo_doc=1`). `exame_medico` — medical exam (`tipo_doc=2`). `fpb_modelo_4` — Subida form (`tipo_doc=6`). Supplementary uploads are also wired: `atestado_residencia` (`15`), `documento_identificacao` (`18`), `certidao_matricula` (`24`), and `outros` (`22`).
 
-Use `list_tiers(gender_id)` to discover `tier_id` values dynamically — the set differs per gender and varies by season.
+Use `list_tiers(gender_id)` to get the gender-specific numeric `tier_id`: tier names/categories are identical across genders, but IDs differ by gender. The hardcoded table is stable across seasons.
 
 ## Domain rules
 
@@ -248,7 +248,7 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 - `list_player_documents(license)` — what's uploaded for this player.
 - `upload_player_document(license, pdf_base64, doc_type?)`.
 - `replace_player_document(license, pdf_base64, doc_type?)` — replaces existing doc of that type.
-- `delete_player_document(doc_id)` — by galeria id from `list_player_documents`.
+- `delete_player_document(license, doc_id)` — by galeria id from `list_player_documents`, scoped to the player's licence.
 
 ### Batch admin
 - `list_batch_enrollments(batch_number)` — every player in a batch.

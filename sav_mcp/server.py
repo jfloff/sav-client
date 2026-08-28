@@ -1043,12 +1043,13 @@ def list_tiers(gender_id: int) -> list[dict]:
     """
     List the registration tiers (escalões) available for a given gender.
 
-    The tier set differs by gender (some categories are male- or female-only),
-    so the gender_id (1=Masculino, 2=Feminino) is required.
+    The tier names and available categories are identical for both genders, but
+    SAV2 assigns different numeric tier IDs by gender, so the gender_id
+    (1=Masculino, 2=Feminino) is required. The table is hardcoded and stable
+    across seasons; this tool does not fetch or server-cache it.
 
     Use this when the LLM needs a valid tier_id for create_batch /
-    find_open_batch without first parsing an enrollment PDF. Cached 7 days
-    server-side.
+    find_open_batch without first parsing an enrollment PDF.
     """
     client = _get_client()
     tiers = client.list_player_registration_tiers(gender_id=gender_id)
@@ -1906,8 +1907,13 @@ def parse_enrollment_forms(documents: list[dict]) -> list[dict]:
     the batch parameters (registration type, tier, gender). exame_medico
     documents are parsed for step-3 metadata and return a medical_exam_id that
     can be passed to preview_enrollment / submit_enrollment. fpb_modelo_4 forms
-    carry no fields — alongside an fpb_modelo_1 their presence adds an inline
-    subida de escalão; they return a mod4_id to pass to preview/submit_enrollment.
+    return ``nome_jogador`` (mandatory), ``licenca_nr`` (optional),
+    ``escalao_actual`` (the origin tier), and ``escalao_subida`` (the destination
+    tier), plus a mod4_id. The licence or name drives player candidate
+    resolution; the origin tier narrows name candidates (with a fallback when
+    OCR tier text drifts), and the destination tier is resolved to the
+    gender-specific numeric tier_id. Alongside an fpb_modelo_1, the mod4 adds
+    an inline subida de escalão; it returns a mod4_id for preview/submit.
 
     Each entry requires ``pdf`` (base64 PDF bytes). ``doc_type`` optionally
     labels it as fpb_modelo_1, exame_medico, or fpb_modelo_4 and skips
@@ -2731,10 +2737,14 @@ def submit_subida_enrollment(
     Distinct from submit_enrollment's inline-subida rider: this commits the
     player to a *standalone* Subida batch via the SAV2 "add player to a
     Subida batch" web flow (eligibility list → cascades → commit op=50).
-    The mod4 carries no OCR fields, so there is no preview/reconciliation
-    step — the licence must be passed directly and is checked against the
-    server's eligible list. The mod4 PDF is uploaded after the commit as
-    the supporting document (tipo_doc=6).
+    The mod4 carries ``nome_jogador`` (mandatory), ``licenca_nr`` (optional),
+    ``escalao_actual`` (origin tier), and ``escalao_subida`` (destination tier).
+    Before this tool is called, its licence/name and origin tier are used to
+    resolve the player and narrow candidates, while the destination tier is
+    resolved to the gender-specific numeric tier used for the Subida batch.
+    This tool then receives the resolved licence, checks it against the
+    server's eligible list, and uploads the mod4 PDF after the commit as the
+    supporting document (tipo_doc=6).
 
     When detentor_signature_b64 is supplied it is overlaid onto the mod4's
     holder-signature slot (and $CLUB_STAMP_PATH onto the club slot) if OCR found
