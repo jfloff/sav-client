@@ -2,6 +2,12 @@
 
 Python library for automating the FPB SAV2 basketball management system. Authoritative reference for AI agents using the library directly.
 
+> **Pinned to an older release?** This document describes the *current* one.
+> Read [`CHANGELOG.md`](../CHANGELOG.md) for everything that changed since yours, and
+> start with the entries marked `IMPACT: silent` — those change response
+> shape without raising, so your code keeps running and reads the wrong
+> field. Each carries a `DETECT:` grep to run against your own codebase.
+
 ## Terminology
 
 | Term | Meaning |

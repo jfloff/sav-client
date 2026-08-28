@@ -13,6 +13,12 @@ entry above it. Each breaking entry carries:
 
 Dates are ISO. Newest first.
 
+**Maintaining this file.** Add the entry in the same change that makes it,
+not afterwards. The 0.90.0 section was reconstructed from `git log` and the
+first attempt missed a fix and miscounted the breaking changes — the details
+that make an entry useful (what silently changes, what to grep for) are the
+ones that do not survive being remembered later.
+
 ---
 
 ## 0.91.0 — 2026-08-28

@@ -7,6 +7,10 @@ Automates player lookups, game scheduling queries, and eligible-players PDF
 generation — tasks that otherwise require navigating the SAV2 web interface
 manually.
 
+Consuming this from an AI coding agent? [`CHANGELOG.md`](CHANGELOG.md) is
+written for that audience — it classifies each breaking change by whether it
+raises or changes data silently, and gives a grep to find affected call sites.
+
 ---
 
 ## Features
