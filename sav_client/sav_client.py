@@ -116,6 +116,13 @@ _REGISTRATIONS_BATCH_DETAIL_OP = "10"
 _REGISTRATIONS_LOAD_EXISTING_PLAYER_OP = "30"
 _REGISTRATIONS_SAVE_STEP1_OP = "33"
 _REGISTRATIONS_SAVE_STEP2_OP = "31"
+# op=33 prefill keys consumed by _build_step2_send. Keep this separate from
+# the op=31 set below: these responses feed different wizard steps.
+_REGISTRATIONS_STEP1_PREFILL_KEYS = (
+  "distrito", "concelho", "localidade", "morada", "codpostal", "localidade_txt",
+)
+# op=31 prefill keys consumed by _commit_registration_step3.
+_REGISTRATIONS_STEP2_PREFILL_KEYS = ("menor_idade", "escalao", "estatuto")
 _REGISTRATIONS_LIST_CONCELHOS_OP = "18"
 _REGISTRATIONS_LIST_LOCALIDADES_OP = "19"   # GET conc — localidades under a concelho
 _REGISTRATIONS_LOAD_SEGURO_OP = "87"
@@ -3886,7 +3893,12 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 1: {exc}") from exc
-    return self._parse_json_response(resp.text, "Could not parse step 1 response")
+    what = "Registration step 1 failed"
+    data = self._parse_json_response(resp.text, "Could not parse step 1 response")
+    self._check_write_response(resp.text, what)
+    return self._validate_registration_prefill(
+      data, step=1, required_keys=_REGISTRATIONS_STEP1_PREFILL_KEYS,
+    )
 
   @staticmethod
   def _build_step2_send(
@@ -3950,7 +3962,31 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(f"Could not save step 2: {exc}") from exc
-    return self._parse_json_response(resp.text, "Could not parse step 2 response")
+    what = "Registration step 2 failed"
+    data = self._parse_json_response(resp.text, "Could not parse step 2 response")
+    self._check_write_response(resp.text, what)
+    return self._validate_registration_prefill(
+      data, step=2, required_keys=_REGISTRATIONS_STEP2_PREFILL_KEYS,
+    )
+
+  @staticmethod
+  def _validate_registration_prefill(
+    data: Any,
+    *,
+    step: int,
+    required_keys: tuple[str, ...],
+  ) -> dict[str, Any]:
+    """Ensure a saved wizard step can safely prefill the following step."""
+    if not isinstance(data, dict):
+      raise SavResponseError(
+        f"Registration step {step} failed: response must be a JSON object"
+      )
+    for key in required_keys:
+      if key not in data:
+        raise SavResponseError(
+          f"Registration step {step} failed: response missing required key {key!r}"
+        )
+    return data
 
   def _resolve_insurance_cascade(
     self, internal_id: int, batch: PlayerRegistrationBatch, escalao: int,
@@ -4985,7 +5021,7 @@ class SavClient:
     except ValueError:
       return  # empty or non-JSON body — no signal either way, so assume success
     if isinstance(data, dict) and "val" in data and str(data["val"]) != "1":
-      raise SavResponseError(f"{what}: {data.get('msg') or data!r}")
+      raise SavResponseError(f"{what}: {data.get('msg') or 'SAV rejected the request'}")
 
   def _parse_json_response(self, text: str, what: str) -> dict[str, Any]:
     """Parse ``text`` as JSON, shielding SAV2's PHP-fatal pages from messages.

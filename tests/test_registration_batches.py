@@ -284,6 +284,108 @@ class TestExamDateWindow:
 
 # ─── subida de escalão (op=21 + commit) ──────────────────────────────────────
 
+class TestRegistrationStepPrefillValidation:
+  """op=33/op=31 responses must be safe to pass into the next wizard step."""
+
+  STEP1_PREFILL = {
+    "distrito": "", "concelho": "", "localidade": "", "morada": "",
+    "codpostal": "", "localidade_txt": "",
+  }
+  STEP2_PREFILL = {"menor_idade": "", "escalao": "", "estatuto": ""}
+  PHP_FATAL = (
+    "<br /><b>Fatal error</b>: Uncaught mysqli_sql_exception: SAV internal "
+    "schema detail in /var/www/html/php/incricoesdb.php:412"
+  )
+
+  def _client(self, body):
+    client = SavClient.__new__(SavClient)
+    client.base_url = "https://sav2.example/"
+    client._timeout = 10
+
+    class _Response:
+      text = body
+
+      def raise_for_status(self):
+        pass
+
+    class _Http:
+      def get(self, *args, **kwargs):
+        return _Response()
+
+      def post(self, *args, **kwargs):
+        return _Response()
+
+    client._http = _Http()
+    return client
+
+  def _save_step(self, client, step):
+    if step == 1:
+      return client._save_registration_step1(1, 88, "step1")
+    return client._save_registration_step2(2, 1, 88, 301772, "step2")
+
+  def test_step1_rejection_surfaces_sav_message_and_stops_before_step2(self, monkeypatch):
+    client = self._client('{"val": 0, "msg": "Morada recusada"}')
+    client.session = {"organizacao": "270"}
+    batch = type("BatchStub", (), {
+      "id": 1, "is_open": True, "type_id": 2, "state": "Em construção",
+      "tier": "Sub 14", "gender": "Masculino", "tier_id": 7,
+    })()
+    monkeypatch.setattr(client, "list_player_registration_batches", lambda: [batch])
+    monkeypatch.setattr(client, "_list_revalidable_licenses", lambda batch_obj: {301772})
+    monkeypatch.setattr(client, "_load_player_record", lambda batch_id, license: {"id": 88})
+    monkeypatch.setattr(client, "_build_step1_send", lambda *args, **kwargs: "step1")
+
+    reached_step2 = False
+
+    def step2_must_not_run(*args, **kwargs):
+      nonlocal reached_step2
+      reached_step2 = True
+
+    monkeypatch.setattr(client, "_save_registration_step2", step2_must_not_run)
+
+    with pytest.raises(SavResponseError, match="Registration step 1 failed: Morada recusada"):
+      client.add_player_to_registration_batch(1, 301772)
+    assert reached_step2 is False
+
+  @pytest.mark.parametrize("step, body", [
+    (1, "[]"), (1, '"unexpected"'), (2, "[]"), (2, '"unexpected"'),
+  ])
+  def test_non_dict_response_names_the_failing_step(self, step, body):
+    with pytest.raises(SavResponseError, match=fr"Registration step {step} failed: response must be a JSON object") as excinfo:
+      self._save_step(self._client(body), step)
+    assert not isinstance(excinfo.value, AttributeError)
+
+  @pytest.mark.parametrize("step, prefill, missing_key", [
+    (1, STEP1_PREFILL, "morada"),
+    (2, STEP2_PREFILL, "estatuto"),
+  ])
+  def test_missing_prefill_key_names_the_step_and_key(self, step, prefill, missing_key):
+    body = {key: value for key, value in prefill.items() if key != missing_key}
+    import json
+
+    with pytest.raises(
+      SavResponseError,
+      match=fr"Registration step {step} failed: response missing required key '{missing_key}'",
+    ):
+      self._save_step(self._client(json.dumps(body)), step)
+
+  @pytest.mark.parametrize("step, prefill", [
+    (1, STEP1_PREFILL),
+    (2, STEP2_PREFILL),
+  ])
+  def test_empty_prefill_values_are_accepted(self, step, prefill):
+    import json
+
+    assert self._save_step(self._client(json.dumps(prefill)), step) == prefill
+
+  @pytest.mark.parametrize("step", [1, 2])
+  def test_php_fatal_does_not_leak_raw_body(self, step):
+    with pytest.raises(SavServerError) as excinfo:
+      self._save_step(self._client(self.PHP_FATAL), step)
+    message = str(excinfo.value)
+    for leak in ("mysqli_sql_exception", "SAV internal schema detail", "incricoesdb.php"):
+      assert leak not in message
+
 class TestSubidaDeEscalao:
   """Subida de escalão drives the op=36 commit via the op=21 tier lookup."""
 
