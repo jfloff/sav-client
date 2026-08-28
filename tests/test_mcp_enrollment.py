@@ -13,12 +13,39 @@ def test_read_enrollment_returns_player_detail(monkeypatch):
 
     def load_existing_registration_record(self, batch_id, license):
       assert (batch_id, license) == (42, 301772)
-      return {"id": 77, "nome": "Player A"}
+      return {
+        "id": 77,
+        "nome": "Player A",
+        "datenasc": "01-03-2015",
+        "dataval": "",
+        "numi": "12345678",
+        "unexpected_sav_field": "must not leak",
+      }
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.read_enrollment(license=301772)
-  assert result == {"id": 77, "nome": "Player A"}
+  assert result == {
+    "license": 301772,
+    "name": "Player A",
+    "birth_date": "2015-03-01",
+    "nif": "",
+    "id_type": 0,
+    "id_number": "12345678",
+    "id_expiry": "",
+    "email": "",
+    "telemovel": "",
+    "telefone": "",
+    "nome_pai": "",
+    "nome_mae": "",
+    "nationality_id": 0,
+    "naturalidade_id": 0,
+    "marital_status_id": 0,
+    "education_level_id": 0,
+    "profession_id": 0,
+  }
+  assert "id" not in result
+  assert "unexpected_sav_field" not in result
 
 
 def test_read_enrollment_license_not_enrolled_returns_structured_error(monkeypatch):

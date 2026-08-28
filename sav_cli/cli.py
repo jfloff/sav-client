@@ -88,6 +88,7 @@ from sav_shared.lookups import (
   tipo_doc_to_doc_type,
 )
 from sav_shared.medical_exam import extract_medical_exam_info
+from sav_shared.serializers import enrollment_record_to_dict
 
 
 # Tracks the root --output flag so SavCliError.show() can format errors
@@ -3151,7 +3152,9 @@ def enrollment_read_cmd(ctx, batch_number, license_):
 
   batch_id = _resolve_batch_id_by_license_or_raise(client, license_)
   try:
-    record = client.load_existing_registration_record(batch_id, license_)
+    record = enrollment_record_to_dict(
+      client.load_existing_registration_record(batch_id, license_), license=license_,
+    )
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
 

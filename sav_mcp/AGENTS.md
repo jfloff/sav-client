@@ -234,7 +234,12 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 ## Other workflows
 
 ### Read / update an already-enrolled player
-- `read_enrollment(license)` — show current enrollment.
+- `read_enrollment(license)` — show current enrollment as the stable DTO
+  `{license, name, birth_date, nif, id_type, id_number, id_expiry, email,
+  telemovel, telefone, nome_pai, nome_mae, nationality_id,
+  naturalidade_id, marital_status_id, education_level_id, profession_id}`.
+  `license` is an int; date fields are ISO where SAV sends a parseable date.
+  SAV's raw internal `id` and workflow keys are not returned.
 - `update_enrollment(license, fields={...})` — patch contact / address / id fields.
 - `update_enrollment_with_document(license, pdf=b64, doc_type?, mod1_values?, field_overrides={...}, file_only?)` — re-reconcile from a fresh PDF and optionally upload it. `mod1_values` is the same trusted values shape as `parse_enrollment_forms` and skips classification and field extraction.
 

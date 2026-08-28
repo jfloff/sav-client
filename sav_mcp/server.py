@@ -119,6 +119,7 @@ from sav_shared.serializers import (
     club_game_to_dict,
     club_to_dict,
     coach_to_dict,
+    enrollment_record_to_dict,
     game_to_dict,
     player_to_dict,
 )
@@ -3118,7 +3119,12 @@ def read_enrollment(license: int) -> dict:
 
     The batch is resolved automatically from the license.
 
-    Returns the enrollment record dict on success, or
+    Returns this enrollment DTO on success:
+    ``{license: int, name, birth_date, nif, id_type, id_number, id_expiry,
+    email, telemovel, telefone, nome_pai, nome_mae, nationality_id,
+    naturalidade_id, marital_status_id, education_level_id, profession_id}``.
+    Dates are ``YYYY-MM-DD`` (or an unchanged unparseable SAV value), and the
+    raw SAV internal ``id`` is not exposed. Returns
     {"error": "license_not_enrolled", "license": int, "open_batches": [...]}
     if the licence is not enrolled in any open batch.
 
@@ -3128,7 +3134,8 @@ def read_enrollment(license: int) -> dict:
     batch_id = _resolve_license_batch(client, license)
     if isinstance(batch_id, dict):
         return batch_id
-    return client.load_existing_registration_record(batch_id, license)
+    record = client.load_existing_registration_record(batch_id, license)
+    return enrollment_record_to_dict(record, license=license)
 
 
 def _projected_enrollment_checklist(

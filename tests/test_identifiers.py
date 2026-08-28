@@ -10,6 +10,7 @@ validator, so `nif="abc"` reached SAV's create-player call verbatim.
 
 import pytest
 
+from sav_shared.serializers import enrollment_record_to_dict as _dto
 from sav_shared.identifiers import (
   NO_LICENSE, normalise_nif, require_license, require_nif, to_license,
 )
@@ -92,3 +93,47 @@ class TestModelo1NifRule:
     from sav_shared.fpb_mod1 import validate_mod1_values
     problems = validate_mod1_values({"nif": "289463491"})
     assert not any("9 digits" in p for p in problems)
+
+
+class TestEnrollmentDtoIdentifiers:
+  """The enrollment read DTO must not reintroduce the str/int identifier split.
+
+  SAV sends its lookup ids as numeric strings. A field named `*_id` returning
+  '155' is the same trap `Player.license` used to be: an LLM comparing it
+  against a numeric id from another tool mismatches silently.
+  """
+
+  def test_every_id_field_is_an_int(self):
+    out = _dto(
+      {"tipo": "1", "nacional": "155", "naturalidade": "155",
+       "estcivil": "2", "hab": "3", "profissao": "4"},
+      license="298352",
+    )
+    for key in ("license", "id_type", "nationality_id", "naturalidade_id",
+                "marital_status_id", "education_level_id", "profession_id"):
+      assert isinstance(out[key], int), f"{key} is {type(out[key]).__name__}"
+
+  def test_absent_ids_are_zero_not_blank(self):
+    out = _dto({}, license=0)
+    assert out["nationality_id"] == 0
+    assert out["id_type"] == 0
+
+  def test_unparseable_id_degrades_to_zero(self):
+    # Read path: SAV sending nonsense must not raise mid-listing.
+    assert _dto({"tipo": "abc"}, license=1)["id_type"] == 0
+
+  def test_nationality_falls_back_to_the_alias_key(self):
+    assert _dto({"nacionalidade": "155"}, license=1)["nationality_id"] == 155
+
+  def test_internal_wire_keys_never_surface(self):
+    out = _dto(
+      {"id": "252319", "existe": 1, "atleta": 0, "numeroGuiaSaold": "8",
+       "nome": "X"},
+      license=1,
+    )
+    for leaked in ("id", "existe", "atleta", "numeroGuiaSaold"):
+      assert leaked not in out
+
+  def test_unknown_sav_field_is_not_passed_through(self):
+    # Allowlist, not denylist: a field SAV adds later must stay private.
+    assert "campo_novo" not in _dto({"campo_novo": "x"}, license=1)

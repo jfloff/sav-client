@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
+from .dates import to_iso
+from .identifiers import to_license
 from .text import iso_date, normalise_text
 
 
@@ -22,6 +25,59 @@ def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
     out["mobile_phone"] = getattr(p, "mobile_phone", "")
     out["nif"] = getattr(p, "nif", "")
   return out
+
+
+def enrollment_record_to_dict(record: Mapping[str, Any], *, license: Any) -> dict:
+  """Serialize SAV's edit-wizard record to the public enrollment read DTO.
+
+  This is deliberately an allowlist. ``load_existing_registration_record`` is
+  also the write path's raw op=30 record, so its wire keys stay private there;
+  CLI and MCP call this serializer before returning an enrollment to a caller.
+  Missing text values are empty strings; every ``*_id`` field is an int, using
+  ``0`` for absent — the licence included — so no identifier on this surface
+  is ever a string.
+  """
+  def value(key: str) -> Any:
+    raw = record.get(key)
+    return "" if raw is None else raw
+
+  def ident(key: str, *fallbacks: str) -> int:
+    """A SAV lookup id as an int, 0 when absent.
+
+    SAV sends these as numeric strings. A field named ``*_id`` returning
+    ``'155'`` would reintroduce exactly the str/int split that
+    ``sav_shared.identifiers`` exists to remove — an LLM comparing it against
+    a numeric id from another tool would silently mismatch.
+    """
+    for candidate in (key, *fallbacks):
+      raw = record.get(candidate)
+      if raw in (None, ""):
+        continue
+      try:
+        return int(str(raw).strip())
+      except ValueError:
+        return 0
+    return 0
+
+  return {
+    "license": to_license(license),
+    "name": value("nome"),
+    "birth_date": to_iso(record.get("nasc") or record.get("datenasc")),
+    "nif": value("nif"),
+    "id_type": ident("tipo"),
+    "id_number": value("numi"),
+    "id_expiry": to_iso(record.get("dataval")),
+    "email": value("email"),
+    "telemovel": value("tele"),
+    "telefone": value("telef"),
+    "nome_pai": value("pai"),
+    "nome_mae": value("mae"),
+    "nationality_id": ident("nacional", "nacionalidade"),
+    "naturalidade_id": ident("naturalidade"),
+    "marital_status_id": ident("estcivil"),
+    "education_level_id": ident("hab"),
+    "profession_id": ident("profissao"),
+  }
 
 
 def game_to_dict(g: Any) -> dict:

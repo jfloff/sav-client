@@ -792,7 +792,13 @@ def test_enrollment_read_detail_json(monkeypatch):
       return 42
 
     def load_existing_registration_record(self, batch_id, license):
-      return {"id": 77, "nome": "Player A"}
+      return {
+        "id": 77,
+        "nome": "Player A",
+        "nasc": "02-04-2014",
+        "numeroGuiaSaold": "workflow-only",
+        "new_sav_wire_key": "must not leak",
+      }
 
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
 
@@ -803,7 +809,14 @@ def test_enrollment_read_detail_json(monkeypatch):
 
   assert result.exit_code == 0, result.output
   payload = _json.loads(result.output)
-  assert payload == {"id": 77, "nome": "Player A"}
+  assert payload["license"] == 301772
+  assert isinstance(payload["license"], int)
+  assert payload["name"] == "Player A"
+  assert payload["birth_date"] == "2014-04-02"
+  assert payload["id_expiry"] == ""
+  assert "id" not in payload
+  assert "numeroGuiaSaold" not in payload
+  assert "new_sav_wire_key" not in payload
 
 
 def test_enrollment_read_requires_exactly_one_flag(monkeypatch):
