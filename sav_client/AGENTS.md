@@ -185,6 +185,32 @@ Fetch `photo_url` and `mobile_phone` for a single player. Returns a stub when `w
 detail = client.get_player_detail(player.id, with_details=True)
 ```
 
+### `find_license_by_nif(nif, *, refresh=False) → int | None`
+
+Resolve a player by Portuguese NIF. **Always the session's own club** — SAV2 discloses a NIF only to the player's own club, so there is no other roster to search and no `club_id` parameter. SAV2 has no NIF search, so resolution means fetching profiles until one matches.
+
+It scans current season → previous season → all seasons and **stops the moment the NIF resolves**, cancelling the rest. Every profile resolved along the way is persisted, so each call leaves the index warmer than it found it and the next call re-fetches strictly less. A hit is cheap; a *miss* still scans the whole club once.
+
+**Read a `None` carefully.** It means one of: the NIF was blank, there is no session club, or the club was scanned to exhaustion without a match. Only the last is authoritative, and the client tracks the difference — after an exhaustive clean scan a coverage marker makes later misses free for `nif_index_ttl` (default 7 days, a `SavClient(...)` kwarg). If *any* licence could not be resolved, no marker is written and the next miss re-scans, deliberately: callers map a miss to "new player" (`derive_enrollment_params` picks `reg_type = 1`), so a marker written over an incomplete scan creates duplicate federation records.
+
+`refresh=True` re-reads every profile, so a corrected NIF can replace a cached row.
+
+### `build_nif_index(*, force=False) → dict`
+
+Pre-pay the scan above for the whole club. **Exhaustive by design — there is no partial mode** (`scope` was removed in 0.92.0): a partial scan cannot support the authoritative miss the index exists to give. Slow and offline-only — one profile POST per not-yet-indexed licence across all seasons, 8-way concurrent, minutes on a large club.
+
+```python
+result = client.build_nif_index()
+if not result["complete"]:
+    # unresolved names the licences whose NIF could not be read; no coverage
+    # marker was written, so a later miss is still non-authoritative.
+    log.warning("incomplete: %s", result["unresolved"])
+```
+
+Returns `{club_id, players_enumerated, players_indexed, no_nif, unresolved, complete, built_at, from_cache}`. `players_indexed` counts profiles *this call* fetched and resolved; `players_enumerated` is the roster size.
+
+**`no_nif` and `unresolved` are not the same thing.** A profile that loads and carries no NIF is a fact — that licence can never match a NIF query, so it counts as covered and is cached with an empty NIF so it is never re-fetched. Only a profile that could not be *read* is unresolved, and only unresolved blocks the marker. On a real club 21% of licences have no NIF on file, so merging the two would make the marker unwritable and every miss a permanent full rescan.
+
 ### `list_games(**kwargs) → list[Game]`
 
 ```python

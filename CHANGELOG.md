@@ -21,6 +21,73 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.92.0 — 2026-08-29
+
+### Breaking
+
+**The NIF index has no scopes** (`863b83b`)
+`IMPACT: raises`
+`build_nif_index(scope=...)` and the `warm_nif_index` MCP tool's `scope`
+parameter are gone, along with `scope` on `Cache.get_nif_index` /
+`record_nif_index` / `clear_nif_index`. The index was keyed
+`(club_id, scope)` with `scope in {"recent", "full"}`, and a partial
+`"recent"` scan wrote a marker that later reads could not tell apart from
+full coverage. There is now one marker per club asserting one thing: every
+licence the club has ever held is indexed.
+`DETECT:` `grep -rn "scope=[\"']\(recent\|full\)[\"']\|_nif_index(" .`
+`FIX:` drop the argument. `build_nif_index()` is now always the exhaustive
+scan. You do **not** need it to get the fast path — the narrowing that
+`scope="recent"` used to give you now lives inside `find_license_by_nif`,
+which needs no pre-warming. Pre-warm only to make a *miss* free.
+The `nif_index` table is dropped and recreated on first open after upgrading:
+one rebuild, and `license_nif` rows are untouched.
+
+**`build_nif_index`'s result dict changed shape** (`863b83b`)
+`IMPACT: silent` — **read this one.**
+`players_indexed` used to report the *roster size*, counted before
+already-indexed licences were filtered out, so a warm no-op build reported
+the whole roster as freshly indexed. It now counts profiles that call
+actually fetched and resolved. New keys `players_enumerated` (the roster
+size), `no_nif`, `unresolved`, and `complete`; `scope` is gone from the dict.
+**`no_nif` and `unresolved` are different answers** — see below.
+`DETECT:` `grep -rn "players_indexed" .`
+`FIX:` use `players_enumerated` for the roster size. Check `complete` before
+treating a scan as authoritative — `warm_nif_index` also reports
+`error: "incomplete_scan"` alongside the unresolved licences.
+
+### Fixed
+
+- **A NIF miss is no longer authoritative after a scan that lost profiles**
+  (`863b83b`).
+  `IMPACT: silent`, and the dangerous one. Profile fetches were swallowed on
+  error and a blank NIF was dropped, but the freshness marker was stamped
+  regardless — so `find_license_by_nif` returned an authoritative `None` for
+  every dropped licence for the whole 7-day TTL. A caller that maps a miss to
+  "new player" (`derive_enrollment_params` picks `reg_type = 1`) would create
+  a duplicate SAV record for a player who already exists. Any unresolved
+  licence now blocks the marker, and unresolved licences are logged at WARNING
+  and returned.
+- **A licence with no NIF on file is no longer re-fetched forever** (`863b83b`). Such a
+  profile wrote no `license_nif` row, so `known_nif_licenses` never considered
+  it known and every later build paid the profile POST again. It is now
+  recorded with an empty NIF, which marks it scanned; `get_license_by_nif`
+  refuses a blank query so those rows can never match.
+  This is **not** treated as a failure. Measured on a live club, 143 of 684
+  licences (21%) legitimately carry no NIF, so counting them as unresolved
+  would make the coverage marker unwritable and every miss a permanent full
+  rescan. A licence with no NIF is *covered* — it can never match a NIF query.
+  Only a profile that could not be read lands in `unresolved` and blocks the
+  marker.
+- **`find_license_by_nif` stops as soon as the NIF resolves** (`863b83b`). It scans current
+  season → previous → all seasons, fetching profiles concurrently and
+  cancelling the rest on a match, instead of building an entire scope before
+  re-probing. Work done before the match is persisted, so each call leaves the
+  index warmer than it found it. This helps the *hit* path; a genuine miss
+  still scans the club once, after which the coverage marker makes subsequent
+  misses free.
+
+---
+
 ## 0.91.0 — 2026-08-28
 
 ### Breaking

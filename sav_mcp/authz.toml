@@ -88,7 +88,7 @@ self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
 # Builds only the node-local SQLite cache, so the default read capability is
-# intentional even when force=true performs a fresh scan.
+# intentional even when force=true performs a fresh full-club scan.
 [tools.warm_nif_index]
 roles = ["coach", "parent", "player"]
 
