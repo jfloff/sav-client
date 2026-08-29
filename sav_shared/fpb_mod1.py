@@ -283,6 +283,12 @@ def carimbo_overlay(
   unset.  effective reflects the final stamp state in the PDF regardless of
   whether *we* applied it.  Captures params via closure.
 
+  When the stamp is applied, the Assinaturas date is filled with today's date
+  (see fill_signature_date) — the club stamped it today. That step no-ops
+  unless the PDF carries our template's AcroForm with the date still blank, so
+  a scan, or a form somebody already dated, is untouched. It never fails the
+  stamp: the OverlayResult always describes the stamp alone.
+
   `rect` places the stamp at an explicit page rectangle instead of an OCR bbox —
   the no-OCR path for a PDF carrying our template's AcroForm, where the slot is
   the fixed CLUB_STAMP_RECT. See overlay_club_stamp.
@@ -296,13 +302,18 @@ def carimbo_overlay(
     if not os.environ.get("CLUB_STAMP_PATH"):
       return pdf_bytes, OverlayResult(applied=None, effective=False)
     try:
-      return (
-        overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox, rect=rect),
-        OverlayResult(applied=True, effective=True),
-      )
+      stamped = overlay_club_stamp(pdf_bytes, carimbo_present=carimbo_present, bbox=bbox, rect=rect)
     except Exception as exc:
       logger.warning("carimbo overlay failed", exc_info=True)
       return pdf_bytes, OverlayResult(applied=False, effective=False, error=f"club stamp failed: {exc}")
+    try:
+      stamped = fill_signature_date(stamped)
+    except Exception:
+      # The stamp is the point of this overlay and it is already applied; an
+      # undated form is still a valid upload, so never fail the stamp over the
+      # date. fill_signature_date no-ops on anything but our template AcroForm.
+      logger.warning("signature date fill failed; uploading the form undated", exc_info=True)
+    return stamped, OverlayResult(applied=True, effective=True)
   return apply
 
 
@@ -1285,6 +1296,46 @@ def read_mod1_acroform(pdf_bytes: bytes) -> dict[str, str] | None:
 def is_filled_mod1_template(raw: dict[str, str]) -> bool:
   """True when `raw` (a read_mod1_acroform result) is our Modelo 1 template."""
   return sum(1 for name in _MOD1_SIGNATURE_FIELDS if name in raw) >= _MOD1_SIGNATURE_MIN
+
+
+def fill_signature_date(pdf_bytes: bytes, *, on: date | None = None) -> bytes:
+  """Write `on` (default: today) into the Modelo 1 Assinaturas date field.
+
+  The Assinaturas box carries a single "Data __/__/__" between the player's
+  signature and the "Diretor(a) e Carimbo Clube" column, so a form we stamp
+  ourselves would otherwise go to the federation stamped but undated. Called
+  by carimbo_overlay right after it applies the stamp — the date is the date
+  we stamped.
+
+  Returns `pdf_bytes` unchanged when it cannot honestly fill the field: the
+  PDF has no AcroForm (a scan/photo — there is no field to write, only a
+  printed line), it is not our template, or any of the three sub-fields is
+  already filled. **A date someone else wrote is never overwritten**, and a
+  partly-filled date is left alone rather than completed with today's parts.
+  """
+  spec = MOD1_FILL_MAPPING["data_assinatura"]
+  raw = read_mod1_acroform(pdf_bytes)
+  if raw is None or not is_filled_mod1_template(raw):
+    return pdf_bytes
+  parts = (spec.dia, spec.mes, spec.ano)  # type: ignore[attr-defined]
+  if any((raw.get(name) or "").strip() for name in parts):
+    return pdf_bytes
+
+  when = on or date.today()
+  # pypdf (not pikepdf) for the same reason render_mod1 uses it: it regenerates
+  # the field appearance stream, so the date prints in viewers that don't honour
+  # NeedAppearances. The stamp overlay is page content and survives the rewrite.
+  reader = PdfReader(io.BytesIO(pdf_bytes))
+  writer = PdfWriter()
+  writer.append(reader)
+  writer.update_page_form_field_values(
+    writer.pages[0],
+    dict(zip(parts, (f"{when.day:02d}", f"{when.month:02d}", str(when.year)))),
+    auto_regenerate=False,
+  )
+  out = io.BytesIO()
+  writer.write(out)
+  return out.getvalue()
 
 
 def _checkbox_on(value: str | None) -> bool:

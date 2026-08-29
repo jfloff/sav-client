@@ -7,16 +7,19 @@ import io
 import os
 import subprocess
 import sys
+from datetime import date
 from pathlib import Path
 
 import pikepdf
 import pytest
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
   CLUB_STAMP_RECT,
   _MOD1_GUARDIAN_KEYS,
+  carimbo_overlay,
+  fill_signature_date,
   render_mod1,
   validate_mod1_values,
 )
@@ -93,6 +96,18 @@ def _png_bytes(size=(60, 24)):
   buf = io.BytesIO()
   Image.new("RGBA", size, (0, 0, 180, 255)).save(buf, "PNG")
   return buf.getvalue()
+
+
+def _set_field(pdf_bytes, name, value):
+  """Write one raw AcroForm value, bypassing render_mod1 — for the half-filled
+  date a human leaves behind."""
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    for f in pdf.Root.AcroForm.Fields:
+      if "/T" in f and str(f.T) == name:
+        f.V = pikepdf.String(value)
+    out = io.BytesIO()
+    pdf.save(out)
+  return out.getvalue()
 
 
 def _has_appearance(pdf_bytes, name):
@@ -282,6 +297,95 @@ class TestSignatureOverlays:
   def test_player_signature_does_not_overlap_stamp_rect(self):
     signed = render_mod1(SAMPLE, player_signature=_png_bytes())
     assert rect_has_overlay(signed, CLUB_STAMP_RECT) is False
+
+
+class TestStampFillsTheSignatureDate:
+  """carimbo_overlay dates the form it stamps (the Assinaturas 'Data' line).
+
+  A form we stamp ourselves would otherwise reach the federation stamped but
+  undated, since nobody is left to write the date by hand.
+  """
+
+  @pytest.fixture
+  def stamp_path(self, tmp_path, monkeypatch):
+    p = tmp_path / "stamp.png"
+    p.write_bytes(_png_bytes())
+    monkeypatch.setenv("CLUB_STAMP_PATH", str(p))
+    return p
+
+  @staticmethod
+  def _stamp(pdf_bytes, *, carimbo_present=False):
+    return carimbo_overlay(
+      carimbo_present=carimbo_present, bbox=None, rect=CLUB_STAMP_RECT,
+    )(pdf_bytes)
+
+  @staticmethod
+  def _date_fields(pdf_bytes):
+    f = _fields(pdf_bytes)
+    return _v(f, "ass_dia"), _v(f, "ass_mes"), _v(f, "ass_ano")
+
+  def test_undated_form_gets_todays_date(self, stamp_path):
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    stamped, result = self._stamp(undated)
+    today = date.today()
+    assert result.applied is True
+    assert self._date_fields(stamped) == (
+      f"{today.day:02d}", f"{today.month:02d}", str(today.year),
+    )
+
+  def test_date_renders_in_every_viewer(self, stamp_path):
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    stamped, _ = self._stamp(undated)
+    assert all(_has_appearance(stamped, n) for n in ("ass_dia", "ass_mes", "ass_ano"))
+
+  def test_stamp_and_other_values_survive_the_date_fill(self, stamp_path):
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    stamped, _ = self._stamp(undated)
+    assert rect_has_overlay(stamped, CLUB_STAMP_RECT) is True
+    f = _fields(stamped)
+    assert _v(f, "Nome Completo") == "Rita Constança Silva"
+    assert _v(f, "Feminino") == "/On"
+    assert _v(f, "dn_ano") == "2010"
+
+  def test_a_date_already_on_the_form_is_never_overwritten(self, stamp_path):
+    stamped, _ = self._stamp(render_mod1(SAMPLE))
+    assert self._date_fields(stamped) == ("08", "07", "2026")
+
+  def test_a_partly_filled_date_is_left_alone(self, stamp_path):
+    partial = render_mod1(
+      {k: v for k, v in SAMPLE.items() if k != "data_assinatura"},
+    )
+    partial = _set_field(partial, "ass_ano", "2026")
+    stamped, _ = self._stamp(partial)
+    assert self._date_fields(stamped) == ("", "", "2026")
+
+  def test_a_form_we_do_not_stamp_is_not_dated(self, stamp_path):
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    stamped, result = self._stamp(undated, carimbo_present=True)
+    assert result.applied is None
+    assert self._date_fields(stamped) == ("", "", "")
+
+  def test_no_stamp_configured_leaves_the_form_untouched(self, monkeypatch):
+    monkeypatch.delenv("CLUB_STAMP_PATH", raising=False)
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    stamped, result = self._stamp(undated)
+    assert result.applied is None
+    assert stamped == undated
+
+
+class TestFillSignatureDate:
+  def test_non_template_pdf_is_returned_unchanged(self):
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+    assert fill_signature_date(buf.getvalue()) == buf.getvalue()
+
+  def test_explicit_date_is_used(self):
+    undated = render_mod1({k: v for k, v in SAMPLE.items() if k != "data_assinatura"})
+    out = fill_signature_date(undated, on=date(2026, 3, 9))
+    f = _fields(out)
+    assert (_v(f, "ass_dia"), _v(f, "ass_mes"), _v(f, "ass_ano")) == ("09", "03", "2026")
 
 
 def test_blank_and_unknown_values_are_skipped():

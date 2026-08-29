@@ -221,6 +221,8 @@ Every `documents` entry is self-contained. Unknown keys are errors, so misspelli
 
 These fast paths skip parse-time OCR, not every possible OCR call. At `submit_enrollment`, the club-stamp logic must determine whether a stamp is physically present. A non-AcroForm Modelo 1 is therefore sent to `parse_fpb_mod1` at submit time even when `values` supplied its fields. A handwritten scan costs zero Document AI calls during parse and one during submit; a filled template costs zero at both stages.
 
+**Stamping also dates the form.** Whenever an upload path applies the club stamp to a Modelo 1 carrying this repository's AcroForm, it fills the Assinaturas "Data" line with the date it stamped — otherwise a form nobody completes by hand reaches the federation stamped but undated. A date already on the form (even a half-filled one) is never overwritten, and a scan has no field to write, so only the template path is affected.
+
 ### Required overrides for `submit_enrollment`
 
 `field_overrides` must include:

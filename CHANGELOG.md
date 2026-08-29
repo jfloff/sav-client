@@ -21,6 +21,31 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.93.0 — 2026-08-29
+
+### Changed
+
+**Stamping a Modelo 1 now dates it** (`fill_signature_date`)
+`IMPACT: silent` — the uploaded PDF gains a value it did not have.
+Every path that overlays the club stamp (`carimbo_overlay`, so
+`upload_player_document`, `replace_player_document`,
+`update_enrollment_with_document`, `submit_enrollment`, and the CLI upload
+paths) now also writes the Assinaturas "Data" line — `ass_dia` / `ass_mes` /
+`ass_ano` — with the date it stamped. A form we stamp ourselves has nobody
+left to date it by hand, so it used to reach the federation stamped but
+undated.
+Only a PDF carrying this repository's Modelo 1 AcroForm is touched; a scan has
+no field to write. A date already on the form is **never** overwritten, and a
+partly-filled date is left alone rather than completed. The stamp never fails
+over the date: if the fill raises, the stamped-but-undated PDF is uploaded and
+a warning is logged.
+`DETECT:` `grep -rn "ass_dia\|data_assinatura" .`
+`FIX:` nothing to change unless you asserted the date stays blank after an
+upload. To choose the date yourself, keep passing `data_assinatura` in
+`values` / `fill_mod1` — a form that already carries one is left as it is.
+
+---
+
 ## 0.92.0 — 2026-08-29
 
 ### Breaking
