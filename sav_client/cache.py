@@ -28,8 +28,8 @@ def resolve_cache_dir(directory: str | Path | None = None) -> Path:
     1. `directory`, when a caller passes one explicitly;
     2. $SAV_CACHE_DIR — lets a containerised caller put the cache on a
        named volume instead of the container filesystem, where a redeploy
-       destroys it along with the persisted NIF-index freshness marker and
-       so re-arms build_nif_index's multi-minute inline rebuild;
+       destroys it along with every resolved licence↔NIF row and the club's
+       NIF coverage marker, so the next NIF miss re-scans the whole club;
     3. ~/.sav, when it already exists — the historical location wins over
        XDG so an upgrade never silently orphans a warm cache;
     4. $XDG_CACHE_HOME/sav, when that variable is set;
@@ -160,15 +160,26 @@ class Cache:
       )
     """)
     # A license↔NIF pair is immutable, but a club roster's completeness is not:
-    # new enrolments can appear after a scan. Scope markers therefore carry a
-    # TTL even though the license_nif rows themselves do not.
+    # new enrolments can appear after a scan. The coverage marker therefore
+    # carries a TTL even though the license_nif rows themselves do not.
+    #
+    # One row per club, asserting one thing: every licence the club has ever
+    # held is in license_nif. Only a scan that enumerated the whole club and
+    # resolved every licence may write it. The pre-0.92 table was keyed
+    # (club_id, scope) with scope in {recent, full}; a partial "recent" scan
+    # stamped a marker later reads could not tell apart from full coverage.
+    # Drop rather than migrate, so no surviving row can be misread as a
+    # completeness claim — this is a cache, and the cost is one rebuild.
+    if any(
+      row[1] == "scope"
+      for row in con.execute("PRAGMA table_info(nif_index)").fetchall()
+    ):
+      con.execute("DROP TABLE nif_index")
     con.execute("""
       CREATE TABLE IF NOT EXISTS nif_index (
-        club_id      INTEGER NOT NULL,
-        scope        TEXT    NOT NULL,
+        club_id      INTEGER PRIMARY KEY,
         built_at     REAL    NOT NULL,
-        player_count INTEGER NOT NULL,
-        PRIMARY KEY (club_id, scope)
+        player_count INTEGER NOT NULL
       )
     """)
     for col, typedef in [
@@ -338,7 +349,13 @@ class Cache:
       con.close()
 
   def get_license_by_nif(self, nif: str) -> int | None:
-    """Return the licence whose NIF matches, or None if unknown."""
+    """Return the licence whose NIF matches, or None if unknown.
+
+    Licences with no NIF on file are stored with an empty ``nif`` to mark them
+    scanned, so a blank query must never match one.
+    """
+    if not nif:
+      return None
     con = self._db()
     try:
       row = con.execute(
@@ -382,17 +399,19 @@ class Cache:
     finally:
       con.close()
 
-  def get_nif_index(
-    self, club_id: int, scope: str, ttl: float,
-  ) -> tuple[float, int] | None:
-    """Return a fresh (built_at, player_count) marker, or None."""
+  def get_nif_index(self, club_id: int, ttl: float) -> tuple[float, int] | None:
+    """Return a fresh (built_at, player_count) coverage marker, or None.
+
+    A marker asserts the club was scanned to exhaustion with every licence
+    resolved, so a caller may treat a NIF miss as authoritative. Its absence
+    means "coverage unknown", never "the club is empty".
+    """
     now = time.time()
     con = self._db()
     try:
       row = con.execute(
-        "SELECT built_at, player_count FROM nif_index "
-        "WHERE club_id = ? AND scope = ?",
-        (club_id, scope),
+        "SELECT built_at, player_count FROM nif_index WHERE club_id = ?",
+        (club_id,),
       ).fetchone()
       if row and (now - row[0]) < ttl:
         return row[0], row[1]
@@ -400,36 +419,33 @@ class Cache:
     finally:
       con.close()
 
-  def record_nif_index(
-    self, club_id: int, scope: str, player_count: int,
-  ) -> None:
-    """Record that a club's NIF index scope was built successfully."""
+  def record_nif_index(self, club_id: int, player_count: int) -> None:
+    """Record that a club's roster was scanned to exhaustion.
+
+    Only call this when every enumerated licence resolved. One unresolved
+    licence makes the club's coverage unknown, and a marker written anyway
+    turns every later lookup for that player into an authoritative miss for
+    the whole TTL — the caller then concludes a player who exists is new.
+    """
     con = self._db()
     try:
       con.execute(
         "INSERT OR REPLACE INTO nif_index "
-        "(club_id, scope, built_at, player_count) VALUES (?, ?, ?, ?)",
-        (club_id, scope, time.time(), player_count),
+        "(club_id, built_at, player_count) VALUES (?, ?, ?)",
+        (club_id, time.time(), player_count),
       )
       con.commit()
     finally:
       con.close()
 
-  def clear_nif_index(
-    self, club_id: int | None = None, scope: str | None = None,
-  ) -> None:
-    """Clear one scope, every scope for a club, or every NIF index marker."""
+  def clear_nif_index(self, club_id: int | None = None) -> None:
+    """Clear one club's coverage marker, or every club's."""
     con = self._db()
     try:
       if club_id is None:
         con.execute("DELETE FROM nif_index")
-      elif scope is None:
-        con.execute("DELETE FROM nif_index WHERE club_id = ?", (club_id,))
       else:
-        con.execute(
-          "DELETE FROM nif_index WHERE club_id = ? AND scope = ?",
-          (club_id, scope),
-        )
+        con.execute("DELETE FROM nif_index WHERE club_id = ?", (club_id,))
       con.commit()
     finally:
       con.close()

@@ -508,20 +508,25 @@ def find_player_by_nif(
 
 
 @server.tool()
-def warm_nif_index(
-    scope: str = "recent",
-    force: bool = False,
-) -> dict:
-    """Build or reuse the session club's node-local NIF lookup index.
+def warm_nif_index(force: bool = False) -> dict:
+    """Exhaustively index the session club's NIFs into the node-local cache.
 
     Always built for the session's own club: SAV2 only exposes a player's NIF
     to their own club, so there is no club to choose and no federation-wide
     index to build; a session without a resolvable club raises ValueError.
-    ``scope="full"`` is SLOW and offline-only: it makes one profile POST per
-    not-yet-indexed licence across all seasons at 8-way concurrency. A large
-    club can take minutes, likely beyond a default MCP client timeout. Its
-    purpose is to let an importer or nightly job pay that cost outside a user
-    request.
+
+    This is SLOW and offline-only: one profile POST per not-yet-indexed licence
+    across all seasons, at 8-way concurrency. A large club can take minutes,
+    likely beyond a default MCP client timeout. Its purpose is to let an
+    importer or nightly job pay that cost outside a user request. There is no
+    partial mode — a partial scan cannot support the authoritative "this player
+    is new" answer the index exists to give, so narrowing lives inside
+    find_player_by_nif instead, where it needs no pre-warming.
+
+    ``complete`` is the field to check. It is false when the roster could not
+    be listed, or when any profile's NIF could not be read; ``unresolved``
+    then names those licences. Only a complete scan lets a later NIF miss be
+    treated as authoritative.
     """
     client = _get_client()
     if not _effective_club(client, None):
@@ -530,19 +535,25 @@ def warm_nif_index(
             "player's own club, so the index is per-club; the session club "
             "could not be resolved)."
         )
-    result = client.build_nif_index(scope=scope, force=force)
+    result = client.build_nif_index(force=force)
     built_at = float(result["built_at"])
     if not built_at:
-        # The roster listing failed, so nothing was indexed and no freshness
+        # The roster listing failed, so nothing was indexed and no coverage
         # marker was written. Say so plainly rather than rendering epoch 0 as a
         # 1970 timestamp that reads like a successful build.
         return {**result, "built_at": None, "error": "roster_unavailable"}
-    return {
+    result = {
         **result,
         "built_at": datetime.fromtimestamp(
             built_at, tz=timezone.utc,
         ).isoformat(),
     }
+    if not result["complete"]:
+        # The scan ran but some profiles were unreadable, so no marker was
+        # written. Name it, so a caller does not read a real built_at as proof
+        # the club is fully covered.
+        result["error"] = "incomplete_scan"
+    return result
 
 
 @server.tool()

@@ -29,7 +29,7 @@ import time
 from dataclasses import replace as _dc_replace
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 from urllib.parse import urljoin
 
 import requests
@@ -56,6 +56,23 @@ from sav_shared.identifiers import require_nif, to_license
 from sav_shared.text import iso_date, normalise_text
 
 logger = logging.getLogger(__name__)
+
+
+class _ScanResult(NamedTuple):
+  """Outcome of resolving NIFs for a batch of own-club licences.
+
+  ``no_nif`` and ``unresolved`` are different answers and must not be merged.
+  A profile that loads and carries no NIF is a *fact* — that licence can never
+  match a NIF query, so it is covered. A fetch that failed is an *unknown*,
+  and only unknowns may block a coverage marker. Measured on a live club,
+  21% of licences legitimately have no NIF on file, so conflating the two
+  makes the marker unwritable and every miss a full rescan, forever.
+  """
+
+  pairs: list[tuple[int, str]]
+  no_nif: list[int]
+  unresolved: list[int]
+  hit: int | None
 
 # ---------------------------------------------------------------------------
 # Internal constants
@@ -953,21 +970,21 @@ class SavClient:
     return self._parse_player_detail_response(raw, player_id=player_id)
 
   def find_license_by_nif(self, nif: str, *, refresh: bool = False) -> int | None:
-    """Return the license of the player with the given NIF in our own roster.
+    """Return this club's licence for ``nif``, progressively and safely.
 
-    Always scoped to the session's own club: SAV2 only exposes a player's NIF
-    to their own club, so there is no other roster we could search.
+    SAV2 only exposes a player's NIF to their own club, so lookup cannot be
+    widened beyond the session club. A persisted licence↔NIF hit is returned
+    immediately unless ``refresh`` requests a full re-read. On a cache miss,
+    recent rosters are scanned first for the common case, then the all-seasons
+    roster establishes an authoritative miss only when every licence resolved.
 
-    Lookup tiers (cheapest first):
-      1. SQLite license↔NIF cache — O(1), survives across processes.
-      2. Current + previous season roster build.
-      3. All-season roster build after a recent-scope miss.
+    Args:
+        nif: Player tax identifier to find.
+        refresh: Re-fetch every roster profile before re-probing the cache.
 
-    Roster completeness is persisted once per club and scope for the configured
-    TTL, so authoritative full-scope misses also survive across processes.
-
-    Returns None when the NIF or session club is missing, or when no roster
-    profile matches.
+    Returns:
+        The matching licence, or None when the NIF is blank, no session club
+        exists, or exhaustive coverage establishes that it is absent.
     """
     nif = nif.strip() if nif else ""
     if not nif:
@@ -983,112 +1000,170 @@ class SavClient:
       return None
 
     if refresh:
-      self.build_nif_index(scope="full", force=True)
+      self.build_nif_index(force=True)
       return self._cache.get_license_by_nif(nif)
 
-    if self._cache.get_nif_index(
-      club_id, "full", self._nif_index_ttl,
-    ) is not None:
+    if self._cache.get_nif_index(club_id, self._nif_index_ttl) is not None:
       return None
 
-    if self._cache.get_nif_index(
-      club_id, "recent", self._nif_index_ttl,
-    ) is None:
-      self.build_nif_index(scope="recent")
-      hit = self._cache.get_license_by_nif(nif)
-      if hit is not None:
-        return hit
+    try:
+      recent_seasons = self._recent_season_ids()
+    except (SavError, ValueError):
+      logger.debug(
+        "Could not resolve recent seasons for club_id=%s; scanning all seasons",
+        club_id,
+        exc_info=True,
+      )
+      recent_seasons = []
 
-    self.build_nif_index(scope="full")
-    return self._cache.get_license_by_nif(nif)
+    full_roster_enumerated = False
+    full_roster_count = 0
+    any_unresolved = False
+    for season in [*recent_seasons, 0]:
+      # season=0 is SAV's all-seasons roster; recent seasons only order the
+      # cheap common case and can never establish complete club coverage.
+      licenses = self._enumerate_club_licenses(
+        None if season == 0 else [season]
+      )
+      if licenses is None:
+        logger.debug(
+          "Skipping NIF scan for club_id=%s season=%s after roster-listing failure",
+          club_id,
+          season,
+        )
+        continue
+      if season == 0:
+        full_roster_enumerated = True
+        full_roster_count = len(licenses)
 
-  def build_nif_index(self, *, scope: str = "recent", force: bool = False) -> dict:
-    """Build or reuse a persisted NIF index scope for the session's own club.
+      known = self._cache.known_nif_licenses(licenses)
+      licenses = [license for license in licenses if license not in known]
+      result = self._scan_licenses(licenses, stop_on_nif=nif)
+      # Save useful work before returning a hit: subsequent searches can skip
+      # every profile that completed before the early-exit cancellation. A
+      # licence with no NIF on file is recorded as an empty row for the same
+      # reason — it is a scanned fact, and without the row every later scan
+      # would fetch that profile again forever.
+      self._cache.record_player_nifs(
+        result.pairs + [(license, "") for license in result.no_nif]
+      )
+      if result.unresolved:
+        any_unresolved = True
+      if result.hit is not None:
+        return result.hit
 
-    Always scoped to the session's own club: SAV2 only exposes a player's NIF
-    to their own club, so no other club's roster can be indexed.
+    # Only an all-seasons enumeration covers the club, and even one profile
+    # whose NIF could not be read makes an otherwise-absent NIF non-authoritative.
+    if full_roster_enumerated and not any_unresolved:
+      self._cache.record_nif_index(club_id, full_roster_count)
+    return None
 
-    A roster-listing failure returns an uncached result with ``built_at=0.0``;
-    no freshness marker is recorded, so the next lookup retries the build.
+  def build_nif_index(self, *, force: bool = False) -> dict:
+    """Exhaustively build or reuse this club's persisted NIF coverage index.
+
+    SAV2 makes NIFs visible only to the session club, so this method always
+    enumerates that club's all-seasons roster. A fresh coverage marker avoids
+    unnecessary work unless ``force`` is true. Forced builds re-fetch profiles
+    already cached so a corrected NIF can replace an immutable cache row.
+
+    A roster-listing failure returns ``built_at=0.0`` and writes no marker.
+    An incomplete profile scan returns its unresolved licences but likewise
+    leaves coverage unmarked, so later duplicate checks retry safely.
+
+    Args:
+        force: Ignore a fresh marker and re-fetch every roster profile.
+
+    Returns:
+        Counts and completion metadata for this build attempt. ``complete``
+        is true only when a coverage marker was already fresh or this call
+        resolved the entire all-seasons roster.
+
+    Raises:
+        ValueError: If there is no session club to enumerate.
     """
-    if scope not in {"recent", "full"}:
-      raise ValueError("scope must be 'recent' or 'full'")
     club_id = int(self.session.get("organizacao") or 0) if self.session else 0
     if not club_id:
       raise ValueError("a session club is required to build the NIF index")
 
     if not force:
-      marker = self._cache.get_nif_index(
-        club_id, scope, self._nif_index_ttl,
-      )
+      marker = self._cache.get_nif_index(club_id, self._nif_index_ttl)
       if marker is not None:
         built_at, player_count = marker
         return {
           "club_id": club_id,
-          "scope": scope,
-          "players_indexed": player_count,
+          "players_enumerated": player_count,
+          "players_indexed": 0,
+          "no_nif": [],
+          "unresolved": [],
+          "complete": True,
           "built_at": built_at,
           "from_cache": True,
         }
 
-    if scope == "recent":
-      try:
-        seasons = self._recent_season_ids()
-      except (SavError, ValueError):
-        logger.debug(
-          "Could not resolve recent seasons for club_id=%s", club_id,
-          exc_info=True,
-        )
-        return {
-          "club_id": club_id, "scope": scope, "players_indexed": 0,
-          "built_at": 0.0, "from_cache": False,
-        }
-    else:
-      seasons = None
-
-    # A forced refresh must re-read known profiles too, so corrected NIFs can
-    # replace immutable-cache rows. Normal staged escalation skips them.
-    built = self._build_club_nif_map(seasons=seasons, refetch_known=force)
-    if built is None:
+    licenses = self._enumerate_club_licenses(seasons=None)
+    if licenses is None:
       return {
-        "club_id": club_id, "scope": scope, "players_indexed": 0,
-        "built_at": 0.0, "from_cache": False,
+        "club_id": club_id,
+        "players_enumerated": 0,
+        "players_indexed": 0,
+        "no_nif": [],
+        "unresolved": [],
+        "complete": False,
+        "built_at": 0.0,
+        "from_cache": False,
       }
 
-    nif_map, player_count = built
-    if nif_map:
-      self._cache.record_player_nifs([
-        (license, nif_value) for nif_value, license in nif_map.items()
-      ])
-    self._cache.record_nif_index(club_id, scope, player_count)
-    if scope == "full":
-      self._cache.record_nif_index(club_id, "recent", player_count)
-    marker = self._cache.get_nif_index(club_id, scope, float("inf"))
-    built_at = marker[0] if marker is not None else time.time()
+    players_enumerated = len(licenses)
+    # A forced refresh must re-read known profiles too, so a corrected NIF can
+    # replace an immutable-cache row. An ordinary build skips them.
+    if not force:
+      known = self._cache.known_nif_licenses(licenses)
+      licenses = [license for license in licenses if license not in known]
+    result = self._scan_licenses(licenses)
+    self._cache.record_player_nifs(
+      result.pairs + [(license, "") for license in result.no_nif]
+    )
+
+    # Only a licence we could not read blocks coverage. A licence with no NIF
+    # on file is covered: it can never match a NIF query.
+    complete = not result.unresolved
+    if complete:
+      # A marker is an authoritative negative-lookup claim, so it can only
+      # follow an exhaustive all-seasons scan with no unreadable profile.
+      self._cache.record_nif_index(club_id, players_enumerated)
+      marker = self._cache.get_nif_index(club_id, float("inf"))
+      built_at = marker[0] if marker is not None else time.time()
+    else:
+      built_at = time.time()
     return {
       "club_id": club_id,
-      "scope": scope,
-      "players_indexed": player_count,
+      "players_enumerated": players_enumerated,
+      "players_indexed": len(result.pairs),
+      "no_nif": result.no_nif,
+      "unresolved": result.unresolved,
+      "complete": complete,
       "built_at": built_at,
       "from_cache": False,
     }
 
-  def _build_club_nif_map(
-    self, *, seasons: list[int] | None, refetch_known: bool = False,
-  ) -> tuple[dict[str, int], int] | None:
-    """Build new {nif → license} entries for one own-club roster scope.
+  def _enumerate_club_licenses(
+    self, seasons: list[int] | None,
+  ) -> list[int] | None:
+    """List unique own-club licences for seasons, preserving roster order.
 
-    Always scoped to the session's own club: SAV2 only exposes a player's NIF
-    to their own club, so a profile fetched for any other club has no NIF.
+    ``seasons=None`` asks SAV for its all-seasons roster (season 0); otherwise
+    each supplied season is listed separately. The method deliberately returns
+    None rather than an empty list when a listing fails, because an empty club
+    is complete but failed coverage must never support an authoritative miss.
 
-    SAV2 has no NIF-based search, so we pay one profile fetch per unique
-    uncached license (parallelised, max 8 workers). ``None`` means the roster
-    could not be listed and must not be marked fresh.
+    Args:
+        seasons: SAV season IDs to list, or None for the all-seasons roster.
+
+    Returns:
+        First-seen unique licence numbers, an empty list for an empty roster,
+        or None when SAV could not list the requested roster.
     """
-    from concurrent.futures import ThreadPoolExecutor
-
     club_id = int(self.session.get("organizacao") or 0) if self.session else 0
-
     try:
       if seasons is None:
         rosters = [self.search_players(club=club_id, season=0)]
@@ -1104,38 +1179,114 @@ class SavClient:
     seen: set[int] = set()
     licenses: list[int] = []
     for roster in rosters:
-      for p in roster:
+      for player in roster:
         try:
-          lic = int(p.license)
+          license = int(player.license)
         except (ValueError, TypeError):
           continue
-        if lic not in seen:
-          seen.add(lic)
-          licenses.append(lic)
-    player_count = len(licenses)
+        if license not in seen:
+          seen.add(license)
+          licenses.append(license)
+    return licenses
+
+  def _scan_licenses(
+    self,
+    licenses: list[int],
+    *,
+    stop_on_nif: str | None = None,
+    max_workers: int = 8,
+  ) -> _ScanResult:
+    """Resolve NIFs for licences, optionally returning as soon as one matches.
+
+    Every profile fetch is scoped to the session club because SAV otherwise
+    hides NIFs. A profile that loads but carries no NIF lands in ``no_nif``;
+    only a fetch that *failed* lands in ``unresolved``. See _ScanResult for
+    why that distinction is load-bearing.
+
+    Args:
+        licenses: Own-club licence numbers whose profiles should be fetched.
+        stop_on_nif: Return early when this NIF is resolved.
+        max_workers: Maximum parallel profile fetches.
+
+    Returns:
+        Resolved (licence, NIF) pairs, licences with no NIF on file, licences
+        that could not be read, and an optional licence whose NIF equals
+        ``stop_on_nif``.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     if not licenses:
-      return {}, 0
+      return _ScanResult(pairs=[], no_nif=[], unresolved=[], hit=None)
 
-    if not refetch_known:
-      known = self._cache.known_nif_licenses(licenses)
-      licenses = [license for license in licenses if license not in known]
-    if not licenses:
-      return {}, player_count
+    club_id = int(self.session.get("organizacao") or 0) if self.session else 0
+    pairs: list[tuple[int, str]] = []
+    no_nif: list[int] = []
+    unresolved: list[int] = []
+    hit: int | None = None
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(licenses))) as pool:
+      futures = {
+        pool.submit(self.load_player_profile, license, club_id=club_id): license
+        for license in licenses
+      }
+      for future in as_completed(futures):
+        license = futures[future]
+        try:
+          profile = future.result()
+        except (SavError, ValueError):
+          # Unknown, not absent — this is the only case that may block a
+          # coverage marker.
+          unresolved.append(license)
+          # The cause stays at debug: a SAV error body carries its table and
+          # constraint names, and this line is warning-level on purpose so the
+          # anomaly is visible without the payload.
+          logger.warning("Could not resolve NIF for license=%s", license)
+          logger.debug(
+            "Profile fetch failed for license=%s", license, exc_info=True,
+          )
+          continue
 
-    def _fetch(lic: int) -> tuple[str, int]:
-      try:
-        profile = self.load_player_profile(lic, club_id=club_id)
-      except (SavError, ValueError):
-        logger.debug("Could not load profile for license=%s", lic, exc_info=True)
-        return "", 0
-      return (profile.get("nif") or "").strip(), lic
+        nif = (profile.get("nif") or "").strip()
+        if not nif:
+          # Common and legitimate — roughly a fifth of a real club's historical
+          # licences. Debug, not warning: 143 warnings on one scan is noise
+          # that buries the fetch failures that actually matter.
+          no_nif.append(license)
+          logger.debug("Profile carries no NIF for license=%s", license)
+          continue
 
-    nif_map: dict[str, int] = {}
-    with ThreadPoolExecutor(max_workers=min(8, len(licenses))) as pool:
-      for nif_val, lic in pool.map(_fetch, licenses):
-        if nif_val and lic:
-          nif_map[nif_val] = lic
-    return nif_map, player_count
+        pairs.append((license, nif))
+        if stop_on_nif is not None and nif == stop_on_nif:
+          hit = license
+          # Cancellation only reaches queued work; up to max_workers - 1
+          # profiles can already be in flight when the matching result lands.
+          for pending in futures:
+            pending.cancel()
+          break
+
+    if hit is not None:
+      # Leaving the `with` block shut the pool down, so every profile that was
+      # still in flight when the match landed has now finished. We already paid
+      # for those POSTs — bank them rather than make the next lookup refetch
+      # them. Failures here are dropped rather than recorded as unresolved: an
+      # early-exit scan never covers the club, so it cannot claim coverage and
+      # has nothing for an unresolved licence to invalidate.
+      seen = {license for license, _ in pairs} | set(no_nif) | set(unresolved)
+      for future, license in futures.items():
+        if license in seen or future.cancelled() or not future.done():
+          continue
+        try:
+          profile = future.result()
+        except (SavError, ValueError):
+          continue
+        nif = (profile.get("nif") or "").strip()
+        if nif:
+          pairs.append((license, nif))
+        else:
+          no_nif.append(license)
+
+    return _ScanResult(
+      pairs=pairs, no_nif=no_nif, unresolved=unresolved, hit=hit,
+    )
 
   def list_games(
     self,
