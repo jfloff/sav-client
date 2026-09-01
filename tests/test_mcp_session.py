@@ -44,6 +44,7 @@ def test_includes_resolved_season_label(monkeypatch):
   assert result["season_id"] == 2026
   assert result["season"] == "2025/2026"
   assert result["season_start_year"] == 2025
+  assert result["season_end_year"] == 2026
 
 
 def test_label_is_best_effort_when_no_batches(monkeypatch):
@@ -56,6 +57,7 @@ def test_label_is_best_effort_when_no_batches(monkeypatch):
   assert result["season_id"] == 2026
   assert result["season"] is None
   assert result["season_start_year"] is None
+  assert result["season_end_year"] is None
 
 
 def test_raises_when_session_uninitialized(monkeypatch):

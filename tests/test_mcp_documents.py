@@ -1450,7 +1450,7 @@ def test_submit_path_stamps_unstamped_mod1_template_without_ocr(monkeypatch, tmp
     "sav_parsers.parse_fpb_mod1",
     lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
   )
-  base = render_mod1(SAMPLE)
+  base = render_mod1(SAMPLE, season="2026/2027")
 
   status = server_module._replace_player_document_from_bytes(
     StubClient(), 12, 301772, base,
@@ -1483,7 +1483,7 @@ def test_submit_path_does_not_double_stamp_mod1_template(monkeypatch, tmp_path):
     "sav_parsers.parse_fpb_mod1",
     lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
   )
-  base = render_mod1(SAMPLE, club_stamp=stamp_bytes)
+  base = render_mod1(SAMPLE, season="2026/2027", club_stamp=stamp_bytes)
 
   status = server_module._replace_player_document_from_bytes(
     StubClient(), 12, 301772, base,

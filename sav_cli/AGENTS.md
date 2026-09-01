@@ -287,6 +287,8 @@ Defaults: all eligible players / coaches included; OUTROS TREINADORES and ENQUAD
 
 Generate a **filled FPB Modelo 1** (player enrollment) PDF from a JSON values dict — the reverse of the OCR-inbound pipeline. Produces a print-ready form for the player/guardian to sign and the club to stamp.
 
+The form's Época is always fetched from SAV's authoritative active-season table. It cannot be passed through `--values` or a CLI option; season-like keys are rejected. This command therefore authenticates even though it does not write to SAV.
+
 ```sh
 sav mod1 fill --values values.json --out mod1.pdf
 sav mod1 fill --values - --out mod1.pdf < values.json          # values from stdin

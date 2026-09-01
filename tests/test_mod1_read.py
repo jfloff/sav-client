@@ -19,7 +19,7 @@ from sav_shared.fpb_mod1 import (
   mod1_acroform_to_fields,
   mod1_values_to_fields,
   read_mod1_acroform,
-  render_mod1,
+  render_mod1 as _render_mod1,
 )
 from sav_shared.files import overlay_image_on_pdf
 
@@ -58,6 +58,10 @@ SAMPLE = {
   "consent_marketing": True,
   "data_assinatura": "2026-07-08",
 }
+
+
+def render_mod1(values, **kwargs):
+  return _render_mod1(values, season="2026/2027", **kwargs)
 
 
 def _filled_pdf(overrides=None):

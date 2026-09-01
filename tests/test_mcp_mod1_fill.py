@@ -1,10 +1,12 @@
 """MCP test for fill_mod1 — returns a base64-encoded, field-filled Modelo 1 PDF."""
 import base64
+import inspect
 import io
 
 import pikepdf
 import pytest
 
+from sav_client.models import Season
 from sav_mcp import server as server_module
 
 # A complete, valid adult enrollment (guardian block omitted, born 1990). The
@@ -20,6 +22,16 @@ VALUES = {
   "consent_data": True, "consent_communications": False, "consent_marketing": True,
   "data_assinatura": "2026-07-08",
 }
+
+
+class _StubClient:
+  def get_current_season(self):
+    return Season(id=65, label="2026/2027", start_year=2026, is_active=True)
+
+
+@pytest.fixture(autouse=True)
+def current_sav_season(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: _StubClient())
 
 
 def _xobject_count(pdf_bytes):
@@ -47,7 +59,13 @@ def test_fill_mod1_returns_filled_pdf():
   assert str(fields["Morada"].get("/V")) == "Rua X, 1"
   assert str(fields["Cartão Cidadão"].get("/V")) == "/On"
   assert str(fields["SIM"].get("/V")) == "/On"
+  assert str(fields["epoca2"].get("/V")) == "2026"
+  assert str(fields["epoca1"].get("/V")) == "2027"
   pdf.close()
+
+
+def test_fill_mod1_has_no_season_parameter():
+  assert "season" not in inspect.signature(server_module.fill_mod1).parameters
 
 
 def test_fill_mod1_overlays_base64_signatures():
@@ -65,3 +83,8 @@ def test_fill_mod1_overlays_base64_signatures():
 def test_fill_mod1_rejects_invalid_values():
   with pytest.raises(ValueError, match="required"):
     server_module.fill_mod1(values={"morada": "Rua X, 1"})
+
+
+def test_fill_mod1_rejects_season_in_values():
+  with pytest.raises(ValueError, match="supplied separately"):
+    server_module.fill_mod1(values={**VALUES, "season": "2025/2026"})

@@ -233,21 +233,23 @@ def get_session_info() -> dict:
     etc.).
 
     This is the source of truth for the current season — read ``season`` /
-    ``season_start_year`` / ``season_id`` from here rather than inferring the
-    season from registration batches, game rows, or player rows (those can be
-    absent off-season, e.g. before the new época's batches are opened).
+    ``season_start_year`` / ``season_end_year`` / ``season_id`` from here rather
+    than inferring the season from registration batches, game rows, or player
+    rows (those can be absent off-season, e.g. before the new época's batches
+    are opened).
 
-    Returns ``{user, profile, club_id, season_id, season, season_start_year}``.
+    Returns ``{user, profile, club_id, season_id, season, season_start_year,
+    season_end_year}``.
 
     season_id is the current epoch — pass it (or omit / pass 0 for all-seasons)
     to tools that accept a season parameter.
 
-    season is the human-readable label (e.g. ``"2025/2026"``) and
-    season_start_year its starting calendar year (e.g. ``2025``). SAV2 stores
-    the season only as the opaque season_id, so the label is resolved from
-    SAV2's season table (the active época); it does not depend on any
-    registration batch existing, so it resolves off-season too. Both fields
-    fall back to ``None`` only if that lookup itself fails.
+    season is the human-readable label (e.g. ``"2025/2026"``), with
+    season_start_year and season_end_year its two calendar years (e.g. ``2025``
+    and ``2026``). SAV2 stores the season only as the opaque season_id, so the
+    label is resolved from SAV2's season table (the active época); it does not
+    depend on any registration batch existing, so it resolves off-season too.
+    All three fields fall back to ``None`` only if that lookup itself fails.
     """
     client = _get_client()
     session = client.session
@@ -258,11 +260,13 @@ def get_session_info() -> dict:
     # (the active época). Best-effort so a transient lookup failure still
     # yields valid (label-less) session info instead of raising.
     season_start_year: int | None = None
+    season_end_year: int | None = None
     season: str | None = None
     try:
         current = client.get_current_season()
         season = current.label
         season_start_year = current.start_year
+        season_end_year = current.end_year
     except SavError:
         logger.debug("Could not resolve current season label", exc_info=True)
 
@@ -273,6 +277,7 @@ def get_session_info() -> dict:
         "season_id": int(session.get("epoca_id") or 0),
         "season": season,
         "season_start_year": season_start_year,
+        "season_end_year": season_end_year,
     }
 
 
@@ -1047,6 +1052,9 @@ def fill_mod1(
     form instead, pass any of player_signature_b64, guardian_signature_b64,
     club_stamp_b64 — each a base64-encoded PNG/JPG image overlaid on its area.
 
+    The form's Época is always SAV's active season, resolved server-side. There
+    is no season parameter, and season-like keys in values are rejected.
+
     values: a dict keyed by these enrollment field keys —
     tipo_inscricao, license, clube, associacao, genero, escalao, nome,
     nacionalidade, pais_nascimento, nif, nasc, tipo, numi, dataval, email, tele,
@@ -1073,8 +1081,10 @@ def fill_mod1(
 
     Returns ``{filename, size_bytes, pdf_b64}``. Decode pdf_b64 to obtain the PDF bytes.
     """
+    season = _get_client().get_current_season()
     pdf = render_mod1(
         values,
+        season=season.label,
         player_signature=base64.b64decode(player_signature_b64) if player_signature_b64 else None,
         guardian_signature=base64.b64decode(guardian_signature_b64) if guardian_signature_b64 else None,
         club_stamp=base64.b64decode(club_stamp_b64) if club_stamp_b64 else None,

@@ -20,7 +20,7 @@ from sav_shared.fpb_mod1 import (
   _MOD1_GUARDIAN_KEYS,
   carimbo_overlay,
   fill_signature_date,
-  render_mod1,
+  render_mod1 as _render_mod1,
   validate_mod1_values,
 )
 from sav_shared.files import rect_has_overlay
@@ -59,6 +59,13 @@ SAMPLE = {
   "consent_marketing": True,
   "data_assinatura": "2026-07-08",
 }
+
+SEASON = "2026/2027"
+
+
+def render_mod1(values, **kwargs):
+  """Render with a fixed explicit season unless a test targets that contract."""
+  return _render_mod1(values, season=SEASON, **kwargs)
 
 
 def _fields(pdf_bytes):
@@ -183,6 +190,11 @@ class TestRenderMod1:
     assert _v(fields, "Nome Completo") == "Rita Constança Silva"
     assert _v(fields, "Nacionalidade") == "Portuguesa"
     assert _v(fields, "País de Nascimento") == "Portugal"
+
+  def test_sav_season_years(self, fields):
+    # The template's names are reversed: epoca2 is visually left/start.
+    assert _v(fields, "epoca2") == "2026"
+    assert _v(fields, "epoca1") == "2027"
 
   def test_gender_and_escalao_checkboxes(self, fields):
     assert _v(fields, "Feminino") == "/On"       # genero by name
@@ -426,11 +438,9 @@ def test_wheel_install_can_fill_mod1(tmp_path):
     check=True, capture_output=True, text=True,
   )
   script = """
-import base64
-from sav_mcp.server import fill_mod1
+from sav_shared.fpb_mod1 import render_mod1
 values = %r
-result = fill_mod1(values=values)
-pdf = base64.b64decode(result["pdf_b64"])
+pdf = render_mod1(values, season="2026/2027")
 assert pdf.startswith(b"%%PDF-")
 print(len(pdf))
 """ % {**{k: v for k, v in SAMPLE.items() if not k.startswith("guardian_")}, "nasc": "1990-03-07"}
@@ -460,6 +470,26 @@ def test_empty_values_render_a_valid_blank_form():
   out = render_mod1({}, validate=False)
   assert out[:5] == b"%PDF-"
   assert len(PdfReader(io.BytesIO(out)).pages) == 1
+
+
+def test_render_requires_explicit_season():
+  with pytest.raises(TypeError, match="season"):
+    _render_mod1({}, validate=False)
+
+
+@pytest.mark.parametrize("season", ("2026", "2026-2027", "2026/2028", 2026))
+def test_render_rejects_invalid_season(season):
+  with pytest.raises(ValueError, match="season"):
+    _render_mod1({}, season=season, validate=False)
+
+
+@pytest.mark.parametrize("key", (
+  "season", "season_id", "season_start_year", "season_end_year",
+  "epoca", "epoca_id", "epoca1", "epoca2",
+))
+def test_render_rejects_season_overrides_in_values(key):
+  with pytest.raises(ValueError, match="supplied separately"):
+    _render_mod1({key: "wrong"}, season=SEASON, validate=False)
 
 
 def _without(values, *keys):
@@ -534,6 +564,16 @@ def test_mapping_targets_exist_in_template():
         targets.extend(group.values())
   missing = sorted(t for t in targets if t not in names)
   assert not missing, f"mapping references PDF fields not in the template: {missing}"
+  assert {"epoca1", "epoca2"} <= names
+
+
+def test_bundled_template_has_no_prefilled_values():
+  with pikepdf.open(render_mod1_template_path()) as pdf:
+    values = {
+      str(f.T): str(f.V) if "/V" in f else ""
+      for f in pdf.Root.AcroForm.Fields if "/T" in f
+    }
+  assert all(value in ("", "/Off") for value in values.values())
 
 
 def render_mod1_template_path():

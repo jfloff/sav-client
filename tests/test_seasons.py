@@ -39,6 +39,8 @@ def test_list_seasons_skips_malformed_entry(monkeypatch):
   client = _client(monkeypatch, [
     {"id": "64", "descricao": "2025/2026", "activa": "1"},
     {"id": "broken", "descricao": "2024/2025", "activa": "0"},
+    {"id": "63", "descricao": "2024/not-a-year", "activa": "0"},
+    {"id": "61", "descricao": "2021/2023", "activa": "0"},
     {"id": "62", "descricao": "2023/2024", "activa": "0"},
   ])
 
@@ -65,6 +67,7 @@ def test_get_current_season_returns_active(monkeypatch):
 
   assert season.id == 64
   assert season.is_active is True
+  assert season.end_year == 2026
 
 
 def test_get_current_season_raises_when_none_is_active(monkeypatch):

@@ -2111,10 +2111,14 @@ class SavClient:
     for entry in entries:
       try:
         label = str(entry["descricao"])
+        start_year_text, end_year_text = label.split("/", 1)
+        start_year = int(start_year_text)
+        if int(end_year_text) != start_year + 1:
+          raise ValueError("season years are not consecutive")
         seasons.append(Season(
           id=int(entry["id"]),
           label=label,
-          start_year=int(label.split("/", 1)[0]),
+          start_year=start_year,
           is_active=str(entry.get("activa")) == "1",
           raw=entry,
         ))

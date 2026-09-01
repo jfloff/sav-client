@@ -114,6 +114,7 @@ class Season:
     id: int          # opaque SAV2 epoch id (epoca_id) — NOT the calendar year
     label: str       # "YYYY/YYYY+1", e.g. "2025/2026"
     start_year: int  # starting calendar year parsed from label, e.g. 2025
+    end_year: int    # property: ending calendar year parsed from label, e.g. 2026
     is_active: bool  # True for the season SAV2 marks current (activa == 1)
 ```
 
@@ -136,6 +137,7 @@ The current (active) season, read straight from SAV2's dedicated season table (`
 ```python
 season = client.get_current_season()
 season.start_year   # 2025
+season.end_year     # 2026
 season.label        # "2025/2026"
 season.id           # opaque epoca_id (sequential; not the calendar year)
 ```

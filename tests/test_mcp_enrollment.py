@@ -226,7 +226,7 @@ def test_parse_enrollment_forms_reads_template_and_skips_ocr(monkeypatch):
     "distrito": "Lisboa", "concelho": "Lisboa",
     "consent_data": True, "consent_communications": True, "consent_marketing": False,
   }
-  pdf_b64 = base64.b64encode(render_mod1(values)).decode()
+  pdf_b64 = base64.b64encode(render_mod1(values, season="2026/2027")).decode()
 
   class StubClient:
     def list_player_registration_tiers(self, gender_id):

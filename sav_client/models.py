@@ -68,6 +68,7 @@ class Season:
         id:          Internal SAV2 season id (``epoca_id``).
         label:       Human label, e.g. "2025/2026".
         start_year:  Starting calendar year parsed from ``label`` (e.g. 2025).
+        end_year:    Ending calendar year parsed from ``label`` (e.g. 2026).
         is_active:   True for the season SAV2 marks as current (``activa == 1``).
     """
 
@@ -76,6 +77,11 @@ class Season:
     start_year: int
     is_active: bool = False
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def end_year(self) -> int:
+        """Ending calendar year parsed from the authoritative SAV label."""
+        return int(self.label.split("/", 1)[1])
 
     def __repr__(self) -> str:
         return (

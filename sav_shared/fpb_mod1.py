@@ -629,6 +629,17 @@ def reconcile_fpb_mod1(
 # importlib.resources so this also works from non-filesystem package loaders.
 _MOD1_TEMPLATE = resources.files("sav_shared").joinpath("files", "mod1", "fpb-mod1.template.pdf")
 
+# The PDF names are reversed relative to visual order: epoca2 is the left/start
+# year and epoca1 is the right/end year. The season is renderer context, not a
+# caller-controlled value field, so it deliberately stays out of
+# MOD1_FILL_MAPPING.
+_MOD1_SEASON_FIELDS: tuple[str, str] = ("epoca2", "epoca1")
+_MOD1_RESERVED_SEASON_KEYS: frozenset[str] = frozenset({
+  "season", "season_id", "season_start_year", "season_end_year",
+  "epoca", "epoca_id", "epoca1", "epoca2",
+})
+_SEASON_LABEL_RE = re.compile(r"^(\d{4})/(\d{4})$")
+
 # Checkbox on-state export value shared by every /Btn field on this form.
 _ON_STATE = "/On"
 
@@ -759,7 +770,7 @@ class _Consent:
 # could later be fed in directly. Distrito/Concelho are free-text on this form,
 # so callers pass names (this renderer does no SAV lookup).
 MOD1_FILL_MAPPING: dict[str, object] = {
-  # ── Header: enrollment type / licence / club / association / season ──────────
+  # ── Header: enrollment type / licence / club / association ───────────────────
   "tipo_inscricao":         _CheckGroup(by_int=_INSCRICAO_PDF_FIELD, by_name=_INSCRICAO_NAME_FIELD),
   "license":                _Text("nr_licenca"),
   "clube":                  _Text("Clube"),
@@ -825,6 +836,19 @@ def _split_date(value: str) -> tuple[str, str, str] | None:
     return None
   ano, mes, dia = parts
   return dia, mes, ano
+
+
+def _split_season_label(value: str) -> tuple[str, str]:
+  """Return the two years from an authoritative SAV ``YYYY/YYYY`` label."""
+  if not isinstance(value, str):
+    raise ValueError(f"season must be a SAV label like '2026/2027'; got {value!r}")
+  match = _SEASON_LABEL_RE.fullmatch(value.strip())
+  if not match:
+    raise ValueError(f"season must be a SAV label like '2026/2027'; got {value!r}")
+  start, end = match.groups()
+  if int(end) != int(start) + 1:
+    raise ValueError(f"season years must be consecutive; got {value!r}")
+  return start, end
 
 
 _POSTAL_RE = re.compile(r"^(\d{4})\s*-?\s*(\d{3})$")
@@ -1096,6 +1120,7 @@ def validate_mod1_values(values: dict) -> list[str]:
 def render_mod1(
   values: dict,
   *,
+  season: str,
   template_path: str | os.PathLike[str] | None = None,
   validate: bool = True,
   player_signature: bytes | str | os.PathLike[str] | None = None,
@@ -1103,6 +1128,10 @@ def render_mod1(
   club_stamp: bytes | str | os.PathLike[str] | None = None,
 ) -> bytes:
   """Fill the blank Modelo 1 AcroForm from `values` and return the PDF bytes.
+
+  `season` is the authoritative SAV label (for example ``"2026/2027"``); it
+  fills the template's two Época fields. It is separate from `values`, and any
+  season-like key in `values` is rejected so form data cannot override it.
 
   `values` is keyed by the canonical enrollment field keys (see
   MOD1_FILL_MAPPING). Text fields take strings; checkbox groups (`tipo`,
@@ -1130,6 +1159,14 @@ def render_mod1(
   are composited with overlay_image_on_pdf. The template file is never mutated —
   a filled copy is returned.
   """
+  reserved = sorted(_MOD1_RESERVED_SEASON_KEYS.intersection(values))
+  if reserved:
+    raise ValueError(
+      "Modelo 1 season is supplied separately; remove from values: "
+      + ", ".join(reserved)
+    )
+  season_start, season_end = _split_season_label(season)
+
   if validate:
     problems = validate_mod1_values(values)
     if problems:
@@ -1137,6 +1174,7 @@ def render_mod1(
         "Invalid Modelo 1 values:\n  - " + "\n  - ".join(problems)
       )
   text_updates, checkbox_names = _mod1_field_updates(values)
+  text_updates.update(dict(zip(_MOD1_SEASON_FIELDS, (season_start, season_end))))
   checkbox_names.add(_DEFAULT_TICKED_BOX)
 
   override_path = os.fspath(template_path) if template_path else os.environ.get("MOD1_TEMPLATE_PATH")

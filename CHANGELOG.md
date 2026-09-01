@@ -21,6 +21,33 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.94.0 — 2026-09-01
+
+### Breaking
+
+**`render_mod1` requires an explicit SAV season label**
+`IMPACT: raises` — direct Python callers that omit `season=` now get a
+`TypeError`. Pass the authoritative label returned by
+`client.get_current_season().label`; do not derive it from the opaque epoch id
+or the wall-clock year.
+`DETECT:` `grep -rn "render_mod1(" .`
+`FIX:` call `render_mod1(values, season=client.get_current_season().label)`.
+
+### Changed
+
+**Generated Modelo 1 forms use SAV's active Época**
+`IMPACT: silent` — the bundled template no longer contains a pre-filled season,
+and the CLI/MCP generation paths now fetch SAV's active season and write its two
+years into the form. `fill_mod1` exposes no season parameter and rejects
+season-like keys in `values`, so callers cannot generate a form for a stale or
+fabricated season. `Season.end_year` and MCP `season_end_year` expose the second
+year of the authoritative label.
+`DETECT:` `grep -rn "fill_mod1\|mod1 fill\|season_start_year" .`
+`FIX:` ensure generation has valid SAV credentials; remove any season-like key
+from the values dict.
+
+---
+
 ## 0.93.0 — 2026-08-29
 
 ### Changed

@@ -174,6 +174,9 @@ sav mod1 fill --values values.json --out mod1.pdf \                   # + embed 
   --player-signature player.png --guardian-signature ee.png --club-stamp carimbo.png
 ```
 
+`sav mod1 fill` authenticates and fills the form's Época from SAV's active
+season. The season cannot be overridden in the values file or with a CLI option.
+
 Run `sav --help` or `sav <command> --help` for full option reference.
 
 ---

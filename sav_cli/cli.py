@@ -1858,6 +1858,8 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   guardian_id_number, guardian_id_expiry, guardian_phone, guardian_email,
   consent_data, consent_communications, consent_marketing, data_assinatura.
 
+  The Época is read from SAV's active season and cannot be supplied in VALUES.
+
   All player fields are mandatory; the Licença FPB (license) is required only for
   a Revalidação; and the guardian_* block is required in full only for a minor
   (derived from nasc) and must be empty otherwise. Invalid input is rejected with
@@ -1885,14 +1887,18 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
     raise SavCliError("Values JSON must be an object (dict).", code="bad_input")
 
   try:
+    season = _make_client().get_current_season()
     pdf = render_mod1(
       values,
+      season=season.label,
       player_signature=player_signature_path,
       guardian_signature=guardian_signature_path,
       club_stamp=club_stamp_path,
     )
   except ValueError as e:
     raise SavCliError(str(e), code="bad_input")
+  except (SavConnectionError, SavResponseError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
   try:
     Path(out_path).write_bytes(pdf)
   except OSError as e:

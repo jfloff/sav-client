@@ -57,6 +57,7 @@ class TestResolvesActiveSeason:
     assert season.id == 64
     assert season.label == "2025/2026"
     assert season.start_year == 2025
+    assert season.end_year == 2026
     assert season.is_active is True
 
   def test_sends_op_168_with_session_identity(self, monkeypatch):
