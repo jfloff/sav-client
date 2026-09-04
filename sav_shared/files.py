@@ -191,70 +191,119 @@ _INK_STROKE_LUMINANCE = 60  # at or below → fully opaque
 # paper. Darker means we do not understand the image, so we leave it alone
 # rather than punching holes in it.
 _INK_BORDER_LUMINANCE = 200
+# Below this, a border pixel reads as cut out rather than as background the
+# author left opaque. Well under half, so anti-aliasing cannot reach it.
+_CUTOUT_BORDER_ALPHA = 128
 
 
-def _has_alpha(img: "Image.Image") -> bool:
-  """Whether `img` carries an alpha channel that is actually used."""
-  if img.mode not in ("RGBA", "LA", "PA") and "transparency" not in img.info:
+def _is_cutout(alpha: "Image.Image") -> bool:
+  """Whether an alpha channel is a deliberate cutout rather than incidental.
+
+  Asked before keying, and *only* about keying: keying a real cutout could
+  punch holes through its own artwork, so a cutout is passed through unkeyed.
+
+  The test is the border, symmetric with _border_is_light: a cutout has
+  transparent edges, because that is what being cut out means. A mere
+  `min(alpha) < 255` is not the same question — a signature captured on an
+  HTML canvas is RGBA whether or not anything is translucent, and one column
+  of anti-aliased edge pixels (or a devicePixelRatio re-blit) is enough to
+  make it look prepared when it is a blank canvas with a stroke on it.
+  """
+  if alpha.getextrema()[0] == 255:
     return False
-  alpha = img.convert("RGBA").getchannel("A")
-  return alpha.getextrema()[0] < 255
+  return _border_median(alpha) < _CUTOUT_BORDER_ALPHA
+
+
+def _border_median(channel: "Image.Image") -> int:
+  """Median value of the 1px border of a single-channel image."""
+  w, h = channel.size
+  pixels = channel.load()
+  edge = [pixels[x, y] for x in range(w) for y in (0, h - 1)]
+  edge += [pixels[x, y] for y in range(h) for x in (0, w - 1)]
+  edge.sort()
+  return edge[len(edge) // 2]
 
 
 def _border_is_light(luminance: "Image.Image") -> bool:
   """Whether the 1px border of a greyscale image reads as paper."""
-  w, h = luminance.size
-  pixels = luminance.load()
-  edge = [pixels[x, y] for x in range(w) for y in (0, h - 1)]
-  edge += [pixels[x, y] for y in range(h) for x in (0, w - 1)]
-  edge.sort()
-  return edge[len(edge) // 2] >= _INK_BORDER_LUMINANCE
+  return _border_median(luminance) >= _INK_BORDER_LUMINANCE
 
 
-def prepare_overlay_image(image_bytes: bytes) -> bytes:
+def _ink_alpha(luminance: "Image.Image") -> "Image.Image":
+  """Map paper-to-ink luminance onto a 0-255 alpha ramp."""
+  span = _INK_PAPER_LUMINANCE - _INK_STROKE_LUMINANCE
+  return luminance.point(
+    lambda value: max(0, min(255, round((_INK_PAPER_LUMINANCE - value) * 255 / span)))
+  )
+
+
+def prepare_overlay_image(image_bytes: bytes, *, crop: bool = True) -> bytes:
   """Key a light background to transparent and crop to the ink.
 
-  Signatures fed in by applications arrive as opaque photos or scans of paper:
-  a solid raster that paints a white box over the form's printed lines, framed
-  by whitespace. Both break the overlay — the box hides the line it should sit
-  on, and the margins corrupt placement, because every overlay sizes itself
-  from the image's own pixel dimensions (aspect ratio in fpb_mod4, and
-  add_overlay's aspect-preserving fit inside a fixed rect in render_mod1).
-  Placement factors are calibrated against the ink, so the image has to be the
-  ink.
+  Signatures fed in by applications arrive framed in blank space — an opaque
+  photo or scan of paper, or a transparent PNG exported from a signing canvas
+  the user only wrote in the middle of. Both break the overlay. A solid raster
+  paints a white box over the form's printed line, and blank margins corrupt
+  placement, because every overlay sizes itself from the image's own pixel
+  dimensions (aspect ratio in fpb_mod4, and add_overlay's aspect-preserving fit
+  inside a fixed rect in render_mod1). Placement factors are calibrated against
+  the ink, so the image has to be the ink.
 
-  Returns PNG bytes with the paper keyed out and the result cropped to the
-  strokes. RGB is preserved, so a blue-pen signature stays blue.
+  Returns PNG bytes cropped to the ink, with paper keyed out when there was
+  paper to key. RGB is preserved, so a blue-pen signature stays blue.
 
-  Returns the input unchanged when there is nothing to do or nothing we
-  understand: an image that already carries real transparency (somebody
-  prepared it deliberately, and its padding may be part of a calibrated
-  placement — the club stamp at CLUB_STAMP_PATH is such a file), an image whose
-  border is not light enough to read as paper, or one that keys to nothing.
+  The two steps are independently gated, because they answer different
+  questions:
+
+  * **Keying** applies only when the image is not already a cutout (see
+    _is_cutout) *and* its border reads as paper (_border_is_light). Anything
+    else is left un-keyed rather than risking holes in artwork we do not
+    understand.
+  * **Cropping** applies whenever we can tell ink from background at all —
+    from the alpha channel of a cutout, or from the key we just computed. It
+    is not gated on alpha: blank margins misplace a transparent image exactly
+    as much as an opaque one.
+
+  Pass ``crop=False`` for an image whose padding is part of a calibrated
+  placement rather than an artifact — the club stamp is placed that way against
+  the fixed CLUB_STAMP_RECT, so its callers say so explicitly instead of
+  leaving it to be inferred from a pixel.
+
+  Returns the input unchanged when there is nothing to do: an image we cannot
+  read as ink on a background (a dark or busy border, with no cutout alpha to
+  fall back on), one that keys to nothing, or one already tight to its ink.
   """
   with Image.open(io.BytesIO(image_bytes)) as img:
     img.load()
-    if _has_alpha(img):
+    rgba = img.convert("RGBA")
+
+  alpha = rgba.getchannel("A")
+  if _is_cutout(alpha):
+    keyed = rgba
+  else:
+    luminance = rgba.convert("RGB").convert("L")
+    if not _border_is_light(luminance):
+      # Neither a cutout nor ink on paper — we have no basis for keying, and
+      # none for telling margin from content either, so leave it alone.
       return image_bytes
-    rgb = img.convert("RGB")
+    alpha = _ink_alpha(luminance)
+    keyed = rgba.copy()
+    keyed.putalpha(alpha)
 
-  luminance = rgb.convert("L")
-  if not _border_is_light(luminance):
-    return image_bytes
-
-  span = _INK_PAPER_LUMINANCE - _INK_STROKE_LUMINANCE
-  alpha = luminance.point(
-    lambda value: max(0, min(255, round((_INK_PAPER_LUMINANCE - value) * 255 / span)))
-  )
   box = alpha.getbbox()
   if box is None:
-    # Blank sheet — keying it would leave nothing to overlay.
+    # Blank sheet or empty canvas — there is no ink to place.
     return image_bytes
 
-  keyed = rgb.convert("RGBA")
-  keyed.putalpha(alpha)
+  if crop and box != (0, 0, *rgba.size):
+    keyed = keyed.crop(box)
+  elif keyed is rgba:
+    # A cutout we were told not to crop, or one already tight to its ink:
+    # nothing was done, so hand back the caller's own bytes.
+    return image_bytes
+
   buf = io.BytesIO()
-  keyed.crop(box).save(buf, format="PNG")
+  keyed.save(buf, format="PNG")
   return buf.getvalue()
 
 

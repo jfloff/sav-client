@@ -238,8 +238,12 @@ def overlay_club_stamp(
   if rect is None and bbox is None:
     raise ValueError("OCR did not return a location for carimbo_clube_presente")
 
+  # crop=False: the stamp is placed verbatim against a calibrated rect
+  # (_CLUB_STAMP_SCALE below, or CLUB_STAMP_RECT on the no-OCR path), so its
+  # padding is part of that placement. Keying still applies, so an opaque
+  # stamp file does not paint a white box over the form.
   with open(stamp_path, "rb") as f:
-    stamp_bytes = prepare_overlay_image(f.read())
+    stamp_bytes = prepare_overlay_image(f.read(), crop=False)
   if rect is not None:
     return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=0)
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
@@ -1227,7 +1231,9 @@ def render_mod1(
   ):
     image_bytes = _load_image_bytes(image)
     if image_bytes:
-      image_bytes = prepare_overlay_image(image_bytes)
+      # The signatures are cropped to their ink; the club stamp is placed
+      # verbatim against the calibrated CLUB_STAMP_RECT (see overlay_club_stamp).
+      image_bytes = prepare_overlay_image(image_bytes, crop=not is_club_stamp)
       pdf_bytes = overlay_image_on_pdf(pdf_bytes, image_bytes, rect=rect, page_index=0)
       club_stamped = club_stamped or is_club_stamp
   if club_stamped:

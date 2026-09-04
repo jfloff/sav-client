@@ -87,6 +87,7 @@ def overlay_signature(
   width_factor: float,
   lift_factor: float,
   label: str,
+  crop: bool = True,
 ) -> bytes:
   """Overlay `image` just above the printed label located by `bbox`.
 
@@ -97,7 +98,8 @@ def overlay_signature(
 
   The image first goes through prepare_overlay_image, so a photographed
   signature on white paper is keyed to transparent and cropped to the ink
-  before its aspect drives the geometry.
+  before its aspect drives the geometry. `crop=False` keys without cropping,
+  for an image whose padding is part of a calibrated placement.
 
   Only fires when `present` is False (OCR ran and found the slot empty); any
   other value returns the PDF unchanged. Raises ValueError when an overlay is
@@ -109,7 +111,7 @@ def overlay_signature(
   if bbox is None:
     raise ValueError(f"OCR did not return a location for {label}")
   ax0, ay0, ax1, ay1 = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
-  image = prepare_overlay_image(image)
+  image = prepare_overlay_image(image, crop=crop)
   img_w, img_h = image_size(image)
   aspect = (img_h / img_w) if img_w else 1.0
   out_w = (ax1 - ax0) * width_factor
@@ -130,6 +132,7 @@ def signature_overlay(
   width_factor: float,
   lift_factor: float,
   label: str,
+  crop: bool = True,
 ) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
   """Return an overlay callable that stamps `image` when OCR found the slot empty.
 
@@ -151,6 +154,7 @@ def signature_overlay(
         overlay_signature(
           pdf_bytes, present=present, bbox=bbox, image=image,
           width_factor=width_factor, lift_factor=lift_factor, label=label,
+          crop=crop,
         ),
         OverlayResult(applied=True, effective=True),
       )
@@ -182,13 +186,14 @@ def club_signature_overlay(
 ) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
   """Overlay callable for the club signature/stamp slot on a Modelo 4.
 
-  Wraps signature_overlay with the club placement factors. Pass
-  read_club_signature(parsed)'s (present, bbox) and the club-stamp image
-  (bytes; None → skip). Compose with fpb_mod1.overlaid_pdf on the mod4 upload
+  Wraps signature_overlay with the club placement factors, and places the
+  stamp verbatim (crop=False) because those factors were calibrated against
+  the stamp file's own framing. Pass read_club_signature(parsed)'s
+  (present, bbox) and the club-stamp image (bytes; None → skip). Compose with fpb_mod1.overlaid_pdf on the mod4 upload
   path, exactly like fpb_mod1.carimbo_overlay.
   """
   return signature_overlay(
     present=present, bbox=bbox, image=image,
     width_factor=_CLUB_STAMP_WIDTH_FACTOR, lift_factor=_CLUB_STAMP_LIFT_FACTOR,
-    label="club_signature",
+    label="club_signature", crop=False,
   )

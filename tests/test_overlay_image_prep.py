@@ -56,11 +56,47 @@ def test_keys_a_noisy_jpeg_capture():
   assert out.size[0] < 300
 
 
-def test_leaves_an_already_transparent_image_untouched():
-  """A prepared PNG (like CLUB_STAMP_PATH) keeps its own padding and geometry."""
-  img = Image.new("RGBA", (100, 100), (0, 0, 0, 0))
+def _cutout(size=(100, 100)) -> Image.Image:
+  """A transparent-background PNG with a stroke in the middle."""
+  img = Image.new("RGBA", size, (0, 0, 0, 0))
   ImageDraw.Draw(img).line([(10, 10), (90, 90)], fill=(0, 0, 0, 255), width=5)
-  data = _png(img)
+  return img
+
+
+def test_crops_a_cutout_without_keying_it():
+  """Cropping is not gated on alpha — blank margins misplace a transparent
+  image exactly as much as an opaque one. Keying still is: a real cutout must
+  not have holes punched through its own artwork."""
+  out = _opened(prepare_overlay_image(_png(_cutout())))
+  assert out.size[0] < 95 and out.size[1] < 95     # cropped to the stroke
+  assert out.getchannel("A").getextrema()[1] == 255  # ink still fully opaque
+
+
+def test_crop_false_returns_a_cutout_untouched():
+  """The club stamp is placed verbatim against a fixed rect, so its callers
+  opt out of cropping explicitly rather than relying on an alpha pixel."""
+  data = _png(_cutout())
+  assert prepare_overlay_image(data, crop=False) is data
+
+
+def test_crops_a_near_opaque_canvas_export():
+  """The 0.96.0 bug: a signing canvas exports RGBA whether or not anything is
+  translucent, and a column of anti-aliased edge pixels made it look prepared.
+  It is a blank canvas with a stroke on it, and must be cropped to the stroke."""
+  img = _sheet(size=(960, 526)).convert("RGBA")
+  # A handful of near-opaque edge pixels: min(alpha) < 255, 0.1% of the image.
+  alpha = img.getchannel("A")
+  for y in range(img.size[1]):
+    alpha.putpixel((0, y), 254)
+  img.putalpha(alpha)
+  assert alpha.getextrema()[0] == 254
+  out = _opened(prepare_overlay_image(_png(img)))
+  assert out.size[0] < 300 and out.size[1] < 60
+  assert out.getchannel("A").getpixel((0, 0)) in range(256)
+
+
+def test_leaves_an_image_already_tight_to_its_ink_untouched():
+  data = _png(_cutout().crop(_cutout().getchannel("A").getbbox()))
   assert prepare_overlay_image(data) is data
 
 

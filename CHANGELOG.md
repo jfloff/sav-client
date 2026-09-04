@@ -21,6 +21,49 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.96.1 — 2026-09-04
+
+### Fixed
+
+**`prepare_overlay_image` no longer skips cropping on images with incidental alpha**
+`IMPACT: silent` — 0.96.0 gated *both* keying and cropping behind
+`min(alpha) < 255`. A signature captured on an HTML canvas is RGBA whether or
+not anything is translucent, so one column of anti-aliased edge pixels — or a
+devicePixelRatio re-blit — was enough to classify a blank canvas with a stroke
+on it as a deliberately prepared cutout. It was passed through with its margins
+intact, and since `add_overlay` fits the image inside a fixed rect preserving
+aspect, the margins dominated the fit. A 960×526 export with `min(alpha)=254`
+(0.1% of pixels non-opaque) drew its ink **58×32pt** inside
+`_PLAYER_SIGNATURE_RECT` where an opaque capture of the same signature drew
+190×27pt — the same field rendering at a third the width depending on which
+app produced the file.
+
+Two changes:
+
+- **Cropping is no longer gated on alpha.** It runs whenever ink can be told
+  from background at all — from a cutout's own alpha, or from the luminance key.
+  Blank margins misplace a transparent image exactly as much as an opaque one;
+  the placement factors are calibrated against the ink either way.
+- **Keying is still gated, on a test that survives anti-aliasing.** `_is_cutout`
+  now asks whether the *border* is transparent (symmetric with the existing
+  `_border_is_light`) instead of whether any pixel is. A genuine cutout still
+  passes through un-keyed, so its artwork keeps its holes.
+
+**New:** `prepare_overlay_image(data, crop=False)` keys without cropping, for an
+image whose padding belongs to a calibrated placement. Both club-stamp paths now
+say so explicitly — `fpb_mod1.overlay_club_stamp`, `render_mod1`'s `club_stamp`
+argument, and `fpb_mod4.club_signature_overlay` — rather than relying on the
+alpha channel to imply it. `$CLUB_STAMP_PATH` output is byte-for-byte what
+0.96.0 produced.
+
+`DETECT:` any caller-supplied signature that reaches `render_mod1` or a mod4
+overlay as a PNG with an alpha channel — canvas/tablet captures in particular.
+Compare rendered ink width against a known-good form.
+`FIX:` nothing to change. Signatures that were rendering too small now fill
+their rect; re-render any form still awaiting submission.
+
+---
+
 ## 0.96.0 — 2026-09-04
 
 ### Changed
