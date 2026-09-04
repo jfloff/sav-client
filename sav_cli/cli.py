@@ -1843,7 +1843,8 @@ def mod1_grp():
               help="Image (PNG/JPG) to overlay on the guardian signature line.")
 @click.option("--club-stamp", "club_stamp_path",
               type=click.Path(exists=True, dir_okay=False), default=None,
-              help="Image (PNG/JPG) to overlay on the club-stamp area.")
+              help="Image (PNG/JPG) to overlay on the club-stamp area. "
+                   "Also fills the Assinaturas date with today's.")
 def mod1_fill_cmd(values_path, out_path, player_signature_path,
                   guardian_signature_path, club_stamp_path):
   """Fill the Modelo 1 PDF form from a JSON values dict and write it to --out.
@@ -1851,7 +1852,16 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   Produces a print-ready form. By default the player/guardian signature lines
   and the club stamp are left blank for hand completion; pass --player-signature
   / --guardian-signature / --club-stamp (image files) to stamp any of them onto
-  the form instead. VALUES keys: tipo_inscricao, license, clube,
+  the form instead.
+
+  --club-stamp also fills the Assinaturas date with today's (unless VALUES
+  already carried data_assinatura): stamping is the club asserting it endorsed
+  the form, so a stamped form is a dated form. Do not stamp a form you are
+  handing to the player — the club carimbo reads to the federation as
+  club-endorsed. For an enrollment, leave --club-stamp off and let `sav enroll`
+  stamp and date the form as it uploads it.
+
+  VALUES keys: tipo_inscricao, license, clube,
   associacao, genero, escalao, nome, nacionalidade, pais_nascimento, nif, nasc,
   tipo, numi, dataval, email, tele, morada, localidade_txt, codpostal,
   distrito, concelho, guardian_name, guardian_relation, guardian_id_type,

@@ -1052,6 +1052,16 @@ def fill_mod1(
     form instead, pass any of player_signature_b64, guardian_signature_b64,
     club_stamp_b64 — each a base64-encoded PNG/JPG image overlaid on its area.
 
+    club_stamp_b64 also fills the Assinaturas date with today's (unless values
+    already carried data_assinatura): stamping is the club asserting it endorsed
+    the form, so a stamped form is a dated form.
+
+    Do not stamp a form you are handing to the player. The PDF returned here is
+    distributable, and the club carimbo reads to the federation as
+    club-endorsed — a stamped form is an attestation, not a preview. For an
+    enrollment, leave club_stamp_b64 unset: submit_enrollment stamps and dates
+    the form itself as it files it.
+
     The form's Época is always SAV's active season, resolved server-side. There
     is no season parameter, and season-like keys in values are rejected.
 

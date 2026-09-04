@@ -385,6 +385,81 @@ class TestStampFillsTheSignatureDate:
     assert stamped == undated
 
 
+class TestGenerationStampFillsTheSignatureDate:
+  """render_mod1 dates the form it stamps, exactly as carimbo_overlay does.
+
+  The invariant is "a Modelo 1 carrying the club stamp carries its Assinaturas
+  date", and it has to hold whichever path applied the stamp. It matters most
+  on the path that combines them: a form pre-stamped here arrives at the upload
+  already stamped, so carimbo_overlay skips — and with it the date fill it owns.
+  """
+
+  @staticmethod
+  def _date_fields(pdf_bytes):
+    f = _fields(pdf_bytes)
+    return _v(f, "ass_dia"), _v(f, "ass_mes"), _v(f, "ass_ano")
+
+  @staticmethod
+  def _undated():
+    return {k: v for k, v in SAMPLE.items() if k != "data_assinatura"}
+
+  def test_stamping_at_generation_dates_the_form(self):
+    stamped = render_mod1(self._undated(), club_stamp=_png_bytes())
+    today = date.today()
+    assert self._date_fields(stamped) == (
+      f"{today.day:02d}", f"{today.month:02d}", str(today.year),
+    )
+
+  def test_a_date_in_values_is_never_overwritten(self):
+    stamped = render_mod1(SAMPLE, club_stamp=_png_bytes())
+    assert self._date_fields(stamped) == ("08", "07", "2026")
+
+  def test_an_unstamped_form_is_left_undated(self):
+    assert self._date_fields(render_mod1(self._undated())) == ("", "", "")
+
+  def test_a_signature_alone_does_not_date_the_form(self):
+    """Only the club stamp is an endorsement to date; signatures are not."""
+    signed = render_mod1(
+      self._undated(),
+      player_signature=_png_bytes(),
+      guardian_signature=_png_bytes(),
+    )
+    assert self._date_fields(signed) == ("", "", "")
+
+  def test_the_date_renders_in_every_viewer(self):
+    stamped = render_mod1(self._undated(), club_stamp=_png_bytes())
+    assert all(_has_appearance(stamped, n) for n in ("ass_dia", "ass_mes", "ass_ano"))
+
+  def test_the_stamp_and_the_other_values_survive_the_date_fill(self):
+    stamped = render_mod1(self._undated(), club_stamp=_png_bytes())
+    assert rect_has_overlay(stamped, CLUB_STAMP_RECT) is True
+    f = _fields(stamped)
+    assert _v(f, "Nome Completo") == "Rita Constança Silva"
+    assert _v(f, "Feminino") == "/On"
+    assert _v(f, "dn_ano") == "2010"
+
+  def test_a_form_stamped_at_generation_stays_dated_through_the_upload(self, tmp_path, monkeypatch):
+    """The case that used to slip through: pre-stamped, so the upload skips."""
+    stamp = tmp_path / "stamp.png"
+    stamp.write_bytes(_png_bytes())
+    monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+    generated = render_mod1(self._undated(), club_stamp=_png_bytes())
+
+    # What the upload path resolves for a template PDF with no OCR: it inspects
+    # the fixed stamp rect itself (see _mod1_overlay_fields).
+    carimbo_present = rect_has_overlay(generated, CLUB_STAMP_RECT)
+    assert carimbo_present is True
+    uploaded, result = carimbo_overlay(
+      carimbo_present=carimbo_present, bbox=None, rect=CLUB_STAMP_RECT,
+    )(generated)
+
+    assert result.applied is None and result.effective is True   # not stamped twice
+    today = date.today()
+    assert self._date_fields(uploaded) == (
+      f"{today.day:02d}", f"{today.month:02d}", str(today.year),
+    )
+
+
 class TestFillSignatureDate:
   def test_non_template_pdf_is_returned_unchanged(self):
     writer = PdfWriter()

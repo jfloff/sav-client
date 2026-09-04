@@ -1153,6 +1153,20 @@ def render_mod1(
   (there are no form fields there): omit them to get a clean form to sign/stamp
   offline; pass them to get the completed form. Any subset may be given.
 
+  **Passing `club_stamp` also fills the Assinaturas date** with today's, unless
+  `values` already carried `data_assinatura` — see the comment at the call to
+  fill_signature_date. A stamp is an attestation, not decoration, so a stamped
+  form is dated. Unlike the upload path, a failure to write the date raises
+  rather than returning a stamped-but-undated form: nothing has been filed yet,
+  so the caller can simply render again.
+
+  **Think before stamping at generation.** The bytes returned here are
+  distributable, and a form carrying the club carimbo reads to the federation as
+  club-endorsed — never hand a stamped form to the member it is about, or to
+  anyone who should not be making that claim on the club's behalf. For the
+  enrolment path, leave `club_stamp` unset and let the upload
+  (carimbo_overlay) stamp and date the form as it files it.
+
   Text is filled with pypdf (which generates appearance streams so it renders
   and prints in every viewer, not only those that honour NeedAppearances);
   checkboxes are ticked with pikepdf (see _tick_checkboxes); signatures/stamp
@@ -1193,14 +1207,26 @@ def render_mod1(
   if checkbox_names:
     pdf_bytes = _tick_checkboxes(pdf_bytes, checkbox_names)
 
-  for image, rect in (
-    (player_signature,   _PLAYER_SIGNATURE_RECT),
-    (guardian_signature, _GUARDIAN_SIGNATURE_RECT),
-    (club_stamp,         CLUB_STAMP_RECT),
+  club_stamped = False
+  for image, rect, is_club_stamp in (
+    (player_signature,   _PLAYER_SIGNATURE_RECT,   False),
+    (guardian_signature, _GUARDIAN_SIGNATURE_RECT, False),
+    (club_stamp,         CLUB_STAMP_RECT,          True),
   ):
     image_bytes = _load_image_bytes(image)
     if image_bytes:
       pdf_bytes = overlay_image_on_pdf(pdf_bytes, image_bytes, rect=rect, page_index=0)
+      club_stamped = club_stamped or is_club_stamp
+  if club_stamped:
+    # Stamping and dating are one action: the carimbo is the club asserting it
+    # endorsed this form, so the form carries the date the club stamped it. The
+    # upload path pairs them in carimbo_overlay; pairing them here too keeps the
+    # invariant "a Modelo 1 carrying the club stamp carries its Assinaturas
+    # date" true no matter which path applied the stamp — a form stamped here
+    # arrives at the upload already stamped, which makes that path skip its own
+    # stamp-and-date step. No-op when `values` supplied data_assinatura:
+    # fill_signature_date never overwrites a date somebody else wrote.
+    pdf_bytes = fill_signature_date(pdf_bytes)
   return pdf_bytes
 
 

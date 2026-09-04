@@ -21,6 +21,49 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.95.0 — 2026-09-04
+
+### Changed
+
+**A Modelo 1 stamped at generation is now dated at generation**
+`IMPACT: silent` — `render_mod1(values, club_stamp=...)` (CLI `sav mod1 fill
+--club-stamp`, MCP `fill_mod1(club_stamp_b64=...)`) now also fills the
+Assinaturas date with today's, so a stamped form is a dated form on the
+generation path as it already was on the upload path. It no-ops when `values`
+carried `data_assinatura` — `fill_signature_date` never overwrites a date
+somebody else wrote — so only forms that were previously left blank change.
+
+Before this, pre-stamping at generation produced forms that reached the FPB
+**stamped but undated**, and nothing reported it: `submit_enrollment` uploads
+the source PDF, `mod1_values_to_fields` emits no `carimbo_clube_presente`, so
+the upload falls back to inspecting `CLUB_STAMP_RECT`, finds the stamp already
+there, and `carimbo_overlay` returns `applied=None, effective=True` before the
+`overlay_club_stamp` / `fill_signature_date` pair it owns. `has_club_stamp` was
+`True` and the form was undated.
+
+`DETECT:` `grep -rn "club_stamp=\|club_stamp_b64\|--club-stamp" .`
+`FIX:` nothing to change if you want the date. If you were relying on a stamped
+form staying undated, pass `data_assinatura` explicitly, or stop stamping at
+generation.
+
+### Deprecated
+
+**Stamping at generation is discouraged, for the enrolment path and generally**
+`IMPACT: silent` — no behaviour change; `club_stamp` still works. Two reasons
+now documented on `render_mod1` / `fill_mod1` / `sav mod1 fill`:
+
+- For an enrolment, leave the stamp off and let `submit_enrollment` (`sav
+  enroll`) stamp and date the form as it files it — that path owns both, and
+  pre-stamping only makes it skip its own step.
+- `fill_mod1` output is distributable. A form carrying the club carimbo reads to
+  the federation as club-endorsed, so a stamped form is an attestation, not a
+  preview — never hand one to the member it is about.
+
+`DETECT:` `grep -rn "club_stamp_b64\|--club-stamp" .`
+`FIX:` drop the stamp from any member-facing or preview generation path.
+
+---
+
 ## 0.94.0 — 2026-09-01
 
 ### Breaking

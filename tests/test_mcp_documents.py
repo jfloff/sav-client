@@ -1497,6 +1497,57 @@ def test_submit_path_does_not_double_stamp_mod1_template(monkeypatch, tmp_path):
   assert _xobjs(captured["bytes"]) == _xobjs(base)
 
 
+def test_submit_path_uploads_a_generation_stamped_mod1_dated(monkeypatch, tmp_path):
+  """A form stamped by render_mod1 reaches the federation stamped *and* dated.
+
+  The upload skips its own stamp-and-date step for an already-stamped form, so
+  the date has to come from the generation side. Before render_mod1 filled it,
+  this exact path uploaded a stamped-but-undated form and reported has_club_stamp
+  True with nothing flagging the missing date.
+  """
+  import io
+  from datetime import date
+
+  from pypdf import PdfReader
+
+  from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp_bytes = base64.b64decode(_png_b64())
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(stamp_bytes)
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
+  )
+  undated = {k: v for k, v in SAMPLE.items() if k != "data_assinatura"}
+  base = render_mod1(undated, season="2026/2027", club_stamp=stamp_bytes)
+
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_1,
+    parsed=mod1_values_to_fields(undated),
+    reg_type=1,
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_club_stamp"] is True
+  assert _xobjs(captured["bytes"]) == _xobjs(base)   # not stamped twice
+  fields = PdfReader(io.BytesIO(captured["bytes"])).get_fields()
+  today = date.today()
+  assert tuple(str(fields[n].get("/V", "")) for n in ("ass_dia", "ass_mes", "ass_ano")) == (
+    f"{today.day:02d}", f"{today.month:02d}", str(today.year),
+  )
+
+
 def test_submit_path_trusted_values_scan_ocr_checks_carimbo_and_closes(
   monkeypatch, tmp_path,
 ):
