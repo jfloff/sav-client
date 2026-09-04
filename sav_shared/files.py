@@ -180,6 +180,84 @@ def load_image_bytes(arg: bytes | str | os.PathLike[str] | None) -> bytes | None
     return f.read()
 
 
+# Ink-keying levels for prepare_overlay_image, on the 0-255 luminance scale.
+# Photographed or scanned paper is never pure white and phone captures are
+# never pure black, so the curve is a ramp rather than a threshold: it keeps
+# anti-aliased stroke edges soft (no halo, no jagged fringe) while pushing
+# paper and JPEG noise to fully transparent.
+_INK_PAPER_LUMINANCE = 240  # at or above → fully transparent
+_INK_STROKE_LUMINANCE = 60  # at or below → fully opaque
+# The border must be at least this light for the image to look like ink on
+# paper. Darker means we do not understand the image, so we leave it alone
+# rather than punching holes in it.
+_INK_BORDER_LUMINANCE = 200
+
+
+def _has_alpha(img: "Image.Image") -> bool:
+  """Whether `img` carries an alpha channel that is actually used."""
+  if img.mode not in ("RGBA", "LA", "PA") and "transparency" not in img.info:
+    return False
+  alpha = img.convert("RGBA").getchannel("A")
+  return alpha.getextrema()[0] < 255
+
+
+def _border_is_light(luminance: "Image.Image") -> bool:
+  """Whether the 1px border of a greyscale image reads as paper."""
+  w, h = luminance.size
+  pixels = luminance.load()
+  edge = [pixels[x, y] for x in range(w) for y in (0, h - 1)]
+  edge += [pixels[x, y] for y in range(h) for x in (0, w - 1)]
+  edge.sort()
+  return edge[len(edge) // 2] >= _INK_BORDER_LUMINANCE
+
+
+def prepare_overlay_image(image_bytes: bytes) -> bytes:
+  """Key a light background to transparent and crop to the ink.
+
+  Signatures fed in by applications arrive as opaque photos or scans of paper:
+  a solid raster that paints a white box over the form's printed lines, framed
+  by whitespace. Both break the overlay — the box hides the line it should sit
+  on, and the margins corrupt placement, because every overlay sizes itself
+  from the image's own pixel dimensions (aspect ratio in fpb_mod4, and
+  add_overlay's aspect-preserving fit inside a fixed rect in render_mod1).
+  Placement factors are calibrated against the ink, so the image has to be the
+  ink.
+
+  Returns PNG bytes with the paper keyed out and the result cropped to the
+  strokes. RGB is preserved, so a blue-pen signature stays blue.
+
+  Returns the input unchanged when there is nothing to do or nothing we
+  understand: an image that already carries real transparency (somebody
+  prepared it deliberately, and its padding may be part of a calibrated
+  placement — the club stamp at CLUB_STAMP_PATH is such a file), an image whose
+  border is not light enough to read as paper, or one that keys to nothing.
+  """
+  with Image.open(io.BytesIO(image_bytes)) as img:
+    img.load()
+    if _has_alpha(img):
+      return image_bytes
+    rgb = img.convert("RGB")
+
+  luminance = rgb.convert("L")
+  if not _border_is_light(luminance):
+    return image_bytes
+
+  span = _INK_PAPER_LUMINANCE - _INK_STROKE_LUMINANCE
+  alpha = luminance.point(
+    lambda value: max(0, min(255, round((_INK_PAPER_LUMINANCE - value) * 255 / span)))
+  )
+  box = alpha.getbbox()
+  if box is None:
+    # Blank sheet — keying it would leave nothing to overlay.
+    return image_bytes
+
+  keyed = rgb.convert("RGBA")
+  keyed.putalpha(alpha)
+  buf = io.BytesIO()
+  keyed.crop(box).save(buf, format="PNG")
+  return buf.getvalue()
+
+
 def overlay_image_on_pdf(
   pdf_bytes: bytes,
   image_bytes: bytes,

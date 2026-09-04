@@ -17,6 +17,7 @@ from pypdf import PdfReader, PdfWriter
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
   CLUB_STAMP_RECT,
+  _GUARDIAN_SIGNATURE_RECT,
   _MOD1_GUARDIAN_KEYS,
   carimbo_overlay,
   fill_signature_date,
@@ -654,3 +655,58 @@ def test_bundled_template_has_no_prefilled_values():
 def render_mod1_template_path():
   from sav_shared.fpb_mod1 import _MOD1_TEMPLATE
   return str(_MOD1_TEMPLATE)
+
+
+class TestGuardianSignatureRect:
+  """The guardian signature is placed by coordinate, not by a form field, so
+  nothing but a test catches it drifting off the printed line."""
+
+  @staticmethod
+  def _printed_line():
+    """Re-derive the "Assinatura ____" line from the template: (x0, x1, baseline).
+
+    Locates the text run, then advances through it with the embedded font's
+    own widths to find where the underscores start and end.
+    """
+    from importlib import resources
+    runs = []
+
+    def visitor(text, cm, tm, font, size):
+      if "Assinatura ___" in text:
+        runs.append((text, tm, font))
+
+    with resources.as_file(
+      resources.files("sav_shared").joinpath("files", "mod1", "fpb-mod1.template.pdf")
+    ) as path:
+      PdfReader(path).pages[0].extract_text(visitor_text=visitor)
+    assert len(runs) == 1, "template no longer has exactly one 'Assinatura ___' run"
+    text, tm, font = runs[0]
+    first_char = int(font["/FirstChar"])
+    widths = [float(w) for w in font["/Widths"]]
+
+    def advance(chars):
+      return sum(widths[ord(c) - first_char] for c in chars) / 1000.0 * tm[0]
+
+    start = tm[4] + advance(text[: text.index("_")])
+    return (start, start + advance("_" * text.count("_")), tm[5])
+
+  def test_is_centred_on_the_printed_line(self):
+    line_x0, line_x1, _ = self._printed_line()
+    x0, _, x1, _ = _GUARDIAN_SIGNATURE_RECT
+    # Within a point of the line's own centre — a signature centred anywhere
+    # else reads as offset to whoever signs it.
+    assert abs((x0 + x1) / 2 - (line_x0 + line_x1) / 2) < 1.0
+
+  def test_stays_within_the_printed_line(self):
+    line_x0, line_x1, _ = self._printed_line()
+    x0, _, x1, _ = _GUARDIAN_SIGNATURE_RECT
+    assert x0 >= line_x0 and x1 <= line_x1
+
+  def test_sits_on_the_line_not_below_it(self):
+    """The rect's bottom is the signature's bottom (add_overlay centres the
+    image, and a wide signature is height-limited), so it belongs at the line."""
+    _, _, baseline = self._printed_line()
+    _, y0, _, y1 = _GUARDIAN_SIGNATURE_RECT
+    assert baseline - 2.0 <= y0 <= baseline
+    # Clears the descenders of the paragraph baselined just above it.
+    assert y1 <= 98.0

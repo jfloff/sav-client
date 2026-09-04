@@ -21,6 +21,61 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.96.0 — 2026-09-04
+
+### Changed
+
+**Signature and stamp images are now keyed and cropped before they are overlaid**
+`IMPACT: silent` — every caller-supplied overlay image (`render_mod1`'s
+`player_signature` / `guardian_signature` / `club_stamp`, mod4's
+`--detentor-signature`, and `$CLUB_STAMP_PATH`) passes through the new
+`sav_shared.files.prepare_overlay_image` before compositing. An **opaque** image
+whose border reads as paper has that background keyed to transparent and is
+cropped to its ink; the overlay then renders smaller-framed and larger-inked
+than before.
+
+Two bugs motivated it, both from applications feeding photographed or scanned
+signatures. An opaque raster paints a white box over the form's printed
+signature line, hiding it. And whitespace margins corrupt placement, because
+every overlay derives its geometry from the image's own pixel dimensions —
+`fpb_mod4.overlay_signature` takes the aspect ratio from `image_size`, and
+`render_mod1` relies on `add_overlay` fitting the image inside a fixed rect
+preserving aspect. The placement factors are calibrated against the ink, so
+padding silently shrank and misplaced the result.
+
+Images are returned **unchanged** when the keying does not apply: one that
+already carries real transparency (a deliberately prepared PNG, such as a
+typical `$CLUB_STAMP_PATH` file, whose padding may be part of a calibrated
+placement), one whose border is too dark to read as paper, or one that keys to
+nothing. So a correct transparent stamp is untouched.
+
+`DETECT:` `grep -rn "player_signature\|guardian_signature\|club_stamp\|detentor.signature\|CLUB_STAMP_PATH" .`
+`FIX:` nothing to change to get the fix. If you were relying on an image's
+whitespace to position it, crop it yourself and add the padding back as
+transparency — an image with an alpha channel is passed through verbatim.
+
+### Fixed
+
+**The guardian signature is no longer placed to the right of its printed line**
+`IMPACT: silent` — `_GUARDIAN_SIGNATURE_RECT` was `(215, 72, 500, 97)`, centred
+at x=357.5. The template's "Assinatura ____" line runs x 191.5 → 408.4, centre
+299.9, so every guardian signature `render_mod1` produced sat ~58pt (2cm) right
+of centre, overran the line's right end by ~92pt, and floated below the line
+rather than resting on it. Now `(195, 78.5, 405, 97.5)`: centred on the line,
+inside its ends, bottom on the baseline where the underscore glyph draws.
+
+Nothing reported it because these are coordinates, not form fields — there is
+no readback. `TestGuardianSignatureRect` in `tests/test_mod1_fill.py` now
+re-derives the line's position from the template's own text run and font
+widths, so a template change fails the suite instead of shifting signatures.
+
+`DETECT:` visual only — open a form produced by `render_mod1(...,
+guardian_signature=...)` before 0.96.0.
+`FIX:` nothing to change. Re-render any form still awaiting submission if the
+placement bothers you; a form already filed is unaffected.
+
+---
+
 ## 0.95.0 — 2026-09-04
 
 ### Changed

@@ -20,7 +20,7 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from .files import bbox_to_pdf_rect, image_size, overlay_image_on_pdf
+from .files import bbox_to_pdf_rect, image_size, overlay_image_on_pdf, prepare_overlay_image
 from .fpb_mod1 import OverlayResult
 
 logger = logging.getLogger(__name__)
@@ -95,6 +95,10 @@ def overlay_signature(
   its bottom sits ``lift_factor × output_height`` above the label. This keeps a
   round stamp round and a wide signature flat regardless of the anchor's shape.
 
+  The image first goes through prepare_overlay_image, so a photographed
+  signature on white paper is keyed to transparent and cropped to the ink
+  before its aspect drives the geometry.
+
   Only fires when `present` is False (OCR ran and found the slot empty); any
   other value returns the PDF unchanged. Raises ValueError when an overlay is
   wanted but `bbox` is None (OCR gave no location). `label` names the slot in
@@ -105,6 +109,7 @@ def overlay_signature(
   if bbox is None:
     raise ValueError(f"OCR did not return a location for {label}")
   ax0, ay0, ax1, ay1 = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
+  image = prepare_overlay_image(image)
   img_w, img_h = image_size(image)
   aspect = (img_h / img_w) if img_w else 1.0
   out_w = (ax1 - ax0) * width_factor

@@ -30,6 +30,7 @@ from .files import (
   bbox_to_pdf_rect,
   load_image_bytes as _load_image_bytes,
   overlay_image_on_pdf,
+  prepare_overlay_image,
   scale_rect as _scale_rect,
 )
 
@@ -238,7 +239,7 @@ def overlay_club_stamp(
     raise ValueError("OCR did not return a location for carimbo_clube_presente")
 
   with open(stamp_path, "rb") as f:
-    stamp_bytes = f.read()
+    stamp_bytes = prepare_overlay_image(f.read())
   if rect is not None:
     return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=0)
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
@@ -713,8 +714,17 @@ _ESCALAO_NAME_FIELD: dict[str, str] = {
 # CLUB_STAMP_RECT is public: the no-OCR upload path needs it to both detect an
 # existing stamp (rect_has_overlay) and place a missing one. The two signature
 # rects stay private — nothing outside this module places those.
+#
+# The guardian rect is derived from the template rather than eyeballed: the
+# "Assinatura ____" run starts at x=155.76 with a 7.92pt Calibri, and its 55
+# underscores span x 191.5 → 408.4 (centre 299.9) on the y=79.44 baseline.
+# The rect is centred on that run and its bottom sits just under the baseline,
+# where the underscore glyph draws, so the signature rests *on* the line; the
+# top clears the descenders of the paragraph baselined at y=100.1. See
+# TestGuardianSignatureRect in tests/test_mod1_fill.py, which re-derives all
+# of this from the template file.
 _PLAYER_SIGNATURE_RECT:   tuple[float, float, float, float] = (55.0, 196.0, 245.0, 228.0)
-_GUARDIAN_SIGNATURE_RECT: tuple[float, float, float, float] = (215.0, 72.0, 500.0, 97.0)
+_GUARDIAN_SIGNATURE_RECT: tuple[float, float, float, float] = (195.0, 78.5, 405.0, 97.5)
 CLUB_STAMP_RECT:         tuple[float, float, float, float] = (410.0, 193.0, 545.0, 231.0)
 
 
@@ -1170,7 +1180,9 @@ def render_mod1(
   Text is filled with pypdf (which generates appearance streams so it renders
   and prints in every viewer, not only those that honour NeedAppearances);
   checkboxes are ticked with pikepdf (see _tick_checkboxes); signatures/stamp
-  are composited with overlay_image_on_pdf. The template file is never mutated —
+  are composited with overlay_image_on_pdf, after prepare_overlay_image keys an
+  opaque paper background to transparent and crops to the ink, so a
+  photographed signature does not paint a white box over the printed line. The template file is never mutated —
   a filled copy is returned.
   """
   reserved = sorted(_MOD1_RESERVED_SEASON_KEYS.intersection(values))
@@ -1215,6 +1227,7 @@ def render_mod1(
   ):
     image_bytes = _load_image_bytes(image)
     if image_bytes:
+      image_bytes = prepare_overlay_image(image_bytes)
       pdf_bytes = overlay_image_on_pdf(pdf_bytes, image_bytes, rect=rect, page_index=0)
       club_stamped = club_stamped or is_club_stamp
   if club_stamped:
