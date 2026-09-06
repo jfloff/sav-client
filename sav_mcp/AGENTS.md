@@ -236,6 +236,15 @@ The `missing_guardian_fields` response from `submit_enrollment` is now a fallbac
 
 For any *"que documentos precisa o jogador X para se inscrever"* question — including future-season / not-yet-enrolled ones — **call `get_enrollment_status(license, reg_type?)` and report its `checklist`**, never answer from general knowledge. The list changes with the player's nationality, and only the tool grounds nationality in their actual record. The checklist is returned for every status: `pending` reflects the live batch's uploads; `enrolled` / `not_enrolled` return a `projected: true` checklist (nationality from the stored record, `reg_type` defaulting to Revalidação/1ª Inscrição). When the player has no SAV record yet (brand-new 1ª Inscrição, no licence), apply the rule below from their stated nationality.
 
+**Reconciling documents you already hold** (a club document store, an upload staging area) against that checklist is a two-call job that touches no SAV state:
+
+1. `classify_documents(documents=[{"pdf": b64}, ...])` → `[{index, doc_type, uploadable}, ...]` — names **every** type SAV files, including the three `parse_enrollment_forms` rejects (`atestado_residencia`, `certidao_matricula`, `documento_identificacao`). Those are exactly the ones a foreign-born checklist turns on, and before this tool the only way to name them was `upload_player_document`, which writes. `outros` is a normal answer, not an error.
+2. Feed those doc types back as `available_doc_types`:
+   - `get_enrollment_status(license, available_doc_types=[...])` when the player has a licence — **prefer this**, it grounds nationality in their real record and unions your documents with the live batch's uploads.
+   - `enrollment_checklist(reg_type, nationality_id?, available_doc_types=[...])` when they have none (a genuinely new 1ª Inscrição). Omitting `nationality_id` gives the foreign-born set on purpose; never pass 155 off a Portuguese-looking name.
+
+Pass **one entry per document** — duplicates carry meaning, since foreign_born needs two `documento_identificacao` and SAV files both under `tipo_doc=18`, so the rule counts rather than names them. An unrecognised doc type raises rather than being dropped, because a silently ignored typo reports a document as missing that you believe you supplied.
+
 For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set splits on nationality:
 
 | Scenario | nacional | Required documents |
@@ -263,7 +272,9 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 ### Generate a Modelo 1 form (outbound)
 - `fill_mod1(values, player_signature_b64?, guardian_signature_b64?, club_stamp_b64?)` — the reverse of parse/reconcile: fill a blank FPB Modelo 1 from a values dict and return `{filename, size_bytes, pdf_b64}` (a print-ready enrollment form). The Época is always fetched from SAV's active-season table; the tool exposes no season argument, and season-like keys in `values` are rejected. `values` keys mirror `field_overrides` plus the header/identity fields (`tipo_inscricao`, `license`, `clube`, `associacao`, `genero`, `escalao`, `nome`, `nacionalidade`, `pais_nascimento`, `data_assinatura`). **Every player field is mandatory; the Licença FPB only for a Revalidação; the guardian block in full only for a minor (from `nasc`) and empty otherwise — invalid input raises.** The player Telefone (landline) is never filled. The three `*_b64` params are optional PNG/JPG signature/stamp images overlaid on their areas — omit them for a form to sign offline, pass any subset for the completed form. A photo or scan on white paper is fine: the background is keyed to transparent and the image cropped to the ink before it is overlaid, so it never paints a box over the printed line and blank margins never shrink it. A transparent PNG (a canvas or tablet capture) is cropped too but never keyed, so a cutout keeps its artwork. **`club_stamp_b64` also fills the Assinaturas date** with today's (unless `values` carried `data_assinatura`) — stamping and dating are one action, so a stamped form is never undated. **Prefer not to stamp here at all:** for an enrollment leave it unset and let `submit_enrollment` stamp and date the form as it files it, and never stamp a form you hand to the player — this output is distributable and the carimbo reads to the federation as club-endorsed. Forms produced here are read back through the AcroForm with no OCR, and adding any of the three images does not break that path. A caller holding the authoritative record can skip the PDF round-trip entirely by passing the same dict as a document entry's `values`.
 
+
 ### Ad-hoc documents
+- `classify_documents(documents)` — identify document types without reading or writing SAV. See [Required documents](#required-documents-depend-on-nationality-and-reg_type).
 - `list_player_documents(license)` — what's uploaded for this player.
 - `upload_player_document(license, pdf_base64, doc_type?)`.
 - `replace_player_document(license, pdf_base64, doc_type?)` — replaces existing doc of that type.

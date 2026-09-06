@@ -182,6 +182,19 @@ roles = ["coach"]
 roles      = ["coach"]
 self_scope = ["parent", "player"]
 
+# Classification touches no SAV record and names no subject: it answers "what
+# kind of document is this file", which is the same answer for everybody. Same
+# roles as parse_enrollment_forms, which is the OCR step it sits beside.
+[tools.classify_documents]
+roles      = ["coach"]
+self_scope = ["parent", "player"]
+
+# A pure policy lookup — the FPB required-document rule, with no SAV call and
+# no subject. A parent asking "what does my child need" is the motivating case,
+# so it is open to every role.
+[tools.enrollment_checklist]
+roles = ["coach", "parent", "player"]
+
 [tools.find_open_batch]
 roles      = ["coach"]
 self_scope = ["parent", "player"]

@@ -21,6 +21,72 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.97.0 — 2026-09-05
+
+### Added
+
+**`classify_documents(documents)` — read-only document typing, for every type SAV files**
+`IMPACT: none` (new tool). Answers "what kind of document is this file" for a
+caller holding a pile of PDFs, without reading or writing SAV. Each entry takes
+exactly one key, `pdf` (base64 PDF or image bytes; images are converted);
+unknown keys are an error, matching `parse_enrollment_forms`. Returns one row
+per input in input order: `{index, doc_type, uploadable}` or `{index, error}`.
+Documents are classified concurrently (4 workers, the same bound
+`parse_enrollment_forms` uses).
+
+This exists because there was **no read-only way to identify a supplementary
+document**. `parse_enrollment_forms` errors with `Unsupported document type` on
+`atestado_residencia`, `certidao_matricula` and `documento_identificacao`,
+because it goes on to extract fields and only fpb_modelo_1 / exame_medico /
+fpb_modelo_4 have field extractors. Those three types are precisely what a
+foreign-born player's checklist turns on, so the only tool that could name them
+was `upload_player_document` with `doc_type` omitted — which writes to SAV.
+Reconciling a club's document store against SAV therefore required uploading
+first. It no longer does.
+
+`outros` is a normal result, not an error: "this file is not an enrollment
+document" is the common answer for a folder that also holds team photos. Unlike
+`parse_enrollment_forms`' `doc_type` hint path, this never calls
+`train_classifier` — it has no label to train on. One Document AI round-trip per
+document, and no caching, so cache against your own file identity if you scan
+repeatedly.
+
+**`enrollment_checklist(reg_type, nationality_id?, available_doc_types?)` — the FPB rule, standalone**
+`IMPACT: none` (new tool). Exposes `compute_enrollment_checklist` with no SAV
+lookup, for a player SAV cannot ground: `get_enrollment_status` keys on a
+licence, and a genuinely new player doing a 1ª Inscrição has none. Returns the
+same `{scenario, reg_type, required, optional, missing}` shape, or null for
+reg_type 3 (Transferência, still not modelled).
+
+Omitting `nationality_id` yields the **foreign_born** set, matching
+`compute_enrollment_checklist`'s existing defensive default — asking for
+documents that turn out to be unnecessary is recoverable; declaring someone
+ready when they are not is not. Do not pass 155 from a Portuguese-looking name
+or a form field; pass it only from a SAV record. Prefer `get_enrollment_status`
+for anyone who has a licence, since it reads their real nationality and their
+live batch instead of taking the caller's word for either.
+
+`available_doc_types` takes one entry per document — duplicates are significant,
+because foreign_born requires **two** `documento_identificacao` and SAV files
+both under `tipo_doc=18`, so they can only be counted. An unrecognised doc type
+raises rather than being dropped: a silently ignored typo would report a
+document as missing that the caller believes they supplied.
+
+### Changed
+
+**`get_enrollment_status` accepts `available_doc_types`**
+`IMPACT: none` when the parameter is omitted — the response is byte-for-byte
+what it was. Supplying it folds documents the caller holds **outside** SAV into
+the checklist counts, so the answer becomes "what is still missing overall"
+rather than "what has SAV been given so far". The response then additionally
+carries `available_doc_types` (echoed back, normalised) and the checklist gains
+`counts_include_available: true`. Applies to all three statuses: `pending` takes
+the union of the live batch's uploads and the supplied set; `enrolled` and
+`not_enrolled` keep `projected: true` (SAV holds no batch uploads) while the
+counts become meaningful against the supplied set.
+
+---
+
 ## 0.96.1 — 2026-09-04
 
 ### Fixed

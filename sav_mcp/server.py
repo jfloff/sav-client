@@ -108,6 +108,8 @@ from sav_shared.lookups import (
     REGISTRATION_TYPE_LABELS,
     TIER_AGE_RANGE_IN_SEASON,
     doc_type_to_tipo_doc,
+    is_uploadable_doc_type,
+    normalize_doc_type,
     player_registration_tiers,
     reference_data,
     tier_birth_years_for_season,
@@ -1968,6 +1970,104 @@ def _parse_one_enrollment_pdf(
 _PARSE_MAX_WORKERS = 4
 
 
+def _classify_one_document(index: int, document: dict) -> dict:
+    """Classify one document: the per-entry body of classify_documents.
+
+    Runs on a worker thread, so it touches no shared state. Never raises —
+    every failure comes back as ``{"index": ..., "error": ...}``, so one
+    unreadable PDF in a batch of forty does not lose the other thirty-nine.
+    """
+    from sav_parsers import classify
+
+    if not isinstance(document, dict):
+        return {"index": index, "error": "Document entry must be an object."}
+    unknown_keys = sorted(set(document) - {"pdf"})
+    if unknown_keys:
+        return {
+            "index": index,
+            "error": f"Unknown document keys: {', '.join(unknown_keys)}",
+        }
+    pdf_b64 = document.get("pdf")
+    if not isinstance(pdf_b64, str) or not pdf_b64.strip():
+        return {"index": index, "error": "Missing or invalid required key: pdf"}
+    try:
+        pdf_bytes = base64.b64decode(pdf_b64)
+    except (binascii.Error, ValueError) as exc:
+        return {"index": index, "error": f"Invalid base64: {exc}"}
+
+    tmp_path: str | None = None
+    try:
+        tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
+        doc_type = classify(tmp_path)
+    except (SavError, ValueError, KeyError, OSError) as exc:
+        return {"index": index, "error": str(exc)}
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+    # Outside the try/finally so the temp file is already gone: this call is a
+    # pure lookup that cannot fail (is_uploadable_doc_type catches ValueError
+    # and returns False), so it needs no cleanup protection of its own.
+    return {
+        "index": index,
+        "doc_type": doc_type.value,
+        "uploadable": is_uploadable_doc_type(doc_type.value),
+    }
+
+
+@server.tool()
+def classify_documents(documents: list[dict]) -> list[dict]:
+    """
+    Identify what kind of enrollment document each PDF is. Reads nothing from
+    SAV and writes nothing anywhere.
+
+    Answers "which of the required documents do I already hold?" for a caller
+    holding a pile of files — a club's document store, an upload staging area,
+    an inbox — before deciding whether to enrol anyone. Pair it with
+    ``enrollment_checklist`` (or ``get_enrollment_status``'s
+    ``available_doc_types``) to turn that pile into a list of what is still
+    missing.
+
+    Covers **every** type SAV files, which is what distinguishes it from
+    ``parse_enrollment_forms``: that tool errors on anything outside
+    fpb_modelo_1 / exame_medico / fpb_modelo_4 because it goes on to extract
+    fields, and only those three have field extractors. The supplementary
+    documents — atestado_residencia, certidao_matricula,
+    documento_identificacao — carry no fields we read, but they are exactly
+    the ones a foreign-born player's checklist turns on, so a caller that only
+    needs the *type* was previously forced through an upload
+    (``upload_player_document`` with no ``doc_type``) to get it. That wrote to
+    SAV. This does not.
+
+    Each entry takes exactly one key, ``pdf`` (base64-encoded PDF or image
+    bytes; images are converted). Unknown keys are an error, matching
+    ``parse_enrollment_forms``, so a misspelling never silently classifies
+    something you meant to hint.
+
+    Returns one row per input, in input order:
+      ``{"index": int, "doc_type": str, "uploadable": bool}`` — ``doc_type``
+      is one of exame_medico, fpb_modelo_1, fpb_modelo_4, atestado_residencia,
+      certidao_matricula, documento_identificacao, or **outros** when the
+      classifier recognises nothing (never an error: "this file is not an
+      enrollment document" is a real and common answer). ``uploadable`` says
+      SAV has a tipo_doc slot for the type — **not** that the document belongs
+      in SAV. Every type SAV files maps today, ``outros`` included, so this is
+      currently true for every row; it exists so a future unmapped type
+      degrades to false instead of failing an upload later.
+      ``{"index": int, "error": str}`` — that PDF could not be classified.
+
+    Classification is one Document AI round-trip per document and does not
+    train the classifier, so re-running is safe but not free; cache results
+    against your own file identity if you scan repeatedly.
+    """
+    jobs = list(enumerate(documents))
+    if len(jobs) <= 1:
+        return [_classify_one_document(index, doc) for index, doc in jobs]
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(_PARSE_MAX_WORKERS, len(jobs))) as pool:
+        return list(pool.map(lambda job: _classify_one_document(*job), jobs))
+
+
 @server.tool()
 def parse_enrollment_forms(documents: list[dict]) -> list[dict]:
     """
@@ -3239,18 +3339,38 @@ def read_enrollment(license: int) -> dict:
     return enrollment_record_to_dict(record, license=license)
 
 
+def _normalise_available_doc_types(values: list[str] | None) -> list[str]:
+    """Validate caller-held document types for a checklist count.
+
+    Raises rather than dropping an unrecognised entry: a typo that silently
+    vanished would report a document as missing when the caller believes they
+    supplied it, and "you still need an exame_medico" is exactly the answer
+    someone acts on.
+    """
+    if not values:
+        return []
+    if isinstance(values, str) or not isinstance(values, (list, tuple)):
+        raise ValueError("available_doc_types must be a list of doc_type strings.")
+    return [normalize_doc_type(value).value for value in values]
+
+
 def _projected_enrollment_checklist(
     client, license: int, reg_type: int, club_id: int,
+    available_doc_types: list[str] | None = None,
 ) -> dict | None:
     """Document checklist for a licence that is *not* in an open batch.
 
     Grounds the portuguese-vs-foreign-born split in the player's actual
     record — the `nacional` (nationality) id read from the op=2 profile —
     so "what will player X need to enrol" can be answered before any batch
-    exists. There are no uploaded documents to count yet, so every required
-    entry comes back unsatisfied; `projected=True` flags this so callers
-    don't read `found_count`/`missing` as a verified gap (unlike the
-    "pending" checklist, which counts docs attached to the live batch).
+    exists. SAV holds no uploads for a player with no batch, so `projected`
+    is always True here: it says the counts do not come from a live batch.
+
+    With no `available_doc_types` every required entry comes back
+    unsatisfied, and `projected=True` is the flag telling callers not to read
+    `found_count`/`missing` as a verified gap. When the caller *does* supply
+    documents they hold outside SAV, the counts become meaningful again —
+    against that supplied set — and `counts_include_available` says so.
 
     Nationality lookup failures fall back to `nacional_id=None`, which
     `compute_enrollment_checklist` treats as foreign_born — the safe error,
@@ -3269,15 +3389,63 @@ def _projected_enrollment_checklist(
         nacional_id = int(nacional_raw) if nacional_raw not in (None, "") else None
     except (TypeError, ValueError):
         nacional_id = None
-    checklist = compute_enrollment_checklist(reg_type, nacional_id, [])
+    available = list(available_doc_types or [])
+    checklist = compute_enrollment_checklist(reg_type, nacional_id, available)
     if checklist is not None:
         checklist["projected"] = True
+        if available:
+            checklist["counts_include_available"] = True
     return checklist
 
 
 @server.tool()
+def enrollment_checklist(
+    reg_type: int = REGISTRATION_TYPE_REVALIDACAO,
+    nationality_id: int | None = None,
+    available_doc_types: list[str] | None = None,
+) -> dict | None:
+    """
+    Which documents an enrollment requires, and which of them you still lack.
+
+    The FPB rule on its own, with no SAV lookup — for a player SAV cannot
+    ground yet. That is the case ``get_enrollment_status`` cannot serve: it
+    keys on a licence, and a genuinely new player (1ª Inscrição, never
+    registered with this club) has none. Prefer ``get_enrollment_status`` for
+    anyone who *does* have a licence, because it reads their real nationality
+    and their live batch rather than taking your word for either.
+
+    Args:
+      reg_type: 1 (1ª Inscrição), 2 (Revalidação), or 4 (Subida standalone).
+        3 (Transferência) is not modelled and returns null.
+      nationality_id: SAV2 nationality id; 155 is Portugal. **Omit it and the
+        answer is the foreign-born set**, which is deliberate — asking for
+        documents the player turns out not to need is recoverable, and telling
+        someone they are ready when they are not is not. Do not pass 155 on
+        the strength of a Portuguese-looking name or a form field; pass it
+        only from a SAV record.
+      available_doc_types: doc types you already hold, one entry per document
+        — duplicates are significant, because the foreign-born rule needs
+        **two** documento_identificacao and SAV files both under the same type,
+        so they can only be counted. ``classify_documents`` produces this list.
+
+    Returns ``{scenario, reg_type, required: [{doc_type, min_count,
+    found_count, satisfied}], optional, missing}``, or null for reg_type 3.
+    An empty ``missing`` means the document requirement is met — it is not a
+    statement that SAV will accept the enrollment, which depends on eligibility
+    rules this tool does not see.
+    """
+    return compute_enrollment_checklist(
+        reg_type,
+        nationality_id,
+        _normalise_available_doc_types(available_doc_types),
+    )
+
+
+@server.tool()
 def get_enrollment_status(
-    license: int, reg_type: int = REGISTRATION_TYPE_REVALIDACAO,
+    license: int,
+    reg_type: int = REGISTRATION_TYPE_REVALIDACAO,
+    available_doc_types: list[str] | None = None,
 ) -> dict:
     """
     Return a player's enrollment status with a required-document checklist.
@@ -3319,7 +3487,21 @@ def get_enrollment_status(
     For "enrolled" the response also carries `player` ({license, name,
     tier, club}). For "not_enrolled" it carries `open_batches` — the
     currently open batches the caller could join.
+
+    `available_doc_types` folds in documents the caller holds **outside** SAV
+    — a club's own document store, an upload staging area — so the checklist
+    answers "what is still missing overall" rather than "what has SAV been
+    given so far". Pass one entry per document (duplicates are significant:
+    foreign_born needs two documento_identificacao, and SAV files both under
+    the same type, so they can only be counted). `classify_documents`
+    produces this list. Omit it and the response is byte-for-byte what it
+    always was; supply it and the response additionally carries
+    `available_doc_types` (echoed back, normalised) and the checklist gains
+    `counts_include_available: true`. An unrecognised doc type raises rather
+    than being dropped — a silently ignored typo would report a document as
+    missing that the caller believes they supplied.
     """
+    available = _normalise_available_doc_types(available_doc_types)
     client = _get_client()
     try:
         # Status is a read, so it scans every pending state — not just the open
@@ -3336,20 +3518,23 @@ def get_enrollment_status(
             if club_id else []
         )
         checklist = _projected_enrollment_checklist(
-            client, license, reg_type, club_id,
+            client, license, reg_type, club_id, available,
         )
+        extra = {"available_doc_types": available} if available else {}
         if roster_hits:
             return {
                 "license": license,
                 "status": "enrolled",
                 "player": player_to_dict(roster_hits[0]),
                 "checklist": checklist,
+                **extra,
             }
         return {
             "license": license,
             "status": "not_enrolled",
             "open_batches": exc.open_batches,
             "checklist": checklist,
+            **extra,
         }
 
     batch = next(
@@ -3370,6 +3555,11 @@ def get_enrollment_status(
     except (TypeError, ValueError):
         nacional_id = None
     reg_type = batch.type_id if batch else 0
+    checklist = compute_enrollment_checklist(
+        reg_type, nacional_id, [*doc_types, *available],
+    )
+    if checklist is not None and available:
+        checklist["counts_include_available"] = True
     return {
         "license": license,
         "status": "pending",
@@ -3379,7 +3569,8 @@ def get_enrollment_status(
             "type": batch.type if batch else "",
             "state": batch.state if batch else "",
         },
-        "checklist": compute_enrollment_checklist(reg_type, nacional_id, doc_types),
+        "checklist": checklist,
+        **({"available_doc_types": available} if available else {}),
     }
 
 
