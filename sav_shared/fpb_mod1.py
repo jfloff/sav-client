@@ -27,6 +27,7 @@ from pypdf import PdfReader, PdfWriter
 from .dates import require_iso, split_date_parts
 from .identifiers import normalise_nif
 from .files import (
+  get_displayed_page_size,
   bbox_to_pdf_rect,
   load_image_bytes as _load_image_bytes,
   overlay_image_on_pdf,
@@ -129,6 +130,21 @@ def read_carimbo(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | No
   return (present, field.bbox)
 
 
+def read_licenca_fpb(parsed: dict[str, ParsedField]) -> tuple[bool | None, BBox | None]:
+  """Read 'licenca_fpb_presente' and its writable-slot bbox from parsed fields.
+
+  sav-parsers corrects the labelled caption anchor to the writable box before
+  pairing it onto this presence field, so the tuple tells the completion path
+  both whether a number is already written and exactly where to write one.
+  **Do not offset the bbox further** — it is the slot, not the anchor.
+  """
+  field = parsed.get("licenca_fpb_presente")
+  if field is None:
+    return (None, None)
+  present = None if field.value is None else bool(field.value)
+  return (present, field.bbox)
+
+
 def read_tipo_inscricao(
   parsed: dict[str, ParsedField], reg_type: int,
 ) -> tuple[bool | None, BBox | None]:
@@ -166,6 +182,36 @@ def _make_cross_png(width: int, height: int) -> bytes:
   return buf.getvalue()
 
 
+def _make_license_png(value: str, height: int) -> bytes:
+  """Render a licence number as black text on a transparent, `height`-tall PNG.
+
+  The OCR locator is the writable box itself, unlike the carimbo locator whose
+  printed label needs calibrated expansion. Keeping the generated image at the
+  locator's height therefore lets ``overlay_image_on_pdf`` place the number
+  directly in that box without an undocumented scale or vertical correction.
+  """
+  from PIL import Image, ImageDraw, ImageFont
+
+  height = max(1, height)
+  font = ImageFont.load_default(size=height)
+  probe = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+  draw = ImageDraw.Draw(probe)
+  left, top, right, bottom = draw.textbbox((0, 0), value, font=font)
+  text_width = max(1, right - left)
+  text_height = max(1, bottom - top)
+  img = Image.new("RGBA", (text_width, height), (0, 0, 0, 0))
+  draw = ImageDraw.Draw(img)
+  draw.text(
+    (-left, (height - text_height) // 2 - top),
+    value,
+    fill=(0, 0, 0, 255),
+    font=font,
+  )
+  buf = io.BytesIO()
+  img.save(buf, format="PNG")
+  return buf.getvalue()
+
+
 def overlay_tipo_inscricao(
   pdf_bytes: bytes,
   *,
@@ -197,12 +243,54 @@ def overlay_tipo_inscricao(
   return overlay_image_on_pdf(pdf_bytes, cross_bytes, rect=rect, page_index=bbox.page)
 
 
-# The OCR carimbo slot is sized to the form's printed box, which is smaller
-# than the physical stamp. Scale the placement rect (about its center) so the
-# overlaid stamp reads at a realistic size, then nudge it up by a fraction of
-# its scaled height so it sits above the printed slot rather than over it.
-_CLUB_STAMP_SCALE = 5.5
-_CLUB_STAMP_Y_SHIFT = 0.5
+def overlay_licenca_fpb(
+  pdf_bytes: bytes,
+  *,
+  license: int | str,
+  licenca_present: bool | None,
+  bbox: BBox | None,
+) -> bytes:
+  """Write a missing licence number into the OCR-located writable box.
+
+  The presence entity's bbox is the writable box itself — sav-parsers corrects
+  the labelled caption anchor to the slot before handing it over. Nothing here
+  moves it; the only local adjustment is an inset so the digits clear the
+  printed borders.
+  """
+  if licenca_present is not False:
+    return pdf_bytes
+  if bbox is None:
+    raise ValueError("OCR did not return a location for licenca_fpb_presente")
+  # `bbox` is already the writable box (sav-parsers >= 0.10.0 corrects the
+  # caption anchor to it). The only adjustment left here is presentation:
+  # narrow the placement so the digits do not touch the printed borders.
+  xs = [v[0] for v in bbox.vertices]
+  ys = [v[1] for v in bbox.vertices]
+  cx = (min(xs) + max(xs)) / 2
+  half_w = (max(xs) - min(xs)) / 2 * _LICENCA_TEXT_INSET
+  slot = [
+    (cx - half_w, min(ys)), (cx + half_w, min(ys)),
+    (cx + half_w, max(ys)), (cx - half_w, max(ys)),
+  ]
+  rect = bbox_to_pdf_rect(pdf_bytes, slot, page_index=bbox.page)
+  # Size the text against the slot's height *as displayed*: on a rotated page
+  # the converted rect's height is the slot's on-screen width. Rendered at a
+  # multiple of the final size so the digits stay crisp once scaled to fit.
+  _, page_h = get_displayed_page_size(pdf_bytes, page_index=bbox.page)
+  slot_ys = [v[1] for v in slot]
+  slot_h = (max(slot_ys) - min(slot_ys)) * page_h
+  height = max(8, int(round(slot_h * _LICENCA_TEXT_SUPERSAMPLE)))
+  text_bytes = _make_license_png(str(license), height)
+  return overlay_image_on_pdf(pdf_bytes, text_bytes, rect=rect, page_index=bbox.page)
+
+
+# Rendering only — the anchor-to-slot geometry moved to sav-parsers 0.10.0.
+# Render the digits larger than needed and let add_overlay scale them down; at
+# 1x a ~14pt slot produces visibly soft text.
+_LICENCA_TEXT_SUPERSAMPLE = 4
+# add_overlay fits the digits to the slot and centres them, so without an inset
+# they touch the printed borders.
+_LICENCA_TEXT_INSET = 0.88
 
 
 def overlay_club_stamp(
@@ -238,19 +326,18 @@ def overlay_club_stamp(
   if rect is None and bbox is None:
     raise ValueError("OCR did not return a location for carimbo_clube_presente")
 
-  # crop=False: the stamp is placed verbatim against a calibrated rect
-  # (_CLUB_STAMP_SCALE below, or CLUB_STAMP_RECT on the no-OCR path), so its
+  # crop=False: the stamp is placed verbatim against a calibrated rect (the
+  # slot sav-parsers hands over, or CLUB_STAMP_RECT on the no-OCR path), so its
   # padding is part of that placement. Keying still applies, so an opaque
   # stamp file does not paint a white box over the form.
   with open(stamp_path, "rb") as f:
     stamp_bytes = prepare_overlay_image(f.read(), crop=False)
   if rect is not None:
     return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=0)
+  # `bbox` is already the writable slot: sav-parsers >= 0.10.0 corrects the
+  # labelled anchor to it before handing over a presence field. Applying an
+  # offset here too would double-correct and land the stamp one step off.
   rect = bbox_to_pdf_rect(pdf_bytes, bbox.vertices, page_index=bbox.page)
-  rect = _scale_rect(rect, _CLUB_STAMP_SCALE)
-  x0, y0, x1, y1 = rect
-  dy = (y1 - y0) * _CLUB_STAMP_Y_SHIFT  # PDF origin is bottom-left, so up is +y
-  rect = (x0, y0 + dy, x1, y1 + dy)
   return overlay_image_on_pdf(pdf_bytes, stamp_bytes, rect=rect, page_index=bbox.page)
 
 
@@ -348,24 +435,89 @@ def inscricao_overlay(
   return apply
 
 
+def licenca_overlay(
+  *,
+  reg_type: int | None,
+  license: int | str | None,
+  licenca_present: bool | None,
+  bbox: BBox | None,
+) -> Callable[[bytes], tuple[bytes, OverlayResult]]:
+  """Return an overlay callable that fills a missing Revalidação licence.
+
+  A filled ``fill_mod1`` form is checked through its own AcroForm and gets
+  ``nr_licenca`` written with pypdf so the appearance stream prints in viewers
+  that ignore NeedAppearances. A member-supplied scan uses the OCR presence
+  field and its paired bbox instead. Both paths refuse to overwrite an
+  existing number; unresolved OCR or a non-template AcroForm remains unknown.
+  """
+  def apply(pdf_bytes: bytes) -> tuple[bytes, OverlayResult]:
+    license_text = "" if license is None else str(license).strip()
+
+    # Only our fillable template has a safe fixed field. An unrelated AcroForm
+    # must not be treated as an OCR scan and painted over just because it has
+    # form fields of its own.
+    raw = read_mod1_acroform(pdf_bytes)
+    if raw is not None:
+      if not is_filled_mod1_template(raw):
+        return pdf_bytes, OverlayResult(applied=None, effective=None)
+      field = MOD1_FILL_MAPPING["license"]
+      current = (raw.get(field.field) or "").strip()  # type: ignore[attr-defined]
+      if current:
+        return pdf_bytes, OverlayResult(applied=None, effective=True)
+      if reg_type != 2 or not license_text or license_text == "0":
+        return pdf_bytes, OverlayResult(applied=None, effective=False)
+      try:
+        return (
+          fill_license_number(pdf_bytes, license_text),
+          OverlayResult(applied=True, effective=True),
+        )
+      except Exception as exc:
+        logger.warning("licence overlay failed", exc_info=True)
+        return pdf_bytes, OverlayResult(
+          applied=False, effective=False, error=f"licence fill failed: {exc}",
+        )
+
+    if licenca_present is True:
+      return pdf_bytes, OverlayResult(applied=None, effective=True)
+    if licenca_present is None:
+      return pdf_bytes, OverlayResult(applied=None, effective=None)
+    if reg_type != 2 or not license_text or license_text == "0":
+      return pdf_bytes, OverlayResult(applied=None, effective=False)
+    try:
+      return (
+        overlay_licenca_fpb(
+          pdf_bytes,
+          license=license_text,
+          licenca_present=licenca_present,
+          bbox=bbox,
+        ),
+        OverlayResult(applied=True, effective=True),
+      )
+    except Exception as exc:
+      logger.warning("licence overlay failed", exc_info=True)
+      return pdf_bytes, OverlayResult(
+        applied=False, effective=False, error=f"licence fill failed: {exc}",
+      )
+  return apply
+
+
 @contextmanager
 def overlaid_pdf(
   pdf_path: str,
   *overlays: Callable[[bytes], tuple[bytes, OverlayResult]],
   dest_dir: str | os.PathLike[str] | None = None,
 ) -> Iterator[tuple[str, list[OverlayResult]]]:
-  """Yield (upload_path, has_club_stamp, stamp_error, has_inscricao_mark, inscricao_error).
+  """Yield (upload_path, overlay_results) after applying each requested overlay.
 
   `dest_dir`, when given, is where the modified copy is written (as
   `stamped.pdf`) instead of a standalone temp file; the caller then owns its
   lifecycle (e.g. an OCR processing dir that gets cleaned up wholesale). When
   None, a NamedTemporaryFile is used and removed on context exit.
 
-  Applies up to two overlays in order: inscription checkbox mark first, then
   Each overlay is a ``Callable[[bytes], tuple[bytes, OverlayResult]]`` — use
-  carimbo_overlay() and inscricao_overlay() (or any compatible factory) to
-  build them.  Overlays run in order; failures are caught inside each factory
-  so one bad overlay never blocks the next.
+  ``inscricao_overlay()``, ``licenca_overlay()``, and ``carimbo_overlay()`` (or
+  any compatible factory) to build them. Overlays run in order; failures are
+  caught inside each factory so one bad overlay never blocks the next.
 
   When no overlay fires (all results have applied=None), the original
   `pdf_path` is yielded unchanged — no temp file is written.
@@ -1415,6 +1567,33 @@ def fill_signature_date(pdf_bytes: bytes, *, on: date | None = None) -> bytes:
     writer.pages[0],
     dict(zip(parts, (f"{when.day:02d}", f"{when.month:02d}", str(when.year)))),
     auto_regenerate=False,
+  )
+  out = io.BytesIO()
+  writer.write(out)
+  return out.getvalue()
+
+
+def fill_license_number(pdf_bytes: bytes, license: int | str) -> bytes:
+  """Write a missing licence number into this module's AcroForm template.
+
+  This deliberately mirrors :func:`fill_signature_date`: pypdf regenerates
+  the text appearance stream, which makes ``nr_licenca`` print even in PDF
+  viewers that ignore NeedAppearances. Non-template PDFs and forms that
+  already carry a number are returned byte-for-byte unchanged.
+  """
+  spec = MOD1_FILL_MAPPING["license"]
+  raw = read_mod1_acroform(pdf_bytes)
+  if raw is None or not is_filled_mod1_template(raw):
+    return pdf_bytes
+  field = spec.field  # type: ignore[attr-defined]
+  if (raw.get(field) or "").strip():
+    return pdf_bytes
+
+  reader = PdfReader(io.BytesIO(pdf_bytes))
+  writer = PdfWriter()
+  writer.append(reader)
+  writer.update_page_form_field_values(
+    writer.pages[0], {field: str(license)}, auto_regenerate=False,
   )
   out = io.BytesIO()
   writer.write(out)

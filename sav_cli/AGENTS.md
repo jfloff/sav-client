@@ -305,6 +305,23 @@ sav mod1 fill --values values.json --out mod1.pdf \            # embed the signa
 
 The three signature images (`--player-signature`, `--guardian-signature`, `--club-stamp`, PNG/JPG) are optional and overlaid on their printed areas: omit them for a clean form to sign offline, pass any subset for the completed form. A photo or scan on white paper is fine: the background is keyed to transparent and the image cropped to the ink before it is overlaid, so it never paints a box over the printed line and blank margins never shrink it. A transparent PNG (a canvas or tablet capture) is cropped too but never keyed, so a cutout keeps its artwork. **`--club-stamp` also fills the Assinaturas date** with today's (unless `--values` carried `data_assinatura`) — stamping and dating are one action, so a stamped form is never undated. Prefer to leave it off: `sav enroll` stamps and dates the form as it uploads it, and a stamped form handed to the player is an attestation, not a preview. The bundled template is resolved module-relative; override with `MOD1_TEMPLATE_PATH`.
 
+### `sav mod1 complete`
+
+Apply the **club-supplied completion** to an existing Modelo 1 and write the result — the tipo_inscrição mark, the Licença FPB, and the club carimbo from `$CLUB_STAMP_PATH`. It runs the same `mod1_completion_path` that `sav enrollment create` runs on its way to the federation, minus the upload, so the output is the artifact a submission will file rather than a lookalike. **It never contacts SAV** — no session, no batch, no upload — which is what separates it from every other command here.
+
+```sh
+sav mod1 complete signed.pdf --out completed.pdf --license 301772   # Revalidação
+sav mod1 complete signed.pdf --out completed.pdf                    # 1ª Inscrição
+```
+
+Takes either artifact a submission can carry and picks the path the upload would: a form from `sav mod1 fill` carries the template AcroForm and is completed at its fixed slots with **no OCR**, while a member-supplied signed scan goes to Document AI for its slots (billed per run). An image is converted to PDF first, so a phone photo works. Every mark is applied only where the slot is empty — an already-stamped, already-ticked, already-numbered form comes back byte-identical.
+
+`--license` only selects the registration type and supplies the number; nothing is looked up. Omitted, the type is inferred as **1ª Inscrição**, whose Licença FPB is correctly left blank (no licence exists until the federation assigns one). The form's own boxes win any disagreement with the inferred type: a scan already ticking Revalidação is left alone rather than ending up with both boxes marked.
+
+Applying the stamp also fills the Assinaturas date with today's, because stamping is the club asserting it endorsed the form. That date fill only reaches the template AcroForm — a scan carries a printed line, not a field, so its date stays as the member wrote it.
+
+`$CLUB_STAMP_PATH` is required at command entry. **The output is an attestation, not a preview:** the carimbo reads to the federation as club-endorsed, so never hand it to a player — use `sav mod1 fill` without `--club-stamp` for that.
+
 ## Workflows
 
 **Find active player:** `sav --output json players --name "João Silva" --status active --all-clubs`. Narrow with `--tier` / `--club` if ambiguous. Pair with `--limit` if you only need one or two hits.

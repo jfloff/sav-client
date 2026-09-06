@@ -59,14 +59,15 @@ from sav_shared.enrollment import (
 from sav_shared.fields import ENROLLMENT_FIELD_META
 from sav_shared.fpb_mod1 import (
   OverlayResult,
-  carimbo_overlay,
-  inscricao_overlay,
+  is_filled_mod1_template,
   overlaid_pdf,
   read_carimbo,
+  read_mod1_acroform,
   read_tipo_inscricao,
   reconcile_fpb_mod1,
   render_mod1,
 )
+from sav_shared.mod1_completion import mod1_completion_path
 from sav_shared.fpb_mod4 import (
   club_signature_overlay,
   detentor_signature_overlay,
@@ -113,6 +114,56 @@ def _require_env(name: str) -> str:
   if not value:
     raise SavCliError(f"Environment variable {name} is required but not set.", code="config_error")
   return value
+
+
+def _require_google_credentials() -> None:
+  """Fail fast when Document AI is about to be called without usable credentials.
+
+  An expired ADC token does not surface as an error: `process_document` is
+  called with no `timeout`, so the client retries and backs off, and the command
+  simply hangs with no output for minutes. Checking first turns that into one
+  actionable line.
+
+  Only definitive auth failures are treated as fatal. Anything else — an unusual
+  environment, a probe that fails for its own reasons — is allowed through so a
+  working setup is never blocked by this check.
+  """
+  try:
+    import google.auth
+    import google.auth.transport.requests as google_requests
+    from google.auth.exceptions import DefaultCredentialsError, RefreshError
+  except ImportError:
+    return
+  try:
+    creds, _ = google.auth.default(
+      scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    if not creds.valid:
+      creds.refresh(google_requests.Request())
+  except (DefaultCredentialsError, RefreshError) as exc:
+    raise SavCliError(
+      f"Document AI credentials are not usable ({exc.__class__.__name__}). "
+      "Run `gcloud auth application-default login` and try again.",
+      code="config_error",
+    )
+  except Exception:
+    return
+
+
+def _needs_document_ai(pdf_path: str) -> bool:
+  """Whether completing `pdf_path` will reach Document AI.
+
+  A form carrying our own filled template AcroForm is completed from its fixed
+  slots with no OCR; anything else is a scan and goes to the parser. Mirrors the
+  routing in `mod1_overlay_fields` so the credential check runs only when a call
+  is actually coming.
+  """
+  try:
+    with open(pdf_path, "rb") as f:
+      raw = read_mod1_acroform(f.read())
+  except OSError:
+    return True
+  return raw is None or not is_filled_mod1_template(raw)
 
 
 def _console(*, err: bool = False) -> Console:
@@ -1689,32 +1740,37 @@ def _inscricao_extras_row(
 def _prepare_club_stamp(
   ctx: click.Context, console: Console, err_console: Console,
   parsed: dict, pdf_path: str, processing_id: str,
-  *, reg_type: int | None = None,
+  *, reg_type: int | None = None, license: int | str | None = None,
 ) -> tuple[str, bool | None, OverlayResult, bool | None, OverlayResult]:
-  """Overlay the inscription checkbox and/or club stamp (when OCR says they
-  are missing) *before* the summary, so the summary reports the real outcome.
+  """Apply the shared Modelo 1 completion overlays before the summary.
 
   Returns (upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r).
 
   The modified copy is written into the OCR processing dir for `processing_id`,
   sharing that session's lifecycle. Registered on `ctx` so it survives the
-  confirm→submit→upload span. Neither overlay raises out here — overlaid_pdf
-  catches failures inside each factory and falls back to the original PDF.
+  confirm→submit→upload span. The caller already ran OCR, so the shared helper
+  is explicitly forbidden from opening a second Document AI session.
   """
   from sav_parsers import processing_dir
 
-  carimbo, bbox = read_carimbo(parsed)
-  tipo_checked, tipo_bbox = (
+  # Slot resolution now lives in the shared helper; these two reads survive only
+  # because the return tuple reports the *pre-existing* state to the summary.
+  carimbo, _ = read_carimbo(parsed)
+  tipo_checked, _ = (
     read_tipo_inscricao(parsed, reg_type) if reg_type is not None else (None, None)
   )
-  upload_path, (inscricao_r, carimbo_r) = ctx.with_resource(
-    overlaid_pdf(
+  upload_path, _status, results = ctx.with_resource(
+    mod1_completion_path(
       pdf_path,
-      inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
-      carimbo_overlay(carimbo_present=carimbo, bbox=bbox),
+      parsed=parsed,
+      processing_id=processing_id,
+      reg_type=reg_type,
+      license=license,
       dest_dir=processing_dir(processing_id),
+      allow_ocr_fallback=False,
     )
   )
+  inscricao_r, licenca_r, carimbo_r = results
   if inscricao_r.applied is True:
     tipo_label = "Revalidação" if reg_type == 2 else "1ª Inscrição"
     console.print(
@@ -1723,6 +1779,16 @@ def _prepare_club_stamp(
   if inscricao_r.error:
     err_console.print(
       f"[yellow]:warning: {inscricao_r.error}[/] — please mark the checkbox manually."
+    )
+  if licenca_r.applied is True:
+    console.print(
+      f"[green]:input_numbers:  Filled Licença FPB [bold]{license}[/] on "
+      f"[bold]{_display_name(pdf_path)}[/].[/]"
+    )
+  if licenca_r.error:
+    err_console.print(
+      f"[yellow]:warning: {licenca_r.error}[/] — will upload WITHOUT the Licença FPB; "
+      "please fill it manually."
     )
   if carimbo_r.applied is True:
     console.print(
@@ -1914,6 +1980,101 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   except OSError as e:
     raise SavCliError(f"Could not write {out_path!r}: {e}", code="io_error")
   click.echo(f"Saved Modelo 1 → {out_path}")
+
+
+@mod1_grp.command("complete")
+@click.argument("pdf_path", type=click.Path(exists=True, dir_okay=False))
+@click.option("--out", "out_path", required=True, help="Path to write the completed PDF.")
+@click.option("--license", "license_", type=int, default=None,
+              help="Licença FPB. Marks the form a Revalidação and fills the licence "
+                   "field when it is blank. Omit for a 1ª Inscrição, which has no "
+                   "licence until the federation assigns one.")
+@click.pass_context
+def mod1_complete_cmd(ctx, pdf_path, out_path, license_):
+  """Apply the club-supplied completion to an existing Modelo 1 and write it to --out.
+
+  Runs exactly what `sav enrollment create` applies on its way to the federation —
+  the tipo_inscrição mark, the Licença FPB, and the club carimbo from
+  $CLUB_STAMP_PATH — but uploads nothing and never contacts SAV. Use it to inspect
+  the artifact a submission will file, before filing it.
+
+  Takes either artifact a submission can carry and decides between them the way the
+  upload does: a form from `sav mod1 fill` carries the template AcroForm and is
+  completed at its fixed slots with no OCR, while a member-supplied signed scan goes
+  to Document AI to locate its slots. Every mark is applied only where the slot is
+  empty, so an already-stamped, already-ticked, already-numbered form comes back
+  untouched.
+
+  Applying the stamp also fills the Assinaturas date with today's, because stamping
+  is the club asserting it endorsed the form. That date fill only reaches the
+  template AcroForm — a scan carries a printed line rather than a field, so its date
+  stays as the member wrote it.
+
+  --license only selects the registration type and supplies the number; nothing is
+  looked up, so this runs offline. Omitted, the type is inferred as 1ª Inscrição —
+  and the form's own boxes win any disagreement, so a scan already ticking
+  Revalidação is left alone rather than ending up with both boxes marked.
+
+  The output is an attestation, not a preview: the carimbo reads to the federation
+  as club-endorsed. Do not hand it to the player — use `sav mod1 fill` without
+  --club-stamp for that.
+  """
+  _require_env("CLUB_STAMP_PATH")
+  console, err_console = _console(), _console(err=True)
+  reg_type = 2 if license_ else 1
+
+  # _stage_pdf converts a photo/scan image to PDF and registers its cleanup on
+  # `ctx`, so there is no temp file to unlink by hand.
+  staged = _stage_pdf(ctx, console, pdf_path)
+  if _needs_document_ai(staged):
+    _require_google_credentials()
+  with mod1_completion_path(
+    staged,
+    reg_type=reg_type,
+    reg_type_derived=True,
+    license=license_,
+    require_stamp=True,
+    degrade_on_lookup_error=True,
+    warning_action="form written",
+  ) as (completed_path, status, results):
+    if not results:
+      # The helper yields no results when it could not inspect the form at all —
+      # OCR failed, or no stamp is configured. Completing the form is this
+      # command's whole promise, so writing a file that merely looks completed
+      # is worse than writing none: the input is untouched and still available.
+      reason = status.get("_ocr_error")
+      raise SavCliError(
+        f"Could not read the form to complete it: {reason}" if reason
+        else "Could not complete the form: no overlay could be resolved.",
+        code="ocr_error" if reason else "config_error",
+      )
+    inscricao_r, licenca_r, carimbo_r = results
+    try:
+      data = Path(completed_path).read_bytes()
+    except OSError as e:
+      raise SavCliError(f"Could not read the completed form: {e}", code="io_error")
+
+  name = _display_name(pdf_path)
+  if inscricao_r.applied is True:
+    label = "Revalidação" if reg_type == 2 else "1ª Inscrição"
+    console.print(f"[green]:ballot_box_with_check:  Marked {label} checkbox on [bold]{name}[/].[/]")
+  if licenca_r.applied is True:
+    console.print(f"[green]:input_numbers:  Filled Licença FPB [bold]{license_}[/] on [bold]{name}[/].[/]")
+  if carimbo_r.applied is True:
+    console.print(f"[green]:label:  Applied club stamp and dated the Assinaturas line on [bold]{name}[/].[/]")
+  for result, hint in (
+    (inscricao_r, "please mark the checkbox manually"),
+    (licenca_r, "please fill the Licença FPB manually"),
+    (carimbo_r, "please stamp the document manually"),
+  ):
+    if result.error:
+      err_console.print(f"[yellow]:warning: {result.error}[/] — {hint}.")
+
+  try:
+    Path(out_path).write_bytes(data)
+  except OSError as e:
+    raise SavCliError(f"Could not write {out_path!r}: {e}", code="io_error")
+  click.echo(f"Saved completed Modelo 1 → {out_path}")
 
 
 @cli.group("enrollment")
@@ -2600,6 +2761,7 @@ def enrollment_create_cmd(
     upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r = _prepare_club_stamp(
       ctx, console, err_console, parsed, pdf_path, processing_id,
       reg_type=reg_type,
+      license=license if reg_type == 2 else None,
     )
     kwargs = _review_and_fill(result, sav_profile)
     _print_submission_summary(
@@ -3376,6 +3538,7 @@ def enrollment_update_cmd(
       upload_path, carimbo, carimbo_r, tipo_checked, inscricao_r = _prepare_club_stamp(
         ctx, console, err_console, parsed, active_pdf, processing_id,
         reg_type=_ocr_reg_type,
+        license=license_ if _ocr_reg_type == 2 else None,
       )
       player_label = _player_label(sav_profile, license_)
       kwargs = _review_and_fill(result, sav_profile)

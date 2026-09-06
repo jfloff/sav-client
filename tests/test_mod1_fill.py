@@ -13,6 +13,7 @@ from pathlib import Path
 import pikepdf
 import pytest
 from pypdf import PdfReader, PdfWriter
+from sav_parsers.types import BBox
 
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
@@ -21,6 +22,7 @@ from sav_shared.fpb_mod1 import (
   _MOD1_GUARDIAN_KEYS,
   carimbo_overlay,
   fill_signature_date,
+  licenca_overlay,
   render_mod1 as _render_mod1,
   validate_mod1_values,
 )
@@ -474,6 +476,76 @@ class TestFillSignatureDate:
     out = fill_signature_date(undated, on=date(2026, 3, 9))
     f = _fields(out)
     assert (_v(f, "ass_dia"), _v(f, "ass_mes"), _v(f, "ass_ano")) == ("09", "03", "2026")
+
+
+class TestLicenseOverlay:
+  """The licence overlay fills only the missing Revalidação slot."""
+
+  @staticmethod
+  def _blank_revalidacao():
+    values = {k: v for k, v in SAMPLE.items() if k != "license"}
+    values["tipo_inscricao"] = 2
+    return render_mod1(values, validate=False)
+
+  @staticmethod
+  def _apply(pdf_bytes, *, reg_type=2, license=301772, present=None, bbox=None):
+    return licenca_overlay(
+      reg_type=reg_type,
+      license=license,
+      licenca_present=present,
+      bbox=bbox,
+    )(pdf_bytes)
+
+  def test_blank_template_gets_the_license_with_a_printable_appearance(self):
+    out, result = self._apply(self._blank_revalidacao())
+    assert result.applied is True
+    assert result.effective is True
+    fields = _fields(out)
+    assert _v(fields, "nr_licenca") == "301772"
+    assert _has_appearance(out, "nr_licenca") is True
+
+  def test_existing_template_license_is_never_overwritten(self):
+    base = render_mod1({**SAMPLE, "tipo_inscricao": 2})
+    out, result = self._apply(base, license=999999)
+    assert result.applied is None
+    assert result.effective is True
+    assert out == base
+    assert _v(_fields(out), "nr_licenca") == "301772"
+
+  def test_primeira_inscricao_never_fills_the_blank_field(self):
+    values = {k: v for k, v in SAMPLE.items() if k != "license"}
+    base = render_mod1(values, validate=False)
+    out, result = self._apply(base, reg_type=1, license=None)
+    assert result.applied is None
+    assert result.effective is False
+    assert out == base
+    assert _v(_fields(out), "nr_licenca") == ""
+
+  def test_scan_uses_the_presence_bbox_without_carimbo_adjustments(self):
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+    base = buf.getvalue()
+    bbox = BBox(
+      page=0,
+      vertices=[(0.20, 0.20), (0.35, 0.20), (0.35, 0.23), (0.20, 0.23)],
+    )
+    out, result = self._apply(base, present=False, bbox=bbox)
+    assert result.applied is True
+    assert result.effective is True
+    assert _page_xobject_count(out) == _page_xobject_count(base) + 1
+
+  def test_unknown_scan_presence_is_left_untouched(self):
+    writer = PdfWriter()
+    writer.add_blank_page(width=595, height=842)
+    buf = io.BytesIO()
+    writer.write(buf)
+    base = buf.getvalue()
+    out, result = self._apply(base, present=None, bbox=None)
+    assert result.applied is None
+    assert result.effective is None
+    assert out == base
 
 
 def test_blank_and_unknown_values_are_skipped():

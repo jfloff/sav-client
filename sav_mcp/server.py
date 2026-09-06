@@ -59,7 +59,6 @@ logger = logging.getLogger(__name__)
 from sav_shared.files import (
     ensure_pdf,
     load_image_bytes,
-    rect_has_overlay,
 )
 from sav_shared.dates import require_iso
 from sav_shared.identifiers import normalise_nif, require_nif
@@ -82,19 +81,19 @@ from sav_shared.enrollment import (
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import (
-    CLUB_STAMP_RECT,
     carimbo_overlay,
     inscricao_overlay,
-    is_filled_mod1_template,
-    mod1_acroform_to_fields,
     mod1_values_to_fields,
     overlaid_pdf,
     player_is_minor,
     read_carimbo,
-    read_mod1_acroform,
     read_tipo_inscricao,
     reconcile_fpb_mod1,
     render_mod1,
+)
+from sav_shared.mod1_completion import (
+    mod1_completion_path,
+    read_mod1_template_fields,
 )
 from sav_shared.fpb_mod4 import (
     club_signature_overlay,
@@ -1108,6 +1107,108 @@ def fill_mod1(
     }
 
 
+@server.tool()
+def complete_mod1(pdf_b64: str, license: int | None = None) -> dict:
+    """
+    Complete a Modelo 1 with the club-supplied marks and return it base64-encoded.
+
+    This is the overlay `submit_enrollment` performs on its way to the
+    federation, minus the upload: the tipo_inscricao checkbox mark, the
+    Revalidação licence fill, and then the carimbo against the server-side
+    $CLUB_STAMP_PATH. Nothing touches SAV: no batch is created, no document is
+    uploaded.
+
+    `license` selects the registration type. Omit it (or pass 0) for 1ª
+    Inscrição; pass a real licence for Revalidação, where the number is filled
+    only if the form's licence field is blank.
+
+    Accepts either artifact a submission can carry, and decides between them the
+    way the upload path does — a form produced by `fill_mod1` carries our
+    template's AcroForm and is completed at its fixed slots with no OCR, while a
+    member-supplied signed scan is sent to OCR to locate both overlay slots.
+
+    Completion is idempotent: marks already present come back unchanged. When
+    the stamp is applied, the Assinaturas date is filled with today's — stamping
+    and dating are one action, so a stamped form is never undated. That date fill
+    no-ops on anything but our template's AcroForm with the date still blank.
+
+    The output is an attestation, not a preview: the carimbo reads to the
+    federation as club-endorsed. Do not hand it to the player — for that, render
+    the form with `fill_mod1` and leave `club_stamp_b64` unset.
+
+    Returns ``{filename, size_bytes, pdf_b64, has_club_stamp,
+    has_inscricao_mark, has_license, reg_type_assumed}`` plus
+    ``stamp_warning``, ``inscricao_warning`` and/or ``license_warning`` only
+    when an overlay could not be applied.
+    `has_club_stamp` is None when the form was not inspected (OCR failed, or the
+    server has no `$CLUB_STAMP_PATH` configured and never looked).
+    """
+    # This derivation is valid ONLY pre-submission, and only inside complete_mod1.
+    reg_type = 2 if license else 1
+    tmp_path = _decode_pdf_to_tempfile(pdf_b64)
+    try:
+        with mod1_completion_path(
+            tmp_path,
+            reg_type=reg_type,
+            license=license,
+            reg_type_derived=True,
+            require_stamp=True,
+            degrade_on_lookup_error=True,
+            warning_action="form returned",
+        ) as (path, status, _results):
+            with open(path, "rb") as f:
+                pdf = f.read()
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+    if "_ocr_error" in status:
+        ocr_error = status["_ocr_error"]
+        status = {
+            "has_club_stamp": None,
+            "has_inscricao_mark": None,
+            "has_license": None,
+            "stamp_warning": f"OCR failed ({ocr_error}); form returned without overlays.",
+        }
+    elif not status:
+        # The upload path skips the overlay entirely when no stamp is
+        # configured, and yields a status that says nothing. Here that silence
+        # would read as "unstamped", which we did not check: nothing inspected
+        # the form, so the honest answer is unknown.
+        status = {
+            "has_club_stamp": None,
+            "has_inscricao_mark": None,
+            "has_license": None,
+            "stamp_warning": (
+                "$CLUB_STAMP_PATH is not set on this server — the form is "
+                "returned unstamped and undated, which is also how "
+                "submit_enrollment would file it; please stamp it manually."
+            ),
+        }
+    else:
+        status = {
+            key: status[key]
+            for key in (
+                "has_club_stamp", "has_inscricao_mark", "has_license",
+                "stamp_warning", "inscricao_warning", "license_warning",
+            )
+            if key in status and (not key.endswith("warning") or status[key])
+        }
+    return {
+        "filename": "modelo1_completed.pdf",
+        "size_bytes": len(pdf),
+        "pdf_b64": base64.b64encode(pdf).decode("ascii"),
+        "has_club_stamp": status["has_club_stamp"],
+        "has_inscricao_mark": status["has_inscricao_mark"],
+        "has_license": status["has_license"],
+        "reg_type_assumed": reg_type,
+        **{
+            key: status[key]
+            for key in ("stamp_warning", "inscricao_warning", "license_warning")
+            if key in status
+        },
+    }
+
+
 # ── Registration batches ──────────────────────────────────────────────────────
 
 @server.tool()
@@ -1544,11 +1645,12 @@ def _replace_player_document_from_bytes(
     """Upload cached PDF bytes as a replacement registration document.
 
     `parsed` is the parse_fpb_mod1 / parse_fpb_mod4 fields dict (when
-    available). For a mod1 it drives the club-stamp and inscription-checkbox
-    overlays (`reg_type` 1 or 2 selects the checkbox). For a mod4 it drives the
-    holder-signature and club-stamp overlays: `detentor_signature` (image bytes)
-    is placed on the empty holder slot and $CLUB_STAMP_PATH on the empty club
-    slot, mirroring the CLI submit path.
+    available). For a mod1 it drives the inscription-checkbox, Revalidação
+    licence, and club-stamp overlays (`reg_type` 1 or 2 selects the checkbox;
+    `license` supplies the number). For a mod4 it drives the holder-signature
+    and club-stamp overlays: `detentor_signature` (image bytes) is placed on
+    the empty holder slot and $CLUB_STAMP_PATH on the empty club slot,
+    mirroring the CLI submit path.
     """
     # has_club_stamp / *_warning describe the uploaded PDF, so they're only added
     # to status when status == "ok"; on "skipped" / "error" there's no uploaded
@@ -1564,113 +1666,75 @@ def _replace_player_document_from_bytes(
     is_mod1 = doc_type == DocType.FPB_MODELO_1 and parsed
     is_mod4 = doc_type == DocType.FPB_MODELO_4 and parsed
     tmp_path: str | None = None
-    overlay_processing_id: str | None = None
     try:
         tmp_path = _pdf_bytes_to_tempfile(pdf_bytes)
-        if is_mod4:
-            det_present, det_bbox = read_detentor_signature(parsed)
-            club_present, club_bbox = read_club_signature(parsed)
-            club_image = load_image_bytes(os.environ.get("CLUB_STAMP_PATH"))
-            overlays = (
-                detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
-                club_signature_overlay(present=club_present, bbox=club_bbox, image=club_image),
-            )
+        if is_mod1:
+            with mod1_completion_path(
+                tmp_path,
+                parsed=parsed,
+                reg_type=reg_type,
+                license=license,
+                warning_action="document uploaded",
+            ) as (upload_path, overlay_status, _results):
+                ok, error = try_replace_document(
+                    client, batch_id, license, upload_path,
+                    tipo_doc=doc_type_to_tipo_doc(doc_type),
+                )
+                status["status"] = "ok" if ok else "error"
+                status["error"] = error
+                if ok:
+                    status.update(overlay_status)
         else:
-            carimbo, carimbo_bbox = read_carimbo(parsed) if is_mod1 else (None, None)
-            template_carimbo = False
-            if is_mod1 and carimbo is None:
-                overlay_fields, overlay_processing_id = _mod1_overlay_fields(tmp_path)
-                carimbo, carimbo_bbox = read_carimbo(overlay_fields)
-                template_carimbo = overlay_processing_id is None
-            tipo_checked, tipo_bbox = (
-                read_tipo_inscricao(parsed, reg_type)
-                if (is_mod1 and reg_type is not None) else (None, None)
-            )
-            overlays = (
-                inscricao_overlay(reg_type=reg_type, already_checked=tipo_checked, bbox=tipo_bbox),
-                carimbo_overlay(
-                    carimbo_present=carimbo,
-                    bbox=carimbo_bbox,
-                    rect=CLUB_STAMP_RECT if template_carimbo else None,
-                ),
-            )
-        with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
-            ok, error = try_replace_document(
-                client, batch_id, license, upload_path,
-                tipo_doc=doc_type_to_tipo_doc(doc_type),
-            )
-            status["status"] = "ok" if ok else "error"
-            status["error"] = error
-            if ok and is_mod4:
-                detentor_r, club_r = results
-                status["has_detentor_signature"] = detentor_r.effective
-                status["signature_warning"] = (
-                    f"{detentor_r.error} — document uploaded without the holder "
-                    "signature; please sign it manually."
-                ) if detentor_r.error else None
-                status["has_club_stamp"] = club_r.effective
-                status["stamp_warning"] = (
-                    f"{club_r.error} — document uploaded without the club stamp; "
-                    "please stamp it manually."
-                ) if club_r.error else None
-            elif ok:
-                inscricao_r, carimbo_r = results
-                status["has_club_stamp"] = carimbo_r.effective
-                status["stamp_warning"] = (
-                    f"{carimbo_r.error} — document uploaded without the club stamp; "
-                    "please stamp it manually."
-                ) if carimbo_r.error else None
-                status["has_inscricao_mark"] = inscricao_r.effective
-                status["inscricao_warning"] = (
-                    f"{inscricao_r.error} — please mark the inscription checkbox manually."
-                ) if inscricao_r.error else None
+            if is_mod4:
+                det_present, det_bbox = read_detentor_signature(parsed)
+                club_present, club_bbox = read_club_signature(parsed)
+                club_image = load_image_bytes(os.environ.get("CLUB_STAMP_PATH"))
+                overlays = (
+                    detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
+                    club_signature_overlay(present=club_present, bbox=club_bbox, image=club_image),
+                )
+            else:
+                overlays = (
+                    inscricao_overlay(reg_type=reg_type, already_checked=None, bbox=None),
+                    carimbo_overlay(carimbo_present=None, bbox=None),
+                )
+            with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
+                ok, error = try_replace_document(
+                    client, batch_id, license, upload_path,
+                    tipo_doc=doc_type_to_tipo_doc(doc_type),
+                )
+                status["status"] = "ok" if ok else "error"
+                status["error"] = error
+                if ok and is_mod4:
+                    detentor_r, club_r = results
+                    status["has_detentor_signature"] = detentor_r.effective
+                    status["signature_warning"] = (
+                        f"{detentor_r.error} — document uploaded without the holder "
+                        "signature; please sign it manually."
+                    ) if detentor_r.error else None
+                    status["has_club_stamp"] = club_r.effective
+                    status["stamp_warning"] = (
+                        f"{club_r.error} — document uploaded without the club stamp; "
+                        "please stamp it manually."
+                    ) if club_r.error else None
+                elif ok:
+                    inscricao_r, carimbo_r = results
+                    status["has_club_stamp"] = carimbo_r.effective
+                    status["stamp_warning"] = (
+                        f"{carimbo_r.error} — document uploaded without the club stamp; "
+                        "please stamp it manually."
+                    ) if carimbo_r.error else None
+                    status["has_inscricao_mark"] = inscricao_r.effective
+                    status["inscricao_warning"] = (
+                        f"{inscricao_r.error} — please mark the inscription checkbox manually."
+                    ) if inscricao_r.error else None
     finally:
-        if overlay_processing_id is not None:
-            from sav_parsers import close_processing
-            try:
-                close_processing(overlay_processing_id)
-            except Exception:
-                logger.debug("close_processing failed for mod1 overlay", exc_info=True)
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
     return status
 
 
-def _read_mod1_template_fields(pdf_bytes: bytes):
-    """If `pdf_bytes` is a Modelo 1 filled from our fillable template, return its
-    values as the same entity-keyed ParsedField dict parse_fpb_mod1 produces —
-    read straight from the AcroForm, no classification or OCR. Returns None when
-    the PDF isn't a filled template (a scan/photo/other doc), so the caller falls
-    back to the Document AI path.
-    """
-    raw = read_mod1_acroform(pdf_bytes)
-    if raw is None or not is_filled_mod1_template(raw):
-        return None
-    return mod1_acroform_to_fields(raw)
-
-
-def _mod1_overlay_fields(tmp_path: str) -> tuple[dict, str | None]:
-    """Resolve Modelo 1 fields for overlays, using AcroForm before OCR.
-
-    The carimbo is a visual signal, so a PDF without our AcroForm must be sent
-    to Document AI to locate it. For a PDF carrying our template AcroForm, the
-    fixed stamp rectangle is inspected locally. This cannot distinguish a club
-    stamp from another graphic placed in that rectangle; it is safe here only
-    because the rectangle is otherwise empty on our template.
-    """
-    with open(tmp_path, "rb") as f:
-        pdf_bytes = f.read()
-    fields = _read_mod1_template_fields(pdf_bytes)
-    if fields is not None:
-        fields["carimbo_clube_presente"] = ParsedField(
-            value=rect_has_overlay(pdf_bytes, CLUB_STAMP_RECT),
-            confidence=1.0,
-        )
-        return fields, None
-
-    from sav_parsers import parse_fpb_mod1
-    parse_result = parse_fpb_mod1(tmp_path)
-    return parse_result["fields"], parse_result["processing_id"]
+_read_mod1_template_fields = read_mod1_template_fields
 
 
 @contextmanager
@@ -1703,60 +1767,63 @@ def _stamped_upload_path(
         yield tmp_path, {}
         return
 
+    if is_mod1:
+        with mod1_completion_path(
+            tmp_path,
+            reg_type=None,
+            license=None,
+            warning_action="document uploaded",
+            degrade_on_lookup_error=True,
+        ) as (upload_path, completion_status, _results):
+            if "_ocr_error" in completion_status:
+                exc = completion_status["_ocr_error"]
+                yield tmp_path, {
+                    "stamp_warning": f"OCR failed ({exc}); uploaded without overlays."
+                }
+            else:
+                status = {
+                    "has_club_stamp": completion_status["has_club_stamp"],
+                }
+                if completion_status.get("stamp_warning"):
+                    status["stamp_warning"] = completion_status["stamp_warning"]
+                yield upload_path, status
+        return
+
     from sav_parsers import close_processing
     processing_id = None
     try:
         try:
-            if is_mod1:
-                fields, processing_id = _mod1_overlay_fields(tmp_path)
-                carimbo, carimbo_bbox = read_carimbo(fields)
-                # No processing_id means the AcroForm answered: no OCR bbox, so
-                # stamp our template's fixed slot instead.
-                overlays = (carimbo_overlay(
-                    carimbo_present=carimbo,
-                    bbox=carimbo_bbox,
-                    rect=CLUB_STAMP_RECT if processing_id is None else None,
-                ),)
-            else:
-                from sav_parsers import parse_fpb_mod4
-                parse_result = parse_fpb_mod4(tmp_path)
-                fields = parse_result["fields"]
-                processing_id = parse_result["processing_id"]
-                det_present, det_bbox = read_detentor_signature(fields)
-                club_present, club_bbox = read_club_signature(fields)
-                overlays = (
-                    detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
-                    club_signature_overlay(present=club_present, bbox=club_bbox, image=club_stamp),
-                )
+            from sav_parsers import parse_fpb_mod4
+            parse_result = parse_fpb_mod4(tmp_path)
+            fields = parse_result["fields"]
+            processing_id = parse_result["processing_id"]
+            det_present, det_bbox = read_detentor_signature(fields)
+            club_present, club_bbox = read_club_signature(fields)
+            overlays = (
+                detentor_signature_overlay(present=det_present, bbox=det_bbox, image=detentor_signature),
+                club_signature_overlay(present=club_present, bbox=club_bbox, image=club_stamp),
+            )
         except Exception as exc:
             logger.warning("OCR for stamp overlay failed; uploading as-is", exc_info=True)
             yield tmp_path, {"stamp_warning": f"OCR failed ({exc}); uploaded without overlays."}
             return
 
         with overlaid_pdf(tmp_path, *overlays) as (upload_path, results):
-            status: dict[str, Any] = {}
-            if is_mod1:
-                (carimbo_r,) = results
-                status["has_club_stamp"] = carimbo_r.effective
-                if carimbo_r.error:
-                    status["stamp_warning"] = (
-                        f"{carimbo_r.error} — document uploaded without the club "
-                        "stamp; please stamp it manually."
-                    )
-            else:
-                detentor_r, club_r = results
-                status["has_detentor_signature"] = detentor_r.effective
-                status["has_club_stamp"] = club_r.effective
-                if detentor_r.error:
-                    status["signature_warning"] = (
-                        f"{detentor_r.error} — document uploaded without the holder "
-                        "signature; please sign it manually."
-                    )
-                if club_r.error:
-                    status["stamp_warning"] = (
-                        f"{club_r.error} — document uploaded without the club stamp; "
-                        "please stamp it manually."
-                    )
+            detentor_r, club_r = results
+            status: dict[str, Any] = {
+                "has_detentor_signature": detentor_r.effective,
+                "has_club_stamp": club_r.effective,
+            }
+            if detentor_r.error:
+                status["signature_warning"] = (
+                    f"{detentor_r.error} — document uploaded without the holder "
+                    "signature; please sign it manually."
+                )
+            if club_r.error:
+                status["stamp_warning"] = (
+                    f"{club_r.error} — document uploaded without the club stamp; "
+                    "please stamp it manually."
+                )
             yield upload_path, status
     finally:
         if processing_id is not None:
@@ -2024,7 +2091,7 @@ def classify_documents(documents: list[dict]) -> list[dict]:
     Answers "which of the required documents do I already hold?" for a caller
     holding a pile of files — a club's document store, an upload staging area,
     an inbox — before deciding whether to enrol anyone. Pair it with
-    ``enrollment_checklist`` (or ``get_enrollment_status``'s
+    ``document_requirements`` (or ``get_enrollment_status``'s
     ``available_doc_types``) to turn that pile into a list of what is still
     missing.
 
@@ -2666,7 +2733,10 @@ def submit_enrollment(
       these also carry has_club_stamp (True/False/None — whether the
       uploaded PDF has the club stamp; None when no OCR ran) and
       stamp_warning (str when the overlay was attempted but failed, else
-      None — surface it so the user can stamp manually).
+      None — surface it so the user can stamp manually). The Modelo 1 source
+      upload also carries has_license and license_warning: a Revalidação's
+      supplied licence is filled when its form slot is blank, and the warning
+      is set when that fill was attempted but failed.
     """
     from sav_parsers import close_processing
 
@@ -3393,19 +3463,23 @@ def _projected_enrollment_checklist(
     checklist = compute_enrollment_checklist(reg_type, nacional_id, available)
     if checklist is not None:
         checklist["projected"] = True
+        # Grounded even here: the nationality came from the player's op=2
+        # profile, not from the caller. Only the document counts are projected.
+        checklist["nationality_source"] = "sav_record"
         if available:
             checklist["counts_include_available"] = True
     return checklist
 
 
 @server.tool()
-def enrollment_checklist(
+def document_requirements(
     reg_type: int = REGISTRATION_TYPE_REVALIDACAO,
     nationality_id: int | None = None,
     available_doc_types: list[str] | None = None,
+    license: int | None = None,
 ) -> dict | None:
     """
-    Which documents an enrollment requires, and which of them you still lack.
+    Which documents an enrollment of this shape requires — the FPB rule, ungrounded.
 
     The FPB rule on its own, with no SAV lookup — for a player SAV cannot
     ground yet. That is the case ``get_enrollment_status`` cannot serve: it
@@ -3428,17 +3502,40 @@ def enrollment_checklist(
         **two** documento_identificacao and SAV files both under the same type,
         so they can only be counted. ``classify_documents`` produces this list.
 
+      license: not accepted — passing one raises, pointing you at
+        ``get_enrollment_status``. A player with a licence should never be
+        answered from a caller-supplied nationality.
+
     Returns ``{scenario, reg_type, required: [{doc_type, min_count,
-    found_count, satisfied}], optional, missing}``, or null for reg_type 3.
+    found_count, satisfied}], optional, missing, nationality_source}``, or null
+    for reg_type 3. ``nationality_source`` is ``"caller"`` here and
+    ``"sav_record"`` from ``get_enrollment_status`` — the two responses are
+    otherwise the same shape, so this is what tells them apart downstream.
     An empty ``missing`` means the document requirement is met — it is not a
     statement that SAV will accept the enrollment, which depends on eligibility
     rules this tool does not see.
     """
-    return compute_enrollment_checklist(
+    if license is not None:
+        # A licence means SAV can ground the answer, and this tool cannot. Fail
+        # loudly at the point of misuse rather than quietly answering from a
+        # nationality the caller guessed.
+        raise ValueError(
+            "document_requirements does not accept a license. Call "
+            "get_enrollment_status(license=...) instead — it reads the player's "
+            "real nationality and their live batch rather than taking your word "
+            "for either."
+        )
+    checklist = compute_enrollment_checklist(
         reg_type,
         nationality_id,
         _normalise_available_doc_types(available_doc_types),
     )
+    if checklist is not None:
+        # Provenance travels with the checklist, so a consumer holding one can
+        # tell a caller-asserted nationality from a SAV-grounded one. The two
+        # tools are otherwise shape-identical.
+        checklist["nationality_source"] = "caller"
+    return checklist
 
 
 @server.tool()
@@ -3558,8 +3655,10 @@ def get_enrollment_status(
     checklist = compute_enrollment_checklist(
         reg_type, nacional_id, [*doc_types, *available],
     )
-    if checklist is not None and available:
-        checklist["counts_include_available"] = True
+    if checklist is not None:
+        checklist["nationality_source"] = "sav_record"
+        if available:
+            checklist["counts_include_available"] = True
     return {
         "license": license,
         "status": "pending",

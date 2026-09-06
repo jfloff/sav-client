@@ -1,4 +1,4 @@
-"""MCP tests for classify_documents and enrollment_checklist.
+"""MCP tests for classify_documents and document_requirements.
 
 Both are read-only: they reach neither SAV nor, in these tests, Document AI —
 `sav_parsers.classify` is stubbed. The point of `classify_documents` is that it
@@ -148,13 +148,13 @@ def test_classify_documents_never_reaches_sav(monkeypatch):
   assert server_module.classify_documents([{"pdf": _pdf()}])[0]["doc_type"] == "fpb_modelo_1"
 
 
-# ── enrollment_checklist ──────────────────────────────────────────────────────
+# ── document_requirements ─────────────────────────────────────────────────────
 
 
 def test_checklist_counts_documents_the_caller_already_holds():
   """The motivating case: reconcile a pile of files against the FPB rule."""
-  without = server_module.enrollment_checklist(reg_type=1, nationality_id=155)
-  with_docs = server_module.enrollment_checklist(
+  without = server_module.document_requirements(reg_type=1, nationality_id=155)
+  with_docs = server_module.document_requirements(
     reg_type=1, nationality_id=155,
     available_doc_types=["fpb_modelo_1", "exame_medico"],
   )
@@ -164,21 +164,82 @@ def test_checklist_counts_documents_the_caller_already_holds():
 
 
 def test_checklist_is_null_for_transferencia():
-  assert server_module.enrollment_checklist(reg_type=3, nationality_id=155) is None
+  assert server_module.document_requirements(reg_type=3, nationality_id=155) is None
 
 
 def test_checklist_rejects_an_unknown_doc_type():
   """A silently dropped typo would report a document the caller supplied as missing."""
   with pytest.raises(ValueError):
-    server_module.enrollment_checklist(
+    server_module.document_requirements(
       reg_type=1, nationality_id=155, available_doc_types=["exame_medic"],
     )
 
 
 def test_checklist_defaults_to_foreign_born_without_a_nationality():
   """Asking for too many documents is recoverable; declaring someone ready is not."""
-  unknown = server_module.enrollment_checklist(reg_type=1)
-  portuguese = server_module.enrollment_checklist(reg_type=1, nationality_id=155)
+  unknown = server_module.document_requirements(reg_type=1)
+  portuguese = server_module.document_requirements(reg_type=1, nationality_id=155)
 
   assert unknown["scenario"] != portuguese["scenario"]
   assert len(unknown["required"]) >= len(portuguese["required"])
+
+
+def test_portuguese_with_both_documents_is_complete():
+  """The portuguese set is just the form and the medical exam."""
+  result = server_module.document_requirements(
+    reg_type=1, nationality_id=155,
+    available_doc_types=["fpb_modelo_1", "exame_medico"],
+  )
+
+  assert result["scenario"] == "portuguese"
+  assert result["missing"] == []
+  assert all(row["satisfied"] for row in result["required"])
+
+
+def test_foreign_born_needs_two_identity_documents():
+  """SAV files both under the same tipo_doc, so the rule counts rather than names."""
+  base = ["fpb_modelo_1", "exame_medico", "atestado_residencia", "certidao_matricula"]
+
+  one = server_module.document_requirements(
+    reg_type=1, available_doc_types=[*base, "documento_identificacao"],
+  )
+  two = server_module.document_requirements(
+    reg_type=1, available_doc_types=[*base, "documento_identificacao", "documento_identificacao"],
+  )
+
+  assert one["missing"] == ["documento_identificacao (need 2, found 1)"]
+  assert two["missing"] == []
+  row = {r["doc_type"]: r for r in two["required"]}["documento_identificacao"]
+  assert (row["min_count"], row["found_count"], row["satisfied"]) == (2, 2, True)
+
+
+def test_standalone_subida_needs_only_the_mod4():
+  result = server_module.document_requirements(reg_type=4)
+
+  assert [row["doc_type"] for row in result["required"]] == ["fpb_modelo_4"]
+  assert server_module.document_requirements(
+    reg_type=4, available_doc_types=["fpb_modelo_4"],
+  )["missing"] == []
+
+
+def test_a_bare_string_is_rejected_not_iterated():
+  """"exame_medico" is 12 characters, not 12 documents."""
+  with pytest.raises(ValueError):
+    server_module.document_requirements(reg_type=1, available_doc_types="exame_medico")
+
+
+def test_passing_a_license_is_refused_and_points_at_the_grounded_tool():
+  """A licence means SAV can ground the answer; this tool cannot, so it refuses.
+
+  Without this the wrong-tool case answers *plausibly* from a nationality the
+  caller guessed — the worst failure mode, because nothing looks broken.
+  """
+  with pytest.raises(ValueError, match="get_enrollment_status"):
+    server_module.document_requirements(reg_type=2, nationality_id=155, license=301772)
+
+
+def test_checklist_declares_its_nationality_is_caller_supplied():
+  """The grounded and ungrounded checklists are otherwise shape-identical."""
+  result = server_module.document_requirements(reg_type=1, nationality_id=155)
+
+  assert result["nationality_source"] == "caller"

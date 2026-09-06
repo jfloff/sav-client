@@ -1464,7 +1464,7 @@ def test_submit_path_stamps_unstamped_mod1_template_without_ocr(monkeypatch, tmp
   assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
 
 
-def test_submit_path_does_not_double_stamp_mod1_template(monkeypatch, tmp_path):
+def test_submit_path_does_not_double_stamp_on_mod1_template(monkeypatch, tmp_path):
   from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
   from test_mod1_read import SAMPLE
 
@@ -1627,3 +1627,343 @@ def test_upload_player_document_non_mod_is_plain(monkeypatch):
 
   assert result == {"success": True}
   assert _xobjs(captured["bytes"]) == _xobjs(base)
+
+
+# ── complete_mod1 ─────────────────────────────────────────────────────────────
+# The tool is the submission upload path minus the upload, so it is tested here,
+# beside the upload tests, against the same completion machinery.
+
+
+def test_complete_mod1_completes_a_template_form_without_ocr_and_dates_it(monkeypatch, tmp_path):
+  """A fill_mod1 form is completed at the fixed slots and dated, with no OCR call.
+
+  Stamping and dating are one action on the upload path; a preview that showed
+  a stamped-but-undated form would not be the artifact that gets filed.
+  """
+  import io
+  from datetime import date
+
+  from pypdf import PdfReader
+
+  from sav_shared.fpb_mod1 import render_mod1
+  from test_mod1_read import SAMPLE
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
+  )
+  undated = {k: v for k, v in SAMPLE.items() if k != "data_assinatura"}
+  base = render_mod1(undated, season="2026/2027")
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["has_club_stamp"] is True
+  assert result["has_inscricao_mark"] is True
+  assert result["has_license"] is False
+  assert result["reg_type_assumed"] == 1
+  assert "stamp_warning" not in result
+  assert set(result) == {
+    "filename", "size_bytes", "pdf_b64", "has_club_stamp",
+    "has_inscricao_mark", "has_license", "reg_type_assumed",
+  }
+  assert result["filename"] == "modelo1_completed.pdf"
+  stamped = base64.b64decode(result["pdf_b64"])
+  assert result["size_bytes"] == len(stamped)
+  assert _xobjs(stamped) == _xobjs(base) + 1
+  fields = PdfReader(io.BytesIO(stamped)).get_fields()
+  today = date.today()
+  assert tuple(str(fields[n].get("/V", "")) for n in ("ass_dia", "ass_mes", "ass_ano")) == (
+    f"{today.day:02d}", f"{today.month:02d}", str(today.year),
+  )
+
+
+def test_complete_mod1_uses_the_ocr_bboxes_for_a_scan(monkeypatch, tmp_path):
+  """A member-supplied scan has no AcroForm, so both slots come from OCR."""
+  captured: dict = {"closed": []}
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  carimbo_bbox = BBox(page=0, vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)])
+  tipo_bbox = BBox(page=0, vertices=[(0.20, 0.20), (0.25, 0.20), (0.25, 0.21), (0.20, 0.21)])
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: {
+      "fields": {
+        "carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox),
+        "tipo_inscricao_revalidacao": ParsedField(value=False, confidence=0.9, bbox=tipo_bbox),
+      },
+      "processing_id": "stamp-preview",
+    },
+  )
+  monkeypatch.setattr(
+    "sav_parsers.close_processing",
+    lambda processing_id, **kwargs: captured["closed"].append(processing_id),
+  )
+  base = _blank_pdf_bytes()
+
+  result = server_module.complete_mod1(
+    pdf_b64=base64.b64encode(base).decode("ascii"), license=301772,
+  )
+
+  assert result["has_club_stamp"] is True
+  assert result["has_inscricao_mark"] is True
+  assert result["reg_type_assumed"] == 2
+  assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 2
+  assert captured["closed"] == ["stamp-preview"]
+
+
+def test_complete_mod1_fills_a_blank_revalidacao_template_license(monkeypatch, tmp_path):
+  """The local completion tool fills a blank AcroForm licence for type 2."""
+  import io
+  from pypdf import PdfReader
+  from sav_shared.fpb_mod1 import render_mod1
+  from test_mod1_read import SAMPLE
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template must not OCR")),
+  )
+  values = {**SAMPLE, "tipo_inscricao": 2}
+  values.pop("license", None)
+  base = render_mod1(values, season="2026/2027", validate=False)
+
+  result = server_module.complete_mod1(
+    pdf_b64=base64.b64encode(base).decode("ascii"), license=301772,
+  )
+
+  assert result["has_license"] is True
+  completed = base64.b64decode(result["pdf_b64"])
+  fields = PdfReader(io.BytesIO(completed)).get_fields()
+  assert str(fields["nr_licenca"].get("/V", "")) == "301772"
+  assert _xobjs(completed) == _xobjs(base) + 1  # only the carimbo is raster
+
+
+def test_complete_mod1_skips_unknown_scan_license_presence(monkeypatch, tmp_path):
+  """An absent licence presence entity is unknown, so no number is drawn."""
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  tipo_bbox = BBox(page=0, vertices=[(0.20, 0.20), (0.25, 0.20), (0.25, 0.21), (0.20, 0.21)])
+  carimbo_bbox = BBox(page=0, vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)])
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: {
+      "fields": {
+        "tipo_inscricao_revalidacao": ParsedField(value=False, confidence=0.9, bbox=tipo_bbox),
+        "carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox),
+      },
+      "processing_id": "license-unknown",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+  base = _blank_pdf_bytes()
+
+  result = server_module.complete_mod1(
+    pdf_b64=base64.b64encode(base).decode("ascii"), license=301772,
+  )
+
+  assert result["has_license"] is None
+  assert "license_warning" not in result
+  assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 2
+
+
+def test_complete_mod1_fills_license_in_scan_from_presence_bbox(monkeypatch, tmp_path):
+  """A false OCR presence plus its paired bbox adds the supplied licence."""
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  tipo_bbox = BBox(page=0, vertices=[(0.20, 0.20), (0.25, 0.20), (0.25, 0.21), (0.20, 0.21)])
+  license_bbox = BBox(page=0, vertices=[(0.30, 0.20), (0.45, 0.20), (0.45, 0.23), (0.30, 0.23)])
+  carimbo_bbox = BBox(page=0, vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)])
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: {
+      "fields": {
+        "tipo_inscricao_revalidacao": ParsedField(value=False, confidence=0.9, bbox=tipo_bbox),
+        "licenca_fpb_presente": ParsedField(value=False, confidence=0.9, bbox=license_bbox),
+        "carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox),
+      },
+      "processing_id": "license-scan",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+  base = _blank_pdf_bytes()
+
+  result = server_module.complete_mod1(
+    pdf_b64=base64.b64encode(base).decode("ascii"), license=301772,
+  )
+
+  assert result["has_license"] is True
+  assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 3
+
+
+def test_submission_path_fills_a_revalidacao_template_license(monkeypatch, tmp_path):
+  """submit_enrollment's replacement path carries the supplied licence fill."""
+  import io
+  from pypdf import PdfReader
+  from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
+  from test_mod1_read import SAMPLE
+
+  captured: dict = {}
+
+  class StubClient:
+    def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
+      with open(file_path, "rb") as f:
+        captured["bytes"] = f.read()
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template must not OCR")),
+  )
+  values = {**SAMPLE, "tipo_inscricao": 2}
+  values.pop("license", None)
+  base = render_mod1(values, season="2026/2027", validate=False)
+  parsed = mod1_values_to_fields(values, validate=False)
+
+  status = server_module._replace_player_document_from_bytes(
+    StubClient(), 12, 301772, base,
+    doc_type=DocType.FPB_MODELO_1, parsed=parsed, reg_type=2,
+  )
+
+  assert status["status"] == "ok"
+  assert status["has_license"] is True
+  fields = PdfReader(io.BytesIO(captured["bytes"])).get_fields()
+  assert str(fields["nr_licenca"].get("/V", "")) == "301772"
+
+
+def test_complete_mod1_does_not_double_mark(monkeypatch, tmp_path):
+  """An already-completed form comes back untouched — same idempotency as upload."""
+  from sav_shared.fpb_mod1 import render_mod1
+  from test_mod1_read import SAMPLE
+
+  stamp_bytes = base64.b64decode(_png_b64())
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(stamp_bytes)
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("template stamp check must not OCR")),
+  )
+  base = render_mod1(SAMPLE, season="2026/2027", club_stamp=stamp_bytes)
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["has_club_stamp"] is True
+  assert result["has_inscricao_mark"] is True
+  assert result["reg_type_assumed"] == 1
+  assert base64.b64decode(result["pdf_b64"]) == base
+
+
+def test_complete_mod1_without_a_configured_stamp_returns_the_form_unstamped(monkeypatch):
+  """No $CLUB_STAMP_PATH means nothing inspected the form: unknown, not unstamped."""
+  from sav_shared.fpb_mod1 import render_mod1
+  from test_mod1_read import SAMPLE
+
+  monkeypatch.delenv("CLUB_STAMP_PATH", raising=False)
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: (_ for _ in ()).throw(AssertionError("no stamp configured, so no OCR")),
+  )
+  base = render_mod1(SAMPLE, season="2026/2027")
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["has_club_stamp"] is None
+  assert result["has_inscricao_mark"] is None
+  assert result["reg_type_assumed"] == 1
+  assert "CLUB_STAMP_PATH" in result["stamp_warning"]
+  assert base64.b64decode(result["pdf_b64"]) == base
+
+
+def test_complete_mod1_never_touches_sav(monkeypatch, tmp_path):
+  """Inspecting a local artifact must not reach the federation — no client, no upload."""
+  from sav_shared.fpb_mod1 import render_mod1
+  from test_mod1_read import SAMPLE
+
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  monkeypatch.setattr(
+    server_module, "_get_client",
+    lambda: (_ for _ in ()).throw(AssertionError("complete_mod1 must not talk to SAV")),
+  )
+  base = render_mod1(SAMPLE, season="2026/2027")
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["has_club_stamp"] is True
+
+
+def test_complete_mod1_derived_type_never_contradicts_the_form(monkeypatch, tmp_path):
+  """A derived reg_type must not tick a box the form contradicts.
+
+  `license` is optional and the type is inferred from it, so a caller who simply
+  omits it for a Revalidação would otherwise have "1ª Inscrição" marked as well —
+  two ticked boxes on a club-endorsed attestation. Only reachable on a scan: a
+  template form's unticked boxes read None, so the overlay already skips.
+  """
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  primeira_bbox = BBox(page=0, vertices=[(0.20, 0.20), (0.25, 0.20), (0.25, 0.21), (0.20, 0.21)])
+  carimbo_bbox = BBox(page=0, vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)])
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: {
+      "fields": {
+        # The member ticked Revalidação, so `primeira` is blank *with* a bbox.
+        "tipo_inscricao_primeira": ParsedField(value=False, confidence=0.9, bbox=primeira_bbox),
+        "tipo_inscricao_revalidacao": ParsedField(value=True, confidence=0.9, bbox=None),
+        "carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox),
+      },
+      "processing_id": "contradiction",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+  base = _blank_pdf_bytes()
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["reg_type_assumed"] == 1
+  assert result["has_inscricao_mark"] is None
+  assert "other registration type" in result["inscricao_warning"]
+  # Only the carimbo was added; the checkbox was left alone.
+  assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 1
+
+
+def test_complete_mod1_derived_type_still_marks_an_unmarked_scan(monkeypatch, tmp_path):
+  """The guard only fires on a contradiction — a blank form is still marked."""
+  stamp = tmp_path / "stamp.png"
+  stamp.write_bytes(base64.b64decode(_png_b64()))
+  monkeypatch.setenv("CLUB_STAMP_PATH", str(stamp))
+  primeira_bbox = BBox(page=0, vertices=[(0.20, 0.20), (0.25, 0.20), (0.25, 0.21), (0.20, 0.21)])
+  carimbo_bbox = BBox(page=0, vertices=[(0.60, 0.80), (0.65, 0.80), (0.65, 0.81), (0.60, 0.81)])
+  monkeypatch.setattr(
+    "sav_parsers.parse_fpb_mod1",
+    lambda p: {
+      "fields": {
+        "tipo_inscricao_primeira": ParsedField(value=False, confidence=0.9, bbox=primeira_bbox),
+        "tipo_inscricao_revalidacao": ParsedField(value=False, confidence=0.9, bbox=None),
+        "carimbo_clube_presente": ParsedField(value=False, confidence=0.9, bbox=carimbo_bbox),
+      },
+      "processing_id": "no-contradiction",
+    },
+  )
+  monkeypatch.setattr("sav_parsers.close_processing", lambda pid, **kw: None)
+  base = _blank_pdf_bytes()
+
+  result = server_module.complete_mod1(pdf_b64=base64.b64encode(base).decode("ascii"))
+
+  assert result["has_inscricao_mark"] is True
+  assert "inscricao_warning" not in result
+  assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 2

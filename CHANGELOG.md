@@ -21,6 +21,128 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.98.0 — 2026-09-06
+
+### Added
+
+**`complete_mod1(pdf_b64, license?)` — the submission's completion overlays, without the upload**
+`IMPACT: none` (new tool; nothing existing changes). A caller can now inspect
+the exact Modelo 1 artifact `submit_enrollment` files: the shared completion
+path marks the tipo_inscricao checkbox, fills a missing Revalidação licence, and
+applies the club carimbo from the server's `$CLUB_STAMP_PATH`, including the
+existing idempotent stamp/date behaviour. The optional `license` selects the
+type: omitted/zero means 1ª Inscrição (`reg_type_assumed=1`), while a real
+licence means Revalidação (`reg_type_assumed=2`) and is written to the blank
+`nr_licenca` field. A number already on the form is never overwritten.
+
+Returns `{filename, size_bytes, pdf_b64, has_club_stamp, has_inscricao_mark,
+has_license, reg_type_assumed}` plus `stamp_warning`, `inscricao_warning`,
+and/or `license_warning` only when an overlay could not be applied. A `fill_mod1`
+AcroForm uses its fixed slots without OCR; a member-supplied scan uses Document
+AI for the licence and carimbo slots. When no stamp path is configured or OCR
+fails, `has_club_stamp` remains `None` rather than claiming the form was
+inspected.
+
+Because the type is *derived* rather than read off an enrollment, it is treated
+as the weaker claim: if the form's other tipo_inscricao box is already ticked,
+the mark is skipped and reported via `inscricao_warning` with
+`has_inscricao_mark: None`, rather than producing an attestation with both boxes
+ticked. Only reachable on a scan — a template form's unticked boxes read as
+unknown, so the inscription overlay already skips them. `submit_enrollment`
+uses the enrollment's authoritative `reg_type` rather than this inferred type,
+and also fills the supplied licence on Revalidação forms as described below.
+
+Touches no SAV endpoint: it creates no batch and uploads nothing, unlike
+`preview_enrollment`, which mints a real batch. `authz.toml` gives it
+`roles = ["coach"]` with no `self_scope` — the output is a club-endorsed
+attestation, so a parent or player must not be able to mint one. The same
+warning `fill_mod1` carries applies: do not hand this PDF to the player.
+
+**`sav mod1 complete <pdf> --out <path> [--license N]`**
+`IMPACT: none` (new command). The CLI counterpart of `complete_mod1`: applies
+the tipo_inscrição mark, the Licença FPB and the club carimbo, and writes the
+result. Contacts SAV for nothing. Accepts an image as well as a PDF. Reports
+each overlay, and on an OCR failure writes **no** file rather than one that
+looks completed but is not.
+
+### Fixed
+
+**Overlays were placed wrongly on every rotated scan**
+`IMPACT: silent` — and it reached the federation. `bbox_to_pdf_rect` mapped
+Document AI's normalized vertices straight onto the page's **mediabox**,
+ignoring `/Rotate`. Document AI measures the page as *displayed*; the mediabox
+is the unrotated space. On a scan with a landscape mediabox and `/Rotate 270` —
+routine scanner and phone-camera output — the club stamp landed in the middle
+of the Escalão row instead of the Diretor/Carimbo box, and the upload reported
+success, because `applied` only ever meant "we drew something", not "we drew it
+in the right place".
+
+This affected every overlay path, not just the new tooling: `sav enrollment
+create`, `submit_enrollment`, `upload_player_document` and
+`replace_player_document` all share the conversion.
+
+Two further errors compounded it, both now fixed by calibrating in the space OCR
+measured in and converting once: the club stamp's nudge followed user-space
+`+y`, which on a rotated page is *sideways* on screen; and the licence text
+sized itself from the converted rect's height, which on a rotated page is the
+slot's on-screen *width*.
+
+`DETECT:` any Modelo 1 or Modelo 4 filed from a scan rather than a `fill_mod1`
+form. Check for `/Rotate`:
+`python -c "from pypdf import PdfReader; p=PdfReader('form.pdf').pages[0]; print(p.get('/Rotate',0))"`
+— anything other than `0` means the stamp on the filed copy is misplaced.
+`FIX:` nothing to change in your code. Re-stamp and re-upload affected
+documents; forms produced by `fill_mod1` were never affected, since that path
+uses a fixed rect and no OCR.
+
+**`sav mod1 complete` no longer hangs on expired Document AI credentials**
+`IMPACT: none` (new command). `sav_parsers.document_ai.process_document` is
+called with no `timeout`, so an unusable ADC token became a silent retry loop —
+observed hanging for minutes with no output. The command now verifies
+credentials before any call that needs them and fails in under a second with
+`Run gcloud auth application-default login`. Only definitive auth errors are
+fatal, and only on the OCR path: a `fill_mod1` form is completed offline and
+never touches credentials. The underlying missing timeout is a sav-parsers
+issue and still open.
+
+### Changed
+
+**Anchor-to-slot geometry moved to sav-parsers; the parser is now pinned**
+`IMPACT: raises` if you run an older parser. sav-parsers `0.10.0`+ returns the
+writable **slot** on `*_presente` bboxes rather than the labelled anchor, so the
+corrections that lived here (`_CLUB_STAMP_SCALE`, `_CLUB_STAMP_Y_SHIFT`,
+`_LICENCA_RIGHT`/`_WIDTH`/`_HEIGHT`, and the `adjust_normalized_box` /
+`anchor_to_slot` helpers) are deleted rather than kept as shims. Placement is
+byte-identical — verified rect-for-rect against the pre-migration output on a
+real rotated scan — because this relocated the maths without recalibrating it.
+`pyproject.toml` pins the parser to a SHA instead of `@main`: an older parser
+would hand back the labelled caption and silently place overlays on it.
+`DETECT:` `grep -rn "adjust_normalized_box\|anchor_to_slot" .`
+`FIX:` drop those calls and pass the presence bbox straight through — it is
+already the slot. Do not offset it further.
+
+**`sav enrollment create` now fills the Licença FPB on Revalidação forms**
+`IMPACT: silent` — the CLI now uses the same shared completion overlays as
+`submit_enrollment`, so a blank Revalidação licence field is filled before the
+Modelo 1 upload. 1ª Inscrição forms still leave that field blank.
+`DETECT:` `grep -rn "_prepare_club_stamp" .`
+`FIX:` no caller change is required; existing CLI invocations get the corrected
+upload behaviour.
+
+**`submit_enrollment` fills the Licença FPB on Revalidação forms before upload**
+`IMPACT: silent` — the shared submission completion path now writes the
+supplied licence into a blank `nr_licenca` field on a `fill_mod1` AcroForm, or
+into the OCR-located `licenca_fpb_presente` slot on a member-supplied scan.
+Existing numbers and 1ª Inscrição forms remain unchanged; the submission
+response now reports `has_license` and `license_warning` alongside the other
+Modelo 1 completion status.
+`DETECT:` `grep -rn "submit_enrollment\|_replace_player_document_from_bytes" .`
+`FIX:` no caller change is required. If a Revalidação is already queued or was
+filed before this release, inspect its Modelo 1 and add the licence manually
+when `has_license` was false or a `license_warning` was returned.
+
+---
+
 ## 0.97.0 — 2026-09-05
 
 ### Added
@@ -51,7 +173,7 @@ document" is the common answer for a folder that also holds team photos. Unlike
 document, and no caching, so cache against your own file identity if you scan
 repeatedly.
 
-**`enrollment_checklist(reg_type, nationality_id?, available_doc_types?)` — the FPB rule, standalone**
+**`document_requirements(reg_type, nationality_id?, available_doc_types?, license?)` — the FPB rule, standalone**
 `IMPACT: none` (new tool). Exposes `compute_enrollment_checklist` with no SAV
 lookup, for a player SAV cannot ground: `get_enrollment_status` keys on a
 licence, and a genuinely new player doing a 1ª Inscrição has none. Returns the
@@ -65,6 +187,15 @@ ready when they are not is not. Do not pass 155 from a Portuguese-looking name
 or a form field; pass it only from a SAV record. Prefer `get_enrollment_status`
 for anyone who has a licence, since it reads their real nationality and their
 live batch instead of taking the caller's word for either.
+
+Named for *the rule*, not for a player, because `get_enrollment_status` answers
+the same question for anyone who has a licence and answers it better — grounding
+nationality in their SAV record instead of the caller's word. Two guards enforce
+that split: passing a `license` here **raises**, pointing at the grounded tool;
+and every checklist now carries `nationality_source` (`"caller"` here,
+`"sav_record"` from `get_enrollment_status`), so a consumer holding one can tell
+a guessed answer from a grounded one. `IMPACT: none` for existing callers of
+`get_enrollment_status` — `nationality_source` is purely additive.
 
 `available_doc_types` takes one entry per document — duplicates are significant,
 because foreign_born requires **two** `documento_identificacao` and SAV files

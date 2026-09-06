@@ -11,6 +11,56 @@ def _write_pdf(tmp_path):
   return pdf_path
 
 
+def _run_cli_mod1_completion(monkeypatch, tmp_path, *, reg_type, license):
+  """Run the CLI's completion wrapper against a blank fillable Modelo 1."""
+  import click
+  from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1
+
+  values = {"tipo_inscricao": reg_type}
+  pdf_path = tmp_path / f"mod1-{reg_type}.pdf"
+  pdf_path.write_bytes(render_mod1(values, season="2026/2027", validate=False))
+  parsed = mod1_values_to_fields(values, validate=False)
+  processing_path = tmp_path / f"processing-{reg_type}"
+  processing_path.mkdir()
+  monkeypatch.setattr("sav_parsers.processing_dir", lambda _id: str(processing_path))
+  monkeypatch.delenv("CLUB_STAMP_PATH", raising=False)
+
+  ctx = click.Context(click.Command("test"))
+  try:
+    return cli_module._prepare_club_stamp(
+      ctx, cli_module.Console(), cli_module.Console(), parsed, str(pdf_path),
+      f"proc-{reg_type}", reg_type=reg_type, license=license,
+    )
+  finally:
+    ctx.close()
+
+
+def test_cli_mod1_completion_fills_license_for_revalidation(monkeypatch, tmp_path):
+  from pypdf import PdfReader
+  import io
+
+  upload_path, *_ = _run_cli_mod1_completion(
+    monkeypatch, tmp_path, reg_type=2, license=301772,
+  )
+
+  with open(upload_path, "rb") as f:
+    fields = PdfReader(io.BytesIO(f.read())).get_fields()
+  assert str(fields["nr_licenca"].get("/V", "")) == "301772"
+
+
+def test_cli_mod1_completion_leaves_license_blank_for_first_registration(monkeypatch, tmp_path):
+  from pypdf import PdfReader
+  import io
+
+  upload_path, *_ = _run_cli_mod1_completion(
+    monkeypatch, tmp_path, reg_type=1, license=None,
+  )
+
+  with open(upload_path, "rb") as f:
+    fields = PdfReader(io.BytesIO(f.read())).get_fields()
+  assert str(fields["nr_licenca"].get("/V", "")) == ""
+
+
 @pytest.fixture
 def batch_stub():
   return type("BatchStub", (), {"id": 12, "number": "2025/12", "club_id": 99})()

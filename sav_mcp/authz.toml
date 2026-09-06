@@ -176,6 +176,15 @@ roles = ["coach"]
 [tools.fill_mod1]
 roles = ["coach"]
 
+# Applies the club's inscription mark and carimbo from the server's own
+# $CLUB_STAMP_PATH to a Modelo 1 and hands the completed PDF back. No SAV write,
+# so it keeps the read capability — but the output is a club-endorsed
+# attestation, so no `self_scope`: a parent or player must never be able to mint
+# one for their own enrollment. `submit_enrollment` does the same completion as
+# it files the form.
+[tools.complete_mod1]
+roles = ["coach"]
+
 
 # ── Enrollment workflow ──────────────────────────────────────────────────────
 [tools.parse_enrollment_forms]
@@ -192,7 +201,7 @@ self_scope = ["parent", "player"]
 # A pure policy lookup — the FPB required-document rule, with no SAV call and
 # no subject. A parent asking "what does my child need" is the motivating case,
 # so it is open to every role.
-[tools.enrollment_checklist]
+[tools.document_requirements]
 roles = ["coach", "parent", "player"]
 
 [tools.find_open_batch]

@@ -95,6 +95,22 @@ def get_pdf_page_box(
     return (float(mb[0]), float(mb[1]), float(mb[2]), float(mb[3]))
 
 
+def get_pdf_page_rotation(pdf_bytes: bytes, *, page_index: int = 0) -> int:
+  """Return a page's /Rotate as one of 0, 90, 180, 270.
+
+  /Rotate is the clockwise rotation a viewer applies when displaying the page,
+  so it is the difference between the coordinate space overlays are placed in
+  (the mediabox) and the one OCR measured against (what the reader sees).
+  Inherited from an ancestor Pages node when the page itself omits it.
+  """
+  with pikepdf.open(io.BytesIO(pdf_bytes)) as pdf:
+    raw = pdf.pages[page_index].get("/Rotate", 0)
+    try:
+      return int(raw) % 360 // 90 * 90
+    except (TypeError, ValueError):
+      return 0
+
+
 def bottom_right_rect(
   pdf_bytes: bytes,
   image_bytes: bytes,
@@ -142,13 +158,41 @@ def bbox_to_pdf_rect(
   page_x0, page_y0, page_x1, page_y1 = get_pdf_page_box(pdf_bytes, page_index=page_index)
   page_w = page_x1 - page_x0
   page_h = page_y1 - page_y0
-  xs = [v[0] for v in normalized_vertices]
-  ys = [v[1] for v in normalized_vertices]
-  x0 = page_x0 + min(xs) * page_w
-  x1 = page_x0 + max(xs) * page_w
-  y0 = page_y1 - max(ys) * page_h
-  y1 = page_y1 - min(ys) * page_h
-  return (x0, y0, x1, y1)
+  rotation = get_pdf_page_rotation(pdf_bytes, page_index=page_index)
+
+  # Document AI normalizes against the page as *rendered*, which is the mediabox
+  # rotated clockwise by /Rotate. Mapping its vertices straight onto the mediabox
+  # silently places every overlay in the wrong spot on a rotated scan — and
+  # phone-camera and scanner output carries /Rotate routinely. Invert the display
+  # rotation here so the rect lands where the reader sees the slot.
+  def to_user_space(nx: float, ny: float) -> tuple[float, float]:
+    if rotation == 90:
+      return (page_x0 + ny * page_w, page_y0 + nx * page_h)
+    if rotation == 180:
+      return (page_x0 + (1.0 - nx) * page_w, page_y0 + ny * page_h)
+    if rotation == 270:
+      return (page_x0 + (1.0 - ny) * page_w, page_y0 + (1.0 - nx) * page_h)
+    return (page_x0 + nx * page_w, page_y1 - ny * page_h)
+
+  points = [to_user_space(vx, vy) for vx, vy in normalized_vertices]
+  xs = [px for px, _ in points]
+  ys = [py for _, py in points]
+  return (min(xs), min(ys), max(xs), max(ys))
+
+
+def get_displayed_page_size(
+  pdf_bytes: bytes, *, page_index: int = 0,
+) -> tuple[float, float]:
+  """Return (width, height) in points of the page *as displayed*.
+
+  /Rotate 90 or 270 swaps the mediabox axes on screen, and OCR measures the
+  displayed page — so anything calibrated against what a reader sees (text
+  height, a nudge "up the page") must be expressed against this, not the
+  mediabox.
+  """
+  x0, y0, x1, y1 = get_pdf_page_box(pdf_bytes, page_index=page_index)
+  w, h = x1 - x0, y1 - y0
+  return (h, w) if get_pdf_page_rotation(pdf_bytes, page_index=page_index) in (90, 270) else (w, h)
 
 
 def scale_rect(
@@ -325,6 +369,10 @@ def overlay_image_on_pdf(
   Use this for any raster overlay — club stamps, checkbox marks, signatures.
   Use image_size + get_pdf_page_box to compute `rect`.
   """
+  # Deliberately no pre-rotation. add_overlay orients the placed content to the
+  # page's /Rotate on its own, while interpreting `rect` in unrotated user space
+  # — verified against a /Rotate 270 scan, where pre-rotating by any of 90/180/
+  # 270 rendered the stamp sideways or upside down and 0 rendered it upright.
   try:
     overlay_pdf = img2pdf.convert(image_bytes)
   except ValueError as exc:
