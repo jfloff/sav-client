@@ -3583,11 +3583,26 @@ def enrollment_fields() -> list[dict]:
     ``concelho`` carries ``null`` because concelhos are distrito-dependent and
     fetched live from SAV, so the bundle has no such key.
 
-    A ``null`` ``label``, ``enum_ref`` or ``field_overrides_key`` means no such
-    value exists upstream, not that it is unknown. Thirteen fields have no
-    ``label`` because no field definition supplies one; nothing is invented to
-    fill the gap. ``exam_date`` is a ``submit_enrollment`` field with no row
-    here: it has no Modelo 1 slot and no field definition to derive from.
+    Every field carries a ``label`` (Portuguese, as printed on the form). A
+    ``null`` ``enum_ref`` or ``field_overrides_key`` means no such value exists
+    upstream, not that it is unknown — ``nif`` and ``nasc`` are cross-checked
+    against SAV but never submitted, so they have no override key.
+    ``exam_date`` is a ``submit_enrollment`` field with no row here: it has no
+    Modelo 1 slot and comes from the medical exam document.
+
+    **`required_when` is what the form requires, not what to ask a human for.**
+    Several always-required fields are not human input and should not appear on
+    an intake form:
+
+      - ``escalao`` follows from ``nasc`` and ``genero`` (the tier age windows
+        in ``sav://lookups``), so compute it rather than asking.
+      - ``clube`` and ``associacao`` are constants for the session's club.
+      - ``license`` comes from the player's SAV record, not the player.
+      - ``data_assinatura`` is filled when the form is stamped.
+
+    What genuinely has to come from a person is the rest: the player's name,
+    nationality, birth date, identity document, contact details, address,
+    consents, and — for a minor — the guardian block.
 
     Every row is derived from the constants that render and validate the form.
     An application mapping external data (a club spreadsheet, an import file)

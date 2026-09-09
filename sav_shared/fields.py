@@ -61,6 +61,22 @@ class FieldDef:
 
 # Order here drives the order of rows in the submission summary table.
 FIELDS: list[FieldDef] = [
+  # ── Label-only: header / enrollment shape ───────────────────────────────
+  # These have no OCR entity, no submit kwarg and no op=2 input: they exist
+  # so every Modelo 1 field has a human label (see `enrollment_field_schema`).
+  # Every derivation below filters them out, so they are inert here.
+  FieldDef(key="tipo_inscricao", label="Tipo de Inscrição"),
+  FieldDef(key="license", label="Licença FPB"),
+  FieldDef(key="clube", label="Clube"),
+  FieldDef(key="associacao", label="Associação"),
+  FieldDef(key="genero", label="Género"),
+  FieldDef(key="escalao", label="Escalão"),
+
+  # ── Label-only: player identity not held in the op=2 profile ────────────
+  FieldDef(key="nome", label="Nome Completo"),
+  FieldDef(key="nacionalidade", label="Nacionalidade"),
+  FieldDef(key="pais_nascimento", label="País de Nascimento"),
+
   # ── Read-only personal (cross-checked, never submitted) ─────────────────
   FieldDef(
     key="nif", label="NIF",
@@ -152,6 +168,10 @@ FIELDS: list[FieldDef] = [
     # OCR side is a checkbox group (parentesco_encarregado_pai/mae/tutor);
     # handled bespoke in fpb_mod1_to_sav_kwargs._pick_checked.
   ),
+  # Label-only: on the Modelo 1 but never submitted to SAV.
+  FieldDef(key="guardian_id_type", label="Tipo Documento Encarregado"),
+  FieldDef(key="guardian_id_number", label="Nº Identificação Encarregado"),
+  FieldDef(key="guardian_id_expiry", label="Validade Documento Encarregado"),
   FieldDef(
     key="guardian_phone", label="Telefone Encarregado",
     ocr_entity="telefone_encarregado", sav_kwarg="guardian_phone",
@@ -179,6 +199,9 @@ FIELDS: list[FieldDef] = [
     ocr_entity="consentimento_marketing", sav_kwarg="consent_marketing",
     is_bool=True,
   ),
+
+  # ── Label-only: part of the hand-completed signature block ──────────────
+  FieldDef(key="data_assinatura", label="Data Assinatura"),
 ]
 
 

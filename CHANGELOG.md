@@ -21,6 +21,40 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.99.1 — 2026-09-09
+
+### Changed
+
+**`enrollment_fields()` now labels every field, and says which ones are not human input**
+`IMPACT: none` (additive; no key changes shape or disappears). Two gaps in
+0.99.0's tool, both about it being usable to build an intake form:
+
+`label` was `null` for the 13 fields with no `FieldDef` — including `nome`,
+which is as central as a field gets. `sav_shared/fields.py:FIELDS` now carries a
+**label-only** `FieldDef` (a `key` and a `label`, nothing else) for each of them,
+so every row has a Portuguese label from the one field registry. These rows have
+no `ocr_entity`, `sav_kwarg` or `profile_html`, and all four constants derived
+from `FIELDS` (`RECONCILE_TEXT`, `RECONCILE_READONLY`, `ENROLLMENT_FIELD_META`,
+`PROFILE_HTML_FIELDS`) filter on exactly those — so they are inert: the derived
+values are byte-identical before and after, and a test now asserts the label-only
+keys stay out of all four. If you add such a row, keep it label-only; giving one
+an `ocr_entity` or `sav_kwarg` enrolls it in the reconcile and submission paths.
+
+`required_when` also read as "a human must type this", which is wrong for four
+always-required fields. The docstrings now say plainly that it describes what the
+*form* requires, and that `escalao` follows from `nasc` + `genero` (the tier age
+windows in `sav://lookups`), `clube`/`associacao` are club constants, `license`
+comes from the player's SAV record, and `data_assinatura` is filled at stamping.
+This is documented rather than modelled as a new column — the row shape is
+unchanged.
+
+`DETECT:` a consumer that renders an input for every row of `enrollment_fields()`,
+or that special-cased a `null` label.
+`FIX:` drop the null-label handling, and skip `escalao`, `clube`, `associacao`,
+`license` and `data_assinatura` on intake forms — derive or supply them instead.
+
+---
+
 ## 0.99.0 — 2026-09-09
 
 ### Added
@@ -67,12 +101,9 @@ bundle has no such key.
 
 Every row is *derived* from `MOD1_FILL_MAPPING` and the mandatory-fill constants
 by `sav_shared.fpb_mod1.enrollment_field_schema()`, which is the point: renaming a
-key changes this output automatically. Nothing here is hand-maintained, which is
-also why `label` is `null` for the 13 fields that have no `FieldDef` (`nome`,
-`genero`, `escalao`, `tipo_inscricao`, …) — a `null` means "no such value exists
-upstream", not "unknown". For the same reason `exam_date` gets no row: it is a
-`submit_enrollment` field with no Modelo 1 slot and no field definition to derive
-from.
+key changes this output automatically. Nothing here is hand-maintained. `exam_date` gets no
+row for the same reason: it is a `submit_enrollment` field with no Modelo 1 slot
+and no field definition to derive from.
 
 `authz.toml` gives it `roles = ["coach", "parent", "player"]` — it names no
 subject and touches no record.

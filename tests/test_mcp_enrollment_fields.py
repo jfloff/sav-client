@@ -9,7 +9,13 @@ field table a second time and allowing the two descriptions to diverge.
 import pytest
 
 from sav_mcp import server as server_module
-from sav_shared.fields import FIELDS
+from sav_shared.fields import (
+  ENROLLMENT_FIELD_META,
+  FIELDS,
+  PROFILE_HTML_FIELDS,
+  RECONCILE_READONLY,
+  RECONCILE_TEXT,
+)
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
   _MOD1_CONSENT_KEYS,
@@ -57,20 +63,23 @@ def test_data_assinatura_is_the_only_optional_field():
   assert optional == ["data_assinatura"]
 
 
-def test_labels_come_from_field_definitions_and_are_never_invented():
-  """`label` is `FieldDef.label` or nothing at all.
+def test_every_label_comes_from_a_field_definition():
+  """`label` is always `FieldDef.label` — never invented here, never missing.
 
-  There is no per-field label for the header/identity keys, and inventing one
-  here would recreate the hand-maintained table this tool exists to remove — so
-  a missing label stays null rather than being filled in.
+  `FIELDS` carries a label-only row for each form field with no OCR entity or
+  submit kwarg, so every field has a human label from one registry. A label
+  invented in the schema function instead would be the hand-maintained table
+  this tool exists to remove; a null label would leave a consumer with nothing
+  to show for fields as central as `nome`.
   """
   rows = _rows_by_id()
   labels_by_key = {f.key: f.label for f in FIELDS}
 
   for key, row in rows.items():
-    assert row["label"] == labels_by_key.get(key)
+    assert row["label"] == labels_by_key[key]
+  assert all(row["label"] for row in rows.values())
   assert rows["nif"]["label"] == "NIF"
-  assert rows["nome"]["label"] is None
+  assert rows["nome"]["label"] == "Nome Completo"
 
 
 def test_consent_fields_are_always_required_booleans():
@@ -90,6 +99,26 @@ def test_date_postal_and_id_type_fields_keep_their_input_contracts():
   assert rows["codpostal"]["type"] == "postal"
   assert rows["tipo"]["type"] == "enum"
   assert rows["tipo"]["enum_ref"] == "id_types"
+
+
+def test_label_only_field_defs_stay_out_of_every_other_derivation():
+  """A label-only `FieldDef` must add a label and nothing else.
+
+  `FIELDS` gained rows carrying only `key` + `label` so that form-only fields
+  (`nome`, `escalao`, the guardian document block, ...) have a human label. They
+  have no `ocr_entity`, `sav_kwarg` or `profile_html`, and every other constant
+  derived from `FIELDS` filters on exactly those — so none of them may leak into
+  the reconcile loops, the submission summary table, or the op=2 parser hints.
+  A leak there would silently reconcile or submit a field SAV has no slot for.
+  """
+  label_only = {f.key for f in FIELDS
+                if not f.ocr_entity and not f.sav_kwarg and not f.profile_html}
+  assert "nome" in label_only and "escalao" in label_only
+
+  assert label_only.isdisjoint({key for _, key, _ in RECONCILE_TEXT})
+  assert label_only.isdisjoint({key for _, key in RECONCILE_READONLY})
+  assert label_only.isdisjoint(set(ENROLLMENT_FIELD_META))
+  assert label_only.isdisjoint({key for _, _, key in PROFILE_HTML_FIELDS})
 
 
 def test_enum_references_resolve_through_reference_data():

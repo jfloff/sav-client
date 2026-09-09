@@ -1183,11 +1183,19 @@ def enrollment_field_schema() -> list[dict]:
   Revalidação, ``minor`` for guardian fields required for a minor, and
   ``optional`` for fields that are not required by those rules.
 
-  A ``None`` ``label`` or ``field_overrides_key`` means that no such value
-  exists upstream, not that the value is unknown. ``enum_ref`` names a key in
-  ``reference_data()`` and is deliberately independent of ``type``: in
-  particular, ``distrito`` is stored as free text on the form but still has
-  the ``distritos`` reference table.
+  Every field carries a ``label``; a ``None`` ``field_overrides_key`` or
+  ``enum_ref`` means no such value exists upstream, not that it is unknown.
+  ``enum_ref`` names a key in ``reference_data()`` and is deliberately
+  independent of ``type``: in particular, ``distrito`` is stored as free text
+  on the form but still has the ``distritos`` reference table.
+
+  Note this describes what the *form* requires, not what a caller must be
+  asked for. Several always-required fields are not human input:
+  ``escalao`` follows from ``nasc`` and ``genero`` via
+  ``TIER_AGE_RANGE_IN_SEASON``, ``clube``/``associacao`` are club constants,
+  ``license`` comes from the player's SAV record, and ``data_assinatura`` is
+  filled when the form is stamped. Callers building an intake form should say
+  so explicitly rather than reading ``required_when`` as "ask a human".
   """
   fields_by_key = {f.key: f for f in FIELDS}
   rows: list[dict] = []
