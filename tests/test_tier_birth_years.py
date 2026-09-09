@@ -1,4 +1,4 @@
-"""Unit tests for tier_birth_years_for_season.
+"""Unit tests for tier_birth_years_for_season and its inverse, tier_for_birth_date.
 
 Sources verified against:
   - FPB Comunicado 057 (Competições Nacionais Escalões de Formação 2025-2026)
@@ -6,9 +6,12 @@ Sources verified against:
 """
 import pytest
 
+from datetime import date
+
 from sav_shared.lookups import (
   TIER_AGE_RANGE_IN_SEASON,
   tier_birth_years_for_season,
+  tier_for_birth_date,
 )
 
 
@@ -96,3 +99,72 @@ class TestAgeTableContract:
       # Parse X from the tier name ("Sub 14" -> 14, "Mini 8" -> 8).
       x = int(tier.split()[-1])
       assert age_range == (x - 1, x), tier
+
+
+class TestTierForBirthDate:
+  """The inverse: birth date → escalão for a season."""
+
+  @pytest.mark.parametrize("birth_year,expected", [
+    (2020, "Baby-Basket"),
+    (2018, "Mini 8"),
+    (2016, "Mini 10"),
+    (2014, "Mini 12"),
+    (2012, "Sub 14"),
+    (2010, "Sub 16"),
+    (2008, "Sub 18"),
+    (2006, "Sénior"),
+  ])
+  def test_matches_published_table(self, birth_year, expected):
+    assert tier_for_birth_date(f"{birth_year}-06-15", 2025) == expected
+
+  def test_is_the_exact_inverse_of_tier_birth_years(self):
+    """Every year the forward function enumerates must map back to its tier.
+
+    The two functions read the same table from opposite ends; if they ever
+    disagree, one of them is placing real players in the wrong escalão.
+    """
+    for tier in TIER_AGE_RANGE_IN_SEASON:
+      years = tier_birth_years_for_season(tier, 2025)
+      if years is None:
+        continue
+      for year in years:
+        assert tier_for_birth_date(f"{year}-01-01", 2025) == tier
+
+  def test_only_the_birth_year_matters(self):
+    """Escalões are birth-year cohorts, so the day and month are ignored."""
+    assert (tier_for_birth_date("2012-01-01", 2025)
+            == tier_for_birth_date("2012-12-31", 2025) == "Sub 14")
+
+  def test_new_year_can_cross_a_cohort_boundary(self):
+    """A month apart across New Year is a different tier when the band ends there."""
+    assert tier_for_birth_date("2013-12-31", 2025) == "Sub 14"
+    assert tier_for_birth_date("2014-01-01", 2025) == "Mini 12"
+
+  def test_accepts_date_objects_and_european_strings(self):
+    """Same input tolerance as the rest of the read path."""
+    assert tier_for_birth_date(date(2012, 6, 15), 2025) == "Sub 14"
+    assert tier_for_birth_date("15-06-2012", 2025) == "Sub 14"
+
+  @pytest.mark.parametrize("value", [None, "", "garbage", "12-2012"])
+  def test_unusable_birth_dates_return_none(self, value):
+    """Refuse to guess: a wrong escalão is a wrong federation record."""
+    assert tier_for_birth_date(value, 2025) is None
+
+  def test_too_young_for_any_modelled_tier_is_none(self):
+    """Below Baby-Basket there is no escalão to offer."""
+    assert tier_for_birth_date("2024-01-01", 2025) is None
+
+  def test_sub_20_ages_come_back_as_senior(self):
+    """Documented limitation, asserted so it stays a known one.
+
+    `Sub 20` is deliberately absent from TIER_AGE_RANGE_IN_SEASON because its
+    window would overlap Sénior's, so ages 19-20 answer "Sénior" even where a
+    club would register the player as Sub 20. The caller reviews the default.
+    """
+    assert tier_for_birth_date("2007-01-01", 2025) == "Sénior"
+    assert tier_for_birth_date("2006-01-01", 2025) == "Sénior"
+
+  def test_season_shifts_the_answer(self):
+    """The same player moves up as the season advances."""
+    assert tier_for_birth_date("2012-06-15", 2025) == "Sub 14"
+    assert tier_for_birth_date("2012-06-15", 2027) == "Sub 16"

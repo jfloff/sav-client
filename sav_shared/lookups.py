@@ -13,8 +13,11 @@ When you add a new lookup here:
 """
 from __future__ import annotations
 
+from datetime import date
+
 from sav_parsers.types import DocType
 
+from .dates import split_date_parts
 from .text import normalise_text
 
 
@@ -238,6 +241,56 @@ def tier_birth_years_for_season(
     return None
   second_year = season_start_year + 1
   return [second_year - age for age in range(min_age, max_age + 1)]
+
+
+def tier_for_birth_date(
+  birth_date: str | date | None, season_start_year: int,
+) -> str | None:
+  """The escalão a player born on ``birth_date`` falls in for season ``Y/Y+1``.
+
+  The inverse of :func:`tier_birth_years_for_season`, and the single place the
+  "which escalão?" rule is implemented — a consumer holding a birth date should
+  call this rather than re-deriving the age windows from
+  ``TIER_AGE_RANGE_IN_SEASON`` itself.
+
+  **Only the birth YEAR matters.** FPB escalões are birth-year cohorts, not
+  birthday-relative ages: for season ``Y/Y+1`` a player born in year ``B`` is
+  placed by ``(Y+1) - B``. So two players born eleven months apart within one
+  calendar year always share a tier, while two born a month apart either side
+  of New Year can fall in different ones — whenever that New Year is a cohort
+  boundary. The birthday itself never matters.
+  A full date is accepted for convenience (ISO or European, same tolerance as
+  :func:`sav_shared.dates.split_date_parts`) and its day and month ignored.
+
+  Gender is not a parameter: the tier *names* are identical across genders — it
+  is only the SAV2 tier *ids* that are renumbered per gender. To get the id,
+  pass the returned name through
+  ``find_id_by_name(name, player_registration_tiers(gender_id))``.
+
+  Returns ``None`` when the birth date is blank or unparseable, and when the
+  player is younger than the lowest modelled tier (under 4 in season).
+
+  **It answers with the formative tier, which is not always the club's
+  choice.** ``Sub 20`` is deliberately absent from ``TIER_AGE_RANGE_IN_SEASON``
+  (its window would overlap Sénior's — see the note above the table), so ages
+  19 and 20 come back as ``"Sénior"`` even where a club would register the
+  player as Sub 20. Masters/Veteranos and BCR are unmodelled for the same
+  reason and are never returned. Treat the result as the default to offer, not
+  as an authority to submit unreviewed.
+  """
+  if isinstance(birth_date, date):
+    birth_year = birth_date.year
+  else:
+    parts = split_date_parts(birth_date) if birth_date is not None else None
+    if parts is None:
+      return None
+    birth_year = int(parts[0])
+
+  age_in_season = season_start_year + 1 - birth_year
+  for tier_name, (min_age, max_age) in TIER_AGE_RANGE_IN_SEASON.items():
+    if age_in_season >= min_age and (max_age is None or age_in_season <= max_age):
+      return tier_name
+  return None
 
 
 # ── ID document types (tipo_identificacao) ─────────────────────────────────────

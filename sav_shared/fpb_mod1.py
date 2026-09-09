@@ -1191,8 +1191,9 @@ def enrollment_field_schema() -> list[dict]:
 
   Note this describes what the *form* requires, not what a caller must be
   asked for. Five always-required fields are not human input, in three senses:
-  ``escalao`` is computed from ``nasc`` and ``genero`` via
-  ``TIER_AGE_RANGE_IN_SEASON``; ``clube``/``associacao``/``data_assinatura``
+  ``escalao`` is computed from ``nasc`` alone, via
+  :func:`sav_shared.lookups.tier_for_birth_date` (the tier name does not depend
+  on gender; ``genero`` only maps it to a SAV tier id); ``clube``/``associacao``/``data_assinatura``
   are constants of the calling context; and ``license``/``tipo_inscricao`` are
   read off the player's SAV record when there is one.
 

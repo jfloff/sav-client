@@ -3593,9 +3593,14 @@ def enrollment_fields() -> list[dict]:
     **`required_when` is what the form requires, not what to ask a human for.**
     Five always-required fields are not human input, in three different senses:
 
-      - **Computed from other rows.** ``escalao`` follows from ``nasc`` and
-        ``genero`` against the tier age windows in ``sav://lookups``. It is a
-        pure function of data you already hold — never ask for it.
+      - **Computed from other rows.** ``escalao`` follows from ``nasc`` alone:
+        call ``sav_shared.lookups.tier_for_birth_date(nasc, season_start_year)``
+        rather than re-deriving the age windows. Escalões are birth-year
+        cohorts, so only the birth year matters, and the tier *name* does not
+        depend on gender — ``genero`` is needed only to map that name to a SAV
+        tier id. Never ask a human for it. The one caveat: ages 19-20 answer
+        ``"Sénior"``, because ``Sub 20`` has no published age window, so treat
+        the result as a default to offer rather than to submit unreviewed.
       - **Constants of the calling context.** ``clube`` and ``associacao``
         belong to the session's club; ``data_assinatura`` is filled when the
         form is stamped.

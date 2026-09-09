@@ -21,6 +21,54 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.100.0 — 2026-09-09
+
+### Added
+
+**`tier_for_birth_date(birth_date, season_start_year)` — the escalão rule, executable**
+`IMPACT: none` (new function; nothing existing changes). `enrollment_fields()`
+documents `escalao` as derivable, but until now nothing derived it: consumers had
+to read `TIER_AGE_RANGE_IN_SEASON` and invert the age windows themselves. This is
+that inversion, living in `sav_shared/lookups.py` next to
+`tier_birth_years_for_season`, whose exact inverse it is — a test asserts every
+year the forward function enumerates maps back to its tier, so the two cannot
+drift into placing players in different escalões.
+
+Accepts a `date` or an ISO/European string (same tolerance as
+`split_date_parts`) and returns the tier name, or `None` for a blank/unparseable
+date or a player younger than Baby-Basket.
+
+Two properties worth knowing, both asserted by tests:
+
+- **Only the birth year matters.** Escalões are birth-year cohorts, so the day
+  and month are ignored: two players born eleven months apart in one calendar
+  year always share a tier, while two born a month apart across New Year can
+  differ. Passing a full date is a convenience, not a precision.
+- **The tier name is gender-independent.** Names are identical across genders;
+  only the SAV2 tier *ids* are renumbered. Get the id with
+  `find_id_by_name(name, player_registration_tiers(gender_id))`.
+
+**Known limitation:** ages 19-20 come back as `"Sénior"`. `Sub 20` is
+deliberately absent from `TIER_AGE_RANGE_IN_SEASON` (its window would overlap
+Sénior's and break the contiguous-ranges invariant), so a club that registers
+those players as Sub 20 must override. Masters/Veteranos and BCR are unmodelled
+for the same reason and are never returned. Treat the result as the default to
+offer, not an authority to submit unreviewed.
+
+### Changed
+
+**`enrollment_fields()` docs: `escalao` needs `nasc` alone, not `nasc` + `genero`**
+`IMPACT: none` (documentation only). 0.99.1 and 0.99.2 said `escalao` follows
+from `nasc` + `genero`. The gender is not part of the derivation — the tier name
+is the same for both genders, and `genero` is needed only to resolve that name to
+a SAV tier id. The docstrings now say so and point at `tier_for_birth_date`.
+
+`DETECT:` code that refuses to compute an escalão until it has a gender.
+`FIX:` derive from the birth date alone; bring in `genero` only when you need the
+SAV tier id.
+
+---
+
 ## 0.99.2 — 2026-09-09
 
 ### Changed
