@@ -204,6 +204,11 @@ self_scope = ["parent", "player"]
 [tools.document_requirements]
 roles = ["coach", "parent", "player"]
 
+# Description of the server's own schema: no SAV call, no subject, no record
+# touched, so it is open to every role.
+[tools.enrollment_fields]
+roles = ["coach", "parent", "player"]
+
 [tools.find_open_batch]
 roles      = ["coach"]
 self_scope = ["parent", "player"]

@@ -42,6 +42,7 @@ if TYPE_CHECKING:
   from sav_parsers.types import BBox
 
 from .fields import (
+  FIELDS,
   RECONCILE_READONLY as _RECONCILE_READONLY,
   RECONCILE_TEXT    as _RECONCILE_TEXT,
 )
@@ -1157,6 +1158,75 @@ _MOD1_GUARDIAN_KEYS: tuple[str, ...] = (
   "guardian_name", "guardian_relation", "guardian_id_type",
   "guardian_id_number", "guardian_id_expiry", "guardian_phone", "guardian_email",
 )
+
+# Canonical key → the `reference_data()` key enumerating its legal values.
+# Deliberately independent of the field's `type`: `distrito` is free text on
+# the printed form but is submitted as a `distrito_id` from this table.
+_MOD1_ENUM_REFS: dict[str, str] = {
+  "tipo_inscricao":    "registration_types",
+  "genero":            "genero",
+  "escalao":           "player_registration_tiers",
+  "tipo":              "id_types",
+  "guardian_id_type":  "id_types",
+  "guardian_relation": "guardian_relations",
+  "distrito":          "distritos",
+}
+
+
+def enrollment_field_schema() -> list[dict]:
+  """Return the machine-readable Modelo 1 enrollment field surface.
+
+  Rows are derived from ``MOD1_FILL_MAPPING`` and the ``_MOD1_*`` rules so
+  this public description cannot drift from the form renderer's field set or
+  validation rules. ``required_when`` is ``always`` for fields required for
+  every enrollment, ``revalidacao`` for the licence required only during a
+  Revalidação, ``minor`` for guardian fields required for a minor, and
+  ``optional`` for fields that are not required by those rules.
+
+  A ``None`` ``label`` or ``field_overrides_key`` means that no such value
+  exists upstream, not that the value is unknown. ``enum_ref`` names a key in
+  ``reference_data()`` and is deliberately independent of ``type``: in
+  particular, ``distrito`` is stored as free text on the form but still has
+  the ``distritos`` reference table.
+  """
+  fields_by_key = {f.key: f for f in FIELDS}
+  rows: list[dict] = []
+  for key, spec in MOD1_FILL_MAPPING.items():
+    if isinstance(spec, _Date):
+      field_type = "date"
+    elif isinstance(spec, _Postal):
+      field_type = "postal"
+    elif isinstance(spec, _CheckGroup):
+      field_type = "enum"
+    elif isinstance(spec, _Consent):
+      field_type = "bool"
+    elif isinstance(spec, _Text):
+      field_type = "text"
+    else:
+      raise ValueError(
+        f"unsupported Modelo 1 field {key!r}: spec type {type(spec).__name__}"
+      )
+
+    if key in _MOD1_REQUIRED_CORE:
+      required_when = "always"
+    elif key == "license":
+      required_when = "revalidacao"
+    elif key in _MOD1_GUARDIAN_KEYS:
+      required_when = "minor"
+    else:
+      required_when = "optional"
+
+    field = fields_by_key.get(key)
+    rows.append({
+      "id": key,
+      "label": field.label if field is not None else None,
+      "type": field_type,
+      "required_when": required_when,
+      "enum_ref": _MOD1_ENUM_REFS.get(key),
+      "values_key": key,
+      "field_overrides_key": field.sav_kwarg if field is not None else None,
+    })
+  return rows
 
 
 def _to_date(value: object) -> date | None:

@@ -82,6 +82,7 @@ from sav_shared.enrollment import (
 from sav_shared.fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from sav_shared.fpb_mod1 import (
     carimbo_overlay,
+    enrollment_field_schema,
     inscricao_overlay,
     mod1_values_to_fields,
     overlaid_pdf,
@@ -3536,6 +3537,66 @@ def document_requirements(
         # tools are otherwise shape-identical.
         checklist["nationality_source"] = "caller"
     return checklist
+
+
+@server.tool()
+def enrollment_fields() -> list[dict]:
+    """
+    Which fields an enrollment takes, of what type, and which are mandatory.
+
+    The counterpart to ``document_requirements``: that tool answers which
+    **documents** an enrollment needs, this one answers which **fields**. For
+    documents use ``document_requirements`` for the ungrounded FPB rule, or
+    ``get_enrollment_status`` for a checklist grounded in the player's SAV
+    record.
+
+    This tool takes no arguments and reaches no SAV endpoint. It describes the
+    server's own schema, so it works without a session. Each row has the shape
+    ``{id, label, type, required_when, enum_ref, values_key,
+    field_overrides_key}``, with one row per Modelo 1 field in printed-form
+    order.
+
+    ``values_key`` is the key inside ``fill_mod1``'s ``values`` dict;
+    ``field_overrides_key`` is the equivalent key inside
+    ``submit_enrollment`` / ``update_enrollment``'s ``field_overrides``.
+    They differ often enough to matter: ``tipo`` → ``id_type``, ``tele`` →
+    ``telemovel``, ``codpostal`` → ``cod_postal``, and ``distrito`` →
+    ``distrito_id``. ``type`` is one of ``text | date | bool | enum | postal``.
+
+    ``required_when`` is the Modelo 1 mandatory-fill rule: ``always``;
+    ``revalidacao`` (``license`` only, when ``tipo_inscricao`` is a
+    Revalidação); ``minor`` (the seven ``guardian_*`` fields); or ``optional``
+    (``data_assinatura`` alone). The ``minor`` rule is load-bearing: SAV2
+    itself accepts a minor with an empty guardian block — reproduced
+    2026-08-27, a ten-year-old was committed with the guardian fields blank and
+    filed — so a consumer must honour this rule rather than assume the
+    federation enforces it. Dates are ``YYYY-MM-DD`` and are rejected, never
+    converted. Do not helpfully reformat a ``DD-MM-YYYY`` value before sending
+    it: a guessed date convention is how a wrong date reaches the federation.
+
+    ``enum_ref`` names the key into the ``sav://lookups`` bundle that
+    enumerates the field's legal values, so validate enums against the live
+    bundle rather than a second copy of the table. It is deliberately
+    independent of ``type``: ``distrito`` is free text on the form
+    (``type: "text"``) but is submitted as a ``distrito_id`` from the
+    ``distritos`` table, so it carries ``enum_ref: "distritos"``.
+    ``concelho`` carries ``null`` because concelhos are distrito-dependent and
+    fetched live from SAV, so the bundle has no such key.
+
+    A ``null`` ``label``, ``enum_ref`` or ``field_overrides_key`` means no such
+    value exists upstream, not that it is unknown. Thirteen fields have no
+    ``label`` because no field definition supplies one; nothing is invented to
+    fill the gap. ``exam_date`` is a ``submit_enrollment`` field with no row
+    here: it has no Modelo 1 slot and no field definition to derive from.
+
+    Every row is derived from the constants that render and validate the form.
+    An application mapping external data (a club spreadsheet, an import file)
+    onto enrollment inputs should drive that mapping from this tool rather
+    than from the ``fill_mod1`` docstring.
+
+    Returns the ordered list of field-schema rows.
+    """
+    return enrollment_field_schema()
 
 
 @server.tool()

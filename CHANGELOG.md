@@ -21,6 +21,69 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.99.0 — 2026-09-09
+
+### Added
+
+**`enrollment_fields()` — the enrollment field surface, as data instead of prose**
+`IMPACT: none` (new tool; nothing existing changes). Until now the only
+description of which fields an enrollment takes was the `values:` paragraph of
+`fill_mod1`'s docstring. `sav://lookups` exported the enum *tables* but never the
+*fields*, so an application that needed to know "what fields exist, of what type,
+and which are mandatory" had to hand-copy that paragraph into its own source —
+and at least one did, acquiring a duplicate table that would drift the first time
+a key was renamed here. This tool is that answer in machine-readable form.
+
+Takes no arguments, reaches no SAV endpoint, and needs no session: it describes
+the server's own schema. Returns one row per Modelo 1 field, in printed-form
+order:
+
+```json
+{"id": "tipo", "label": "Tipo de Documento", "type": "enum",
+ "required_when": "always", "enum_ref": "id_types",
+ "values_key": "tipo", "field_overrides_key": "id_type"}
+```
+
+`values_key` is the key inside `fill_mod1`'s `values` dict; `field_overrides_key`
+is the equivalent key inside `submit_enrollment` / `update_enrollment`'s
+`field_overrides`. They differ often enough to matter (`tipo` → `id_type`,
+`tele` → `telemovel`, `codpostal` → `cod_postal`, `distrito` → `distrito_id`), and
+a `null` `field_overrides_key` means the field genuinely has no submit kwarg —
+`nif` and `nasc` are cross-checked against SAV but never written.
+
+`required_when` is the Modelo 1 mandatory-fill rule: `always`, `revalidacao`
+(`license` only), `minor` (the seven `guardian_*` fields), or `optional`
+(`data_assinatura` alone). **The `minor` rule is load-bearing.** SAV2 itself
+accepts a minor with an empty guardian block, so a consumer must enforce it
+rather than assume the federation will.
+
+`enum_ref` names the `sav://lookups` key enumerating a field's legal values, so a
+consumer validates enums against the live bundle instead of a second copy of the
+table. It is deliberately independent of `type`: `distrito` is free text on the
+form (`type: "text"`) but takes a `distrito_id` from the `distritos` table on
+submission, so it carries `enum_ref: "distritos"` anyway. `concelho` carries
+`null` — concelhos are distrito-dependent and fetched live from SAV, so the
+bundle has no such key.
+
+Every row is *derived* from `MOD1_FILL_MAPPING` and the mandatory-fill constants
+by `sav_shared.fpb_mod1.enrollment_field_schema()`, which is the point: renaming a
+key changes this output automatically. Nothing here is hand-maintained, which is
+also why `label` is `null` for the 13 fields that have no `FieldDef` (`nome`,
+`genero`, `escalao`, `tipo_inscricao`, …) — a `null` means "no such value exists
+upstream", not "unknown". For the same reason `exam_date` gets no row: it is a
+`submit_enrollment` field with no Modelo 1 slot and no field definition to derive
+from.
+
+`authz.toml` gives it `roles = ["coach", "parent", "player"]` — it names no
+subject and touches no record.
+
+`DETECT:` `grep -rn "tipo_inscricao\|guardian_id_type\|localidade_txt" --include=*.py .`
+in your own codebase — a hand-maintained copy of the enrollment field list.
+`FIX:` replace it with a call to `enrollment_fields()`, and resolve enum values
+through `sav://lookups` using each row's `enum_ref`.
+
+---
+
 ## 0.98.0 — 2026-09-06
 
 ### Added
