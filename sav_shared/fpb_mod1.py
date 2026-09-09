@@ -1190,12 +1190,18 @@ def enrollment_field_schema() -> list[dict]:
   on the form but still has the ``distritos`` reference table.
 
   Note this describes what the *form* requires, not what a caller must be
-  asked for. Several always-required fields are not human input:
-  ``escalao`` follows from ``nasc`` and ``genero`` via
-  ``TIER_AGE_RANGE_IN_SEASON``, ``clube``/``associacao`` are club constants,
-  ``license`` comes from the player's SAV record, and ``data_assinatura`` is
-  filled when the form is stamped. Callers building an intake form should say
-  so explicitly rather than reading ``required_when`` as "ask a human".
+  asked for. Five always-required fields are not human input, in three senses:
+  ``escalao`` is computed from ``nasc`` and ``genero`` via
+  ``TIER_AGE_RANGE_IN_SEASON``; ``clube``/``associacao``/``data_assinatura``
+  are constants of the calling context; and ``license``/``tipo_inscricao`` are
+  read off the player's SAV record when there is one.
+
+  That last pair is the weak case. "Has a licence → Revalidação" is wrong for a
+  player licensed at another club — a Transferência, which this form cannot
+  express (the only boxes are ``primeira`` and ``revalidacao``). So
+  ``tipo_inscricao`` is genuine human input exactly when the player is unknown
+  or transferring in. Callers building an intake form should encode all of this
+  rather than reading ``required_when`` as "ask a human".
   """
   fields_by_key = {f.key: f for f in FIELDS}
   rows: list[dict] = []

@@ -3591,14 +3591,29 @@ def enrollment_fields() -> list[dict]:
     Modelo 1 slot and comes from the medical exam document.
 
     **`required_when` is what the form requires, not what to ask a human for.**
-    Several always-required fields are not human input and should not appear on
-    an intake form:
+    Five always-required fields are not human input, in three different senses:
 
-      - ``escalao`` follows from ``nasc`` and ``genero`` (the tier age windows
-        in ``sav://lookups``), so compute it rather than asking.
-      - ``clube`` and ``associacao`` are constants for the session's club.
-      - ``license`` comes from the player's SAV record, not the player.
-      - ``data_assinatura`` is filled when the form is stamped.
+      - **Computed from other rows.** ``escalao`` follows from ``nasc`` and
+        ``genero`` against the tier age windows in ``sav://lookups``. It is a
+        pure function of data you already hold — never ask for it.
+      - **Constants of the calling context.** ``clube`` and ``associacao``
+        belong to the session's club; ``data_assinatura`` is filled when the
+        form is stamped.
+      - **Read off the player's SAV record, when there is one.** ``license``
+        and ``tipo_inscricao`` are the same question — *does this player
+        already hold a licence with this club?* — so resolve them together
+        through ``get_enrollment_status`` rather than asking.
+
+    That third group is a weaker claim than the other two, and must not be
+    inferred blindly. "Has a licence → Revalidação" is wrong for a player
+    licensed at **another** club: that is a Transferência (reg_type 3), which
+    the Modelo 1 cannot even express — the form carries only the ``primeira``
+    and ``revalidacao`` boxes. So ``tipo_inscricao`` is a genuine human
+    decision exactly when the player is unknown or transferring in, and
+    otherwise follows from their record. ``complete_mod1`` derives it as
+    ``2 if license else 1``, which is sound only there, pre-submission;
+    ``submit_enrollment`` uses the enrollment's authoritative ``reg_type``
+    instead.
 
     What genuinely has to come from a person is the rest: the player's name,
     nationality, birth date, identity document, contact details, address,

@@ -21,6 +21,41 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.99.2 — 2026-09-09
+
+### Changed
+
+**`enrollment_fields()` sorts the non-human fields into three kinds, and flags the weak one**
+`IMPACT: none` (documentation only; no row changes shape or value). 0.99.1 said
+five always-required fields are "not human input" and listed them flat. They are
+not equivalent, and treating them as one bucket invites a wrong inference:
+
+- **Computed** — `escalao`, a pure function of `nasc` + `genero` against the tier
+  age windows in `sav://lookups`. Never ask for it.
+- **Context constants** — `clube` and `associacao` (the session's club),
+  `data_assinatura` (filled at stamping).
+- **Read off the player's record, when there is one** — `license` and
+  `tipo_inscricao`, which are one question: *does this player already hold a
+  licence with this club?* Resolve both through `get_enrollment_status`.
+
+The third kind is explicitly weaker than the other two. **`has a licence →
+Revalidação` is wrong for a player licensed at another club** — that is a
+Transferência (reg_type 3), which the Modelo 1 cannot express at all: the form
+carries only the `primeira` and `revalidacao` boxes. So `tipo_inscricao` is
+genuine human input exactly when the player is unknown or transferring in, and
+otherwise follows from their record. `complete_mod1`'s `2 if license else 1`
+stays sound only where it is, pre-submission; `submit_enrollment` continues to
+use the enrollment's authoritative `reg_type`.
+
+Still documented rather than modelled as a column — the row shape is unchanged.
+
+`DETECT:` a consumer that derives `tipo_inscricao` from the presence of a licence.
+`FIX:` resolve it through `get_enrollment_status`, and ask a human when the
+player is unknown or transferring in — an inferred Revalidação silently files a
+transfer as the wrong registration type.
+
+---
+
 ## 0.99.1 — 2026-09-09
 
 ### Changed
