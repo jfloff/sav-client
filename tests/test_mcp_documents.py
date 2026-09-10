@@ -379,7 +379,7 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
   }
 
 
-def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
+def test_add_enrollment_returns_source_document_upload_payload(monkeypatch):
   replace_calls: list[int] = []
 
   class StubClient:
@@ -418,7 +418,7 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
     },
   )
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="12",
     license=301772,
     mod1_id="form-1",
@@ -441,7 +441,7 @@ def test_submit_enrollment_returns_source_document_upload_payload(monkeypatch):
   assert result["medical_exam_upload"] is None
 
 
-def test_submit_enrollment_raises_when_exam_date_missing_without_medical_exam(monkeypatch):
+def test_add_enrollment_raises_when_exam_date_missing_without_medical_exam(monkeypatch):
   import pytest
 
   result_obj = type(
@@ -470,10 +470,10 @@ def test_submit_enrollment_raises_when_exam_date_missing_without_medical_exam(mo
   )
 
   with pytest.raises(ValueError, match="Enrollment requires exam_date"):
-    server_module.submit_enrollment(batch_number="12", license=301772, mod1_id="form-1")
+    server_module.add_enrollment(batch_number="12", license=301772, mod1_id="form-1")
 
 
-def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
+def test_add_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
   captured = {"kwargs": None, "close": []}
   replace_calls: list[int] = []
 
@@ -523,7 +523,7 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
     },
   )
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="12", license=301772, mod1_id="form-1", medical_exam_id="exam-1",
   )
 
@@ -544,7 +544,7 @@ def test_submit_enrollment_uses_medical_exam_date_and_uploads_exam(monkeypatch):
   ]
 
 
-def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
+def test_add_enrollment_manual_exam_override_wins(monkeypatch):
   captured = {"kwargs": None, "close": []}
 
   class StubClient:
@@ -593,7 +593,7 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
     },
   )
 
-  server_module.submit_enrollment(
+  server_module.add_enrollment(
     batch_number="12",
     license=301772,
     mod1_id="form-1",
@@ -605,7 +605,7 @@ def test_submit_enrollment_manual_exam_override_wins(monkeypatch):
   assert captured["close"][-1] == ("proc-em", {"exam_date": "2026-05-02"})
 
 
-def test_submit_enrollment_raises_when_exam_date_missing(monkeypatch):
+def test_add_enrollment_raises_when_exam_date_missing(monkeypatch):
   import pytest
 
   result_obj = type(
@@ -640,7 +640,7 @@ def test_submit_enrollment_raises_when_exam_date_missing(monkeypatch):
   )
 
   with pytest.raises(ValueError, match="exam_date"):
-    server_module.submit_enrollment(
+    server_module.add_enrollment(
       batch_number="12", license=301772, mod1_id="form-1", medical_exam_id="exam-1",
     )
 
@@ -747,7 +747,7 @@ def _submit_stub_forms(result_obj, *, with_mod4: bool) -> dict:
   return forms
 
 
-def test_submit_enrollment_with_mod4_marks_subida(monkeypatch):
+def test_add_enrollment_with_mod4_marks_subida(monkeypatch):
   captured: dict = {"uploads": []}
 
   class StubClient:
@@ -771,7 +771,7 @@ def test_submit_enrollment_with_mod4_marks_subida(monkeypatch):
   monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
   monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=True))
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="12",
     license=301772,
     mod1_id="form-1",
@@ -787,7 +787,7 @@ def test_submit_enrollment_with_mod4_marks_subida(monkeypatch):
   assert result["subida_document_upload"]["status"] == "ok"
 
 
-def test_submit_enrollment_without_mod4_is_not_subida(monkeypatch):
+def test_add_enrollment_without_mod4_is_not_subida(monkeypatch):
   captured: dict = {}
 
   class StubClient:
@@ -811,7 +811,7 @@ def test_submit_enrollment_without_mod4_is_not_subida(monkeypatch):
   monkeypatch.setattr("sav_parsers.close_processing", lambda processing_id, corrections=None: None)
   monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=False))
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="12",
     license=301772,
     mod1_id="form-1",
@@ -823,7 +823,7 @@ def test_submit_enrollment_without_mod4_is_not_subida(monkeypatch):
   assert result["subida_document_upload"] is None
 
 
-def test_submit_enrollment_rejects_non_mod4_artifact(monkeypatch):
+def test_add_enrollment_rejects_non_mod4_artifact(monkeypatch):
   import pytest
 
   result_obj = type("ResultStub", (), {
@@ -838,7 +838,7 @@ def test_submit_enrollment_rejects_non_mod4_artifact(monkeypatch):
   monkeypatch.setattr(server_module, "_forms", forms)
 
   with pytest.raises(ValueError, match="not an fpb_modelo_4"):
-    server_module.submit_enrollment(
+    server_module.add_enrollment(
       batch_number="12",
       license=301772,
       mod1_id="form-1",
@@ -847,7 +847,7 @@ def test_submit_enrollment_rejects_non_mod4_artifact(monkeypatch):
     )
 
 
-def test_submit_enrollment_rejects_inline_subida_on_type4(monkeypatch):
+def test_add_enrollment_rejects_inline_subida_on_type4(monkeypatch):
   """The XOR guardrail: a mod1 form already routed to reg_type 4 (standalone
   Subida) can't also carry an inline mod4 rider."""
   import pytest
@@ -864,7 +864,7 @@ def test_submit_enrollment_rejects_inline_subida_on_type4(monkeypatch):
   monkeypatch.setattr(server_module, "_forms", forms)
 
   with pytest.raises(ValueError, match="inline_subida is only valid"):
-    server_module.submit_enrollment(
+    server_module.add_enrollment(
       batch_number="12",
       license=301772,
       mod1_id="form-1",
@@ -873,7 +873,7 @@ def test_submit_enrollment_rejects_inline_subida_on_type4(monkeypatch):
     )
 
 
-def test_submit_enrollment_subida_no_tier_error_propagates(monkeypatch):
+def test_add_enrollment_subida_no_tier_error_propagates(monkeypatch):
   """A non-guardian SavConfigError (e.g. no subida tier) is re-raised, not
   swallowed as a missing-guardian retry."""
   import pytest
@@ -897,7 +897,7 @@ def test_submit_enrollment_subida_no_tier_error_propagates(monkeypatch):
   monkeypatch.setattr(server_module, "_forms", _submit_stub_forms(result_obj, with_mod4=True))
 
   with pytest.raises(SavConfigError, match="no subida tier"):
-    server_module.submit_enrollment(
+    server_module.add_enrollment(
       batch_number="12",
       license=301772,
       mod1_id="form-1",
@@ -995,7 +995,7 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
   assert "existing_sav_id" not in result
 
 
-def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
+def test_add_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
   """Type-1 submit must pass the OCR-derived demographics (name, birth_date,
   gender_id, nif, …) instead of a reconcile result. It must also look up the
   newly-assigned licence in the batch listing so the source PDF upload
@@ -1045,7 +1045,7 @@ def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
     },
   })
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="726",
     license=None,
     mod1_id="form-1",
@@ -1065,7 +1065,7 @@ def test_submit_enrollment_type1_dispatches_via_primeira_kwargs(monkeypatch):
   assert captured["uploads"] == [(321160, 1)]
 
 
-def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypatch):
+def test_add_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypatch):
   """If the post-commit batch listing doesn't contain a row matching the
   supplied name, the upload is skipped with a clear status rather than
   silently uploading against licence=0."""
@@ -1103,7 +1103,7 @@ def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypa
     },
   })
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="726", license=None, mod1_id="form-1",
     field_overrides={"exam_date": "2025-09-26"},
   )
@@ -1114,7 +1114,7 @@ def test_submit_enrollment_type1_skips_upload_when_licence_lookup_fails(monkeypa
   assert "refusing to guess" in result["source_document_upload"]["error"]
 
 
-def test_submit_enrollment_type1_refuses_to_guess_between_namesakes(monkeypatch):
+def test_add_enrollment_type1_refuses_to_guess_between_namesakes(monkeypatch):
   """A namesake already in the batch must not receive the new player's documents.
 
   Resolving the new licence by name matched the *first* row with that name, and
@@ -1163,7 +1163,7 @@ def test_submit_enrollment_type1_refuses_to_guess_between_namesakes(monkeypatch)
     },
   })
 
-  result = server_module.submit_enrollment(
+  result = server_module.add_enrollment(
     batch_number="726", license=None, mod1_id="form-1",
     field_overrides={"exam_date": "2025-09-26"},
   )
@@ -1805,7 +1805,7 @@ def test_complete_mod1_fills_license_in_scan_from_presence_bbox(monkeypatch, tmp
 
 
 def test_submission_path_fills_a_revalidacao_template_license(monkeypatch, tmp_path):
-  """submit_enrollment's replacement path carries the supplied licence fill."""
+  """add_enrollment's replacement path carries the supplied licence fill."""
   import io
   from pypdf import PdfReader
   from sav_shared.fpb_mod1 import mod1_values_to_fields, render_mod1

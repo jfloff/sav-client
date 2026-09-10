@@ -157,6 +157,13 @@ roles = ["coach"]
 [tools.get_batch]
 roles = ["coach"]
 
+[tools.check_batch_ready]
+roles = ["coach"]
+
+[tools.submit_batch]
+capability = "write"
+roles      = ["coach"]
+
 
 # ── Game sheets — operational coach tools ────────────────────────────────────
 [tools.list_game_sheets]
@@ -180,7 +187,7 @@ roles = ["coach"]
 # $CLUB_STAMP_PATH to a Modelo 1 and hands the completed PDF back. No SAV write,
 # so it keeps the read capability — but the output is a club-endorsed
 # attestation, so no `self_scope`: a parent or player must never be able to mint
-# one for their own enrollment. `submit_enrollment` does the same completion as
+# one for their own enrollment. `add_enrollment` does the same completion as
 # it files the form.
 [tools.complete_mod1]
 roles = ["coach"]
@@ -244,7 +251,7 @@ self_scope      = ["parent", "player"]
 subject_license = ["license"]
 subject_nif     = ["nif"]
 
-[tools.submit_enrollment]
+[tools.add_enrollment]
 capability      = "write"
 roles           = ["coach"]
 self_scope      = ["parent", "player"]

@@ -133,6 +133,9 @@ _REGISTRATIONS_BATCH_DETAIL_OP = "10"
 _REGISTRATIONS_LOAD_EXISTING_PLAYER_OP = "30"
 _REGISTRATIONS_SAVE_STEP1_OP = "33"
 _REGISTRATIONS_SAVE_STEP2_OP = "31"
+# The browser fires op=116 only for type-1/2 batches; type-3/4 skips it.
+_REGISTRATIONS_SUBMIT_PRECHECK_OP = "116"
+_REGISTRATIONS_SUBMIT_OP = "8"
 # op=33 prefill keys consumed by _build_step2_send. Keep this separate from
 # the op=31 set below: these responses feed different wizard steps.
 _REGISTRATIONS_STEP1_PREFILL_KEYS = (
@@ -280,6 +283,26 @@ def _decode_sav_flag(
     f"SAV returned an unrecognised value for {field!r}; refusing to guess "
     f"whether it means true or false."
   )
+
+
+def _normalise_registration_blockers(raw: Any) -> list[dict[str, Any]]:
+  """Map SAV's ``validaficheiros``/``ficheiros`` rows to public blocker data."""
+  if not isinstance(raw, list):
+    return []
+
+  blockers: list[dict[str, Any]] = []
+  for entry in raw:
+    if not isinstance(entry, dict):
+      continue
+    name = entry.get("nome")
+    reasons = entry.get("validacao")
+    if not isinstance(reasons, list):
+      reasons = [] if reasons in (None, "") else [reasons]
+    blockers.append({
+      "name": "" if name is None else str(name),
+      "reasons": [str(reason) for reason in reasons],
+    })
+  return blockers
 
 
 def _coerce_exam_date(value: str | None, *, today: date | None = None) -> str:
@@ -2415,6 +2438,228 @@ class SavClient:
     logger.info("Deleted batch %s", batch_id)
     self._cache.forget_licenses_in_batch(batch_id)
     self._invalidate_batch_memo()
+
+  def check_registration_batch_ready(self, batch_id: int) -> dict:
+    """Check whether SAV will accept submission of a registration batch.
+
+    For type-1 (1ª Inscrição) and type-2 (Revalidação) batches this mirrors
+    the browser's ``aprovGuia`` precheck, ``op=116``. SAV returns three
+    separate gates: ``val`` must be 1, ``check_menor`` must not be 0, and
+    ``validaficheiros`` must be empty. The returned value deliberately
+    normalises those inconsistent SAV field names to ``ready``, ``checked``,
+    ``blockers`` and ``reason``.
+
+    The browser does not call op=116 for type-3 (Transferência) or type-4
+    (Subida) batches, so this method does not guess at that endpoint's
+    behaviour. It returns ``checked=False`` and ``ready=False`` for those
+    types; callers that submit them should rely on the op=8 response instead.
+
+    Args:
+        batch_id: Internal SAV2 batch ID (``guia_id``).
+
+    Returns:
+        A dict shaped as ``{"ready": bool, "checked": bool,
+        "blockers": [{"name": str, "reasons": [str]}], "reason": str | None}``.
+        ``reason`` is ``"rejected"`` when ``val`` is not 1,
+        ``"minor_data_incomplete"`` when ``check_menor`` is 0,
+        ``"missing_documents"`` when documents are missing, and
+        ``"not_checked_for_type"`` for type-3/4 batches.
+
+    Raises:
+        ValueError: If ``batch_id`` is not visible in the batch listing.
+        SavResponseError: If the client is not logged in or SAV's response
+                          cannot be parsed.
+        SavConnectionError: On network errors.
+
+    SAV answers these checks with JSON over HTTP. A successful HTTP status
+    therefore does not itself mean that the batch is ready; the three gates
+    above must be applied to the JSON body.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before check_registration_batch_ready()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    if batch.type_id >= 3:
+      return {
+        "ready": False,
+        "checked": False,
+        "blockers": [],
+        "reason": "not_checked_for_type",
+      }
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_SUBMIT_PRECHECK_OP, "id": batch.id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not check registration batch {batch_id} readiness: {exc}"
+      ) from exc
+
+    data = self._parse_json_response(
+      resp.text, "Could not parse registration batch readiness response (op=116)",
+    )
+    blockers = _normalise_registration_blockers(data.get("validaficheiros"))
+
+    if str(data.get("val")) != "1":
+      reason = "rejected"
+    elif str(data.get("check_menor")) == "0":
+      reason = "minor_data_incomplete"
+    elif data.get("validaficheiros"):
+      reason = "missing_documents"
+    else:
+      return {
+        "ready": True,
+        "checked": True,
+        "blockers": [],
+        "reason": None,
+      }
+
+    return {
+      "ready": False,
+      "checked": True,
+      "blockers": blockers,
+      "reason": reason,
+    }
+
+  def submit_registration_batch(self, batch_id: int) -> dict:
+    """Submit an open player registration batch ("guia") to FPB for validation.
+
+    The browser submits with ``GET php/incricoesdb.php?op=8&id=<guia_id>``.
+    Before that request, type-1 and type-2 batches always go through
+    :meth:`check_registration_batch_ready`, which mirrors ``op=116``, and
+    there is no way to skip it. SAV itself skips that precheck for type-3
+    (Transferência) and type-4 (Subida), so for those two types op=8's own
+    ``ficheiros`` array is the only gate — the same position the browser is in.
+
+    A 200 response from op=8 is not proof of submission. SAV can refuse the
+    batch by returning a non-empty ``ficheiros`` array, and can signal a
+    rejection through ``val != 1``. Both cases are surfaced as normalised
+    blocker data. After a non-rejecting response this method invalidates the
+    batch listing memo and re-lists the batch, because only the state
+    transition proves that the write happened.
+
+    Args:
+        batch_id: Internal SAV2 batch ID (``guia_id``), not a licence or item ID.
+
+    Returns:
+        A dict containing ``submitted=True``, the ``batch_id``, and the
+        confirmed new ``state`` and integer ``state_id`` from SAV's listing.
+
+    Raises:
+        ValueError: If the batch is unknown, not open, or is blocked by the
+                    readiness precheck.
+        SavResponseError: If SAV rejects op=8 or the confirmed state is still
+                          ``Em construção``.
+        SavWriteUnverifiedError: If the post-submit state cannot be confirmed.
+        SavConnectionError: On network errors.
+
+    The state guard is intentional: SAV can still render an ``aprovGuia``
+    button for a previously submitted batch, so this client must prevent a
+    double submit before firing the irreversible op=8 request.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before submit_registration_batch()"
+      )
+
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+    if not batch.is_open:
+      raise ValueError(
+        f"Batch {batch.id} is not open (state={batch.state!r}, "
+        f"state_id={batch.state_id}); only 'Em construção' batches can be submitted."
+      )
+
+    readiness = self.check_registration_batch_ready(batch_id)
+    # Type-3/4 has checked=False because SAV offers no op=116 precheck. Do
+    # not turn that absence of a check into an extra client-side rejection:
+    # refusing there would make this client stricter than the site itself.
+    if readiness["checked"] and not readiness["ready"]:
+      raise ValueError(
+        f"Batch {batch.id} is not ready to submit: "
+        f"reason={readiness['reason']!r}, blockers={readiness['blockers']!r}"
+      )
+
+    try:
+      resp = self._http.get(
+        self._url(_REGISTRATIONS_PATH),
+        params={"op": _REGISTRATIONS_SUBMIT_OP, "id": batch.id},
+        timeout=self._timeout,
+      )
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not submit registration batch {batch_id}: {exc}"
+      ) from exc
+
+    data = self._parse_json_response(
+      resp.text, "Could not parse registration batch submit response (op=8)",
+    )
+    blockers = _normalise_registration_blockers(data.get("ficheiros"))
+    if str(data.get("val")) != "1":
+      raise SavResponseError(
+        f"Could not submit registration batch {batch.id}: "
+        f"reason='rejected', blockers={blockers!r}, "
+        f"message={data.get('msg') or 'SAV rejected the request'!r}"
+      )
+    if data.get("ficheiros"):
+      raise SavResponseError(
+        f"Could not submit registration batch {batch.id}: "
+        f"reason='missing_documents', blockers={blockers!r}"
+      )
+
+    self._invalidate_batch_memo()
+    try:
+      confirmed = next(
+        (b for b in self.list_player_registration_batches() if b.id == batch.id),
+        None,
+      )
+    except (SavError, ValueError) as exc:
+      raise SavWriteUnverifiedError(
+        f"Submission of registration batch {batch.id} may have succeeded, "
+        "but its new state could not be confirmed. Do not retry without "
+        "checking SAV first."
+      ) from exc
+
+    if confirmed is None:
+      raise SavWriteUnverifiedError(
+        f"Submission of registration batch {batch.id} may have succeeded, "
+        "but SAV no longer returned the batch in its listing. Do not retry "
+        "without checking SAV first."
+      )
+    confirmed_state_id = int(confirmed.state_id)
+    if confirmed_state_id == _REGISTRATIONS_STATE_OPEN:
+      raise SavResponseError(
+        f"SAV answered 200 for submission of batch {batch.id}, but the batch "
+        f"is still in state {confirmed.state!r} (state_id={confirmed.state_id})."
+      )
+
+    logger.info(
+      "Submitted registration batch %s; confirmed state=%s (state_id=%s)",
+      confirmed.id, confirmed.state, confirmed.state_id,
+    )
+    return {
+      "submitted": True,
+      "batch_id": int(confirmed.id),
+      "state": str(confirmed.state),
+      "state_id": confirmed_state_id,
+    }
 
   def remove_player_from_registration_batch(
     self,

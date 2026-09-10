@@ -989,6 +989,96 @@ def test_enrollment_delete_requires_exactly_one_flag(monkeypatch):
   assert "exactly one" in both.output.lower()
 
 
+def test_enrollment_submit_dry_run_never_submits(monkeypatch):
+  captured = {"check": None, "submit": 0}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      assert number == "2025/999"
+      return 42
+
+    def check_registration_batch_ready(self, batch_id):
+      captured["check"] = batch_id
+      return {
+        "ready": False,
+        "checked": True,
+        "blockers": [{"name": "Ana", "reasons": ["Falta documento"]}],
+        "reason": "missing_documents",
+      }
+
+    def submit_registration_batch(self, batch_id):
+      captured["submit"] += 1
+      raise AssertionError("--dry-run must not submit")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "submit", "--batch", "2025/999", "--dry-run"],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured == {"check": 42, "submit": 0}
+  assert "not ready" in result.output
+  assert "Ana" in result.output
+  assert "Falta documento" in result.output
+
+
+def test_enrollment_submit_confirmation_no_aborts_without_submitting(monkeypatch):
+  captured = {"submit": 0}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 42
+
+    def submit_registration_batch(self, batch_id):
+      captured["submit"] += 1
+      raise AssertionError("declined confirmation must not submit")
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "submit", "--batch", "2025/999"],
+    input="n\n",
+  )
+
+  assert result.exit_code != 0
+  assert captured["submit"] == 0
+  assert "irreversible" in result.output
+  assert "2025/999" in result.output
+
+
+def test_enrollment_submit_prints_confirmed_state(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 42
+
+    def submit_registration_batch(self, batch_id):
+      captured["batch_id"] = batch_id
+      return {
+        "submitted": True,
+        "batch_id": batch_id,
+        "state": "Em Validação",
+        "state_id": 9,
+      }
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "submit", "--batch", "2025/999"],
+    input="y\n",
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured == {"batch_id": 42}
+  assert "Em Validação" in result.output
+  assert "state_id=9" in result.output
+
+
 def test_enrollment_create_auto_classifies_two_positionals_into_form_and_exam(
   monkeypatch, tmp_path, batch_stub, reconcile_result_stub,
 ):

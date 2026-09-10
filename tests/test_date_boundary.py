@@ -72,7 +72,7 @@ class TestParseEnrollmentFormsExamDate:
 
 
 class TestValidateOverrides:
-  """The shared override guard used by submit_enrollment / update_with_document."""
+  """The shared override guard used by add_enrollment / update_with_document."""
 
   def test_passes_iso_through(self):
     out = server_module._validate_overrides(

@@ -145,6 +145,156 @@ def test_delete_batch_deletes_whole_batch(monkeypatch):
   assert result == {"deleted": True, "batch_number": "2025/999"}
 
 
+def test_check_batch_ready_adds_batch_number_to_sav_verdict(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      captured["number"] = number
+      return 99
+
+    def check_registration_batch_ready(self, batch_id):
+      captured["batch_id"] = batch_id
+      return {
+        "ready": True,
+        "checked": True,
+        "blockers": [],
+        "reason": None,
+      }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.check_batch_ready(batch_number="2025/999")
+
+  assert captured == {"number": "2025/999", "batch_id": 99}
+  assert result == {
+    "ready": True,
+    "checked": True,
+    "blockers": [],
+    "reason": None,
+    "batch_number": "2025/999",
+  }
+
+
+def test_check_batch_ready_returns_blockers(monkeypatch):
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 99
+
+    def check_registration_batch_ready(self, batch_id):
+      return {
+        "ready": False,
+        "checked": True,
+        "blockers": [{"name": "Ana", "reasons": ["Exame médico"]}],
+        "reason": "missing_documents",
+      }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.check_batch_ready(batch_number="2025/999")
+
+  assert result["ready"] is False
+  assert result["reason"] == "missing_documents"
+  assert result["blockers"] == [
+    {"name": "Ana", "reasons": ["Exame médico"]},
+  ]
+  assert result["batch_number"] == "2025/999"
+
+
+def test_check_batch_ready_type_3_is_explicitly_unchecked(monkeypatch):
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 99
+
+    def check_registration_batch_ready(self, batch_id):
+      return {
+        "ready": False,
+        "checked": False,
+        "blockers": [],
+        "reason": "not_checked_for_type",
+      }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.check_batch_ready(batch_number="2025/transfer")
+
+  assert result == {
+    "ready": False,
+    "checked": False,
+    "blockers": [],
+    "reason": "not_checked_for_type",
+    "batch_number": "2025/transfer",
+  }
+
+
+def test_submit_batch_blocked_result_names_player_blockers(monkeypatch):
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 99
+
+    def check_registration_batch_ready(self, batch_id):
+      return {
+        "ready": False,
+        "checked": True,
+        "blockers": [{"name": "Ana", "reasons": ["Falta documento"]}],
+        "reason": "missing_documents",
+      }
+
+    def submit_registration_batch(self, batch_id):
+      raise ValueError(
+        "Batch 99 is not ready to submit: reason='missing_documents', "
+        "blockers=[{'name': 'Ana', 'reasons': ['Falta documento']}]"
+      )
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.submit_batch(batch_number="2025/999")
+
+  assert result == {
+    "error": "batch_not_ready",
+    "batch_number": "2025/999",
+    "reason": "missing_documents",
+    "blockers": [{"name": "Ana", "reasons": ["Falta documento"]}],
+  }
+
+
+def test_submit_batch_allows_unchecked_type_3(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id(self, number):
+      return 99
+
+    def check_registration_batch_ready(self, batch_id):
+      return {
+        "ready": False,
+        "checked": False,
+        "blockers": [],
+        "reason": "not_checked_for_type",
+      }
+
+    def submit_registration_batch(self, batch_id):
+      captured["batch_id"] = batch_id
+      return {
+        "submitted": True,
+        "batch_id": batch_id,
+        "state": "Em Validação",
+        "state_id": 9,
+      }
+
+  monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  result = server_module.submit_batch(batch_number="2025/transfer")
+
+  assert captured == {"batch_id": 99}
+  assert result == {
+    "submitted": True,
+    "batch_id": 99,
+    "state": "Em Validação",
+    "state_id": 9,
+  }
+
+
 def test_update_enrollment_drops_batch_number(monkeypatch):
   captured = {}
 

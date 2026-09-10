@@ -191,6 +191,237 @@ class TestPreHttpGuards:
       client.add_player_to_registration_batch(1, 301772)
 
 
+class TestRegistrationBatchSubmission:
+  """Offline coverage for the irreversible guia submission endpoints."""
+
+  BATCH_ID = 631324
+
+  @staticmethod
+  def _batch(*, type_id=2, state_id=1, state="Em construção"):
+    """A real PlayerRegistrationBatch, so the `is_open` gate under test is
+    the model's own property rather than a stub that hardcodes the answer."""
+    return PlayerRegistrationBatch(
+      id=TestRegistrationBatchSubmission.BATCH_ID,
+      number="48", type_id=type_id, type="Revalidação",
+      association_id=7, association="AB Santarém",
+      club_id=2430, club="Rio Maior Basket",
+      tier_id=15, tier="Mini 12", gender_id=1, gender="Masculino",
+      state_id=state_id, state=state, state_date="2026-09-10",
+      item_count=1, season_id=65, season="2026/2027",
+    )
+
+  def _client(self, monkeypatch, batches, responses):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": "42", "organizacao": "270"}
+    monkeypatch.setattr(client, "list_player_registration_batches", batches)
+    get = Mock(side_effect=[
+      type("Resp", (), {
+        "text": body,
+        "raise_for_status": lambda self: None,
+      })()
+      for body in responses
+    ])
+    monkeypatch.setattr(client._http, "get", get)
+    return client, get
+
+  def test_precheck_clean_is_ready(self, monkeypatch):
+    batch = self._batch()
+    client, get = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      ['{"val": 1, "check_menor": "1", "validaficheiros": []}'],
+    )
+
+    result = client.check_registration_batch_ready(self.BATCH_ID)
+
+    assert result == {
+      "ready": True,
+      "checked": True,
+      "blockers": [],
+      "reason": None,
+    }
+    assert get.call_args.kwargs["params"] == {"op": "116", "id": self.BATCH_ID}
+
+  def test_precheck_missing_documents_surfaces_blockers(self, monkeypatch):
+    batch = self._batch()
+    client, _ = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      ['{"val": 1, "check_menor": 1, "validaficheiros": '
+       '[{"nome": "Ana", "validacao": ["Exame médico", "BI"]}]}'],
+    )
+
+    result = client.check_registration_batch_ready(self.BATCH_ID)
+
+    assert result == {
+      "ready": False,
+      "checked": True,
+      "blockers": [{"name": "Ana", "reasons": ["Exame médico", "BI"]}],
+      "reason": "missing_documents",
+    }
+
+  def test_precheck_minor_data_is_blocked(self, monkeypatch):
+    batch = self._batch()
+    client, _ = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      ['{"val": "1", "check_menor": 0, "validaficheiros": []}'],
+    )
+
+    result = client.check_registration_batch_ready(self.BATCH_ID)
+
+    assert result["ready"] is False
+    assert result["reason"] == "minor_data_incomplete"
+    assert result["blockers"] == []
+
+  def test_precheck_rejection_is_blocked(self, monkeypatch):
+    batch = self._batch()
+    client, _ = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      ['{"val": "0", "check_menor": 1, "validaficheiros": '
+       '[{"nome": "Ana", "validacao": ["Guia bloqueada"]}]}'],
+    )
+
+    result = client.check_registration_batch_ready(self.BATCH_ID)
+
+    assert result["ready"] is False
+    assert result["reason"] == "rejected"
+    assert result["blockers"] == [
+      {"name": "Ana", "reasons": ["Guia bloqueada"]},
+    ]
+
+  def test_type_3_precheck_is_explicitly_unchecked(self, monkeypatch):
+    batch = self._batch(type_id=3)
+    client, get = self._client(
+      monkeypatch, lambda season=None: [batch], [],
+    )
+
+    result = client.check_registration_batch_ready(self.BATCH_ID)
+
+    assert result == {
+      "ready": False,
+      "checked": False,
+      "blockers": [],
+      "reason": "not_checked_for_type",
+    }
+    get.assert_not_called()
+
+  def test_submit_non_open_batch_names_actual_state(self, monkeypatch):
+    batch = self._batch(state_id=9, state="Em Validação")
+    client, get = self._client(
+      monkeypatch, lambda season=None: [batch], [],
+    )
+
+    with pytest.raises(ValueError, match=r"Em Validação.*state_id=9"):
+      client.submit_registration_batch(self.BATCH_ID)
+
+    get.assert_not_called()
+
+  def test_submit_blocked_by_precheck_never_fires_op_8(self, monkeypatch):
+    batch = self._batch()
+    client, get = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      ['{"val": 1, "check_menor": 1, "validaficheiros": '
+       '[{"nome": "Ana", "validacao": ["Falta documento"]}]}'],
+    )
+
+    with pytest.raises(ValueError, match=r"Ana.*Falta documento"):
+      client.submit_registration_batch(self.BATCH_ID)
+
+    assert get.call_count == 1
+    assert get.call_args.kwargs["params"]["op"] == "116"
+
+  def test_submit_op_8_ficheiros_is_a_refusal(self, monkeypatch):
+    batch = self._batch()
+    client, get = self._client(
+      monkeypatch,
+      lambda season=None: [batch],
+      [
+        '{"val": 1, "check_menor": 1, "validaficheiros": []}',
+        '{"val": 1, "ficheiros": '
+        '[{"nome": "Ana", "validacao": ["Exame em falta"]}]}',
+      ],
+    )
+
+    with pytest.raises(SavResponseError, match=r"missing_documents.*Ana.*Exame em falta"):
+      client.submit_registration_batch(self.BATCH_ID)
+
+    assert get.call_args.kwargs["params"] == {"op": "8", "id": self.BATCH_ID}
+
+  def test_submit_success_invalidates_and_confirms_state_without_forgetting_licenses(
+    self, monkeypatch,
+  ):
+    open_batch = self._batch()
+    confirmed_batch = self._batch(state_id=9, state="Em Validação")
+    batches = Mock(side_effect=[[open_batch], [open_batch], [confirmed_batch]])
+    client, get = self._client(
+      monkeypatch,
+      batches,
+      [
+        '{"val": 1, "check_menor": 1, "validaficheiros": []}',
+        '{"msg": "1", "val": "1", "ficheiros": []}',
+      ],
+    )
+    invalidate = Mock()
+    forget = Mock()
+    monkeypatch.setattr(client, "_invalidate_batch_memo", invalidate)
+    monkeypatch.setattr(client._cache, "forget_licenses_in_batch", forget)
+
+    result = client.submit_registration_batch(self.BATCH_ID)
+
+    assert result == {
+      "submitted": True,
+      "batch_id": self.BATCH_ID,
+      "state": "Em Validação",
+      "state_id": 9,
+    }
+    assert get.call_args_list[0].kwargs["params"] == {
+      "op": "116", "id": self.BATCH_ID,
+    }
+    assert get.call_args_list[1].kwargs["params"] == {
+      "op": "8", "id": self.BATCH_ID,
+    }
+    invalidate.assert_called_once_with()
+    forget.assert_not_called()
+
+  def test_type_4_submits_without_a_precheck_request(self, monkeypatch):
+    """SAV fires no op=116 for Subida, so op=8's own `ficheiros` is the only
+    gate. The client must not invent a stricter rule and refuse the submit."""
+    open_batch = self._batch(type_id=4)
+    confirmed = self._batch(type_id=4, state_id=9, state="Em Validação")
+    batches = Mock(side_effect=[[open_batch], [open_batch], [confirmed]])
+    client, get = self._client(
+      monkeypatch, batches, ['{"msg": "1", "val": 1, "ficheiros": []}'],
+    )
+
+    result = client.submit_registration_batch(self.BATCH_ID)
+
+    assert result["submitted"] is True
+    assert result["state_id"] == 9
+    # One request only: op=8. No op=116 was attempted for this type.
+    assert get.call_count == 1
+    assert get.call_args.kwargs["params"] == {"op": "8", "id": self.BATCH_ID}
+
+  def test_submit_success_body_but_open_state_raises(self, monkeypatch):
+    open_batch = self._batch()
+    batches = Mock(side_effect=[[open_batch], [open_batch], [open_batch]])
+    client, get = self._client(
+      monkeypatch,
+      batches,
+      [
+        '{"val": 1, "check_menor": 1, "validaficheiros": []}',
+        '{"msg": "1", "val": 1, "ficheiros": []}',
+      ],
+    )
+
+    with pytest.raises(SavResponseError, match=r"still.*Em construção"):
+      client.submit_registration_batch(self.BATCH_ID)
+
+    assert get.call_args.kwargs["params"] == {"op": "8", "id": self.BATCH_ID}
+
+
 class TestExamDateWindow:
   """`_coerce_exam_date` bounds the exam date to SAV's validity window.
 

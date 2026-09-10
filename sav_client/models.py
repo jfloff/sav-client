@@ -307,8 +307,8 @@ class PlayerRegistrationBatch:
       club_id, club:               Owning club.
       tier_id, tier:               Tier/escalão (e.g. id=5, name="Sub 14").
       gender_id, gender:           1=Masculino, 2=Feminino.
-      state_id, state:             1=Em construção, plus Devolvida/Em
-                                    Validação/Em Pagamento.
+      state_id, state:             1=Em construção, 9=Em Validação; Devolvida and
+                                    Em Pagamento (ids unknown).
       state_date:   ISO date the batch entered its current state.
       item_count:   Number of players currently in the batch.
       season_id, season: Season epoch.

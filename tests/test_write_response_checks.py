@@ -107,7 +107,7 @@ class TestBatchItemsDoesNotSwallowFatals:
   player answered HTTP 200 with a MariaDB syntax fatal. The HTML parser found
   no `editJogador(` rows in it and returned [], so the batch looked empty —
   indistinguishable from "no players yet", and the caller had no way to know
-  SAV was broken. submit_enrollment's type-1 licence resolution reads this
+  SAV was broken. add_enrollment's type-1 licence resolution reads this
   listing, so a silent [] there is not a cosmetic problem.
   """
 

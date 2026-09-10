@@ -13,7 +13,7 @@ Enrollment workflow:
     3. preview_enrollment(license=null)  → full reconciled profile (auto-resolves the
        player from the form; returns {resolved: false, candidates} when ambiguous, so the
        user picks and preview is re-called with an explicit license)
-    4. submit_enrollment  → license (auto-uploads fpb_modelo_1 and optional exame_medico)
+    4. add_enrollment  → license (auto-uploads fpb_modelo_1 and optional exame_medico)
 
     resolve_player still exists for explicit control (show the candidate list before
     previewing); preview_enrollment folds it in for the unambiguous common case.
@@ -1061,7 +1061,7 @@ def fill_mod1(
     Do not stamp a form you are handing to the player. The PDF returned here is
     distributable, and the club carimbo reads to the federation as
     club-endorsed — a stamped form is an attestation, not a preview. For an
-    enrollment, leave club_stamp_b64 unset: submit_enrollment stamps and dates
+    enrollment, leave club_stamp_b64 unset: add_enrollment stamps and dates
     the form itself as it files it.
 
     The form's Época is always SAV's active season, resolved server-side. There
@@ -1113,7 +1113,7 @@ def complete_mod1(pdf_b64: str, license: int | None = None) -> dict:
     """
     Complete a Modelo 1 with the club-supplied marks and return it base64-encoded.
 
-    This is the overlay `submit_enrollment` performs on its way to the
+    This is the overlay `add_enrollment` performs on its way to the
     federation, minus the upload: the tipo_inscricao checkbox mark, the
     Revalidação licence fill, and then the carimbo against the server-side
     $CLUB_STAMP_PATH. Nothing touches SAV: no batch is created, no document is
@@ -1182,7 +1182,7 @@ def complete_mod1(pdf_b64: str, license: int | None = None) -> dict:
             "stamp_warning": (
                 "$CLUB_STAMP_PATH is not set on this server — the form is "
                 "returned unstamped and undated, which is also how "
-                "submit_enrollment would file it; please stamp it manually."
+                "add_enrollment would file it; please stamp it manually."
             ),
         }
     else:
@@ -1523,7 +1523,7 @@ def _append_minor_guardian_review(preview: dict, birth_date: object) -> None:
     already carrying a value in the preview's `fields` is appended as a
     ``needs_review`` row (sav_value/ocr_value None) and added to the
     `needs_review` list — so the caller collects them up front instead of
-    hitting submit_enrollment's missing_guardian_fields round-trip. Non-minors
+    hitting add_enrollment's missing_guardian_fields round-trip. Non-minors
     (and unknown birth dates) leave the preview untouched.
     """
     if not player_is_minor(birth_date):
@@ -2144,7 +2144,7 @@ def parse_enrollment_forms(documents: list[dict]) -> list[dict]:
     fpb_modelo_1 forms are parsed for the main enrollment workflow and return
     the batch parameters (registration type, tier, gender). exame_medico
     documents are parsed for step-3 metadata and return a medical_exam_id that
-    can be passed to preview_enrollment / submit_enrollment. fpb_modelo_4 forms
+    can be passed to preview_enrollment / add_enrollment. fpb_modelo_4 forms
     return ``nome_jogador`` (mandatory), ``licenca_nr`` (optional),
     ``escalao_actual`` (the origin tier), and ``escalao_subida`` (the destination
     tier), plus a mod4_id. The licence or name drives player candidate
@@ -2396,7 +2396,7 @@ def resolve_player(batch_number: str, mod1_id: str) -> dict:
     For 1ª Inscrição (type 1): the player doesn't exist in SAV yet, so
     there's no eligibility list to match against. Returns ``{resolved: true,
     license: null, reg_type: 1, ocr_name, ocr_birth_date, ocr_gender_id}``
-    so the caller proceeds directly to preview_enrollment / submit_enrollment.
+    so the caller proceeds directly to preview_enrollment / add_enrollment.
     When the OCR yielded enough identifying data (gender + birth date + id
     number) the server's op=11 duplicate check is fired pre-emptively — a
     match means the player already has a SAV record and Revalidação is the
@@ -2521,9 +2521,9 @@ def preview_enrollment(
     reg_type=1): there is no SAV profile to reconcile against. The preview
     echoes the OCR'd fields as-is, marking any required-but-missing or
     low-confidence reads as needs_review so the caller supplies them via
-    field_overrides on submit_enrollment.
+    field_overrides on add_enrollment.
 
-    The reconciliation result is cached internally so submit_enrollment can
+    The reconciliation result is cached internally so add_enrollment can
     use it without repeating the network call. When medical_exam_id is
     supplied, the response also includes a `medical_exam` sidecar with the
     parsed step-3 exam metadata.
@@ -2532,7 +2532,7 @@ def preview_enrollment(
     before submit: `reg_type` (1/2) + `reg_type_label`, `inline_subida` (true
     when mod4_id is supplied → the player is also promoted right away), and a
     plain-language `enrollment_route`. Pass the same mod4_id to
-    submit_enrollment to actually commit the inline subida.
+    add_enrollment to actually commit the inline subida.
 
     nif: optional explicit subject claim — the athlete's NIF that the caller
     asserts this enrollment is for. Used by downstream wrappers to enforce
@@ -2555,7 +2555,7 @@ def preview_enrollment(
 
     batch_number is load-bearing when license is null (it names the batch whose
     eligible list drives auto-resolution); with an explicit licence it is
-    validated only when submit_enrollment is called.
+    validated only when add_enrollment is called.
     """
     form = _forms.get(mod1_id)
     if form is None:
@@ -2675,7 +2675,7 @@ def preview_enrollment(
 
 
 @server.tool()
-def submit_enrollment(
+def add_enrollment(
     batch_number: str,
     license: int | None,
     mod1_id: str,
@@ -2686,9 +2686,16 @@ def submit_enrollment(
     detentor_signature_b64: str | None = None,
 ) -> dict:
     """
-    Submit the player enrollment using the data prepared by preview_enrollment.
+    Add ONE player to a registration batch, using the data prepared by
+    preview_enrollment.
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
+    This files a single enrolment into a batch that stays open afterwards. It
+    does not send anything to the federation — for the final, irreversible
+    submission of the whole batch to FPB, use submit_batch(batch_number).
+
+    Renamed from `submit_enrollment` in 0.101.0, because that name read as
+    "submit the batch" and the two operations are not interchangeable.
 
     Revalidação (license is a real SAV licence): the reconciled kwargs from
     preview_enrollment are used; field_overrides supply values for every
@@ -2727,7 +2734,7 @@ def submit_enrollment(
       success=true + license on success.
       success=false + missing_guardian_fields  fallback for when a minor's
         guardian info is still absent at submit time (preview_enrollment
-        already lists these in needs_review) — call submit_enrollment again
+        already lists these in needs_review) — call add_enrollment again
         with those fields added to field_overrides.
       success=true also includes source_document_upload and
       medical_exam_upload with {doc_type, status, error}. When status=="ok"
@@ -2753,7 +2760,7 @@ def submit_enrollment(
     # (no reconcile to cache). Either signal counts as "preview ran".
     previewed = form.get("previewed") or (form.get("reconcile_result") is not None)
     if not previewed:
-        raise ValueError("Call preview_enrollment before submit_enrollment")
+        raise ValueError("Call preview_enrollment before add_enrollment")
 
     medical_exam: dict[str, Any] | None = None
     medical_exam_info = None
@@ -2791,7 +2798,7 @@ def submit_enrollment(
             )
         result = form.get("reconcile_result")
         if result is None:
-            raise ValueError("Call preview_enrollment before submit_enrollment")
+            raise ValueError("Call preview_enrollment before add_enrollment")
         kwargs = dict(result.kwargs)
         kwargs.pop("license", None)
         needs_review = result.needs_review
@@ -2994,7 +3001,7 @@ def submit_subida_enrollment(
     """
     Submit a standalone Subida de escalão enrollment (type-4 batch).
 
-    Distinct from submit_enrollment's inline-subida rider: this commits the
+    Distinct from add_enrollment's inline-subida rider: this commits the
     player to a *standalone* Subida batch via the SAV2 "add player to a
     Subida batch" web flow (eligibility list → cascades → commit op=50).
     The mod4 carries ``nome_jogador`` (mandatory), ``licenca_nr`` (optional),
@@ -3050,7 +3057,7 @@ def submit_subida_enrollment(
         raise ValueError(
             f"Batch {batch_number!r} is type {batch.type_id} ({batch.type!r}); "
             f"submit_subida_enrollment requires a Subida (type-4) batch. For an "
-            f"inline subida on a 1ª Inscrição / Revalidação, use submit_enrollment "
+            f"inline subida on a 1ª Inscrição / Revalidação, use add_enrollment "
             f"with mod4_id."
         )
 
@@ -3558,7 +3565,7 @@ def enrollment_fields() -> list[dict]:
 
     ``values_key`` is the key inside ``fill_mod1``'s ``values`` dict;
     ``field_overrides_key`` is the equivalent key inside
-    ``submit_enrollment`` / ``update_enrollment``'s ``field_overrides``.
+    ``add_enrollment`` / ``update_enrollment``'s ``field_overrides``.
     They differ often enough to matter: ``tipo`` → ``id_type``, ``tele`` →
     ``telemovel``, ``codpostal`` → ``cod_postal``, and ``distrito`` →
     ``distrito_id``. ``type`` is one of ``text | date | bool | enum | postal``.
@@ -3587,7 +3594,7 @@ def enrollment_fields() -> list[dict]:
     ``null`` ``enum_ref`` or ``field_overrides_key`` means no such value exists
     upstream, not that it is unknown — ``nif`` and ``nasc`` are cross-checked
     against SAV but never submitted, so they have no override key.
-    ``exam_date`` is a ``submit_enrollment`` field with no row here: it has no
+    ``exam_date`` is a ``add_enrollment`` field with no row here: it has no
     Modelo 1 slot and comes from the medical exam document.
 
     **`required_when` is what the form requires, not what to ask a human for.**
@@ -3617,7 +3624,7 @@ def enrollment_fields() -> list[dict]:
     decision exactly when the player is unknown or transferring in, and
     otherwise follows from their record. ``complete_mod1`` derives it as
     ``2 if license else 1``, which is sound only there, pre-submission;
-    ``submit_enrollment`` uses the enrollment's authoritative ``reg_type``
+    ``add_enrollment`` uses the enrollment's authoritative ``reg_type``
     instead.
 
     What genuinely has to come from a person is the rest: the player's name,
@@ -3857,6 +3864,77 @@ def delete_batch(batch_number: str) -> dict:
     batch_id = client.resolve_batch_id(batch_number)
     client.delete_player_registration_batch(batch_id)
     return {"deleted": True, "batch_number": batch_number}
+
+
+@server.tool()
+def check_batch_ready(batch_number: str) -> dict:
+    """Check SAV's own readiness verdict for a registration batch.
+
+    This is read-only: it does not submit the batch or change any enrollment.
+    ``batch_number`` is the human-visible batch number (as shown in the SAV2
+    UI). The result includes that number plus SAV's normalised ``ready``,
+    ``checked``, ``blockers`` and ``reason`` fields.
+
+    For batch types 1 and 2 this mirrors SAV's op=116 precheck. For types 3
+    (Transferência) and 4 (Subida), SAV does not offer a precheck, so
+    ``checked`` is ``False``; that is not a failure and does not establish
+    that the batch is ready.
+    """
+    client = _get_client()
+    try:
+        batch_id = client.resolve_batch_id(batch_number)
+        readiness = client.check_registration_batch_ready(batch_id)
+    except (SavError, ValueError) as exc:
+        return {"error": str(exc), "batch_number": batch_number}
+    return {**readiness, "batch_number": batch_number}
+
+
+@server.tool()
+def submit_batch(batch_number: str) -> dict:
+    """Submit the WHOLE registration batch to FPB for validation. This is
+    irreversible: the batch stops accepting new players after it is submitted
+    and leaves the club's control for federation validation. To add one player
+    to a batch, use ``add_enrollment``; that is a different operation. To
+    submit the whole batch, run ``check_batch_ready`` first.
+
+    For batch types 3 (Transferência) and 4 (Subida), SAV performs no
+    readiness precheck, so ``checked`` comes back ``False``. That is not a
+    failure and is not permission to assume readiness; op=8's response is the
+    only gate for those types.
+
+    ``batch_number`` is the human-visible batch number (as shown in the SAV2
+    UI). A successful result contains the confirmed new state and ``state_id``.
+    """
+    client = _get_client()
+    try:
+        batch_id = client.resolve_batch_id(batch_number)
+    except (SavError, ValueError) as exc:
+        return {"error": str(exc), "batch_number": batch_number}
+
+    try:
+        return client.submit_registration_batch(batch_id)
+    except (SavError, ValueError) as exc:
+        # submit_registration_batch already performs the mandatory precheck.
+        # Re-read only after a ValueError so a blocked submission becomes a
+        # structured result with player/reason data without adding a second
+        # readiness request to the successful path. The fallback keeps the
+        # client's original legible message for other ValueErrors and for
+        # lightweight test/client doubles that do not expose the read method.
+        if isinstance(exc, ValueError):
+            check_ready = getattr(client, "check_registration_batch_ready", None)
+            if check_ready is not None:
+                try:
+                    readiness = check_ready(batch_id)
+                except (SavError, ValueError):
+                    readiness = None
+                if readiness and readiness["checked"] and not readiness["ready"]:
+                    return {
+                        "error": "batch_not_ready",
+                        "batch_number": batch_number,
+                        "reason": readiness["reason"],
+                        "blockers": readiness["blockers"],
+                    }
+        return {"error": str(exc), "batch_number": batch_number}
 
 
 # ── Registration documents ────────────────────────────────────────────────────

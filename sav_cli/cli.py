@@ -2079,7 +2079,7 @@ def mod1_complete_cmd(ctx, pdf_path, out_path, license_):
 
 @cli.group("enrollment")
 def enrollment_grp():
-  """Create, read, update, and delete player enrolments in Revalidação batches."""
+  """Create, read, update, submit, and delete player enrolments and batches."""
 
 
 def _resolve_subida_player_or_prompt(
@@ -3734,6 +3734,51 @@ def _upload_mod4_update(
   )
 
 
+def _print_batch_readiness(
+  batch_number: str, readiness: dict, *, output: str,
+) -> None:
+  """Render SAV's batch-submission precheck for human or machine output."""
+  result = {"batch_number": batch_number, **readiness}
+  if output == "json":
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    return
+  if output == "csv":
+    click.echo("field,value")
+    for key in ("batch_number", "ready", "checked", "reason"):
+      click.echo(f"{key},{result.get(key)}")
+    for blocker in result.get("blockers", []):
+      reasons = "; ".join(str(reason) for reason in blocker.get("reasons", []))
+      click.echo(f"blocker,{blocker.get('name', '')}: {reasons}")
+    return
+
+  console = _console()
+  if not readiness.get("checked"):
+    console.print(
+      f"[yellow]:warning: SAV does not run a readiness precheck for batch "
+      f"#{batch_number} (checked=False). This is not a failure and does not "
+      "establish readiness; op=8 is the only gate.[/]"
+    )
+    return
+
+  if readiness.get("ready"):
+    console.print(
+      f"[green]:white_check_mark: Batch #{batch_number} is ready to submit.[/]"
+    )
+    return
+
+  console.print(
+    f"[yellow]:warning: Batch #{batch_number} is not ready to submit "
+    f"(reason: {readiness.get('reason') or 'unknown'}).[/]"
+  )
+  blockers = readiness.get("blockers") or []
+  for blocker in blockers:
+    console.print(f"  [bold]{blocker.get('name') or 'Unknown player'}[/]")
+    for reason in blocker.get("reasons") or []:
+      console.print(f"    [yellow]:warning:[/] {reason}")
+  if not blockers:
+    console.print("  [yellow]:warning:[/] No player-specific blockers returned.")
+
+
 @enrollment_grp.command("delete")
 @click.option("--license", "license_", type=int, default=None,
               help="Remove this player's enrolment (batch resolved automatically).")
@@ -3779,6 +3824,73 @@ def enrollment_delete_cmd(ctx, license_, batch_number):
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
   console.print(f"[green]:white_check_mark: Batch #{batch_number} deleted.[/]")
+
+
+@enrollment_grp.command("submit")
+@click.option("--batch", "batch_number", type=str, required=True,
+              help="Submit the entire batch to FPB for validation.")
+@click.option("--dry-run", is_flag=True, default=False,
+              help="Run SAV's readiness precheck without submitting.")
+@click.pass_context
+def enrollment_submit_cmd(ctx, batch_number, dry_run):
+  """Submit an entire registration batch to FPB for validation.
+
+  \b
+    sav enrollment submit --batch BATCH_NUMBER
+    sav enrollment submit --batch BATCH_NUMBER --dry-run
+
+  Submission is irreversible: after confirmation, the batch stops accepting
+  new players and leaves the club's control for federation validation.
+  """
+  output = ctx.obj["output"]
+  client = _make_client()
+  batch_id = _resolve_batch_id_or_raise(client, batch_number)
+
+  if dry_run:
+    try:
+      readiness = client.check_registration_batch_ready(batch_id)
+    except (SavConnectionError, SavResponseError, ValueError) as e:
+      raise SavCliError(str(e), code=_exc_code(e))
+    _print_batch_readiness(batch_number, readiness, output=output)
+    return
+
+  if not click.confirm(
+    f"Submit batch {batch_number} to FPB for validation? This action is "
+    "irreversible and the batch will stop accepting new players.",
+    default=False,
+  ):
+    raise click.Abort()
+
+  try:
+    result = client.submit_registration_batch(batch_id)
+  except (SavConnectionError, SavResponseError, ValueError) as e:
+    # submit_registration_batch performs its own mandatory precheck. If that
+    # check blocks the batch, re-read it so the CLI can show the same player /
+    # reason structure as --dry-run instead of only a repr in an exception.
+    if isinstance(e, ValueError):
+      try:
+        readiness = client.check_registration_batch_ready(batch_id)
+      except (SavConnectionError, SavResponseError, ValueError):
+        readiness = None
+      if readiness and readiness.get("checked") and not readiness.get("ready"):
+        _print_batch_readiness(batch_number, readiness, output=output)
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  if output == "json":
+    click.echo(json.dumps(result, ensure_ascii=False, indent=2))
+    return
+  if output == "csv":
+    click.echo("field,value")
+    for key in ("submitted", "batch_id", "state", "state_id"):
+      click.echo(f"{key},{result[key]}")
+    return
+
+  console = _console()
+  console.print(
+    f"[green]:white_check_mark: Batch #{batch_number} submitted to FPB. "
+    f"Confirmed state: [bold]{result['state']}[/] "
+    f"(state_id={result['state_id']}).[/]"
+  )
 
 
 def main():

@@ -21,6 +21,50 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.101.0 — 2026-09-10
+
+### Breaking
+
+**`submit_enrollment` is now `add_enrollment`**
+`IMPACT: raises` — in-repo Python call sites fail at import. **Over MCP the
+failure is softer and more dangerous: an agent calling `submit_enrollment` gets
+"unknown tool", which reads like a transient error and invites a retry rather
+than a fix.** If you see that, the tool was renamed; do not retry.
+
+The old name meant "add one player to a batch", but read as "submit the batch".
+Now that a real batch-submission tool exists (`submit_batch`, below, which is
+irreversible), the ambiguity was a footgun pointed at the one operation that
+cannot be undone.
+
+`DETECT:` `grep -rn "submit_enrollment" --include=*.py --include=*.toml .`
+`FIX:` rename to `add_enrollment`. Signature, return value and behaviour are
+unchanged — the name is the only difference.
+
+Note `submit_subida_enrollment` is **not** renamed and also means "add one
+player" (the Subida variant). That inconsistency survives this release.
+
+### Added
+
+The registration-batch lifecycle is now complete: this package can submit a
+finished batch to FPB for validation, where before it could build a batch but
+not send it.
+
+`submit_batch` submits the **whole batch** and is irreversible; it is not the
+same operation as `add_enrollment`, which adds **one player** to a batch.
+After `submit_batch`, the batch stops accepting new players and leaves the
+club's control.
+
+`check_batch_ready` is SAV's own readiness verdict from op=116. Prefer it when
+deciding whether a type-1/2 batch can be submitted: it is better grounded than
+`document_requirements` / `enrollment_checklist`, which are our model of the
+FPB rule. For type-3 (Transferência) and type-4 (Subida) batches SAV runs no
+precheck, so `checked=False`; op=8's own response is the only gate there.
+
+The confirmed post-submit state is returned, including the now-documented
+`state_id=9` meaning `Em Validação`.
+
+---
+
 ## 0.100.3 — 2026-09-10
 
 ### Fixed
