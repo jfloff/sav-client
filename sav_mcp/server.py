@@ -22,7 +22,7 @@ Standalone Subida (type-4) uses the mod4 OCR fields (licenca_nr/name/escalao_sub
     1. parse_enrollment_forms  → mod4_id + parsed metadata
     2. resolve_subida_target   → license + tier_id + gender_id (or candidates)
     3. ensure_open_batch(reg_type=4, …)  → Subida batch_number
-    4. submit_subida_enrollment(batch_number, license, mod4_id)
+    4. add_subida_enrollment(batch_number, license, mod4_id)
 
 Document tools (post-enrollment, ad-hoc):
     list_player_documents / upload_player_document /
@@ -2442,7 +2442,7 @@ def resolve_subida_target(mod4_id: str) -> dict:
     gender-scoped tier table.
 
     Use the result to call find_open_batch / create_batch (reg_type=4) and
-    then submit_subida_enrollment.
+    then add_subida_enrollment.
 
     Returns:
       resolved=true + license + tier_id + tier_name + gender_id + gender_label
@@ -2992,14 +2992,24 @@ def add_enrollment(
 
 
 @server.tool()
-def submit_subida_enrollment(
+def add_subida_enrollment(
     batch_number: str,
     license: int,
     mod4_id: str,
     detentor_signature_b64: str | None = None,
 ) -> dict:
     """
-    Submit a standalone Subida de escalão enrollment (type-4 batch).
+    Add ONE player to a standalone Subida de escalão batch (type-4).
+
+    This files a single enrolment; it does not send anything to the
+    federation. For the final, irreversible submission of the whole batch to
+    FPB, use submit_batch(batch_number) — note that SAV runs no readiness
+    precheck for type-4 batches.
+
+    Renamed from `submit_subida_enrollment` in 0.102.0, for the same reason
+    `submit_enrollment` became `add_enrollment` in 0.101.0: the `submit_`
+    prefix read as "submit the batch", which is a different and irreversible
+    operation.
 
     Distinct from add_enrollment's inline-subida rider: this commits the
     player to a *standalone* Subida batch via the SAV2 "add player to a
@@ -3056,7 +3066,7 @@ def submit_subida_enrollment(
     if batch.type_id != 4:
         raise ValueError(
             f"Batch {batch_number!r} is type {batch.type_id} ({batch.type!r}); "
-            f"submit_subida_enrollment requires a Subida (type-4) batch. For an "
+            f"add_subida_enrollment requires a Subida (type-4) batch. For an "
             f"inline subida on a 1ª Inscrição / Revalidação, use add_enrollment "
             f"with mod4_id."
         )

@@ -258,7 +258,7 @@ self_scope      = ["parent", "player"]
 subject_license = ["license"]
 subject_nif     = ["nif"]
 
-[tools.submit_subida_enrollment]
+[tools.add_subida_enrollment]
 capability      = "write"
 roles           = ["coach"]
 self_scope      = ["parent", "player"]

@@ -21,6 +21,31 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.102.0 — 2026-09-10
+
+### Breaking
+
+**`submit_subida_enrollment` is now `add_subida_enrollment`**
+`IMPACT: raises` — in-repo Python call sites fail at import. **Over MCP an
+agent calling the old name gets "unknown tool", which reads like a transient
+error and invites a retry rather than a fix.** If you see that, the tool was
+renamed; do not retry.
+
+This finishes what 0.101.0 started. That release renamed `submit_enrollment` to
+`add_enrollment` but left this one alone, so the surface still had a `submit_`
+prefixed tool that meant "add one player" — the exact ambiguity the rename
+existed to remove, sitting next to `submit_batch`, which is irreversible.
+
+`DETECT:` `grep -rn "submit_subida_enrollment" --include=*.py --include=*.toml .`
+`FIX:` rename to `add_subida_enrollment`. Signature, return value and behaviour
+are unchanged — the name is the only difference.
+
+Every "add one player" tool is now `add_*`, and `submit_batch` is the only
+`submit_*` tool. If a tool name starts with `submit_`, it sends a whole batch
+to the federation and cannot be undone.
+
+---
+
 ## 0.101.0 — 2026-09-10
 
 ### Breaking
@@ -41,7 +66,8 @@ cannot be undone.
 unchanged — the name is the only difference.
 
 Note `submit_subida_enrollment` is **not** renamed and also means "add one
-player" (the Subida variant). That inconsistency survives this release.
+player" (the Subida variant). That inconsistency survives this release — it is
+resolved in 0.102.0, which renames it to `add_subida_enrollment`.
 
 ### Added
 

@@ -1224,8 +1224,8 @@ def test_replace_from_bytes_skips_signed_mod4(monkeypatch):
   assert _xobjs(captured["bytes"]) == _xobjs(base)  # nothing overlaid
 
 
-def test_submit_subida_enrollment_signs_mod4(monkeypatch):
-  """submit_subida_enrollment decodes detentor_signature_b64 and overlays it.
+def test_add_subida_enrollment_signs_mod4(monkeypatch):
+  """add_subida_enrollment decodes detentor_signature_b64 and overlays it.
 
   Also asserts the double-listing fix: the batch object is found by number in
   a single list_player_registration_batches() call, no separate
@@ -1258,7 +1258,7 @@ def test_submit_subida_enrollment_signs_mod4(monkeypatch):
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
   monkeypatch.setattr(server_module, "_forms", forms)
 
-  result = server_module.submit_subida_enrollment(
+  result = server_module.add_subida_enrollment(
     batch_number="12", license=301772, mod4_id="mod4-1",
     detentor_signature_b64=_png_b64(),
   )
@@ -1269,7 +1269,7 @@ def test_submit_subida_enrollment_signs_mod4(monkeypatch):
   assert list_calls["n"] == 1  # single listing, no double round-trip
 
 
-def test_submit_subida_enrollment_unknown_batch_raises(monkeypatch):
+def test_add_subida_enrollment_unknown_batch_raises(monkeypatch):
   """An unknown batch number raises the same not-found error as before."""
   import pytest
 
@@ -1286,12 +1286,12 @@ def test_submit_subida_enrollment_unknown_batch_raises(monkeypatch):
   })
 
   with pytest.raises(ValueError, match="Batch '999' not found"):
-    server_module.submit_subida_enrollment(
+    server_module.add_subida_enrollment(
       batch_number="999", license=301772, mod4_id="mod4-1",
     )
 
 
-def test_submit_subida_enrollment_wrong_type_raises(monkeypatch):
+def test_add_subida_enrollment_wrong_type_raises(monkeypatch):
   """A non-type-4 batch raises the existing Subida-required guard message."""
   import pytest
 
@@ -1310,7 +1310,7 @@ def test_submit_subida_enrollment_wrong_type_raises(monkeypatch):
   })
 
   with pytest.raises(ValueError, match="requires a Subida .type-4. batch"):
-    server_module.submit_subida_enrollment(
+    server_module.add_subida_enrollment(
       batch_number="12", license=301772, mod4_id="mod4-1",
     )
 
