@@ -2813,7 +2813,9 @@ class SavClient:
     the current step-3 selections as ``step3_prefill``. For an exam-date edit,
     ``None`` for taxa, guardian fields, consents, or inline_subida preserves
     that prefill; every explicit value (including ``False``, ``0``, and ``""``)
-    is written.
+    is written. The one exception is ``taxa``, whose prefill can hold SAV's
+    "not selected" sentinel ``-1``: that is not a stored choice, so it is
+    ignored and the fee is resolved from the op=162 → op=26 cascade instead.
     """
     def _preserve(explicit: Any, prefill_key: str, parameter: str) -> Any:
       if explicit is not None:
@@ -2821,10 +2823,36 @@ class SavClient:
       preserved.append(parameter)
       return step3_prefill.get(prefill_key)
 
+    def _taxa_is_unselected(value: Any) -> bool:
+      """Whether op=31's stored ``taxa`` means "nobody has chosen a fee".
+
+      SAV encodes an unmade step-3 choice as the sentinel ``-1`` rather than
+      as a missing key — confirmed live on 2026-09-10, where a fresh
+      Revalidação's op=31 returned ``taxa='-1'`` alongside ``subida=-1`` and
+      ``seguro=-1``. Ids ``<= 0`` are treated the same way _resolve_taxa_id
+      treats them in the op=26 option list: not real fees.
+      """
+      if value is None:
+        return True
+      if isinstance(value, str):
+        value = value.strip()
+        if not value:
+          return True
+      try:
+        return int(value) <= 0
+      except (TypeError, ValueError):
+        return False
+
     # Keep the list to field names, rather than values, so the audit log does
     # not duplicate guardian contact details or GDPR choices.
     preserved: list[str] = []
-    taxa_id = _preserve(taxa_id, "taxa", "taxa_id")
+    # taxa is the one preserved field carrying a not-selected sentinel, so it
+    # cannot go through _preserve unguarded: preserving ``-1`` would file "no
+    # fee chosen" *and* suppress the op=162 → op=26 cascade below, which exists
+    # to make exactly that choice. An explicit ``-1`` from the caller is a real
+    # instruction to clear the fee and is still honoured.
+    if not _taxa_is_unselected(step3_prefill.get("taxa")):
+      taxa_id = _preserve(taxa_id, "taxa", "taxa_id")
     guardian_name = _preserve(
       guardian_name, "nome_encarregado_menor", "guardian_name",
     )
@@ -2946,9 +2974,10 @@ class SavClient:
       internal_id, batch, escalao,
     )
 
-    # Old or incomplete op=31 responses have no saved taxa to preserve. Keep
-    # the established cascade as a compatibility fallback; normal exam-date
-    # edits use the prefill's stored ``taxa`` above and do not reach this path.
+    # Reached whenever no fee is in play yet: every fresh enrolment (op=31
+    # returns the ``-1`` sentinel), plus old or incomplete responses with no
+    # ``taxa`` key at all. An edit over an item that already has a real fee
+    # preserves it above and does not reach this path.
     if taxa_id is None:
       taxa_id = self._resolve_taxa_id(
         batch, internal_id, step3_prefill.get("estatuto", ""),

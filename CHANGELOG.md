@@ -21,6 +21,47 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.100.3 — 2026-09-10
+
+### Fixed
+
+**Every fresh enrollment filed "Taxa de inscrição: Não selecionado"**
+`IMPACT: silent` — the commit succeeded and the record carried no registration
+fee. `_commit_registration_step3` preserves op=31's stored step-3 selections
+whenever the caller passes `None`, so that an exam-date edit does not clobber
+choices someone made by hand. For `taxa` that preservation was unconditional,
+and it assumed "no fee chosen" would arrive as an *absent* key.
+
+It does not. SAV encodes an unmade step-3 choice as the sentinel `-1`, the same
+way it does for `subida` and `seguro`. Confirmed live on 2026-09-10: op=31 for a
+player not yet in a batch returns `taxa: "-1"`. So the preservation path faithfully
+preserved "nobody has chosen one", `taxa_id` was no longer `None` by the time the
+`if taxa_id is None` guard below it ran, and `_resolve_taxa_id` — the op=162 →
+op=26 cascade written for exactly this case — never fired. The commit body sent
+`"taxa": "-1"`.
+
+Observed on licence 270158 (Sub 14 Feminino), whose tier offers exactly one fee
+(`1093 Isento Sub14 Fem FBP`) — the auto-pick case the resolver exists to handle.
+
+The prefill's `taxa` is now ignored when it holds a not-selected sentinel (`-1`,
+any id `<= 0`, empty, or absent), so the cascade resolves the fee as intended.
+An explicit `taxa_id=-1` from the caller is unchanged: that is a deliberate
+instruction to clear the fee, and it is still written. Preservation of a genuine
+stored fee on the update path is unchanged.
+
+`DETECT:` `grep -rn "add_player_to_registration_batch\|submit_enrollment" --include=*.py .`
+— any call that omits `taxa_id` (nearly all of them) previously filed `-1` and
+now files a resolved fee. Records already filed with `-1` keep it until they are
+edited; an edit that omits `taxa_id` will now resolve and fill the fee.
+
+`FIX:` nothing to change for the single-fee case. Where a tier offers **two or
+more** fees, the resolver raises `SavConfigError` ("Multiple taxa options … Pass
+taxa_id= to disambiguate") instead of silently filing `-1`. Pass the id: as
+`taxa_id=` on `add_player_to_registration_batch`, or as
+`field_overrides={"taxa_id": <id>}` on the `submit_enrollment` MCP tool.
+
+---
+
 ## 0.100.2 — 2026-09-10
 
 ### Fixed

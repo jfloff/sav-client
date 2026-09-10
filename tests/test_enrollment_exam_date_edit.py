@@ -5,6 +5,7 @@ exam-date edit preserves that prefill unless an explicit value, including
 false or an empty string, asks to overwrite it.
 """
 
+import json
 from datetime import date, timedelta
 
 import pytest
@@ -40,6 +41,7 @@ def _bare_client() -> SavClient:
   client.session = {"user": "u"}
   client._timeout = 5
   client._base_url = "https://example.invalid"
+  client.base_url = "https://example.invalid/"
   # The step-3 commit invalidates the batch-listing memo; a bare (no-__init__)
   # client needs the memo attributes present for that.
   client._batch_memo = {}
@@ -348,3 +350,132 @@ def test_update_enrollment_keeps_explicit_false_and_empty_values(monkeypatch):
   assert captured["guardian_phone"] == ""
   assert captured["guardian_relation"] == ""
   assert captured["taxa_id"] == ""
+
+
+# ── taxa: SAV's "-1" is a sentinel, not a stored choice ─────────────────────
+# Captured live from op=26 on 2026-09-10 (Sub 14 Feminino, licence 270154):
+# SAV emits single-quoted attributes and marks the sentinel as selected.
+_TAXA_ONE_OPTION = (
+  "<option value='-1' selected> - Não selecionado – </option>"
+  "<option value='1093' >Isento Sub14 Fem FBP | Sub 14 F </option>"
+)
+_TAXA_TWO_OPTIONS = (
+  "<option value='-1' selected> - Não selecionado – </option>"
+  "<option value='1093' >Isento Sub14 Fem FBP | Sub 14 F </option>"
+  "<option value='1094' >Taxa Sub14 Fem FBP | Sub 14 F </option>"
+)
+
+
+class _TaxaHttp:
+  """Serves the op=162 pre-check and op=26 option list; records both."""
+
+  def __init__(self, options_html):
+    self._options_html = options_html
+    self.gets: list[dict] = []
+    self.posts: list[dict] = []
+
+  def post(self, url, **kwargs):
+    self.posts.append(kwargs.get("params") or {})
+    return self._json('{"msg":"1","alerta":""}')
+
+  def get(self, url, **kwargs):
+    params = kwargs.get("params") or {}
+    self.gets.append(params)
+    return self._json(json.dumps({"msg": self._options_html, "alerta": ""}))
+
+  @staticmethod
+  def _json(text):
+    return type("R", (), {"text": text, "raise_for_status": lambda self: None})()
+
+  @property
+  def taxa_lookups(self):
+    return [p for p in self.gets if str(p.get("op")) == "26"]
+
+
+def _stub_step3_commit_with_real_taxa(monkeypatch, client, prefill, options_html):
+  """Like _stub_step3_commit but leaves _resolve_taxa_id real, driving it
+  through a stubbed op=162 → op=26 cascade."""
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  monkeypatch.delattr(client, "_resolve_taxa_id")
+  http = _TaxaHttp(options_html)
+  client._http = http
+  return captured, http
+
+
+def test_fresh_enrollment_resolves_taxa_instead_of_filing_the_sentinel(monkeypatch):
+  """The bug: op=31 returns taxa='-1' for a player with no fee chosen yet, and
+  preserving that sentinel both filed "Não selecionado" and suppressed the
+  cascade that exists to choose."""
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0, "taxa": "-1"}
+  captured, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill)
+
+  assert captured["body"]["taxa"] == "1093"
+  assert len(http.taxa_lookups) == 1
+
+
+@pytest.mark.parametrize("stored", ["-1", -1, 0, "", "  ", None])
+def test_every_unselected_taxa_form_triggers_the_cascade(monkeypatch, stored):
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0}
+  if stored is not None:
+    prefill["taxa"] = stored
+  captured, _ = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill)
+
+  assert captured["body"]["taxa"] == "1093"
+
+
+def test_multiple_taxa_options_still_raise_with_the_list(monkeypatch):
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0, "taxa": "-1"}
+  _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_TWO_OPTIONS,
+  )
+  with pytest.raises(SavConfigError, match=r"Multiple taxa options.*1093.*1094"):
+    _commit_step3(client, prefill)
+
+
+def test_explicit_taxa_id_is_honoured_and_never_re_resolved(monkeypatch):
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0, "taxa": "-1"}
+  captured, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill, taxa_id=777)
+
+  assert captured["body"]["taxa"] == "777"
+  assert http.taxa_lookups == []
+
+
+def test_explicit_sentinel_taxa_id_clears_the_fee_without_re_resolving(monkeypatch):
+  """An administrator clearing the fee back to "not selected" is a real
+  instruction; only the *prefill's* sentinel is ignored."""
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0, "taxa": "1090"}
+  captured, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill, taxa_id=-1)
+
+  assert captured["body"]["taxa"] == "-1"
+  assert http.taxa_lookups == []
+
+
+def test_update_path_still_preserves_a_genuine_stored_taxa(monkeypatch):
+  """The regression this change could cause: an edit that does not mention the
+  fee must not re-resolve over one already chosen."""
+  client = _bare_client()
+  prefill = {"estatuto": "6", "escalao": 6, "menor_idade": 0, "taxa": "1090"}
+  captured, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill)
+
+  assert captured["body"]["taxa"] == "1090"
+  assert http.taxa_lookups == []
