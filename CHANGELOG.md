@@ -21,6 +21,19 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.100.1 — 2026-09-10
+
+### Changed
+
+**`sav-parsers` pin moved to `ac80cfe`**
+`IMPACT: none`. The pin advances to the tip of sav-parsers `main`; the only
+delta from the previous pin (`215973a`) is a new test file in that repo, so no
+shipped parser code changed and no behaviour here moves with it. Recorded so
+the pin's history stays readable — a pin that jumps commits with no entry looks
+like it might have carried a silent change.
+
+---
+
 ## 0.100.0 — 2026-09-09
 
 ### Added
