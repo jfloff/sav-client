@@ -21,6 +21,55 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.100.2 — 2026-09-10
+
+### Fixed
+
+**Automated enrollment filed every scanned Modelo 1 with the Revalidação licence blank**
+`IMPACT: silent` — and it reached the federation. `mod1_completion_path` chose a
+single *source* for its slot reads — `tipo_fields = parsed if parsed is not None
+else overlay_fields` — so a caller that supplied `parsed` was never asked a
+second time, per question. That is right when `parsed` comes from a real OCR
+session, but a club supplying its own player data passes
+`mod1_values_to_fields(values)`, which is built from the AcroForm fill mapping:
+it carries `licenca_fpb` (the licence *text*) and never `licenca_fpb_presente`.
+`read_licenca_fpb` therefore returned `(None, None)`, `licenca_overlay` correctly
+declined to guess a location, and the licence was skipped.
+
+The give-away is that the club stamp and the inscription mark *were* applied on
+the same document: the carimbo path had already run Document AI and was holding
+the licence presence entity and its writable-slot bbox the whole time. Nothing
+was missing except the willingness to ask the second dict.
+
+Nobody noticed because `has_license: None` means "not inspected", not "not
+filled", and no warning is emitted for an uninspected slot.
+
+Slot reads are now resolved per question rather than per source: `parsed` is
+asked first, and where it yields an unknown presence the already-in-hand
+`overlay_fields` are asked instead, with presence and bbox always taken from the
+same dict. `read_tipo_inscricao` had the identical shape — the
+`tipo_inscricao_*` entities exist only when the caller ticked that box — and gets
+the same treatment, including the `reg_type_derived` contradiction check.
+
+No new Document AI call is introduced: the fallback is capped at fields the
+carimbo path already produced. `allow_ocr_fallback=False` is unaffected, since
+in that mode `overlay_fields` *is* `parsed` and the fallback is a no-op.
+`licenca_overlay`'s refusal to overwrite an existing number is untouched — the
+fallback supplies a location and a presence answer, never permission to
+overwrite.
+
+`DETECT:` any Modelo 1 filed through `submit_enrollment` or another path that
+passes caller-supplied values as `parsed` — grep your own code for
+`mod1_values_to_fields` and for `parsed=` at `mod1_completion_path` call sites.
+Check filed scans for an empty Licença FPB box, and check stored upload
+responses for `"has_license": null` on a `reg_type` 2 document.
+
+`FIX:` none needed at the call site — upgrade and the licence is filled. Modelo
+1s already filed with the federation carry a blank licence and need correcting
+by hand.
+
+---
+
 ## 0.100.1 — 2026-09-10
 
 ### Changed

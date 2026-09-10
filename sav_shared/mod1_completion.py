@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any
 
@@ -69,6 +69,32 @@ def mod1_overlay_fields(tmp_path: str) -> tuple[dict[str, Any], str | None]:
 
   parse_result = parse_fpb_mod1(tmp_path)
   return parse_result["fields"], parse_result["processing_id"]
+
+
+def _read_mod1_slot(
+  reader: Callable[..., tuple[Any, Any]],
+  parsed: dict | None,
+  overlay_fields: dict[str, Any],
+  *reader_args: Any,
+) -> tuple[Any, Any]:
+  """Read one slot, falling back to already-resolved overlay fields when safe.
+
+  Enrollment fields can answer one slot while omitting another, so each
+  question gets its own fallback. This is safe because both readers only
+  inspect fields already in memory, and the fallback is capped at the
+  ``overlay_fields`` produced by the existing carimbo path — no new OCR call is
+  introduced. The value and bbox are always returned by the same reader call.
+  """
+  fields = parsed if parsed is not None else overlay_fields
+  result = reader(fields, *reader_args)
+  if (
+    parsed is not None
+    and result[0] is None
+    and overlay_fields is not parsed
+    and overlay_fields
+  ):
+    result = reader(overlay_fields, *reader_args)
+  return result
 
 
 @contextmanager
@@ -152,19 +178,23 @@ def mod1_completion_path(
           carimbo, carimbo_bbox = read_carimbo(overlay_fields)
           template_carimbo = opened_processing_id is None
 
-      tipo_fields = parsed if parsed is not None else overlay_fields
       tipo_checked, tipo_bbox = (
-        read_tipo_inscricao(tipo_fields, reg_type)
+        _read_mod1_slot(
+          read_tipo_inscricao, parsed, overlay_fields, reg_type,
+        )
         if reg_type is not None else (None, None)
       )
-      licenca_present, licenca_bbox = read_licenca_fpb(tipo_fields)
+      licenca_present, licenca_bbox = _read_mod1_slot(
+        read_licenca_fpb, parsed, overlay_fields,
+      )
       contradiction_warning: str | None = None
       if reg_type_derived and tipo_checked is False:
         # A derived type is a guess from the caller's arguments. If the form
         # explicitly marks the other box, leave both the form and the
         # attestation truthful instead of ticking a second registration type.
-        other_checked, _ = read_tipo_inscricao(
-          tipo_fields, 1 if reg_type == 2 else 2,
+        other_checked, _ = _read_mod1_slot(
+          read_tipo_inscricao, parsed, overlay_fields,
+          1 if reg_type == 2 else 2,
         )
         if other_checked is True:
           tipo_checked, tipo_bbox = None, None
