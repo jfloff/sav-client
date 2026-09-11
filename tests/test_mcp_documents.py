@@ -20,6 +20,14 @@ def _blank_pdf_bytes() -> bytes:
   return img2pdf.convert(buf.getvalue())
 
 
+def _jpg_bytes() -> bytes:
+  import io
+  from PIL import Image
+  buf = io.BytesIO()
+  Image.new("RGB", (8, 8), (255, 255, 255)).save(buf, "JPEG")
+  return buf.getvalue()
+
+
 def _png_b64() -> str:
   import io
   from PIL import Image
@@ -2028,3 +2036,143 @@ def test_mutations_still_refuse_a_submitted_batch(monkeypatch):
   result = server_module.delete_player_document(license=257901, doc_id=1)
 
   assert result["error"] == "license_not_enrolled"
+
+
+def test_download_player_document_round_trips_filed_pdf(monkeypatch):
+  filed_pdf = b"%PDF-1.7\nfiled document\n"
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted is True
+      return 632478
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      assert (batch_id, license, tipo_doc) == (632478, 257901, None)
+      return [{
+        "tipo_doc": 2,
+        "file_path": "uploads/exame.pdf",
+        "filename": "exame.pdf",
+        "content": filed_pdf,
+      }]
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+
+  result = server_module.download_player_document(license=257901)
+
+  assert len(result) == 1
+  assert base64.b64decode(result[0]["pdf_b64"]) == filed_pdf
+  assert result[0]["size_bytes"] == len(filed_pdf)
+  assert result[0]["filename"] == "exame.pdf"
+  assert "file_path" not in result[0]
+
+
+def test_download_player_document_filters_by_doc_type(monkeypatch):
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 12
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      captured["tipo_doc"] = tipo_doc
+      return [{
+        "tipo_doc": 2,
+        "file_path": "uploads/exame.pdf",
+        "filename": "exame.pdf",
+        "content": b"%PDF-1.7\n",
+      }]
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+
+  result = server_module.download_player_document(
+    license=301772, doc_type="exame_medico",
+  )
+
+  assert captured["tipo_doc"] == 2
+  assert result[0]["doc_type"] == "exame_medico"
+
+
+def test_download_player_document_reads_a_submitted_batch(monkeypatch):
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      assert include_submitted is True
+      return 632478
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      return [{
+        "tipo_doc": 1,
+        "file_path": "uploads/modelo.pdf",
+        "filename": "modelo.pdf",
+        "content": b"%PDF-1.7\n",
+      }]
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+
+  result = server_module.download_player_document(license=257901)
+
+  assert result[0]["doc_type"] == "fpb_modelo_1"
+
+
+def test_download_player_document_returns_unenrolled_error_unchanged(monkeypatch):
+  error = {
+    "error": "license_not_enrolled",
+    "license": 999999,
+    "open_batches": [],
+  }
+
+  class StubClient:
+    pass
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+  monkeypatch.setattr(
+    server_module,
+    "_resolve_license_batch",
+    lambda client, license, *, include_submitted=False: error,
+  )
+
+  assert server_module.download_player_document(license=999999) is error
+
+
+def test_download_player_document_converts_jpg_to_pdf(monkeypatch):
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 12
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      return [{
+        "tipo_doc": 2,
+        "file_path": "uploads/exame.jpg",
+        "filename": "exame.jpg",
+        "content": _jpg_bytes(),
+      }]
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+
+  result = server_module.download_player_document(license=301772)
+
+  pdf_bytes = base64.b64decode(result[0]["pdf_b64"])
+  assert pdf_bytes.startswith(b"%PDF")
+  # The name follows the bytes: saving pdf_b64 under a ".jpg" name would write
+  # a PDF that no viewer opens by extension.
+  assert result[0]["filename"] == "exame.pdf"
+  assert result[0]["size_bytes"] == len(pdf_bytes)
+
+
+def test_download_player_document_uses_null_for_unmapped_tipo_doc(monkeypatch):
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 12
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      return [{
+        "tipo_doc": 16,
+        "file_path": "uploads/declaration.pdf",
+        "filename": "declaration.pdf",
+        "content": b"%PDF-1.7\n",
+      }]
+
+  monkeypatch.setattr(server_module, "_get_client", StubClient)
+
+  result = server_module.download_player_document(license=301772)
+
+  assert result[0]["doc_type"] is None

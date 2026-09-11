@@ -223,8 +223,9 @@ def _resolve_license_batch(
     **Read-only tools should pass True.** Without it a player whose batch has
     been submitted reads as `license_not_enrolled`, which is simply false: they
     are enrolled, and further along than anyone still in an open batch. Only
-    `read_enrollment` and `list_player_documents` pass it; the six mutation
-    callers deliberately keep the narrow behaviour.
+    `read_enrollment`, `list_player_documents`, and
+    `download_player_document` pass it; the six mutation callers deliberately
+    keep the narrow behaviour.
     """
     try:
         return client.resolve_batch_id_by_license(
@@ -4007,6 +4008,57 @@ def list_player_documents(license: int) -> list[dict] | dict:
         }
         for doc in docs
     ]
+
+
+@server.tool()
+def download_player_document(
+    license: int, doc_type: str | None = None,
+) -> list[dict] | dict:
+    """Download filed enrollment documents for a player as base64 PDFs.
+
+    This reads submitted batches too: a player whose batch is in
+    "Em Validação" is enrolled, not un-enrolled. ``doc_type`` may be one of
+    the usual document-type strings; when omitted, every filed document is
+    returned. Omitting ``doc_type`` can be several MB of base64 for a full
+    checklist, so naming a ``doc_type`` is the normal call.
+
+    Each result is ``{"doc_type": str | null, "filename": str,
+    "size_bytes": int, "pdf_b64": str}``. SAV2-only document types with no
+    sav-parsers equivalent use ``doc_type: null``. The returned bytes are
+    always PDFs, including when SAV stored an image upload. Returns
+    ``{"error": "license_not_enrolled", ...}`` when the licence is in no
+    pending batch at all.
+
+    Stored URLs and ``uploads/...`` paths are deliberately never returned:
+    SAV2 serves them without authentication and they can expose a player's
+    medical documents.
+    """
+    client = _get_client()
+    batch_id = _resolve_license_batch(client, license, include_submitted=True)
+    if isinstance(batch_id, dict):
+        return batch_id
+    tipo_doc = doc_type_to_tipo_doc(doc_type) if doc_type is not None else None
+    docs = client.download_player_registration_documents(
+        batch_id, license, tipo_doc=tipo_doc,
+    )
+    result = []
+    for doc in docs:
+        pdf_bytes = ensure_pdf(doc["content"])
+        mapped = tipo_doc_to_doc_type(doc["tipo_doc"])
+        # SAV accepts .jpg uploads, and ensure_pdf wraps one into a PDF above.
+        # The stored name keeps its image extension, so carrying it through
+        # unchanged hands the caller PDF bytes under a name ending .jpg —
+        # rename to match what pdf_b64 actually holds.
+        filename = doc["filename"]
+        if not doc["content"].startswith(b"%PDF"):
+            filename = f"{filename.rsplit('.', 1)[0]}.pdf"
+        result.append({
+            "doc_type": mapped.value if mapped is not None else None,
+            "filename": filename,
+            "size_bytes": len(pdf_bytes),
+            "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+        })
+    return result
 
 
 def _pdf_bytes_to_tempfile(data: bytes) -> str:

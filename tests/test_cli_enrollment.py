@@ -702,7 +702,7 @@ def test_enrollment_update_mod1_skips_classify(monkeypatch, tmp_path):
   )
   monkeypatch.setattr("sav_parsers.close_processing", lambda pid, corrections=None: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
-    "resolve_batch_id_by_license": lambda self, license: 12,
+    "resolve_batch_id_by_license": lambda self, license, **kwargs: 12,
     "load_player_profile": lambda self, lic: {},
     "update_player_in_registration_batch": lambda self, *a, **kw: None,
     "replace_player_registration_document": lambda self, *a, **kw: None,
@@ -731,7 +731,7 @@ def test_enrollment_update_medical_exam_uploads_exam(monkeypatch, tmp_path):
   uploaded: list = []
   monkeypatch.setattr("sav_parsers.train_classifier", lambda path, dt: None)
   monkeypatch.setattr(cli_module, "_make_client", lambda: type("C", (), {
-    "resolve_batch_id_by_license": lambda self, license: 12,
+    "resolve_batch_id_by_license": lambda self, license, **kwargs: 12,
     "replace_player_registration_document": lambda self, batch_id, lic, path, tipo_doc: uploaded.append(path),
   })())
 
@@ -1489,3 +1489,218 @@ def test_enrollment_create_rejects_pdf_input_without_mod1(monkeypatch, tmp_path)
 
   assert result.exit_code != 0
   assert "No fpb_modelo_1 form provided" in result.output
+
+
+def test_enrollment_documents_lists_filed_documents(monkeypatch):
+  """Listing includes submitted documents as non-editable rows."""
+  captured = {}
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      captured["include_submitted"] = include_submitted
+      return 42
+
+    def list_player_registration_documents(self, batch_id, license):
+      return [
+        {"doc_id": 10, "tipo_doc": 2, "file_path": "uploads/exame.pdf"},
+        {"doc_id": None, "tipo_doc": 1, "file_path": "uploads/modelo.pdf"},
+      ]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli, ["enrollment", "documents", "301772"],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["include_submitted"] is True
+  assert "exame_medico" in result.output
+  assert "modelo.pdf" in result.output
+  assert "false" in result.output
+  assert "uploads/" not in result.output
+
+
+def test_enrollment_documents_downloads_expected_files(monkeypatch, tmp_path):
+  """Download mode names files by licence and document type and preserves bytes."""
+  out_dir = tmp_path / "documents"
+  files = [
+    {
+      "tipo_doc": 1,
+      "file_path": "uploads/stored-modelo.pdf",
+      "filename": "stored-modelo.pdf",
+      "content": b"modelo bytes",
+    },
+    {
+      "tipo_doc": 2,
+      "file_path": "uploads/stored-exam.pdf",
+      "filename": "stored-exam.pdf",
+      "content": b"exam bytes",
+    },
+  ]
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 42
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      assert tipo_doc is None
+      return files
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "documents", "301772", "--out", str(out_dir)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert (out_dir / "301772_fpb_modelo_1.pdf").read_bytes() == b"modelo bytes"
+  assert (out_dir / "301772_exame_medico.pdf").read_bytes() == b"exam bytes"
+  assert "uploads/" not in result.output
+
+
+def test_enrollment_documents_download_preserves_jpg_extension(monkeypatch, tmp_path):
+  out_dir = tmp_path / "documents"
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 42
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      return [{
+        "tipo_doc": 2,
+        "file_path": "uploads/exame.jpg",
+        "filename": "exame.jpg",
+        "content": b"jpeg bytes",
+      }]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "documents", "301772", "--out", str(out_dir)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert (out_dir / "301772_exame_medico.jpg").read_bytes() == b"jpeg bytes"
+  assert not (out_dir / "301772_exame_medico.pdf").exists()
+
+
+def test_enrollment_documents_avoids_collisions_and_existing_files(monkeypatch, tmp_path):
+  out_dir = tmp_path / "documents"
+  out_dir.mkdir()
+  existing = out_dir / "301772_exame_medico.pdf"
+  existing.write_bytes(b"keep me")
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 42
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      return [
+        {
+          "tipo_doc": 2,
+          "file_path": "uploads/exam-1.pdf",
+          "filename": "exam-1.pdf",
+          "content": b"first",
+        },
+        {
+          "tipo_doc": 2,
+          "file_path": "uploads/exam-2.pdf",
+          "filename": "exam-2.pdf",
+          "content": b"second",
+        },
+      ]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "documents", "301772", "--out", str(out_dir)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert existing.read_bytes() == b"keep me"
+  assert (out_dir / "301772_exame_medico_2.pdf").read_bytes() == b"first"
+  assert (out_dir / "301772_exame_medico_3.pdf").read_bytes() == b"second"
+
+
+def test_enrollment_documents_type_filter_passes_tipo_doc(monkeypatch, tmp_path):
+  captured = {}
+  out_dir = tmp_path / "documents"
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      return 42
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      captured["tipo_doc"] = tipo_doc
+      return [{
+        "tipo_doc": 2,
+        "file_path": "uploads/exam.pdf",
+        "filename": "exam.pdf",
+        "content": b"exam bytes",
+      }]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    [
+      "enrollment", "documents", "301772", "--type", "exame_medico",
+      "--out", str(out_dir),
+    ],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["tipo_doc"] == 2
+  assert list(out_dir.iterdir()) == [out_dir / "301772_exame_medico.pdf"]
+
+
+def test_enrollment_documents_submitted_batch_downloads(monkeypatch, tmp_path):
+  captured = {}
+  out_dir = tmp_path / "documents"
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      captured["include_submitted"] = include_submitted
+      return 632482
+
+    def download_player_registration_documents(self, batch_id, license, *, tipo_doc=None):
+      captured["download"] = (batch_id, license)
+      return [{
+        "tipo_doc": 1,
+        "file_path": "uploads/filed.pdf",
+        "filename": "filed.pdf",
+        "content": b"filed bytes",
+      }]
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["enrollment", "documents", "251097", "--out", str(out_dir)],
+  )
+
+  assert result.exit_code == 0, result.output
+  assert captured["include_submitted"] is True
+  assert captured["download"] == (632482, 251097)
+  assert (out_dir / "251097_fpb_modelo_1.pdf").read_bytes() == b"filed bytes"
+
+
+def test_enrollment_documents_license_not_enrolled_error(monkeypatch):
+  from sav_client.exceptions import LicenseNotEnrolledError
+
+  class StubClient:
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+      raise LicenseNotEnrolledError(license=license, open_batches=[])
+
+  monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
+
+  result = CliRunner().invoke(
+    cli_module.cli,
+    ["--output", "json", "enrollment", "documents", "999999"],
+  )
+
+  assert result.exit_code != 0
+  assert '"code": "license_not_enrolled"' in result.output

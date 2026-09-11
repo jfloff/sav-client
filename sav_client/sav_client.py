@@ -1976,6 +1976,14 @@ class SavClient:
         self._cache.record_license_batch(license, batch.id)
         return batch
 
+    # TODO: when include_submitted is True this advertises submitted batches as
+    # joinable — the exact hazard 0.102.2 called out and fixed for
+    # classify_enrollment_status, where the two lists (batches scanned vs
+    # batches offered) were deliberately separated. Here they are still one
+    # list, so read_enrollment, list_player_documents and
+    # download_player_document tell a caller to add a player to a lote that has
+    # already left the club. Fixing it changes what three existing tools
+    # return, so it wants its own change and changelog entry.
     raise LicenseNotEnrolledError(
       license=license,
       open_batches=[
@@ -3647,14 +3655,18 @@ class SavClient:
 
   def list_player_registration_documents(
     self, batch_id: int, license: int,
-  ) -> list[dict[str, int]]:
+  ) -> list[dict[str, int | str | None]]:
     """
     List the documents currently uploaded for a player in a batch.
 
-    Returns one ``{"doc_id": int, "tipo_doc": int}`` entry per document, in
-    the order the SAV2 server lists them. ``doc_id`` is the galeria id used
-    by ``delete_player_registration_document()``; ``tipo_doc`` matches the
-    upload modal's type select (1 = Modelo 1, 2 = Exame Médico, ...).
+    Returns one ``{"doc_id": int | None, "tipo_doc": int, "file_path":
+    str | None}`` entry per document, in the order the SAV2 server lists them.
+    ``doc_id`` is the galeria id used by
+    ``delete_player_registration_document()``; ``tipo_doc`` matches the
+    upload modal's type select (1 = Modelo 1, 2 = Exame Médico, ...);
+    ``file_path`` is the stored relative path used to view the document.
+    Unlike ``doc_id``, ``file_path`` survives submission, so it remains
+    available for filed documents.
 
     Raises:
         SavResponseError:   not logged in.
@@ -3673,6 +3685,106 @@ class SavClient:
       raise ValueError(f"Batch id={batch_id} not found")
     _, _, docs = self._fetch_registration_documents(batch, license)
     return docs
+
+  def _download_registration_document_file(self, file_path: str) -> bytes:
+    """
+    Fetch one stored document by the relative path op=91 renders in its
+    ``goToPage(...)`` view button.
+
+    The file lives under ``base_url`` and is served directly by the web
+    server, not through ``incricoesdb.php`` — a missing one is a plain HTTP
+    404, which ``raise_for_status()`` turns into a ``SavConnectionError``.
+    The magic-byte check guards the other failure: an expired session answers
+    200 with an HTML login page, and writing that to a ``.pdf`` would hand the
+    caller a file that looks fine until someone opens it.
+    """
+    try:
+      resp = self._http.get(self._url(file_path), timeout=self._timeout)
+      resp.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+      raise SavConnectionError(
+        f"Could not download registration document {file_path}: {exc}"
+      ) from exc
+
+    content = resp.content
+    is_pdf = content.startswith(b"%PDF")
+    is_image = (
+      # Mirrors sav_shared.files._IMAGE_MAGICS, the allow-list ensure_pdf()
+      # accepts downstream. Accepting a format it rejects would only move the
+      # failure to the caller that converts the bytes.
+      content.startswith((
+        b"\xff\xd8\xff",       # JPEG
+        b"\x89PNG\r\n\x1a\n",  # PNG
+        b"GIF87a",             # GIF
+        b"GIF89a",
+        b"BM",                 # BMP
+        b"II*\x00",            # little-endian TIFF
+        b"MM\x00*",            # big-endian TIFF
+      ))
+    )
+    if not (is_pdf or is_image):
+      raise SavResponseError(
+        f"Registration document {file_path} was neither a PDF nor a known image"
+      )
+    return content
+
+  def download_player_registration_documents(
+    self,
+    batch_id: int,
+    license: int,
+    *,
+    tipo_doc: int | None = None,
+  ) -> list[dict]:
+    """
+    Download the stored registration documents for a player in a batch.
+
+    Returns one ``{"tipo_doc": int, "file_path": str, "filename": str,
+    "content": bytes}`` entry per document, in SAV2's order. Pass
+    ``tipo_doc`` to restrict the result to one document type. Rows without a
+    stored view path are skipped.
+
+    Raises:
+        SavResponseError:   not logged in, or a downloaded body is not a PDF
+                            or known image.
+        SavConnectionError: network errors.
+        ValueError:         batch_id not found.
+    """
+    from pathlib import Path
+
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before download_player_registration_documents()"
+      )
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+
+    # Reading filed documents is the purpose of this method. Submitted batches
+    # deliberately have no is_open guard: op=91 still exposes their stored
+    # goToPage paths even though the write methods must refuse them.
+    _, _, docs = self._fetch_registration_documents(batch, license)
+    result = []
+    for doc in docs:
+      if tipo_doc is not None and doc["tipo_doc"] != tipo_doc:
+        continue
+      file_path = doc["file_path"]
+      if file_path is None:
+        logger.warning(
+          "Skipping registration document without file path for license=%s "
+          "in batch=%s",
+          license, batch.id,
+        )
+        continue
+      result.append({
+        "tipo_doc": doc["tipo_doc"],
+        "file_path": file_path,
+        "filename": Path(file_path).name,
+        "content": self._download_registration_document_file(file_path),
+      })
+    return result
 
   def replace_player_registration_document(
     self,
@@ -3720,7 +3832,7 @@ class SavClient:
 
   def _fetch_registration_documents(
     self, batch: PlayerRegistrationBatch, license: int,
-  ) -> tuple[int, int | None, list[dict[str, int | None]]]:
+  ) -> tuple[int, int | None, list[dict[str, int | str | None]]]:
     """
     Op=91 — fetch a player's existing registration documents.
 
@@ -3732,9 +3844,14 @@ class SavClient:
         in the HTML (this is NOT the user_id from op=35; it's created when
         the player is added to the batch via op=36). **None for a batch that
         is no longer open** — see below.
-      - ``docs`` is a list of ``{"doc_id": int | None, "tipo_doc": int}``.
+      - ``docs`` is a list of ``{"doc_id": int | None, "tipo_doc": int,
+        "file_path": str | None}``.
         ``doc_id`` comes from each row's ``deleteDoc(doc_id, licenca, guia,
         ...)`` onclick and is **None for a batch that is no longer open**.
+        ``file_path`` comes from the row's ``goToPage(file_path)`` onclick and
+        is ``None`` when SAV renders no view button. Unlike ``doc_id`` and
+        ``inscricao``, it survives submission, which makes a filed document
+        readable.
 
     **Submitted batches render read-only.** Once a batch leaves "Em
     construção", SAV still returns HTTP 200 with a real ``body`` listing every
@@ -3820,7 +3937,7 @@ class SavClient:
     # production 2026-09-11: licence 257901 in batch 632478 ("Em Validação")
     # returned two rows, both with goToPage and neither with deleteDoc, against
     # licence 296838 in batch 632315 ("Em construção") which had both.
-    docs: list[dict[str, int | None]] = []
+    docs: list[dict[str, int | str | None]] = []
     for row in soup.find_all("tr"):
       button = row.find(attrs={"onclick": re.compile(r"deleteDoc\(")})
       doc_id: int | None = None
@@ -3829,9 +3946,18 @@ class SavClient:
         if m_doc is None:
           continue
         doc_id = int(m_doc.group(1))
-      elif row.find(attrs={"onclick": re.compile(r"goToPage\(")}) is None:
+      view_button = row.find(attrs={"onclick": re.compile(r"goToPage\(")})
+      if button is None and view_button is None:
         # Neither handler: a header row or a layout row, not a document.
         continue
+      file_path: str | None = None
+      if view_button is not None:
+        m_file = re.search(
+          r"goToPage\(\s*[\"']([^\"']+)[\"']\s*\)",
+          view_button["onclick"],
+        )
+        if m_file is not None:
+          file_path = m_file.group(1)
       cell = row.find("td", class_="text-left")
       label = normalise_text(cell.get_text()) if cell else ""
       tipo_doc = labels.get(label, 0)
@@ -3842,7 +3968,11 @@ class SavClient:
           "Unrecognised document type %r for license %s in batch %s; "
           "reporting tipo_doc=0", cell.get_text().strip() if cell else "", license, batch.id,
         )
-      docs.append({"doc_id": doc_id, "tipo_doc": tipo_doc})
+      docs.append({
+        "doc_id": doc_id,
+        "tipo_doc": tipo_doc,
+        "file_path": file_path,
+      })
     return next_slot, inscricao, docs
 
   # ------------------------------------------------------------------

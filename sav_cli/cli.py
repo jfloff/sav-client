@@ -378,10 +378,14 @@ def _resolve_batch_id_or_raise(client: SavClient, batch_number: str) -> int:
     raise SavCliError(str(e), code=_exc_code(e))
 
 
-def _resolve_batch_id_by_license_or_raise(client: SavClient, license: int) -> int:
+def _resolve_batch_id_by_license_or_raise(
+  client: SavClient, license: int, *, include_submitted: bool = False,
+) -> int:
   """Resolve the batch a license is enrolled in, or raise SavCliError with a hint."""
   try:
-    return client.resolve_batch_id_by_license(license)
+    return client.resolve_batch_id_by_license(
+      license, include_submitted=include_submitted,
+    )
   except LicenseNotEnrolledError as e:
     raise SavCliError(str(e), code="license_not_enrolled")
   except ValueError as e:
@@ -3282,6 +3286,155 @@ def enrollment_status_cmd(ctx, license_):
     )
   else:
     console.print("\n[green]:white_check_mark: All required documents uploaded.[/]")
+
+
+@enrollment_grp.command("documents")
+@click.argument("license_", type=int)
+@click.option(
+  "--type", "doc_type_value", default=None,
+  help=(
+    "Restrict to one document type "
+    f"({ '|'.join(DOC_TYPE_CHOICES) })."
+  ),
+)
+@click.option(
+  "--out", "out_dir", type=click.Path(file_okay=False), default=None,
+  help="Download documents into this directory.",
+)
+@click.pass_context
+def enrollment_documents_cmd(ctx, license_, doc_type_value, out_dir):
+  """List or download a player's filed enrollment documents.
+
+  \b
+    sav enrollment documents LICENSE
+    sav enrollment documents LICENSE --type exame_medico --out DIR
+
+  Submitted batches are included because their filed documents remain
+  available even after SAV stops accepting changes.
+  """
+  output = ctx.obj["output"]
+
+  selected_tipo_doc = None
+  if doc_type_value is not None:
+    selected_tipo_doc = _tipo_doc_for_upload(_resolve_doc_type(doc_type_value))
+
+  client = _make_client()
+  batch_id = _resolve_batch_id_by_license_or_raise(
+    client, license_, include_submitted=True,
+  )
+
+  if out_dir is None:
+    try:
+      documents = client.list_player_registration_documents(batch_id, license_)
+    except (SavConnectionError, SavResponseError, ValueError) as e:
+      raise SavCliError(str(e), code=_exc_code(e))
+    if selected_tipo_doc is not None:
+      documents = [
+        document for document in documents
+        if document["tipo_doc"] == selected_tipo_doc
+      ]
+
+    rows = []
+    for document in documents:
+      mapped = tipo_doc_to_doc_type(document["tipo_doc"])
+      rows.append({
+        "doc_type": mapped.value if mapped is not None else None,
+        "editable": document["doc_id"] is not None,
+        "filename": (
+          Path(document["file_path"]).name
+          if document["file_path"] else ""
+        ),
+      })
+
+    if output == "json":
+      click.echo(json.dumps(rows, ensure_ascii=False, indent=2))
+      return
+    if output == "csv":
+      click.echo("doc_type,editable,filename")
+      for row in rows:
+        click.echo(
+          f"{row['doc_type'] or ''},{str(row['editable']).lower()},"
+          f"{row['filename']}"
+        )
+      return
+
+    _render_table(
+      ["doc_type", "editable", "filename"],
+      [
+        [
+          row["doc_type"] or "",
+          str(row["editable"]).lower(),
+          row["filename"],
+        ]
+        for row in rows
+      ],
+    )
+    return
+
+  try:
+    documents = client.download_player_registration_documents(
+      batch_id, license_, tipo_doc=selected_tipo_doc,
+    )
+  except (SavConnectionError, SavResponseError, ValueError) as e:
+    raise SavCliError(str(e), code=_exc_code(e))
+
+  destination_dir = Path(out_dir)
+  try:
+    destination_dir.mkdir(parents=True, exist_ok=True)
+  except OSError as e:
+    raise SavCliError(f"Could not create {out_dir!r}: {e}", code="io_error")
+
+  saved = []
+  used_paths: set[Path] = set()
+  for document in documents:
+    mapped = tipo_doc_to_doc_type(document["tipo_doc"])
+    doc_type = mapped.value if mapped is not None else None
+    if doc_type is None:
+      base_name = Path(document["filename"]).name
+    else:
+      extension = Path(document["file_path"]).suffix
+      base_name = f"{license_}_{doc_type}{extension}"
+
+    base_path = Path(base_name)
+    stem = base_path.stem
+    extension = base_path.suffix
+    counter = 1
+    while True:
+      numbered = "" if counter == 1 else f"_{counter}"
+      destination = destination_dir / f"{stem}{numbered}{extension}"
+      if (
+        destination not in used_paths
+        and not destination.exists()
+        and not destination.is_symlink()
+      ):
+        used_paths.add(destination)
+        break
+      counter += 1
+
+    try:
+      destination.write_bytes(document["content"])
+    except OSError as e:
+      raise SavCliError(f"Could not write {str(destination)!r}: {e}", code="io_error")
+    saved.append({
+      "doc_type": doc_type,
+      "path": str(destination),
+      "size_bytes": len(document["content"]),
+    })
+
+  if output == "json":
+    click.echo(json.dumps(saved, ensure_ascii=False, indent=2))
+    return
+  if output == "csv":
+    click.echo("doc_type,path,size_bytes")
+    for row in saved:
+      click.echo(f"{row['doc_type'] or ''},{row['path']},{row['size_bytes']}")
+    return
+
+  for row in saved:
+    # An unmapped SAV2-only type has no public name to print; the file name is
+    # the only thing that identifies it, and "Saved  → x.pdf" reads as a bug.
+    label = row["doc_type"] or Path(row["path"]).name
+    click.echo(f"Saved {label} → {row['path']}")
 
 
 @enrollment_grp.command("read")

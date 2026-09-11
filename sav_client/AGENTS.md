@@ -429,7 +429,15 @@ The player must already be added to the batch (op=36) — the upload `inscricao`
 
 ### `list_player_registration_documents(batch_id, license) → list[dict]`
 
-List currently uploaded documents for this player+batch as `[{"doc_id", "tipo_doc"}, ...]`. `doc_id` is the galeria id used by `delete_player_registration_document()`.
+List currently uploaded documents for this player+batch as `[{"doc_id", "tipo_doc", "file_path"}, ...]`. `doc_id` is the galeria id used by `delete_player_registration_document()`. `file_path` is the stored relative path from the row's `goToPage(...)` view button — and unlike `doc_id`, **it survives submission**: a batch in "Em Validação" withholds every galeria id (nothing can be deleted or replaced any more) but still renders the path, which is what makes a filed document readable.
+
+### `download_player_registration_documents(batch_id, license, *, tipo_doc=None) → list[dict]`
+
+Download what the player has filed, as `[{"tipo_doc", "file_path", "filename", "content"}, ...]` in SAV's own order; pass `tipo_doc` to fetch one type. `content` is the raw bytes — a `.pdf` or, since SAV accepts image uploads, a `.jpg`; take the extension from `file_path` rather than assuming PDF.
+
+**This is deliberately the one document method with no `is_open` guard.** Upload, replace and delete all refuse a submitted batch because SAV cannot accept the change; reading back a document the federation already holds is exactly what this is for, so the submitted case is the motivating one, not an edge case.
+
+The files themselves are served straight off `base_url` with **no authentication at all** — an anonymous GET of the stored path returns the same bytes (verified 2026-09-11). Treat the path as a secret: it is a world-readable link to a player's medical exam, which is why neither the CLI nor the MCP surface ever prints or returns it.
 
 ### `delete_player_registration_document(doc_id) → None`
 

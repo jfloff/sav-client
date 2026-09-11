@@ -36,7 +36,7 @@ This file is intended to be loaded as the LLM's system prompt (or first context 
 All PDFs cross the MCP boundary as **base64-encoded strings**.
 
 - Inputs: `parse_enrollment_forms(documents=[{"pdf": b64}, ...])`, `upload_player_document(pdf_base64=...)`, `replace_player_document(pdf_base64=...)`, `update_enrollment_with_document(pdf=...)`.
-- Outputs: `generate_game_sheet_pdf`, `fill_mod1`, and `complete_mod1` return `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use.
+- Outputs: `generate_game_sheet_pdf`, `fill_mod1`, `complete_mod1`, and `download_player_document` return `{filename, size_bytes, pdf_b64}` — decode `pdf_b64` to bytes to use. `download_player_document` returns a *list* of them, one per filed document.
 
 ## Date convention
 
@@ -283,6 +283,7 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 ### Ad-hoc documents
 - `classify_documents(documents)` — identify document types without reading or writing SAV. See [Required documents](#required-documents-depend-on-nationality-and-reg_type).
 - `list_player_documents(license)` — what's uploaded for this player.
+- `download_player_document(license, doc_type?)` — read a filed document back, as `[{doc_type, filename, size_bytes, pdf_b64}]`. **Works on submitted batches**, which is the point: once a lote leaves "Em construção" SAV withholds every galeria id, so `delete`/`replace` are closed but the document the federation holds is still readable. Omitting `doc_type` returns *everything* filed — several MB of base64 for a full checklist — so name a `doc_type` unless you genuinely need all of them. An image upload comes back converted to PDF, with the filename's extension changed to match.
 - `upload_player_document(license, pdf_base64, doc_type?)`.
 - `replace_player_document(license, pdf_base64, doc_type?)` — replaces existing doc of that type.
 - `delete_player_document(license, doc_id)` — by galeria id from `list_player_documents`, scoped to the player's licence.
@@ -324,7 +325,7 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 Two kinds of failure surface:
 
 - **Structured error dicts** (LLM-actionable, no exception raised):
-  - `{error: "license_not_enrolled", license, open_batches: [...]}` — from `read_enrollment`, `update_enrollment`, `update_enrollment_with_document`, `delete_enrollment`, `list_player_documents`, `upload_player_document`, `replace_player_document`.
+  - `{error: "license_not_enrolled", license, open_batches: [...]}` — from `read_enrollment`, `update_enrollment`, `update_enrollment_with_document`, `delete_enrollment`, `list_player_documents`, `download_player_document`, `upload_player_document`, `replace_player_document`.
   - `{resolved: false, candidates: [...]}` / `{resolved: false, error: "player_already_in_sav"}` — from `resolve_player` **and** from `preview_enrollment` when called with `license: null` and the player doesn't resolve to one licence. Ask the user to pick / switch to Revalidação, then re-call `preview_enrollment` with an explicit `license`.
   - `{success: false, missing_guardian_fields: [...]}` — fallback from `submit_enrollment` when a minor's guardian fields were still absent at submit time (`preview_enrollment` surfaces them in `needs_review` up front).
 - **Raised exceptions** — programming errors (unknown `mod1_id`, invalid `team`, malformed base64). Surface these to the user; they indicate a bug or a malformed input.
@@ -368,7 +369,7 @@ On a parameter's JSON Schema property inside `inputSchema`:
 
 | Tier | Meaning | Examples |
 |------|---------|----------|
-| `read` | Pure lookups, no SAV2 state change (also covers OCR-only steps that cache nothing in SAV2). | `search_players`, `get_game_sheet`, `parse_enrollment_forms`, `list_player_documents`. |
+| `read` | Pure lookups, no SAV2 state change (also covers OCR-only steps that cache nothing in SAV2). | `search_players`, `get_game_sheet`, `parse_enrollment_forms`, `list_player_documents`, `download_player_document`. |
 | `write` | Mutates SAV2 (create / update). | `submit_enrollment`, `update_enrollment`, `upload_player_document`, `create_batch`. |
 | `delete` | Destructive (removes records or files). Conventionally `roles = []` (admin-only). | `delete_enrollment`, `delete_batch`, `delete_player_document`. |
 

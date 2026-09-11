@@ -119,6 +119,13 @@ roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
+# A parent reading back their own child's filed documents is the motivating
+# self-scope case.
+[tools.download_player_document]
+roles           = ["coach"]
+self_scope      = ["parent", "player"]
+subject_license = ["license"]
+
 # Wrapper-side lookup: hydrates the caller-scope (NIF → license) at onboarding.
 # Parent/player may call it for their own NIF (subject_nif gate stops
 # enumeration); the wrapper also calls it internally with its own session.

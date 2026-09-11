@@ -20,10 +20,14 @@ from sav_client.models import PlayerRegistrationBatch
 from sav_client.sav_client import SavClient
 
 
-def _row(galeria: int, label: str) -> str:
+def _row(galeria: int, label: str, file_path: str | None) -> str:
+  view_button = (
+    f"<button onclick='goToPage(\"{file_path}\")'></button>"
+    if file_path is not None else ""
+  )
   return (
     f"<tr id='r{galeria}'>"
-    f"<td><button onclick='goToPage(\"x.pdf\")'></button></td>"
+    f"<td>{view_button}</td>"
     f"<td class='text-left'>\n                {label}</td>"
     f"<td>27-08-2026 13:17:06</td><td>Rio Maior Basket</td>"
     f"<td><button onclick='deleteDoc({galeria},298352,630304,1, 2)'></button></td>"
@@ -40,11 +44,24 @@ SELECT = (
   "</select>"
 )
 
+# The view paths follow the shape every live capture shows —
+# `uploads/galeria_docs/jogadores/<licenca>_<inscricao>_<epoch>.<ext>` — keyed
+# to this fixture's own licence (298352). The 2026-08-27 capture predates any
+# interest in the path, so its real filenames were not recorded; the *paths
+# verbatim from production* live in SUBMITTED_BODY below.
 LIVE_BODY = (
   "<table><tbody>"
   "<tr><td><button onclick='checkDoc(1,780605,298352,630304)'></button></td></tr>"
-  + _row(2278594, "Modelo 1 - Inscrição jogadores (Primeira ou Revalidação)")
-  + _row(2278595, "Exame Médico")
+  + _row(
+    2278594,
+    "Modelo 1 - Inscrição jogadores (Primeira ou Revalidação)",
+    "uploads/galeria_docs/jogadores/298352_780605_1756300626.pdf",
+  )
+  + _row(
+    2278595,
+    "Exame Médico",
+    "uploads/galeria_docs/jogadores/298352_780605_1756300627.pdf",
+  )
   + "</tbody></table>" + SELECT
 )
 
@@ -73,8 +90,16 @@ class TestDocumentTypeFromLabel:
   def test_distinguishes_types_that_share_deletedoc_arguments(self, client, monkeypatch):
     _, _, docs = _fetch(client, monkeypatch, LIVE_BODY)
     assert docs == [
-      {"doc_id": 2278594, "tipo_doc": 1},
-      {"doc_id": 2278595, "tipo_doc": 2},
+      {
+        "doc_id": 2278594,
+        "tipo_doc": 1,
+        "file_path": "uploads/galeria_docs/jogadores/298352_780605_1756300626.pdf",
+      },
+      {
+        "doc_id": 2278595,
+        "tipo_doc": 2,
+        "file_path": "uploads/galeria_docs/jogadores/298352_780605_1756300627.pdf",
+      },
     ]
 
   def test_inscricao_id_still_parsed(self, client, monkeypatch):
@@ -86,32 +111,36 @@ class TestDocumentTypeFromLabel:
     body = (
       "<table><tbody>"
       "<tr><td><button onclick='checkDoc(1,780605,298352,630304)'></button></td></tr>"
-      + _row(99, "Novo Tipo Que Não Conhecemos")
+      + _row(99, "Novo Tipo Que Não Conhecemos", "uploads/unknown.pdf")
       + "</tbody></table>" + SELECT
     )
     _, _, docs = _fetch(client, monkeypatch, body)
-    assert docs == [{"doc_id": 99, "tipo_doc": 99}]
+    assert docs == [{"doc_id": 99, "tipo_doc": 99, "file_path": "uploads/unknown.pdf"}]
 
   def test_static_map_covers_a_response_without_a_select(self, client, monkeypatch):
     body = (
       "<table><tbody>"
       "<tr><td><button onclick='checkDoc(1,780605,298352,630304)'></button></td></tr>"
-      + _row(2278595, "Exame Médico")
+      + _row(2278595, "Exame Médico", "uploads/exame.pdf")
       + "</tbody></table>"
     )
     _, _, docs = _fetch(client, monkeypatch, body)
-    assert docs == [{"doc_id": 2278595, "tipo_doc": 2}]
+    assert docs == [{
+      "doc_id": 2278595, "tipo_doc": 2, "file_path": "uploads/exame.pdf",
+    }]
 
   def test_unknown_label_reports_zero_rather_than_guessing(self, client, monkeypatch):
     """tipo_doc=0 matches no real type, so replace_* leaves the row alone."""
     body = (
       "<table><tbody>"
       "<tr><td><button onclick='checkDoc(1,780605,298352,630304)'></button></td></tr>"
-      + _row(4242, "Algo Completamente Novo")
+      + _row(4242, "Algo Completamente Novo", "uploads/unknown-label.pdf")
       + "</tbody></table>"
     )
     _, _, docs = _fetch(client, monkeypatch, body)
-    assert docs == [{"doc_id": 4242, "tipo_doc": 0}]
+    assert docs == [{
+      "doc_id": 4242, "tipo_doc": 0, "file_path": "uploads/unknown-label.pdf",
+    }]
 
   def test_empty_document_list(self, client, monkeypatch):
     body = (
@@ -214,6 +243,10 @@ class TestSubmittedBatchIsStillReadable:
     # The types survive: they come from the row label via _DOC_TYPE_LABELS,
     # which is what makes a checklist readable for a submitted enrolment.
     assert [d["tipo_doc"] for d in docs] == [1, 2]
+    assert [d["file_path"] for d in docs] == [
+      "uploads/galeria_docs/jogadores/257901_783358_1789078995.pdf",
+      "uploads/galeria_docs/jogadores/257901_783358_1789078999.pdf",
+    ]
     assert slot == 3
     # The write-only ids do not. None here means "SAV withheld it", and must
     # never be read as "there are no documents".
@@ -250,3 +283,106 @@ class TestSubmittedBatchIsStillReadable:
       client.upload_player_registration_document(
         632478, 257901, str(pdf), tipo_doc=2,
       )
+
+
+class TestDownloadRegistrationDocuments:
+  def test_filters_by_type_and_returns_all_in_server_order(self, client, monkeypatch):
+    batch = type("BatchStub", (), {"id": 632478, "is_open": False})()
+    docs = [
+      {
+        "doc_id": None,
+        "tipo_doc": 1,
+        "file_path": "uploads/modelo.pdf",
+      },
+      {
+        "doc_id": None,
+        "tipo_doc": 2,
+        "file_path": "uploads/exame.jpg",
+      },
+    ]
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", lambda: [batch], raising=False,
+    )
+    monkeypatch.setattr(
+      client, "_fetch_registration_documents",
+      lambda b, lic: (3, None, docs),
+      raising=False,
+    )
+    monkeypatch.setattr(
+      client, "_download_registration_document_file",
+      lambda path: {"uploads/modelo.pdf": b"%PDF-1.6", "uploads/exame.jpg": b"\xff\xd8\xff"}[path],
+      raising=False,
+    )
+
+    filtered = client.download_player_registration_documents(632478, 257901, tipo_doc=2)
+    all_docs = client.download_player_registration_documents(632478, 257901)
+
+    assert filtered == [{
+      "tipo_doc": 2,
+      "file_path": "uploads/exame.jpg",
+      "filename": "exame.jpg",
+      "content": b"\xff\xd8\xff",
+    }]
+    assert [doc["filename"] for doc in all_docs] == ["modelo.pdf", "exame.jpg"]
+
+  def test_does_not_refuse_a_submitted_batch(self, client, monkeypatch):
+    batch, _ = _fetch_for(
+      client, monkeypatch, SUBMITTED_BODY, state_id=9, state="Em Validação",
+    )
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", lambda: [batch], raising=False,
+    )
+    monkeypatch.setattr(
+      client, "_download_registration_document_file",
+      lambda path: b"%PDF-1.6\n%%EOF\n",
+      raising=False,
+    )
+
+    docs = client.download_player_registration_documents(632478, 257901)
+
+    assert [doc["filename"] for doc in docs] == [
+      "257901_783358_1789078995.pdf",
+      "257901_783358_1789078999.pdf",
+    ]
+
+  def test_skips_a_row_without_a_view_button(self, client, monkeypatch):
+    body = (
+      "<table><tbody>"
+      "<tr><td><button onclick='checkDoc(1,780605,298352,630304)'></button></td></tr>"
+      + _row(2278594, "Modelo 1 - Inscrição jogadores (Primeira ou Revalidação)", None)
+      + "</tbody></table>" + SELECT
+    )
+    _, _, docs = _fetch(client, monkeypatch, body)
+    assert docs == [{"doc_id": 2278594, "tipo_doc": 1, "file_path": None}]
+
+    batch = type("BatchStub", (), {"id": 630304, "is_open": True})()
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", lambda: [batch], raising=False,
+    )
+    monkeypatch.setattr(
+      client, "_fetch_registration_documents",
+      lambda b, lic: (3, 780605, docs),
+      raising=False,
+    )
+    monkeypatch.setattr(
+      client, "_download_registration_document_file",
+      lambda path: pytest.fail("a row without a view path must not be downloaded"),
+      raising=False,
+    )
+    assert client.download_player_registration_documents(630304, 298352) == []
+
+  def test_download_helper_rejects_html_and_returns_pdf(self, client, monkeypatch):
+    class Response:
+      def __init__(self, content):
+        self.content = content
+
+      def raise_for_status(self):
+        return None
+
+    response = Response(b"<html><body>login</body></html>")
+    client._http = type("Http", (), {"get": lambda self, *a, **k: response})()
+    with pytest.raises(SavResponseError, match="neither a PDF"):
+      client._download_registration_document_file("uploads/document.pdf")
+
+    response.content = b"%PDF-1.6\n%%EOF\n"
+    assert client._download_registration_document_file("uploads/document.pdf") == response.content

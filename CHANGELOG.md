@@ -21,6 +21,63 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.103.0 — 2026-09-11
+
+### Added
+
+**Filed enrollment documents can now be read back**
+`IMPACT: silent` — additive, but `list_player_registration_documents()` grew a
+key. Nothing changes shape or meaning; a caller comparing a document dict for
+exact equality (`doc == {"doc_id": ..., "tipo_doc": ...}`) now sees that
+comparison fail.
+
+Until now the surface could list what a player had filed and write documents,
+but never read one back. That gap was worst exactly where writing is closed:
+once a batch leaves "Em construção" SAV withholds every galeria id, so a
+submitted enrollment was a black box — no way to re-read the medical exam's
+date, confirm the Modelo 1 actually filed carries the club stamp, or hand a
+parent a copy.
+
+The op=91 response already carried the answer. Each document row renders a
+`goToPage("uploads/galeria_docs/jogadores/<file>.pdf")` view button, and unlike
+`checkDoc`/`deleteDoc` **that path survives submission** — verified against
+batch 632315 (Em construção) and batch 632482 (Em Validação), which return the
+same markup for it. So this is a parse addition to an op already called, not a
+new endpoint. (SAV2's own UI uses op=107 for the read-only view; it returns the
+same paths minus `num`, and is not worth a second code path.)
+
+New:
+- `SavClient.download_player_registration_documents(batch_id, license, *,
+  tipo_doc=None)` → `[{tipo_doc, file_path, filename, content}]`.
+- `sav enrollment documents LICENSE [--type TYPE] [--out DIR]` — lists, or
+  downloads into `DIR` as `<license>_<doc_type>.<ext>`.
+- MCP `download_player_document(license, doc_type?)` →
+  `[{doc_type, filename, size_bytes, pdf_b64}]`.
+- `list_player_registration_documents()` entries gained `file_path`.
+
+`DETECT:` `grep -rn "tipo_doc\"\s*:" --include=*.py .` — look for equality
+comparisons against a whole document dict rather than key access.
+`FIX:` compare the keys you care about (`doc["tipo_doc"]`), not the dict.
+
+**This is the one document method with no `is_open` guard, on purpose.**
+Upload, replace and delete each refuse a submitted batch because SAV cannot
+accept the change. Reading is the opposite case, and the submitted batch is the
+motivating one — do not "restore" the missing guard by analogy.
+
+**The stored files are served without authentication.** An anonymous GET of the
+`uploads/...` path returns the same bytes as an authenticated one. The path is
+therefore a world-readable link to a player's medical exam, and neither the CLI
+nor the MCP tool prints or returns it — only `filename`. Keep it that way.
+
+Known issue, not fixed here: `LicenseNotEnrolledError.open_batches` is built
+from the same widened list when `include_submitted=True`, so `read_enrollment`,
+`list_player_documents` and `download_player_document` advertise submitted
+batches as joinable — the hazard 0.102.2 separated the two lists to avoid in
+`classify_enrollment_status`. Fixing it changes what three existing tools
+return, so it wants its own entry. TODO recorded at the raise site.
+
+---
+
 ## 0.102.2 — 2026-09-11
 
 ### Fixed
