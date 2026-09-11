@@ -21,6 +21,89 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.102.1 — 2026-09-11
+
+### Fixed
+
+**Reading any enrolment in a submitted batch raised instead of returning**
+`IMPACT: raises` — `get_enrollment_status(license=...)` threw
+`SavResponseError("Could not find inscricao id in op=91 response")` as soon as
+the player's batch reached `Em Validação`. A regression in *reach*, not in code:
+before `submit_batch` existed (0.101.0) a club could not easily put a batch into
+that state from this package, so the read path was never exercised against one.
+
+Confirmed against production 2026-09-11 by capturing op=91 for a submitted batch
+(licence 257901, batch 632478) and an open one (licence 296838, batch 632315).
+A submitted batch still returns HTTP 200 with a full `body` — every document,
+its type label, timestamp and uploader — but SAV drops the `checkDoc` and
+`deleteDoc` handlers and the type `<select>`, because none of those actions are
+available once the batch has left the club. The parser anchored on exactly those
+handlers.
+
+Two distinct bugs fell out of that, and the second was worse:
+
+- `inscricao` is parsed from `checkDoc`, and its absence raised. It is now
+  tolerated **only when the batch is not open**; an open batch with no
+  `checkDoc` still raises, because there it means SAV's markup changed.
+- `docs` was parsed by scanning for `deleteDoc`, so a submitted batch returned
+  an **empty document list** — reporting "no documents" for a record that
+  demonstrably had them. Silent, and worse than the crash. Rows are now matched
+  on either handler. Document *types* resolve normally via the static
+  `_DOC_TYPE_LABELS` fallback, which is what a checklist needs; `doc_id` comes
+  back None, since SAV genuinely withholds the galeria id in this state.
+
+`DETECT:` `grep -rn "_fetch_registration_documents\|list_player_documents" --include=*.py .`
+— any caller that treats `doc_id` as always-int, or reads an empty `docs` list
+as "nothing uploaded", needs to handle the submitted case.
+`FIX:` treat `doc_id=None` as "exists but not actionable in this state", not as
+absent. Callers needing only document types are unaffected.
+
+**Uploading to a submitted batch was refused only by accident**
+`IMPACT: silent` — worth reading even though nothing broke yet. The refusal came
+from the `inscricao` parse raising, not from any deliberate check. Making reads
+tolerate a missing `inscricao` removed that accidental protection, which would
+have let an upload build op=92's URL with `inscricao=None` and send a corrupt
+request instead of refusing. `upload_player_registration_document` and
+`replace_player_registration_document` now guard explicitly on `batch.is_open`
+and name the offending state in the error.
+
+**Read-only tools reported enrolled players as not enrolled**
+`IMPACT: raises` — `list_player_documents` and `read_enrollment` answered
+`{"error": "license_not_enrolled"}` for any player whose batch had been
+submitted. They resolve through `_resolve_license_batch`, which searched open
+batches only, so a submitted batch looked like no batch at all.
+
+`_resolve_license_batch` gained `include_submitted: bool = False`. The two
+read-only tools pass True; the six mutation callers (`update_enrollment`,
+`update_enrollment_with_document`, `delete_enrollment`, `upload_player_document`,
+`delete_player_document`, `replace_player_document`) deliberately keep the narrow
+behaviour — for a mutation, "not in an open batch" is the correct answer, since
+a batch that has left the club cannot accept changes.
+
+`DETECT:` `grep -rn "resolve_batch_id_by_license" --include=*.py .` — any test
+double or wrapper implementing this method needs the new keyword in its
+signature.
+`FIX:` add `*, include_submitted: bool = False` to the signature. Pass True only
+from read paths.
+
+### Changed
+
+**`list_player_documents` entries gained an `editable` field**
+`IMPACT: silent` — additive, so anything reading `doc_id` / `doc_type` by key is
+unaffected; only an exact-shape comparison of the returned dicts breaks. Entries
+are now `{"doc_id": int | null, "doc_type": str | null, "editable": bool}`.
+
+`editable` is False exactly when SAV withheld the galeria id, i.e. the batch is
+no longer open. It exists because a bare `doc_id: null` reads as a parse failure,
+when the actionable fact is "this document is real but cannot be deleted or
+replaced".
+
+`DETECT:` `grep -rn "list_player_documents" --include=*.py .`
+`FIX:` read fields by key rather than comparing whole dicts. Gate any
+delete/replace on `editable` rather than assuming `doc_id` is an int.
+
+---
+
 ## 0.102.0 — 2026-09-10
 
 ### Breaking

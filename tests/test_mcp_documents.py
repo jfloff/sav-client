@@ -42,7 +42,7 @@ def test_upload_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -64,7 +64,7 @@ def test_upload_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -86,7 +86,7 @@ def test_replace_player_document_translates_doc_type(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -108,7 +108,7 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -128,7 +128,7 @@ def test_replace_player_document_classifies_when_doc_type_omitted(monkeypatch):
 
 def test_list_player_documents_returns_parser_doc_types(monkeypatch):
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def list_player_registration_documents(self, batch_id, license):
@@ -143,11 +143,13 @@ def test_list_player_documents_returns_parser_doc_types(monkeypatch):
 
   result = server_module.list_player_documents(license=301772)
 
+  # `editable` is part of the contract as of 0.102.1: an open batch's documents
+  # carry a galeria id and can be deleted, a submitted batch's cannot.
   assert result == [
-    {"doc_id": 1, "doc_type": DocType.FPB_MODELO_1.value},
-    {"doc_id": 2, "doc_type": DocType.EXAME_MEDICO.value},
-    {"doc_id": 3, "doc_type": DocType.FPB_MODELO_4.value},
-    {"doc_id": 4, "doc_type": DocType.DOCUMENTO_IDENTIFICACAO.value},
+    {"doc_id": 1, "doc_type": DocType.FPB_MODELO_1.value, "editable": True},
+    {"doc_id": 2, "doc_type": DocType.EXAME_MEDICO.value, "editable": True},
+    {"doc_id": 3, "doc_type": DocType.FPB_MODELO_4.value, "editable": True},
+    {"doc_id": 4, "doc_type": DocType.DOCUMENTO_IDENTIFICACAO.value, "editable": True},
   ]
 
 
@@ -282,7 +284,7 @@ def test_update_enrollment_with_document_accepts_trusted_mod1_values(monkeypatch
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def load_player_profile(self, license):
@@ -1325,7 +1327,7 @@ def test_upload_player_document_signs_mod4(monkeypatch):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -1352,7 +1354,7 @@ def test_replace_player_document_signs_mod4(monkeypatch):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -1377,7 +1379,7 @@ def test_update_enrollment_with_document_file_only_signs_mod4(monkeypatch):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -1404,7 +1406,7 @@ def test_replace_player_document_stamps_mod1(monkeypatch, tmp_path):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -1606,7 +1608,7 @@ def test_upload_player_document_non_mod_is_plain(monkeypatch):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def upload_player_registration_document(self, batch_id, license, file_path, *, tipo_doc):
@@ -1967,3 +1969,62 @@ def test_complete_mod1_derived_type_still_marks_an_unmarked_scan(monkeypatch, tm
   assert result["has_inscricao_mark"] is True
   assert "inscricao_warning" not in result
   assert _xobjs(base64.b64decode(result["pdf_b64"])) == _xobjs(base) + 2
+
+
+# ─── submitted batches are readable, but not mutable (0.102.1) ───────────────
+
+class _SubmittedBatchClient:
+  """A client whose player sits in a batch that has left "Em construção".
+
+  `resolve_batch_id_by_license` mirrors the real one: it finds the batch only
+  when the caller opts into submitted states.
+  """
+
+  def __init__(self):
+    self.session = {"organizacao": 2430}
+
+  def resolve_batch_id_by_license(self, license, *, include_submitted=False):
+    if not include_submitted:
+      from sav_client.exceptions import LicenseNotEnrolledError
+      raise LicenseNotEnrolledError(license=license, open_batches=[])
+    return 632478
+
+  def list_player_registration_documents(self, batch_id, license):
+    # What op=91 yields for a submitted batch: types known, ids withheld.
+    return [
+      {"doc_id": None, "tipo_doc": 1},
+      {"doc_id": None, "tipo_doc": 2},
+    ]
+
+
+def test_list_player_documents_reads_a_submitted_batch(monkeypatch):
+  """The bug: a submitted player's documents came back license_not_enrolled."""
+  monkeypatch.setattr(server_module, "_get_client", _SubmittedBatchClient)
+
+  result = server_module.list_player_documents(license=257901)
+
+  assert result == [
+    {"doc_id": None, "doc_type": DocType.FPB_MODELO_1.value, "editable": False},
+    {"doc_id": None, "doc_type": DocType.EXAME_MEDICO.value, "editable": False},
+  ]
+
+
+def test_submitted_batch_documents_are_not_reported_as_missing(monkeypatch):
+  """doc_id=None means "exists, not actionable" — never "no document"."""
+  monkeypatch.setattr(server_module, "_get_client", _SubmittedBatchClient)
+
+  result = server_module.list_player_documents(license=257901)
+
+  assert len(result) == 2
+  assert all(d["doc_type"] is not None for d in result)
+  assert not any(d["editable"] for d in result)
+
+
+def test_mutations_still_refuse_a_submitted_batch(monkeypatch):
+  """The six mutation callers keep the narrow resolve deliberately: a batch
+  that has left the club cannot accept changes."""
+  monkeypatch.setattr(server_module, "_get_client", _SubmittedBatchClient)
+
+  result = server_module.delete_player_document(license=257901, doc_id=1)
+
+  assert result["error"] == "license_not_enrolled"

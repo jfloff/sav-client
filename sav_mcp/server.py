@@ -205,16 +205,31 @@ def _verify_nif_claim(form: dict[str, Any], claimed_nif: str | None) -> None:
         )
 
 
-def _resolve_license_batch(client: SavClient, license: int) -> int | dict:
-    """Resolve the open batch for a license.
+def _resolve_license_batch(
+    client: SavClient, license: int, *, include_submitted: bool = False,
+) -> int | dict:
+    """Resolve the batch for a license.
 
     Returns the batch_id on success, or a structured error dict shaped as
     ``{"error": "license_not_enrolled", "license": int, "open_batches": [...]}``
-    when the license is not enrolled in any open batch. Tools should return
-    that dict directly so the LLM client can act on it.
+    when the license is not enrolled. Tools should return that dict directly so
+    the LLM client can act on it.
+
+    ``include_submitted`` widens the search past "Em construção" to every
+    pending state. It defaults to False because most callers here are
+    *mutations*, and a batch that has left the club cannot accept changes — for
+    those, "not in an open batch" is the correct and useful answer.
+
+    **Read-only tools should pass True.** Without it a player whose batch has
+    been submitted reads as `license_not_enrolled`, which is simply false: they
+    are enrolled, and further along than anyone still in an open batch. Only
+    `read_enrollment` and `list_player_documents` pass it; the six mutation
+    callers deliberately keep the narrow behaviour.
     """
     try:
-        return client.resolve_batch_id_by_license(license)
+        return client.resolve_batch_id_by_license(
+            license, include_submitted=include_submitted,
+        )
     except LicenseNotEnrolledError as exc:
         return {
             "error": "license_not_enrolled",
@@ -3420,7 +3435,7 @@ def read_enrollment(license: int) -> dict:
     To list every player in a batch, use list_batch_enrollments(batch_number).
     """
     client = _get_client()
-    batch_id = _resolve_license_batch(client, license)
+    batch_id = _resolve_license_batch(client, license, include_submitted=True)
     if isinstance(batch_id, dict):
         return batch_id
     record = client.load_existing_registration_record(batch_id, license)
@@ -3956,15 +3971,25 @@ def list_player_documents(license: int) -> list[dict] | dict:
 
     The batch is resolved automatically from the license.
 
-    Each entry: {"doc_id": int, "doc_type": str | null}. doc_id is the
-    galeria id expected by delete_player_document. SAV2-only document types
-    with no sav-parsers equivalent are returned with doc_type=null.
+    Each entry: {"doc_id": int | null, "doc_type": str | null, "editable":
+    bool}. doc_id is the galeria id expected by delete_player_document.
+    SAV2-only document types with no sav-parsers equivalent are returned with
+    doc_type=null.
 
-    Returns {"error": "license_not_enrolled", ...} if the licence is not
-    enrolled in any open batch.
+    **Submitted batches return doc_id=null and editable=false.** Once a batch
+    leaves "Em construção" SAV stops emitting the galeria id, because the
+    document can no longer be deleted or replaced. The document is still there
+    and its type is still reported — null here means "exists, but not
+    actionable", never "missing". Do not pass a null doc_id to
+    delete_player_document.
+
+    This tool reads submitted batches too: a player whose batch is in
+    "Em Validação" is enrolled, not un-enrolled. Returns
+    {"error": "license_not_enrolled", ...} only when the licence is in no
+    pending batch at all.
     """
     client = _get_client()
-    batch_id = _resolve_license_batch(client, license)
+    batch_id = _resolve_license_batch(client, license, include_submitted=True)
     if isinstance(batch_id, dict):
         return batch_id
     docs = client.list_player_registration_documents(batch_id, license)
@@ -3975,6 +4000,10 @@ def list_player_documents(license: int) -> list[dict] | dict:
                 mapped.value if (mapped := tipo_doc_to_doc_type(doc["tipo_doc"])) is not None
                 else None
             ),
+            # Explicit rather than leaving callers to infer it from a null id:
+            # "I cannot delete this" is the actionable fact, and a bare null
+            # reads as a parse failure.
+            "editable": doc["doc_id"] is not None,
         }
         for doc in docs
     ]

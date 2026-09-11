@@ -245,7 +245,7 @@ class TestUpdateMod4DetentorSignature:
     class StubClient:
       _cache = None
 
-      def resolve_batch_id_by_license(self, license):
+      def resolve_batch_id_by_license(self, license, *, include_submitted=False):
         return 12
 
       def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):

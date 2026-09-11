@@ -3530,6 +3530,18 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
 
+    if not batch.is_open:
+      # Until 0.102.0 this was enforced by accident: op=91 omits `checkDoc` for
+      # a submitted batch, so parsing the inscricao raised. That parse now
+      # tolerates the omission so *reads* work, which removes the accidental
+      # refusal — hence this explicit one. Without it an upload would build
+      # op=92's URL with `inscricao=None` and send a corrupt request instead of
+      # refusing a batch SAV cannot accept changes for.
+      raise ValueError(
+        f"Batch {batch.id} is {batch.state!r} (state_id={batch.state_id}), not "
+        f"'Em construção'; documents can only be changed while a batch is open."
+      )
+
     # `inscricao` (the per-batch registration record id) is the only value
     # we still need from op=91. We deliberately ignore the modal's `num`
     # field: the SAV2 web UI hardcodes `n=1` and multipart key `file0` for
@@ -3660,6 +3672,13 @@ class SavClient:
     )
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
+    if not batch.is_open:
+      # Same reasoning as the upload guard: a submitted batch yields
+      # doc_id=None, which would be passed straight to op=94's delete.
+      raise ValueError(
+        f"Batch {batch.id} is {batch.state!r} (state_id={batch.state_id}), not "
+        f"'Em construção'; documents can only be changed while a batch is open."
+      )
 
     _, _, docs = self._fetch_registration_documents(batch, license)
     for doc in docs:
@@ -3672,7 +3691,7 @@ class SavClient:
 
   def _fetch_registration_documents(
     self, batch: PlayerRegistrationBatch, license: int,
-  ) -> tuple[int, int, list[dict[str, int]]]:
+  ) -> tuple[int, int | None, list[dict[str, int | None]]]:
     """
     Op=91 — fetch a player's existing registration documents.
 
@@ -3682,10 +3701,28 @@ class SavClient:
       - ``inscricao`` is the per-batch registration record id, parsed from
         the embedded ``checkDoc(n, inscricao, licenca, guia, ...)`` onclick
         in the HTML (this is NOT the user_id from op=35; it's created when
-        the player is added to the batch via op=36).
-      - ``docs`` is a list of ``{"doc_id": int, "tipo_doc": int}`` parsed
-        from each row's ``deleteDoc(doc_id, licenca, guia, tipo_doc, ...)``
-        onclick handler in the embedded HTML.
+        the player is added to the batch via op=36). **None for a batch that
+        is no longer open** — see below.
+      - ``docs`` is a list of ``{"doc_id": int | None, "tipo_doc": int}``.
+        ``doc_id`` comes from each row's ``deleteDoc(doc_id, licenca, guia,
+        ...)`` onclick and is **None for a batch that is no longer open**.
+
+    **Submitted batches render read-only.** Once a batch leaves "Em
+    construção", SAV still returns HTTP 200 with a real ``body`` listing every
+    document — type label, timestamp and uploader — but drops the ``checkDoc``
+    and ``deleteDoc`` handlers and the type ``<select>``, because none of those
+    actions are available any more. So for such a batch:
+
+      - ``tipo_doc`` still resolves, via the static ``_DOC_TYPE_LABELS``
+        fallback rather than the (now absent) ``<option>`` list. This is what
+        makes a document checklist readable for a submitted enrolment.
+      - ``inscricao`` and every ``doc_id`` come back None. They are the ids the
+        *write* paths need, and those paths must refuse a submitted batch
+        anyway — they guard on ``batch.is_open`` before reaching this method,
+        so a None never reaches op=92's URL.
+
+    Callers that only need document *types* (the checklist) work unchanged.
+    Callers needing an id must not treat None as "no documents".
     """
     import re
     resp = self._get(
@@ -3708,13 +3745,22 @@ class SavClient:
 
     body = data.get("body") or ""
     next_slot = int(data.get("num", 1))
+    # `checkDoc(...)` is the only place op=91 exposes the inscricao id, and SAV
+    # emits it only while the batch is still editable. For a submitted batch the
+    # handler is absent by design, so its absence there is not a parse failure —
+    # raising on it made every *read* of a submitted enrolment fail. The two
+    # cases are kept apart deliberately: an open batch with no checkDoc means
+    # SAV's markup changed and we want to hear about it loudly.
     m_check = re.search(r"checkDoc\(\s*\d+\s*,\s*(\d+)", body)
-    if not m_check:
+    if m_check:
+      inscricao: int | None = int(m_check.group(1))
+    elif batch.is_open:
       raise SavResponseError(
         f"Could not find inscricao id in op=91 response for license "
         f"{license}, batch {batch.id}: {body[:200]!r}"
       )
-    inscricao = int(m_check.group(1))
+    else:
+      inscricao = None
 
     # The document type is NOT in deleteDoc(...). Its arguments are
     # (galeria, licenca, guia, agente, tipo_guia) — agente and tipo_guia are the
@@ -3736,13 +3782,26 @@ class SavClient:
       if value.isdigit():
         labels[normalise_text(option.get_text())] = int(value)
 
-    docs: list[dict[str, int]] = []
+    # A submitted batch renders its documents read-only: SAV emits the rows,
+    # their type label and a `goToPage("<file>")` view link, but drops every
+    # `deleteDoc(...)` handler. Anchoring the row scan on deleteDoc therefore
+    # reported a submitted batch as holding *no* documents — silently wrong for
+    # a record that demonstrably has them. Rows are matched on either handler,
+    # and `doc_id` is None where SAV withheld the galeria id. Confirmed against
+    # production 2026-09-11: licence 257901 in batch 632478 ("Em Validação")
+    # returned two rows, both with goToPage and neither with deleteDoc, against
+    # licence 296838 in batch 632315 ("Em construção") which had both.
+    docs: list[dict[str, int | None]] = []
     for row in soup.find_all("tr"):
       button = row.find(attrs={"onclick": re.compile(r"deleteDoc\(")})
-      if button is None:
-        continue
-      m_doc = re.search(r"deleteDoc\(\s*(\d+)", button["onclick"])
-      if m_doc is None:
+      doc_id: int | None = None
+      if button is not None:
+        m_doc = re.search(r"deleteDoc\(\s*(\d+)", button["onclick"])
+        if m_doc is None:
+          continue
+        doc_id = int(m_doc.group(1))
+      elif row.find(attrs={"onclick": re.compile(r"goToPage\(")}) is None:
+        # Neither handler: a header row or a layout row, not a document.
         continue
       cell = row.find("td", class_="text-left")
       label = normalise_text(cell.get_text()) if cell else ""
@@ -3754,7 +3813,7 @@ class SavClient:
           "Unrecognised document type %r for license %s in batch %s; "
           "reporting tipo_doc=0", cell.get_text().strip() if cell else "", license, batch.id,
         )
-      docs.append({"doc_id": int(m_doc.group(1)), "tipo_doc": tipo_doc})
+      docs.append({"doc_id": doc_id, "tipo_doc": tipo_doc})
     return next_slot, inscricao, docs
 
   # ------------------------------------------------------------------

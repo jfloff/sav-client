@@ -7,7 +7,7 @@ from sav_mcp import server as server_module
 
 def test_read_enrollment_returns_player_detail(monkeypatch):
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       assert license == 301772
       return 42
 
@@ -52,7 +52,7 @@ def test_read_enrollment_license_not_enrolled_returns_structured_error(monkeypat
   from sav_client.exceptions import LicenseNotEnrolledError
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       raise LicenseNotEnrolledError(
         license=license,
         open_batches=[{"number": "2025/123", "tier": "Sub 14", "gender": "M"}],
@@ -94,7 +94,7 @@ def test_delete_enrollment_removes_player(monkeypatch):
   class StubClient:
     _cache = _Cache()
 
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 42
 
     def remove_player_from_registration_batch(self, batch_id, license):
@@ -111,7 +111,7 @@ def test_delete_enrollment_license_not_enrolled_returns_structured_error(monkeyp
   from sav_client.exceptions import LicenseNotEnrolledError
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       raise LicenseNotEnrolledError(license=license, open_batches=[])
 
     def remove_player_from_registration_batch(self, batch_id, license):
@@ -299,7 +299,7 @@ def test_update_enrollment_drops_batch_number(monkeypatch):
   captured = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 42
 
     def update_player_in_registration_batch(self, batch_id, license, **kwargs):
@@ -341,7 +341,7 @@ def test_update_enrollment_returns_structured_error_when_not_enrolled(monkeypatc
   from sav_client.exceptions import LicenseNotEnrolledError
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       raise LicenseNotEnrolledError(
         license=license,
         open_batches=[{"number": "2025/1", "tier": "Sub 14", "gender": "F"}],

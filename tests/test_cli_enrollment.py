@@ -124,7 +124,7 @@ def test_enrollment_update_maps_parser_tipo_names_for_file_replace(monkeypatch, 
   captured: list[int] = []
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
@@ -151,7 +151,7 @@ def test_enrollment_update_classifies_exam_for_file_replace(monkeypatch, tmp_pat
   captured: list[int] = []
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
@@ -179,7 +179,7 @@ def test_enrollment_update_uploads_classified_outros_without_reconcile(monkeypat
   uploaded = []
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
@@ -207,7 +207,7 @@ def test_enrollment_update_non_mod1_uploads_without_reconcile(monkeypatch, tmp_p
   uploaded = []
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 12
 
     def replace_player_registration_document(self, batch_id, license, pdf, *, tipo_doc):
@@ -811,7 +811,7 @@ def test_enrollment_read_detail(monkeypatch):
   captured: dict = {}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       captured["resolver_arg"] = license
       return 42
 
@@ -838,7 +838,7 @@ def test_enrollment_read_detail_json(monkeypatch):
   import json as _json
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 42
 
     def load_existing_registration_record(self, batch_id, license):
@@ -890,7 +890,7 @@ def test_enrollment_read_license_not_enrolled_lists_open_batches(monkeypatch):
   from sav_client.exceptions import LicenseNotEnrolledError
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       raise LicenseNotEnrolledError(
         license=license,
         open_batches=[{"number": "2025/123", "tier": "Sub 14", "gender": "M"}],
@@ -911,7 +911,7 @@ def test_enrollment_delete_license_confirms_and_removes(monkeypatch):
   captured: dict = {"removed": None}
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 42
 
     def remove_player_from_registration_batch(self, batch_id, license):
@@ -933,7 +933,7 @@ def test_enrollment_delete_license_aborts_on_no(monkeypatch):
   """Answering 'n' to the player-delete prompt aborts without removal."""
 
   class StubClient:
-    def resolve_batch_id_by_license(self, license):
+    def resolve_batch_id_by_license(self, license, *, include_submitted=False):
       return 42
 
     def remove_player_from_registration_batch(self, batch_id, license):

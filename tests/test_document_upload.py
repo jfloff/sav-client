@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from sav_client.models import PlayerRegistrationBatch
 from sav_client.sav_client import SavClient
 
 
@@ -50,10 +51,16 @@ def _build_client_for_upload(monkeypatch, tmp_path, *, modal_num: int):
   client._timeout = 10
   client._http = _FakeHttp()
 
-  batch = type(
-    "BatchStub", (),
-    {"id": 12, "number": "2025/12", "type_id": 2, "club_id": 99},
-  )()
+  # A real model, not a stub: the upload path guards on `batch.is_open`, and a
+  # stub that hardcodes it would not exercise the property doing the work.
+  batch = PlayerRegistrationBatch(
+    id=12, number="2025/12", type_id=2, type="Revalidação",
+    association_id=7, association="AB Santarém",
+    club_id=99, club="Rio Maior Basket",
+    tier_id=10, tier="Sub 18", gender_id=1, gender="Masculino",
+    state_id=1, state="Em construção", state_date="2026-09-11",
+    item_count=1, season_id=65, season="2026/2027",
+  )
   monkeypatch.setattr(
     client, "list_player_registration_batches",
     lambda: [batch], raising=False,
