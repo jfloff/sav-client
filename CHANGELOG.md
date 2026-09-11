@@ -21,6 +21,53 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.102.2 — 2026-09-11
+
+### Fixed
+
+**`enrollment_status_bulk` reported filed players as never enrolled**
+`IMPACT: silent` — **and this one could file duplicate registrations with the
+federation.** The bulk path answered `not_enrolled` for any player whose batch
+had been submitted, while `get_enrollment_status` answered `pending` for the
+same licence. A caller classifying a whole roster from the bulk tool — the
+normal way to do roster work — sees an athlete already filed with FPB as
+indistinguishable from one never enrolled, and enrolls them a second time. With
+`submit_batch` now automating submission (0.101.0), that duplicate reaches the
+federation and cannot be withdrawn.
+
+0.102.1 widened `get_enrollment_status`, `read_enrollment` and
+`list_player_documents` to see submitted batches. It missed
+`classify_enrollment_status`, which backs the bulk tool: it scanned only
+`b.is_open` batches for items, so a player in "Em Validação" was found in no
+batch at all and fell through to `not_enrolled`.
+
+The scan now covers every in-flight batch. Note the two lists are deliberately
+separate and only one widened: the batches scanned for a licence (all in-flight)
+versus the `open_batches` advertised on a `not_enrolled` row (still
+"Em construção" only). Merging them would advertise a submitted lote as
+joinable — telling a caller to add a player to a batch that has left the club.
+
+`DETECT:` `grep -rn "enrollment_status_bulk\|classify_enrollment_status" --include=*.py .`
+`FIX:` nothing to change at the call site. Re-check any logic that branched on
+`not_enrolled`, since licences in submitted batches now correctly report
+`pending` — in particular anything that treated `not_enrolled` as "safe to
+enroll".
+
+Cost: item scanning goes from one call per *open* batch to one per *in-flight*
+batch (4 → 6 for the reference club). The existing TODO on
+`list_player_registration_batch_items` re-listing batches per call therefore
+bites slightly harder; not addressed here.
+
+### Note for anyone reading the code
+
+`PlayerRegistrationBatch.is_pending` is `return True`, not a state test — SAV
+drops a batch from the listing once it completes, so being listed *is* what
+pending means. The `is_pending` filter is a no-op today and is written for
+intent, matching `resolve_batch_by_license`. A test that asserted non-open
+batches were skipped was asserting the bug, and has been corrected.
+
+---
+
 ## 0.102.1 — 2026-09-11
 
 ### Fixed

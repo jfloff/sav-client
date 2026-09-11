@@ -1995,7 +1995,7 @@ class SavClient:
     The single-licence path (``resolve_batch_id_by_license`` feeding
     ``get_enrollment_status``) is N+1: each licence re-lists batches, scans
     every open batch's items, then probes the roster. This collapses the
-    shared work — one batch listing, one item scan per open batch, one
+    shared work — one batch listing, one item scan per in-flight batch, one
     roster query — into maps that classify every requested licence in
     memory, independent of how many are passed.
 
@@ -2010,10 +2010,17 @@ class SavClient:
       "enrolled"     → {"status", "name"}   (active in the club roster)
       "not_enrolled" → {"status", "open_batches": [...]}
 
-    "pending" wins over "enrolled": a player sitting in an open batch is
+    "pending" wins over "enrolled": a player sitting in an in-flight batch is
     mid-registration even if last season's licence is still active in the
     roster — same precedence as the single-licence path, where the batch
     lookup runs first.
+
+    "pending" covers **all four** in-flight states, not just "Em construção",
+    matching ``get_enrollment_status``. A player in "Em Validação" is filed and
+    must never read as ``not_enrolled`` — a caller sweeping a roster would take
+    that as "never enrolled" and file a duplicate registration with the
+    federation. ``open_batches`` on a ``not_enrolled`` row stays narrow, and
+    lists only batches that can still accept a player.
 
     Side effect: records each found (licence → batch) in the cache so a
     later single-player lookup starts warm.
@@ -2021,11 +2028,31 @@ class SavClient:
     requested = [int(lic) for lic in licenses]
 
     batches = self.list_player_registration_batches(season=season)
+
+    # Two lists, deliberately. They answer different questions and only one of
+    # them widens:
+    #   * `pending_batches` — where a licence might already be filed. This must
+    #     cover every in-flight state, or a player sitting in "Em Validação" is
+    #     found nowhere and reported `not_enrolled`. That answer is actively
+    #     dangerous now that batches can be auto-submitted: a roster sweep would
+    #     read it as "never enrolled" and file a duplicate registration with the
+    #     federation, which cannot be undone.
+    #   * `open_batches` — the batches a player could still *join*, used only
+    #     for the `open_batches` field on a `not_enrolled` row. This must stay
+    #     narrow, or we would advertise a submitted lote as joinable.
+    # Collapsing these into one list is the bug this split exists to prevent.
+    #
+    # `is_pending` is currently `return True` — the listing only ever contains
+    # in-flight batches, so being listed *is* what pending means. The filter is
+    # therefore a no-op today; it is written this way to state the intent and to
+    # stay correct if that property ever becomes a real predicate. It mirrors
+    # `resolve_batch_by_license`, which gates the same way.
+    pending_batches = [b for b in batches if b.is_pending]
     open_batches = [b for b in batches if b.is_open]
 
-    # licence → (batch, name) from one item scan per open batch.
+    # licence → (batch, name) from one item scan per in-flight batch.
     license_batch: dict[int, tuple[PlayerRegistrationBatch, str]] = {}
-    for batch in open_batches:
+    for batch in pending_batches:
       # TODO: list_player_registration_batch_items re-lists batches on every
       # call; an internal variant taking the batch object would drop this
       # pass from O(2·open batches) to O(open batches) HTTP calls.
@@ -2045,6 +2072,8 @@ class SavClient:
         except (TypeError, ValueError):
           continue
 
+    # Narrow on purpose — see the note above. A `not_enrolled` player can only
+    # be added to a batch that is still "Em construção".
     open_summaries = [
       {"number": b.number, "tier": b.tier, "gender": b.gender}
       for b in open_batches

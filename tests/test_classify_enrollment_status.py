@@ -92,7 +92,15 @@ def test_pending_wins_over_enrolled(monkeypatch, tmp_cache):
   assert out[301772]["status"] == "pending"
 
 
-def test_closed_batches_are_not_scanned(monkeypatch, tmp_cache):
+def test_every_listed_batch_is_scanned(monkeypatch, tmp_cache):
+  """Previously asserted the opposite — that a non-open batch is skipped — and
+  that assumption *was* the bug.
+
+  SAV drops a batch from the listing once it completes, so anything still
+  listed is still in flight and may hold the licence we are asked about
+  (`PlayerRegistrationBatch.is_pending` documents exactly this). Skipping a
+  listed batch is how a player in "Em Validação" came back `not_enrolled`.
+  """
   scanned: list[int] = []
 
   client = SavClient.__new__(SavClient)
@@ -113,7 +121,7 @@ def test_closed_batches_are_not_scanned(monkeypatch, tmp_cache):
 
   out = client.classify_enrollment_status([301772])
 
-  assert scanned == [12]  # the closed batch (state_id=3) is skipped
+  assert sorted(scanned) == [11, 12], "a listed batch is in flight and must be scanned"
   assert out[301772]["status"] == "pending"
 
 
@@ -179,3 +187,88 @@ def test_no_roster_query_without_club(monkeypatch, tmp_cache):
 def test_empty_input_returns_empty(monkeypatch, tmp_cache):
   client = _client(monkeypatch, tmp_cache, batches=[], items={}, roster=[])
   assert client.classify_enrollment_status([]) == {}
+
+
+# ─── submitted batches must not read as not_enrolled (0.102.2) ───────────────
+
+def test_player_in_a_submitted_batch_is_pending(monkeypatch, tmp_cache):
+  """The bug: the item scan covered only open batches, so a player filed in
+  "Em Validação" was found nowhere and fell through to `not_enrolled`.
+
+  That answer is dangerous, not merely wrong: a roster sweep reads it as
+  "never enrolled" and files a duplicate registration with the federation,
+  which cannot be undone.
+  """
+  client = _client(
+    monkeypatch, tmp_cache,
+    batches=[_batch(99, "2025/99", state_id=9)],
+    items={99: [{"license": 257901, "name": "Submitted Player"}]},
+    roster=[],
+  )
+
+  out = client.classify_enrollment_status([257901])
+
+  assert out[257901]["status"] == "pending"
+  assert out[257901]["batch"]["number"] == "2025/99"
+  assert out[257901]["batch"]["state"] == "Em Validação"
+
+
+def test_not_enrolled_open_batches_excludes_submitted_ones(monkeypatch, tmp_cache):
+  """The trap in the fix: widening the item scan must not widen the list of
+  batches a player could *join*. A submitted lote has left the club."""
+  client = _client(
+    monkeypatch, tmp_cache,
+    batches=[_batch(12, "2025/12"), _batch(99, "2025/99", state_id=9)],
+    items={},
+    roster=[],
+  )
+
+  out = client.classify_enrollment_status([999])
+
+  assert out[999]["status"] == "not_enrolled"
+  assert out[999]["open_batches"] == [
+    {"number": "2025/12", "tier": "Sub 14", "gender": "Masculino"},
+  ], "a submitted batch must never be advertised as joinable"
+
+
+def test_pending_beats_enrolled_for_a_submitted_batch(monkeypatch, tmp_cache):
+  """Precedence must hold for submitted batches too: an athlete already filed,
+  whose previous licence is still active in the roster, is `pending`."""
+  client = _client(
+    monkeypatch, tmp_cache,
+    batches=[_batch(99, "2025/99", state_id=9)],
+    items={99: [{"license": 257901, "name": "Both"}]},
+    roster=[_P(257901, "Both")],
+  )
+
+  out = client.classify_enrollment_status([257901])
+
+  assert out[257901]["status"] == "pending"
+
+
+@pytest.mark.parametrize("state_id", [1, 9])
+def test_bulk_and_single_paths_agree(monkeypatch, tmp_cache, state_id):
+  """The property that actually broke: the bulk pass and the single-licence
+  lookup must identify the same batch for the same licence, in every in-flight
+  state. Asserted directly, because the two paths drifted silently."""
+  batch = _batch(77, "2025/77", state_id=state_id)
+  client = _client(
+    monkeypatch, tmp_cache,
+    batches=[batch],
+    items={77: [{"license": 257901, "name": "Player"}]},
+    roster=[],
+  )
+
+  # classify_* warms the licence→batch cache, so the single path then takes its
+  # op=30 validation probe. Stub it: this test is about the two paths agreeing
+  # on *which batch*, not about the probe.
+  monkeypatch.setattr(
+    client, "load_existing_registration_record",
+    lambda batch_id, license: {"existe": 1}, raising=False,
+  )
+  bulk = client.classify_enrollment_status([257901])[257901]
+  single = client.resolve_batch_by_license(257901, include_submitted=True)
+
+  assert bulk["status"] == "pending"
+  assert bulk["batch"]["number"] == single.number
+  assert bulk["batch"]["state"] == single.state
