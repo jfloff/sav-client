@@ -1306,6 +1306,130 @@ class TestRemovePlayerFromRegistrationBatch:
       client.remove_player_from_registration_batch(999999999, 301772)
 
 
+class TestDeleteBatchDrainsPlayersFirst:
+  """Deleting a batch must release its players first.
+
+  SAV2 keeps every licence pinned to the batch it was enrolled in even after
+  op=9 removes the batch itself: the player then shows up in no batch the club
+  can see, yet op=139 still refuses to offer them for a new enrolment, so they
+  cannot be registered again at all. The only way out is to remove each player
+  (op=29) *while the batch still exists*, exactly as the SAV2 UI's per-row
+  button does, and delete the empty batch afterwards.
+  """
+
+  BATCH_ID = 12
+  REMOVE_OP = "29"
+  DELETE_OP = "9"
+
+  def _client(self, monkeypatch, items, probe=None):
+    """Client whose op=29 and op=9 calls are recorded rather than sent."""
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270", "perfil": 1, "user": "u"}
+    calls: list[tuple[str, int]] = []
+    response = type("Resp", (), {
+      "text": "OK",
+      "raise_for_status": lambda self: None,
+    })()
+
+    def _get(self, url, params=None, timeout=None, **kwargs):
+      params = params or {}
+      calls.append((params.get("op"), params.get("id")))
+      return response
+
+    monkeypatch.setattr(client, "_http", type("Http", (), {"get": _get})())
+    batch = type("BatchStub", (), {"id": self.BATCH_ID, "type_id": 2})()
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", Mock(return_value=[batch]),
+    )
+    monkeypatch.setattr(
+      client, "list_player_registration_batch_items", Mock(return_value=items),
+    )
+    if probe is None:
+      probe = Mock(side_effect=SavRecordNotFoundError("gone"))
+    monkeypatch.setattr(client, "load_existing_registration_record", probe)
+    monkeypatch.setattr(client._cache, "forget_license_batch", Mock())
+    monkeypatch.setattr(client._cache, "forget_licenses_in_batch", Mock())
+    return client, calls
+
+  def test_every_player_is_removed_before_the_batch_goes(self, monkeypatch):
+    client, calls = self._client(monkeypatch, [
+      {"license": 301772, "name": "A"},
+      {"license": 301773, "name": "B"},
+    ])
+
+    freed = client.delete_player_registration_batch(self.BATCH_ID)
+
+    assert calls == [
+      (self.REMOVE_OP, 301772),
+      (self.REMOVE_OP, 301773),
+      (self.DELETE_OP, self.BATCH_ID),
+    ], "op=9 must fire last, on an already-empty batch"
+    assert freed == [301772, 301773]
+
+  def test_an_empty_batch_is_deleted_without_any_removals(self, monkeypatch):
+    client, calls = self._client(monkeypatch, [])
+
+    assert client.delete_player_registration_batch(self.BATCH_ID) == []
+    assert calls == [(self.DELETE_OP, self.BATCH_ID)]
+
+  def test_a_failed_removal_leaves_the_batch_standing(self, monkeypatch):
+    """The whole point: a batch we failed to delete is fixable, a player
+    stranded inside a deleted batch is not."""
+    still_enrolled = Mock(side_effect=[SavRecordNotFoundError("gone"), {"id": 88}])
+    client, calls = self._client(
+      monkeypatch,
+      [{"license": 301772, "name": "A"}, {"license": 301773, "name": "B"}],
+      probe=still_enrolled,
+    )
+
+    with pytest.raises(SavResponseError, match="301773") as excinfo:
+      client.delete_player_registration_batch(self.BATCH_ID)
+
+    assert (self.DELETE_OP, self.BATCH_ID) not in calls
+    assert "1 of 2" in str(excinfo.value), "the caller needs to know who was freed"
+
+  def test_an_unverified_removal_does_not_delete_the_batch(self, monkeypatch):
+    """SAV took the removal but could not be asked whether it landed. Deleting
+    now would strand the player if it did not."""
+    broken_probe = Mock(side_effect=SavServerError("op=30 fatal"))
+    client, calls = self._client(
+      monkeypatch, [{"license": 301772, "name": "A"}], probe=broken_probe,
+    )
+
+    with pytest.raises(SavWriteUnverifiedError, match="NOT deleted"):
+      client.delete_player_registration_batch(self.BATCH_ID)
+
+    assert (self.DELETE_OP, self.BATCH_ID) not in calls
+
+  def test_an_unlistable_batch_is_not_deleted(self, monkeypatch):
+    """Without the item list there is no way to know who would be stranded."""
+    client, calls = self._client(monkeypatch, [])
+    monkeypatch.setattr(
+      client, "list_player_registration_batch_items",
+      Mock(side_effect=SavServerError("op=10 fatal")),
+    )
+
+    with pytest.raises(SavServerError):
+      client.delete_player_registration_batch(self.BATCH_ID)
+
+    assert calls == []
+
+  def test_the_batch_is_resolved_once_not_per_player(self, monkeypatch):
+    """Each removal used to re-list every batch to find the row it already
+    had, turning a 20-player batch into 60 requests."""
+    client, _ = self._client(monkeypatch, [
+      {"license": 301772, "name": "A"},
+      {"license": 301773, "name": "B"},
+      {"license": 301774, "name": "C"},
+    ])
+
+    client.delete_player_registration_batch(self.BATCH_ID)
+
+    # The item listing resolves the batch too, but it is stubbed here, so this
+    # counts only the delete path itself: one lookup, not one per licence.
+    assert client.list_player_registration_batches.call_count == 1
+
+
 class TestStep1PrefillIsNotAWriteAck:
   """`val` is not a universal success flag in SAV.
 

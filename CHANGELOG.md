@@ -21,6 +21,54 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.104.0 — 2026-09-12
+
+### Fixed
+
+**Deleting a batch stranded every player in it**
+`IMPACT: silent` — **and the players it stranded could not be enrolled
+anywhere afterwards.** `delete_player_registration_batch()` fired op=9 and
+nothing else, mirroring what the batch row looks like in the UI. But SAV2 does
+not release a batch's items when the batch goes: each licence stays pinned to
+the now-missing batch, so it appears in no batch the club can see while op=139
+still refuses to offer it for a new enrolment. The player is invisible and
+unenrollable at once, and nothing in the response says so — the delete reports
+success.
+
+The batch is now drained first: op=10 lists its items, op=29 removes each
+licence (the call the SAV2 UI's own per-row remove button makes), and op=9
+fires only once the batch is empty. Each removal keeps the existing op=30
+verification, so a removal SAV silently ignored is still caught.
+
+**A drain that cannot finish refuses the delete.** If the items cannot be
+listed, or any removal fails or cannot be verified, the batch is left standing
+and the error names the licence that blocked it plus how many were freed before
+it. This is deliberate and is the whole point of the change: a batch we failed
+to delete can be deleted again, a player stranded in a deleted batch cannot be
+recovered from here. It does mean a batch whose item listing SAV is failing on
+is no longer deletable through us — accept the retry, do not add a force path.
+
+Changed:
+- `SavClient.delete_player_registration_batch(batch_id)` returns `list[int]`
+  (the freed licences, in removal order) instead of `None`, and can now raise
+  `SavResponseError` / `SavWriteUnverifiedError` / `ValueError` from the drain.
+- MCP `delete_batch()` gained `freed_licenses: [int]` in its result.
+- `sav enrollment delete --batch` prints the released licences.
+
+`DETECT:` `grep -rn "delete_player_registration_batch\|delete_batch" --include=*.py .`
+`FIX:` nothing to change for a caller that ignored the return value. A caller
+that treated the delete as infallible now needs to handle a refusal — and
+should, since the refusal is the case where players are still in the batch.
+A caller comparing `delete_batch()`'s dict for exact equality must switch to
+key access.
+
+Also: `remove_player_from_registration_batch()` split its body into a private
+`_remove_batch_item(batch, license)` that takes an already-resolved batch, so
+the drain loop resolves the batch once rather than re-listing every batch per
+player. Public behaviour is unchanged.
+
+---
+
 ## 0.103.0 — 2026-09-11
 
 ### Added

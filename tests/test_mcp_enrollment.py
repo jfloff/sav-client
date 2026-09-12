@@ -137,12 +137,18 @@ def test_delete_batch_deletes_whole_batch(monkeypatch):
 
     def delete_player_registration_batch(self, batch_id):
       captured["deleted_id"] = batch_id
+      return [301772, 301773]
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
 
   result = server_module.delete_batch(batch_number="2025/999")
   assert captured["deleted_id"] == 99
-  assert result == {"deleted": True, "batch_number": "2025/999"}
+  assert result == {
+    "deleted": True,
+    "batch_number": "2025/999",
+    # The players the delete released, so the caller can re-enroll them.
+    "freed_licenses": [301772, 301773],
+  }
 
 
 def test_check_batch_ready_adds_batch_number_to_sav_verdict(monkeypatch):

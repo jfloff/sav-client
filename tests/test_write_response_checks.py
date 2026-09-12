@@ -8,6 +8,8 @@ positive acknowledgement without inventing a contract, but we can refuse the two
 failure shapes SAV actually produces.
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from sav_client.exceptions import SavResponseError, SavServerError
@@ -19,6 +21,11 @@ PHP_FATAL = (
   "update a parent row: a foreign key constraint fails (`sav2`.`guias`, "
   "CONSTRAINT `fk_guia_item`) in /var/www/html/php/regdb.php:412"
 )
+
+
+def _batch(batch_id, type_id=2):
+  """Minimal stand-in for the PlayerRegistrationBatch row a write resolves first."""
+  return SimpleNamespace(id=batch_id, type_id=type_id)
 
 
 @pytest.fixture
@@ -93,6 +100,14 @@ class TestCacheIsNotUpdatedOnRejection:
     client._cache = _Cache()
     client._http = _Http()
     monkeypatch.setattr(client, "_invalidate_batch_memo", lambda: None, raising=False)
+    # Reach op=9 itself: the drain that now precedes it is not under test here.
+    monkeypatch.setattr(
+      client, "_require_batch", lambda batch_id: _batch(batch_id), raising=False,
+    )
+    monkeypatch.setattr(
+      client, "list_player_registration_batch_items", lambda batch_id: [],
+      raising=False,
+    )
 
     with pytest.raises(SavResponseError):
       client.delete_player_registration_batch(12)

@@ -3882,14 +3882,24 @@ def delete_batch(batch_number: str) -> dict:
     Only open ("Em construção") batches can be deleted; submitted batches
     will raise an error from SAV2.
 
-    Returns {"deleted": True, "batch_number": str} on success.
+    Every player is removed from the batch first, so they go back to being
+    enrollable elsewhere — SAV2 leaves them stranded in the deleted batch
+    otherwise. If a player cannot be removed, the batch is NOT deleted and
+    the error says how many were freed; retry once SAV accepts the removal.
+
+    Returns {"deleted": True, "batch_number": str, "freed_licenses": [int]}
+    on success, where freed_licenses are the players released by the delete.
 
     To remove a single player from a batch, use delete_enrollment(license).
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
-    client.delete_player_registration_batch(batch_id)
-    return {"deleted": True, "batch_number": batch_number}
+    freed = client.delete_player_registration_batch(batch_id)
+    return {
+        "deleted": True,
+        "batch_number": batch_number,
+        "freed_licenses": freed,
+    }
 
 
 @server.tool()

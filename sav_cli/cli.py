@@ -3944,6 +3944,10 @@ def enrollment_delete_cmd(ctx, license_, batch_number):
   \b
     sav enrollment delete --license LICENSE       Remove one player's enrolment.
     sav enrollment delete --batch BATCH_NUMBER    Delete the entire batch.
+
+  Deleting a batch removes every player from it first, so they return to the
+  enrollable pool; SAV2 strands them otherwise. If a player cannot be removed,
+  the batch is left intact rather than deleted.
   """
   if (license_ is None) == (batch_number is None):
     raise click.UsageError("Pass exactly one of --license LICENSE or --batch BATCH_NUMBER.")
@@ -3973,10 +3977,15 @@ def enrollment_delete_cmd(ctx, license_, batch_number):
   ):
     raise click.Abort()
   try:
-    client.delete_player_registration_batch(batch_id)
+    freed = client.delete_player_registration_batch(batch_id)
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
   console.print(f"[green]:white_check_mark: Batch #{batch_number} deleted.[/]")
+  if freed:
+    console.print(
+      f"[dim]{len(freed)} player(s) released and enrollable again: "
+      f"{', '.join(str(lic) for lic in freed)}[/]"
+    )
 
 
 @enrollment_grp.command("submit")

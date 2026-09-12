@@ -1882,6 +1882,20 @@ class SavClient:
     with self._batch_memo_lock:
       self._batch_memo.clear()
 
+  def _require_batch(self, batch_id: int) -> PlayerRegistrationBatch:
+    """Return the batch row for ``batch_id``, raising if the club has no such batch.
+
+    Raises:
+        ValueError: If no visible batch carries that ID.
+    """
+    batch = next(
+      (b for b in self.list_player_registration_batches() if b.id == batch_id),
+      None,
+    )
+    if batch is None:
+      raise ValueError(f"Batch id={batch_id} not found")
+    return batch
+
   def resolve_batch_id(self, number: str) -> int:
     """Translate a human-visible batch number (`numero_guia`) to internal batch_id.
 
@@ -2440,23 +2454,75 @@ class SavClient:
     self._invalidate_batch_memo()
     return new_id
 
-  def delete_player_registration_batch(self, batch_id: int) -> None:
+  def delete_player_registration_batch(self, batch_id: int) -> list[int]:
     """
-    Delete a player registration batch ("Lote") by ID.
+    Delete a player registration batch ("Lote") by ID, emptying it first.
+
+    SAV2 does not release a batch's players when the batch itself goes: op=9
+    drops the batch row, but every licence still in it stays pinned to that
+    now-missing batch and never returns to the pool op=139 lists, so the
+    player cannot be enrolled again anywhere. The batch is therefore drained
+    one licence at a time (op=29 — the call the SAV2 UI's per-row remove
+    button makes) and deleted only once it is empty.
+
+    A drain that cannot complete refuses the delete: if the items cannot be
+    listed, or any removal fails or cannot be verified, the batch is left
+    standing so the delete can be retried. That is deliberate — a batch we
+    failed to delete is fixable, a player stranded in a deleted batch is not.
 
     Only batches in state "Em construção" (open) can be deleted; submitted
-    batches typically cannot. The server response is currently ignored —
-    this method raises only on transport/HTTP errors.
+    batches typically cannot.
 
     Args:
         batch_id: The internal batch ID (``Batch.id``).
 
+    Returns:
+        The licences freed from the batch, in removal order. Empty when the
+        batch held no players.
+
     Raises:
-        SavConnectionError: On network errors.
+        SavConnectionError:      On network errors.
+        SavWriteUnverifiedError: If a removal's outcome could not be checked.
+        SavResponseError:        If the batch could not be emptied; the
+                                 message reports how many licences were
+                                 freed before the failure.
+        ValueError:              If batch_id is not found.
     """
     if self.session is None:
       raise SavResponseError(
         "Must call login() before delete_player_registration_batch()"
+      )
+
+    batch = self._require_batch(batch_id)
+    licenses = [
+      item["license"]
+      for item in self.list_player_registration_batch_items(batch_id)
+    ]
+    total = len(licenses)
+    freed: list[int] = []
+    for license in licenses:
+      try:
+        self._remove_batch_item(batch, license)
+      except SavWriteUnverifiedError as exc:
+        raise SavWriteUnverifiedError(
+          f"Batch {batch_id} was NOT deleted: licence {license} may or may not "
+          f"have been removed from it, so the batch could not be emptied "
+          f"({len(freed)} of {total} licences freed before this). Check in SAV "
+          "whether that player is still in the batch before retrying the delete."
+        ) from exc
+      except (SavError, ValueError) as exc:
+        raise SavResponseError(
+          f"Batch {batch_id} was NOT deleted: licence {license} could not be "
+          f"removed from it ({exc}), and deleting a batch that still holds "
+          f"players strands them in it. {len(freed)} of {total} licences were "
+          "freed; retry the delete once SAV accepts that removal."
+        ) from exc
+      freed.append(license)
+
+    if freed:
+      logger.info(
+        "Emptied batch %s before deleting it: freed %s licence(s)",
+        batch_id, len(freed),
       )
 
     url = self._url(_REGISTRATIONS_PATH)
@@ -2475,6 +2541,7 @@ class SavClient:
     logger.info("Deleted batch %s", batch_id)
     self._cache.forget_licenses_in_batch(batch_id)
     self._invalidate_batch_memo()
+    return freed
 
   def check_registration_batch_ready(self, batch_id: int) -> dict:
     """Check whether SAV will accept submission of a registration batch.
@@ -2718,13 +2785,30 @@ class SavClient:
         "Must call login() before remove_player_from_registration_batch()"
       )
 
-    batch = next(
-      (b for b in self.list_player_registration_batches() if b.id == batch_id),
-      None,
-    )
-    if batch is None:
-      raise ValueError(f"Batch id={batch_id} not found")
+    self._remove_batch_item(self._require_batch(batch_id), license)
 
+  def _remove_batch_item(
+    self,
+    batch: PlayerRegistrationBatch,
+    license: int,
+  ) -> None:
+    """
+    Remove one licence from an already-resolved batch (op=29).
+
+    Split out of ``remove_player_from_registration_batch`` so a caller
+    holding the batch row — the drain loop in
+    ``delete_player_registration_batch`` — does not re-list every batch once
+    per player just to look that same row up again.
+
+    Args:
+        batch:   The resolved target batch.
+        license: Licence number of the player to remove.
+
+    Raises:
+        SavConnectionError:      On network errors.
+        SavWriteUnverifiedError: If the removal could not be confirmed.
+        SavResponseError:        If the player is still in the batch after.
+    """
     try:
       resp = self._http.get(
         self._url(_REGISTRATIONS_PATH),
@@ -2739,11 +2823,11 @@ class SavClient:
       resp.raise_for_status()
     except requests.exceptions.RequestException as exc:
       raise SavConnectionError(
-        f"Could not remove player {license} from batch {batch_id}: {exc}"
+        f"Could not remove player {license} from batch {batch.id}: {exc}"
       ) from exc
 
     self._check_write_response(
-      resp.text, f"Could not remove player {license} from batch {batch_id}",
+      resp.text, f"Could not remove player {license} from batch {batch.id}",
     )
     # op=29 has no reliable success-body contract, so a non-rejecting body
     # cannot establish that the player was removed. Probe for *this licence*
@@ -2757,7 +2841,7 @@ class SavClient:
     # run against a batch whose item listing SAV is failing on, which is
     # exactly where a removal tends to be needed.
     try:
-      self.load_existing_registration_record(batch_id, license)
+      self.load_existing_registration_record(batch.id, license)
     except SavRecordNotFoundError:
       pass  # gone from the batch — the removal is confirmed
     except (SavError, ValueError) as exc:
@@ -2766,14 +2850,14 @@ class SavClient:
       # a more harmful lie than requiring a later re-lookup.
       self._cache.forget_license_batch(license)
       raise SavWriteUnverifiedError(
-        f"Removal of licence {license} from batch {batch_id} may have succeeded, "
+        f"Removal of licence {license} from batch {batch.id} may have succeeded, "
         "but its outcome could not be verified because SAV could not be asked "
         "whether the player is still in the batch. Do not retry without "
         "checking SAV first."
       ) from exc
     else:
       raise SavResponseError(
-        f"SAV did not remove licence {license} from batch {batch_id}: the "
+        f"SAV did not remove licence {license} from batch {batch.id}: the "
         f"player is still enrolled in it after the request."
       )
 
@@ -4344,12 +4428,7 @@ class SavClient:
         "Must call login() before list_player_registration_batch_items()"
       )
 
-    batch = next(
-      (b for b in self.list_player_registration_batches() if b.id == batch_id),
-      None,
-    )
-    if batch is None:
-      raise ValueError(f"Batch id={batch_id} not found")
+    batch = self._require_batch(batch_id)
     import re
 
     resp = self._get(

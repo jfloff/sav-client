@@ -960,6 +960,7 @@ def test_enrollment_delete_batch_deletes_whole_batch(monkeypatch):
 
     def delete_player_registration_batch(self, batch_id):
       captured["deleted_id"] = batch_id
+      return [301772]
 
   monkeypatch.setattr(cli_module, "_make_client", lambda: StubClient())
 
@@ -971,6 +972,8 @@ def test_enrollment_delete_batch_deletes_whole_batch(monkeypatch):
   assert result.exit_code == 0, result.output
   assert captured["deleted_id"] == 42
   assert "deleted" in result.output.lower()
+  # The players it released are named, so they can be enrolled again.
+  assert "301772" in result.output
 
 
 def test_enrollment_delete_requires_exactly_one_flag(monkeypatch):
