@@ -1,7 +1,10 @@
 """Offline MCP tests for the unified lookup_player tool."""
 
+import json
+
 import pytest
 
+from sav_client import SavClient
 from sav_client.models import Player
 from sav_mcp import server as server_module
 
@@ -96,6 +99,65 @@ def test_lookup_player_nests_profile_without_field_collisions(monkeypatch):
   assert result["profile"]["name"] == "Profile Name"
   assert result["profile"]["nif"] == "999999999"
   assert stub.profile_calls == [("301772", 200)]
+
+
+def test_lookup_player_federation_wide_profile_reuses_exact_search_cache(
+  monkeypatch, tmp_path,
+):
+  client = SavClient("https://sav2.fpb.pt", "user", "pass", cache_dir=tmp_path)
+  client.session = {"epoca_id": 100, "organizacao": 200, "perfil": 1, "user": "t"}
+  html = (
+    "<table><tbody><tr>"
+    '<td><button onclick="seeJogador(1949, 1)"></button></td>'
+    "<td><i class='fa-color-activo'></i></td>"
+    "<td>194998</td><td>Roster Name</td><td>AB Test</td>"
+    "<td>Other Club</td><td>Sub 14</td><td>Masculino</td>"
+    "<td>2025/2026</td><td>FBP</td><td>2012-06-08</td><td>Portuguesa</td>"
+    "</tr></tbody></table>"
+  )
+  calls = []
+
+  def fake_post_form(path, payload, params=None):
+    calls.append((path, payload, params))
+    if params == {"op": "1"}:
+      return html
+    if params == {"op": "2"}:
+      assert payload["user_id"] == 1949
+      return json.dumps({
+        "msg": (
+          '<img src="uploads/1949.jpg">'
+          '<input id="nome" value="Profile Name">'
+          '<input id="telem" value="912345678">'
+          '<input id="nif" value="">'
+        ),
+      })
+    raise AssertionError(f"unexpected request: path={path!r} params={params!r}")
+
+  monkeypatch.setattr(client, "_post_form", fake_post_form)
+
+  def fail(*args, **kwargs):
+    raise AssertionError("exact licence profile lookup must not scan federation clubs")
+
+  monkeypatch.setattr(client, "_resolve_club_id_by_name", fail)
+  monkeypatch.setattr(client, "list_clubs", fail)
+  monkeypatch.setattr(server_module, "_get_client", lambda: client)
+
+  result = server_module.lookup_player(
+    license=194998, club_id=0, status="all",
+    with_details=True, with_profile=True,
+  )
+
+  assert result is not None
+  assert result["club_id"] == 0
+  assert result["photo_url"] == "uploads/1949.jpg"
+  assert result["mobile_phone"] == "912345678"
+  assert result["nif"] == ""
+  assert result["profile"] == {
+    "nome": "Profile Name", "tele": "912345678",
+  }
+  assert client._cache.get_player_id(194998) == 1949
+  assert [params for _, _, params in calls].count({"op": "1"}) == 1
+  assert [params for _, _, params in calls].count({"op": "2"}) == 2
 
 
 class _ProbeStubClient:

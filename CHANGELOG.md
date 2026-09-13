@@ -29,6 +29,22 @@ real SAV2 on 2026-09-12.
 
 ### Fixed
 
+**Exact federation-wide licence lookup no longer hangs building the club map**
+`IMPACT: silent` — an exact licence search with `club=0` could parse the
+matching row and then stall while enriching every club in every association
+just to resolve the row's display name. It now returns the native match
+promptly, keeps `club_id=0` when SAV2 does not provide a source-club id, and
+still caches the licence → internal player id used by detail and profile
+loads.
+
+`DETECT:` `grep -rn "club_id" --include=*.py .` — treat `club_id=0` as
+unresolved on exact licence lookups; do not infer a source club from the
+display name.
+
+`FIX:` no caller change is needed unless it assumed every federation-wide
+exact-licence row had a resolved `club_id`; broad federation-wide searches
+retain their existing club-name resolution.
+
 **`estatuto=` was dead code on the Revalidação path**
 `IMPACT: silent` — the parameter was accepted and discarded. Passing it changed
 nothing about the request. `add_player_to_registration_batch` forwarded

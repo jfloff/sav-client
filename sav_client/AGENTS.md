@@ -146,7 +146,7 @@ season.id           # opaque epoca_id (sequential; not the calendar year)
 
 ```python
 client.search_players(club=270)                        # explicit single-club scope
-client.search_players(license="301772", club=0)        # exact licence lookup still needs a scope
+client.search_players(license="301772", club=0)        # exact licence lookup uses SAV2's native federation-wide match
 client.search_players(tier="Sénior", club=270)
 client.search_players(status="active", club=270)       # client-side active/inactive filter
 client.search_players(tier=["Mini 12", "Mini 10"], club=0)  # parallel, deduplicated
@@ -176,6 +176,11 @@ client.search_players(season=0, club=0)                # all seasons
 | `limit` | `int\|None` | `None` | Caps results; short-circuits parallel scans |
 
 `club` (non-None, non-0) and `association` don't combine meaningfully — `association` only applies when `club=0`.
+
+An exact licence lookup with `club=0` uses SAV2's native federation-wide
+match. Its result keeps `club_id=0` when the response does not include a
+resolvable source-club id; broad federation-wide searches retain the
+club-name resolution used to attribute their rows.
 
 Results are always sorted by `Player.id` before return, so `limit` slicing is reproducible for the same result set. (On `limit` + parallel scans the short-circuit may pick a different *subset* across runs due to network timing, but the returned list is always in stable order.)
 

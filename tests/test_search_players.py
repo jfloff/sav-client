@@ -368,11 +368,10 @@ class TestClubIdStamping:
 
 
 class TestClubZeroClubIdResolution:
-  """A federation-wide search (club=0) carries no scoped club id to stamp, so
-  club_id is resolved by matching the row's club name against the club list."""
+  """Broad federation-wide rows resolve club ids; exact licence rows do not."""
 
-  def _client(self):
-    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+  def _client(self, cache_dir=None):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass", cache_dir=cache_dir)
     client.session = {"epoca_id": 123, "organizacao": 456, "perfil": 1, "user": "t"}
     return client
 
@@ -425,6 +424,56 @@ class TestClubZeroClubIdResolution:
     [player] = client._search_players_single(club=0)
 
     assert player.club_id == 0
+
+  def test_exact_license_keeps_club_zero_without_building_club_map(self, monkeypatch, tmp_path):
+    client = self._client(cache_dir=tmp_path)
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', db_id=1949, license='194998', club_name='Other Club')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+
+    def fail(*args, **kwargs):
+      raise AssertionError("exact licence lookup must not resolve federation-wide club names")
+
+    monkeypatch.setattr(client, "_resolve_club_id_by_name", fail)
+    monkeypatch.setattr(client, "list_clubs", fail)
+
+    [player] = client.search_players(
+      license="194998", club=0, season=0, status="all",
+    )
+
+    assert player.id == 1949
+    assert player.club_id == 0
+    assert client._cache.get_player_id(194998) == 1949
+
+  def test_exact_license_details_use_row_id_without_club_resolution(self, monkeypatch, tmp_path):
+    client = self._client(cache_dir=tmp_path)
+    html = f"<table><tbody>{_player_row('Sub 14', 'Masculino', db_id=1949, license='194998', club_name='Other Club')}</tbody></table>"
+    monkeypatch.setattr(client, "_post_form", lambda *a, **k: html)
+    monkeypatch.setattr(
+      client, "_resolve_club_id_by_name",
+      lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("exact licence lookup must not resolve federation-wide club names")
+      ),
+    )
+    detail_ids = []
+
+    def fake_detail(player_id, *, with_details=False):
+      detail_ids.append(player_id)
+      return Player(
+        id=player_id, license="", name="", association="", club="", tier="",
+        gender="", birth_date="", nationality="", status="",
+        photo_url="https://example.test/photo.jpg", mobile_phone="912345678",
+      )
+
+    monkeypatch.setattr(client, "get_player_detail", fake_detail)
+
+    [player] = client.search_players(
+      license="194998", club=0, season=0, status="all", with_details=True,
+    )
+
+    assert detail_ids == [1949]
+    assert player.club_id == 0
+    assert player.photo_url == "https://example.test/photo.jpg"
+    assert client._cache.get_player_id(194998) == 1949
 
   def test_list_clubs_raising_leaves_club_id_zero(self, monkeypatch):
     client = self._client()

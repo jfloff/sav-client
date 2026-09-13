@@ -401,7 +401,8 @@ class SavClient:
     self._seasons: list[Season] | None = None
 
     # Lazily-built, memoized club name->id map used to resolve club_id on
-    # federation-wide player searches (club=0); see _resolve_club_id_by_name.
+    # broad federation-wide player searches (club=0); exact licence lookups
+    # keep the native row's club_id=0 and do not need this map.
     self._club_ids_by_name: dict[str, int] | None = None
 
     # Short-TTL in-process memo for list_player_registration_batches(), keyed
@@ -885,7 +886,13 @@ class SavClient:
     club: int,
     page: int = 1,
   ) -> list[Player]:
-    """Issue a single search request for one club and return results."""
+    """Issue one search request and return its parsed player rows.
+
+    Club-scoped requests stamp every row with their requested club id. A
+    federation-wide exact-licence request preserves ``club_id=0`` when SAV2
+    does not provide a source id, while broad federation-wide rows retain the
+    legacy club-name resolution through ``_resolve_club_id_by_name``.
+    """
     payload = {
       "jc_findByLicense": license,
       "jc_findByName": name,
@@ -907,14 +914,15 @@ class SavClient:
     players = self._parse_players_response(html)
     # Search rows carry the club name but no id column; stamp the club we
     # scoped to so every row is attributable to its source club (the fan-out
-    # paths — club list, all-clubs — all funnel through here per club). A
-    # federation-wide search (club=0, used by the licence short-circuit in
-    # search_players) has no scoped club to stamp, so instead resolve each
-    # row's club name to an id via the cached club list (exact name match).
-    # 0 in club_id then means "unresolved", not "no club".
+    # paths — club list, all-clubs — all funnel through here per club).
+    # Federation-wide exact-licence rows have no scoped club to stamp. Keep
+    # club_id=0 for that path: the native SAV2 match is already exact, and
+    # resolving the display name would trigger a federation-wide club scan
+    # before the result can return. Broad federation-wide rows retain the
+    # legacy exact-name club resolution; 0 means "unresolved" there.
     if club:
       players = [_dc_replace(p, club_id=club) for p in players]
-    elif players:
+    elif players and not license:
       players = [
         _dc_replace(p, club_id=self._resolve_club_id_by_name(p.club))
         for p in players
@@ -932,8 +940,10 @@ class SavClient:
   def _resolve_club_id_by_name(self, club_name: str) -> int:
     """Resolve a search row's club name to its id via the full club list.
 
-    Used only for federation-wide searches (club=0), which return the club
-    name but no id column. The name→id map is built lazily from
+    Used only for broad federation-wide searches (club=0), which return the
+    club name but no id column. Exact licence lookups deliberately skip this
+    helper because their native result keeps ``club_id=0``. The name→id map
+    is built lazily from
     ``list_clubs(all_associations=True)`` (already cached with a 7-day TTL)
     and memoized on the instance so repeated federation-wide searches in one
     process don't rebuild it. Fails open: any error, or a name with no exact

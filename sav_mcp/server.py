@@ -598,7 +598,10 @@ def lookup_player(
     club_id defaults to the session's own club when omitted. club_id=0 searches
     federation-wide, and only for a licence: SAV2 matches a licence across every
     club natively, so this is a single request per ladder rung — no more
-    expensive than a club-scoped lookup.
+    expensive than a club-scoped lookup. The roster row keeps ``club_id=0``
+    when SAV2 does not provide a source-club id; the internal player id is
+    cached during that search so ``with_profile`` does not need another wide
+    search.
     A nif is always resolved against your own club because SAV2 only exposes a
     player's NIF to their own club, so a nif with any other club_id (including
     club_id=0), or with no resolvable session club, raises instead of silently
@@ -646,8 +649,9 @@ def lookup_player(
     if with_profile:
         # Prefer the club the row came from over the requested one. A row from
         # a club-scoped search is stamped with its source club; a federation-
-        # wide one is not (club_id stays 0), and 0 is exactly what the bridge
-        # inside load_player_profile wants for its own single-request lookup.
+        # wide one is not (club_id deliberately stays 0). The search path has
+        # already cached the row's internal SAV id, so load_player_profile can
+        # use that id directly and its club=0 fallback search is not reached.
         result["profile"] = client.load_player_profile(
             row.license, club_id=row.club_id or effective_club,
         )
