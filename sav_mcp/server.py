@@ -2700,6 +2700,8 @@ def add_enrollment(
     mod4_id: str | None = None,
     nif: str | None = None,
     detentor_signature_b64: str | None = None,
+    estatuto: int | None = None,
+    allow_ineligible: bool = False,
 ) -> dict:
     """
     Add ONE player to a registration batch, using the data prepared by
@@ -2712,6 +2714,13 @@ def add_enrollment(
 
     Renamed from `submit_enrollment` in 0.101.0, because that name read as
     "submit the batch" and the two operations are not interchangeable.
+
+    estatuto: the player's FBP status id. Leave unset — SAV resolves it from
+    its own stored selection or its op=151 default. Supply it only when an
+    enrolment fails saying no estatuto could be determined.
+
+    allow_ineligible: enroll a licence SAV does not list as revalidable.
+    Recovery only, for a player stranded by a lote deleted before 0.105.0.
 
     Revalidação (license is a real SAV licence): the reconciled kwargs from
     preview_enrollment are used; field_overrides supply values for every
@@ -2872,7 +2881,10 @@ def add_enrollment(
             )
     try:
         client.add_player_to_registration_batch(
-            batch_id, license or 0, inline_subida=inline_subida, **kwargs,
+            batch_id, license or 0, inline_subida=inline_subida,
+            allow_ineligible=allow_ineligible,
+            **({"estatuto": estatuto} if estatuto is not None else {}),
+            **kwargs,
         )
     except SavConfigError as exc:
         # Only minor/guardian errors are retry cases; they carry the field list
@@ -3199,6 +3211,8 @@ def create_enrollment_manual(
     batch_number: str,
     license: int,
     fields: dict[str, Any] | None = None,
+    estatuto: int | None = None,
+    allow_ineligible: bool = False,
 ) -> dict:
     """
     Enroll a player in a batch using their existing SAV profile, with optional
@@ -3214,12 +3228,21 @@ def create_enrollment_manual(
     (exam_date, guardian_name, guardian_relation, guardian_phone, guardian_email,
     consent_data, consent_communications, consent_marketing).
 
+    estatuto: the player's FBP status id. Leave unset — SAV resolves it. Supply
+    it only when an enrolment fails saying no estatuto could be determined.
+
+    allow_ineligible: enroll a licence SAV does not list as revalidable.
+    Recovery only, for a player stranded by a lote deleted before 0.105.0;
+    SAV accepts the enrolment even though its eligible list omits them.
+
     Returns: {"success": True, "license": int} on success.
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
     client.add_player_to_registration_batch(
-        batch_id, license, **(fields or {}),
+        batch_id, license, allow_ineligible=allow_ineligible,
+        **({"estatuto": estatuto} if estatuto is not None else {}),
+        **(fields or {}),
     )
     return {"success": True, "license": license}
 
@@ -3882,24 +3905,20 @@ def delete_batch(batch_number: str) -> dict:
     Only open ("Em construção") batches can be deleted; submitted batches
     will raise an error from SAV2.
 
-    Every player is removed from the batch first, so they go back to being
-    enrollable elsewhere — SAV2 leaves them stranded in the deleted batch
-    otherwise. If a player cannot be removed, the batch is NOT deleted and
-    the error says how many were freed; retry once SAV accepts the removal.
+    The batch must already be EMPTY. A batch that still holds players is
+    refused, because SAV2 keeps every licence pinned to the deleted lote and
+    then excludes it from the revalidable list — the player can no longer be
+    enrolled anywhere, and there is no way to release them afterwards.
 
-    Returns {"deleted": True, "batch_number": str, "freed_licenses": [int]}
-    on success, where freed_licenses are the players released by the delete.
+    To delete a batch with players in it, call delete_enrollment(license) for
+    each player first (each removal is verified against SAV), then call this.
 
-    To remove a single player from a batch, use delete_enrollment(license).
+    Returns {"deleted": True, "batch_number": str} on success.
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
-    freed = client.delete_player_registration_batch(batch_id)
-    return {
-        "deleted": True,
-        "batch_number": batch_number,
-        "freed_licenses": freed,
-    }
+    client.delete_player_registration_batch(batch_id)
+    return {"deleted": True, "batch_number": batch_number}
 
 
 @server.tool()

@@ -2454,21 +2454,24 @@ class SavClient:
     self._invalidate_batch_memo()
     return new_id
 
-  def delete_player_registration_batch(self, batch_id: int) -> list[int]:
+  def delete_player_registration_batch(self, batch_id: int) -> None:
     """
-    Delete a player registration batch ("Lote") by ID, emptying it first.
+    Delete an **empty** player registration batch ("Lote") by ID.
 
     SAV2 does not release a batch's players when the batch itself goes: op=9
     drops the batch row, but every licence still in it stays pinned to that
     now-missing batch and never returns to the pool op=139 lists, so the
-    player cannot be enrolled again anywhere. The batch is therefore drained
-    one licence at a time (op=29 — the call the SAV2 UI's per-row remove
-    button makes) and deleted only once it is empty.
+    player cannot be enrolled again anywhere. There is no repair — op=29
+    against a deleted lote answers ``'0'`` (rejection), so the licence cannot
+    be released after the fact. 38 athletes were stranded this way on
+    2026-09-12 by 32 deletes made before this guard existed.
 
-    A drain that cannot complete refuses the delete: if the items cannot be
-    listed, or any removal fails or cannot be verified, the batch is left
-    standing so the delete can be retried. That is deliberate — a batch we
-    failed to delete is fixable, a player stranded in a deleted batch is not.
+    A batch that still holds players is therefore refused outright. Empty it
+    first with ``remove_player_from_registration_batch()``, one licence at a
+    time, so each removal is verified against SAV before the next; only then
+    delete it. 0.104.0 drained the batch automatically inside this call, which
+    was still one call away from an unrecoverable mistake — the emptying has
+    to be the caller's explicit act.
 
     Only batches in state "Em construção" (open) can be deleted; submitted
     batches typically cannot.
@@ -2476,53 +2479,32 @@ class SavClient:
     Args:
         batch_id: The internal batch ID (``Batch.id``).
 
-    Returns:
-        The licences freed from the batch, in removal order. Empty when the
-        batch held no players.
-
     Raises:
-        SavConnectionError:      On network errors.
-        SavWriteUnverifiedError: If a removal's outcome could not be checked.
-        SavResponseError:        If the batch could not be emptied; the
-                                 message reports how many licences were
-                                 freed before the failure.
-        ValueError:              If batch_id is not found.
+        SavConnectionError: On network errors.
+        SavResponseError:   If the batch still holds players, or SAV refuses
+                            the delete.
+        ValueError:         If batch_id is not found.
     """
     if self.session is None:
       raise SavResponseError(
         "Must call login() before delete_player_registration_batch()"
       )
 
-    batch = self._require_batch(batch_id)
+    self._require_batch(batch_id)
     licenses = [
       item["license"]
       for item in self.list_player_registration_batch_items(batch_id)
     ]
-    total = len(licenses)
-    freed: list[int] = []
-    for license in licenses:
-      try:
-        self._remove_batch_item(batch, license)
-      except SavWriteUnverifiedError as exc:
-        raise SavWriteUnverifiedError(
-          f"Batch {batch_id} was NOT deleted: licence {license} may or may not "
-          f"have been removed from it, so the batch could not be emptied "
-          f"({len(freed)} of {total} licences freed before this). Check in SAV "
-          "whether that player is still in the batch before retrying the delete."
-        ) from exc
-      except (SavError, ValueError) as exc:
-        raise SavResponseError(
-          f"Batch {batch_id} was NOT deleted: licence {license} could not be "
-          f"removed from it ({exc}), and deleting a batch that still holds "
-          f"players strands them in it. {len(freed)} of {total} licences were "
-          "freed; retry the delete once SAV accepts that removal."
-        ) from exc
-      freed.append(license)
-
-    if freed:
-      logger.info(
-        "Emptied batch %s before deleting it: freed %s licence(s)",
-        batch_id, len(freed),
+    if licenses:
+      listing = ", ".join(str(lic) for lic in licenses[:10])
+      if len(licenses) > 10:
+        listing += f", … ({len(licenses) - 10} more)"
+      raise SavResponseError(
+        f"Batch {batch_id} still holds {len(licenses)} player(s) and was NOT "
+        f"deleted: {listing}. Deleting it would strand them — SAV keeps each "
+        f"licence pinned to the deleted lote and then excludes it from op=139, "
+        f"with no way to release it afterwards. Remove each player first with "
+        f"remove_player_from_registration_batch(), then delete the empty batch."
       )
 
     url = self._url(_REGISTRATIONS_PATH)
@@ -2541,7 +2523,6 @@ class SavClient:
     logger.info("Deleted batch %s", batch_id)
     self._cache.forget_licenses_in_batch(batch_id)
     self._invalidate_batch_memo()
-    return freed
 
   def check_registration_batch_ready(self, batch_id: int) -> dict:
     """Check whether SAV will accept submission of a registration batch.
@@ -2921,6 +2902,9 @@ class SavClient:
     nationality_id: int = _REGISTRATIONS_PORTUGAL_ID,
     naturalidade_id: int = _REGISTRATIONS_PORTUGAL_ID,
     country_id: int = _REGISTRATIONS_PORTUGAL_ID,
+    # Not type-1 only, despite sitting in this block: every type's step-3
+    # commit carries an estatuto, and until 0.105.0 this parameter reached
+    # only the 1ª Inscrição path while Revalidação silently ignored it.
     estatuto: int | None = None,
     # ─── STEP 1 — Personal data (op=33 revalidação / op=12 primeira) ──────────
     # Revalidação: auto-derived from op=35; None = keep stored value.
@@ -2953,6 +2937,7 @@ class SavClient:
     consent_data: bool = True,
     consent_communications: bool = True,
     consent_marketing: bool = False,
+    allow_ineligible: bool = False,
   ) -> int:
     """
     Add a player to an open registration batch.
@@ -3000,13 +2985,25 @@ class SavClient:
           guardian_*:          Required when the player is a minor; raises
                                SavConfigError otherwise.
           consent_*:           GDPR consents.
+          estatuto:            Estatuto (FBP status) id. Applies to every
+                               batch type. None resolves it from SAV: op=31's
+                               stored selection, else op=151's default for
+                               this player. Supply it only when SAV offers no
+                               single answer — an empty estatuto cannot be
+                               committed, so this is the way past that.
+
+        allow_ineligible: Enrol a licence op=139 does not list. Recovery only:
+                          the list is the right answer for an ordinary add,
+                          and SAV omits a player from it for real reasons as
+                          well as for the deleted-lote one this exists for.
 
     Returns:
         Internal SAV2 user id of the added player.
 
     Raises:
         ValueError:        Missing/invalid exam_date, unknown batch, or
-                           player not eligible for revalidation.
+                           player not eligible for revalidation (unless
+                           allow_ineligible=True).
         SavConfigError:    Missing guardian fields for a minor; or batch is
                            not a Revalidação.
         SavResponseError:  Server signals failure on commit.
@@ -3112,11 +3109,26 @@ class SavClient:
           morada=morada, cod_postal=cod_postal,
           localidade_txt=localidade_txt,
           distrito_id=distrito_id, concelho_id=concelho_id,
+          estatuto=estatuto,
         ))
-      raise ValueError(
-        f"Licence {license} is not eligible for revalidation in batch "
-        f"{batch.id} ({batch.tier} {batch.gender}). The server's eligible "
-        f"list has {len(eligible)} player(s); pass one of those licences."
+      if not allow_ineligible:
+        raise ValueError(
+          f"Licence {license} is not eligible for revalidation in batch "
+          f"{batch.id} ({batch.tier} {batch.gender}). The server's eligible "
+          f"list has {len(eligible)} player(s); pass one of those licences. "
+          f"If this player was stranded by a deleted lote, retry with "
+          f"allow_ineligible=True — SAV accepts the enrolment even though "
+          f"op=139 omits them."
+        )
+      # op=139 is a *listing*, not a gate: SAV's own wizard steps accept an
+      # enrolment for a licence the list omits. Proven on 2026-09-12, when all
+      # 38 players stranded by deleted lotes were enrolled this way, each on
+      # the fee SAV itself offered them. Opt-in because the list is still the
+      # right answer for every ordinary add — bypassing it routinely would
+      # re-enroll players who are genuinely ineligible.
+      logger.warning(
+        "Licence %s is not in batch %s's op=139 eligible list — proceeding "
+        "on allow_ineligible=True", license, batch.id,
       )
 
     # ── STEP 1: Load player demographics, save personal data ──────────────────
@@ -3143,7 +3155,7 @@ class SavClient:
 
     return _finish(self._commit_registration_step3(
       batch, internal_id, license, step3_prefill,
-      exam_date=exam_date, taxa_id=taxa_id,
+      exam_date=exam_date, taxa_id=taxa_id, estatuto=estatuto,
       promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
       guardian_name=guardian_name, guardian_relation=guardian_relation,
       guardian_phone=guardian_phone, guardian_email=guardian_email,
@@ -3161,6 +3173,7 @@ class SavClient:
     *,
     exam_date: str | None,
     taxa_id: int | str | None,
+    estatuto: int | str | None = None,
     promote_to_tier_id: int | None,
     inline_subida: bool | None,
     guardian_name: str | None,
@@ -3182,6 +3195,11 @@ class SavClient:
     is written. The one exception is ``taxa``, whose prefill can hold SAV's
     "not selected" sentinel ``-1``: that is not a stored choice, so it is
     ignored and the fee is resolved from the op=162 → op=26 cascade instead.
+
+    ``estatuto`` is the second exception and works the other way round: it is
+    never written blank, because SAV answers an empty one with a server-side
+    SQL error. An explicit value wins over the prefill, and an empty prefill
+    falls back to SAV's own op=151 default — see _resolve_estatuto.
     """
     def _preserve(explicit: Any, prefill_key: str, parameter: str) -> Any:
       if explicit is not None:
@@ -3332,6 +3350,17 @@ class SavClient:
           f"{', '.join(missing)}"
         )
 
+    # ── Estatuto ──────────────────────────────────────────────────────────────
+    # Settled before the cascades so a player SAV cannot place is refused
+    # without firing the fee and insurance lookups for them first. It feeds
+    # both the op=26 fee list and the commit body, which is why an empty one
+    # used to surface twice: as "No taxa options returned" when a fee had to
+    # be resolved, and as a server-side SQL fatal when one did not.
+    estatuto = self._resolve_estatuto(
+      batch, internal_id, license,
+      explicit=estatuto, prefill=step3_prefill.get("estatuto", ""),
+    )
+
     # ── Insurance cascade ─────────────────────────────────────────────────────
     # Note: only companhia is used downstream — seguro_id is fetched and used
     # internally by op=175 to derive companhia, then discarded.
@@ -3345,9 +3374,7 @@ class SavClient:
     # ``taxa`` key at all. An edit over an item that already has a real fee
     # preserves it above and does not reach this path.
     if taxa_id is None:
-      taxa_id = self._resolve_taxa_id(
-        batch, internal_id, step3_prefill.get("estatuto", ""),
-      )
+      taxa_id = self._resolve_taxa_id(batch, internal_id, estatuto)
 
     # ── Pre-commit hook + final commit ────────────────────────────────────────
     self._registration_precommit(batch.id, internal_id)
@@ -3358,7 +3385,7 @@ class SavClient:
       "guiaid": batch.id,
       "userid": internal_id,
       "transf": 0,
-      "estatuto": str(step3_prefill.get("estatuto", "")),
+      "estatuto": str(estatuto),
       "exame": "1",
       "sub": subida_id,
       "obs": "",
@@ -3409,6 +3436,7 @@ class SavClient:
     concelho_id: int | None,
     exam_date: str | None = None,
     taxa_id: int | str | None = None,
+    estatuto: int | str | None = None,
     promote_to_tier_id: int | None = None,
     inline_subida: bool | None = None,
     guardian_name: str | None = None,
@@ -3461,7 +3489,7 @@ class SavClient:
     if editing_exam:
       return self._commit_registration_step3(
         batch, internal_id, license, step3_prefill or {},
-        exam_date=exam_date, taxa_id=taxa_id,
+        exam_date=exam_date, taxa_id=taxa_id, estatuto=estatuto,
         promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
         guardian_name=guardian_name, guardian_relation=guardian_relation,
         guardian_phone=guardian_phone, guardian_email=guardian_email,
@@ -3498,6 +3526,7 @@ class SavClient:
     concelho_id: int | None = None,
     exam_date: str | None = None,
     taxa_id: int | str | None = None,
+    estatuto: int | str | None = None,
     promote_to_tier_id: int | None = None,
     inline_subida: bool | None = None,
     guardian_name: str | None = None,
@@ -3577,7 +3606,7 @@ class SavClient:
       morada=morada, cod_postal=cod_postal,
       localidade_txt=localidade_txt,
       distrito_id=distrito_id, concelho_id=concelho_id,
-      exam_date=exam_date, taxa_id=taxa_id,
+      exam_date=exam_date, taxa_id=taxa_id, estatuto=estatuto,
       promote_to_tier_id=promote_to_tier_id, inline_subida=inline_subida,
       guardian_name=guardian_name, guardian_relation=guardian_relation,
       guardian_phone=guardian_phone, guardian_email=guardian_email,
@@ -5279,38 +5308,38 @@ class SavClient:
       )
     return data
 
-  def _load_primeira_estatuto(
-    self, batch: PlayerRegistrationBatch, userid: int,
-  ) -> int:
-    """Op=151 — pick the player's estatuto from the dropdown SAV exposes.
+  def _load_estatuto_options(
+    self, batch: PlayerRegistrationBatch, userid: int, tipo: int,
+  ) -> dict[str, Any]:
+    """Op=151 — the estatuto dropdown SAV serves for one player in one batch.
 
-    Revalidação reads estatuto off the stored player record; for type-1
-    there's nothing stored yet so SAV serves a dropdown. The UI locks
-    Portuguese FBP players to a single option, so we auto-pick when exactly
-    one real (>0) option is returned. Multi-option means a non-PT player
-    (Comunitário / Não Comunitário / Equiparado) — surface a config error
-    asking the caller to pass an explicit choice.
+    The browser fires this for *every* batch type, not just type-1
+    (``guiasjog.js``, the step-3 handler). The response carries the option
+    HTML in ``estatutos`` and SAV's own per-player default in ``id``.
     """
-    import re
-
     try:
       r = self._http.post(
         self._url(_REGISTRATIONS_PATH),
         params={"op": _REGISTRATIONS_PRIMEIRA_ESTATUTOS_OP},
-        data={
-          "userid": userid,
-          "tipo": _REGISTRATIONS_TYPE_PRIMEIRA,
-          "guiaid": batch.id,
-        },
+        data={"userid": userid, "tipo": tipo, "guiaid": batch.id},
         headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
         timeout=self._timeout,
       )
       r.raise_for_status()
-      data = json.loads(r.text)
+      return json.loads(r.text)
     except (requests.exceptions.RequestException, ValueError) as exc:
       raise SavConnectionError(f"Estatuto op=151 failed: {exc}") from exc
 
-    options = {
+  @staticmethod
+  def _parse_estatuto_options(data: dict[str, Any]) -> dict[int, str]:
+    """Real (>0) estatuto choices from an op=151 response.
+
+    ``<option value=0></option>`` is SAV's blank row, not a choice — the same
+    "ids <= 0 are not real" rule _resolve_taxa_id applies to the fee list.
+    """
+    import re
+
+    return {
       int(val): label.strip()
       for val, label in re.findall(
         r"<option value='?(-?\d+)'?[^>]*>\s*([^<]+?)\s*<",
@@ -5318,6 +5347,122 @@ class SavClient:
       )
       if int(val) > 0
     }
+
+  def _load_estatuto_default(
+    self, batch: PlayerRegistrationBatch, userid: int,
+  ) -> int | None:
+    """SAV's own estatuto pick for this player, or None if it offers no view.
+
+    This is the fallback the browser uses and this client did not: for any
+    batch type other than 1 the step-3 handler selects ``res['id']`` straight
+    from op=151, and only overrides it when op=31's prefill estatuto is
+    non-empty. Verified live on 2026-09-13 against batch 632884 (type 2),
+    where op=151 answered ``id='6'`` (FBP) for two players and ``id='10'``
+    (Sem FBP Comunitário) for a third — a per-player value, not a constant.
+
+    Falls back to a lone real option when SAV returns no usable ``id``.
+    """
+    data = self._load_estatuto_options(batch, userid, batch.type_id)
+    return self._estatuto_default_from(data, self._parse_estatuto_options(data))
+
+  @staticmethod
+  def _as_estatuto_id(value: Any) -> int | None:
+    """``value`` as a real estatuto id, or None if it is not one.
+
+    ``None``, ``""`` and ``0`` all mean "nothing chosen": ``0`` is the blank
+    ``<option value=0></option>`` row, not a status. Non-numeric values are
+    rejected too — every estatuto SAV serves is a numeric option id.
+    """
+    text = str(value).strip() if value is not None else ""
+    if text.lstrip("-").isdigit() and int(text) > 0:
+      return int(text)
+    return None
+
+  @staticmethod
+  def _estatuto_default_from(
+    data: dict[str, Any], options: dict[int, str],
+  ) -> int | None:
+    """SAV's pick out of an op=151 response already fetched, or None.
+
+    Split from the fetch so the refusal path can report the options it saw
+    without asking SAV a second time for the answer it just gave.
+    """
+    raw = str(data.get("id", "")).strip()
+    if raw.lstrip("-").isdigit() and int(raw) > 0:
+      return int(raw)
+    if len(options) == 1:
+      return next(iter(options))
+    return None
+
+  def _resolve_estatuto(
+    self,
+    batch: PlayerRegistrationBatch,
+    internal_id: int,
+    license: int,
+    *,
+    explicit: int | str | None,
+    prefill: Any,
+  ) -> int:
+    """Settle the estatuto for a step-3 commit, refusing to send an empty one.
+
+    Order: an explicit caller value, then op=31's stored selection, then the
+    default SAV itself offers via op=151. Unlike the other step-3 fields,
+    ``""`` and ``0`` are not writable values here — they are SAV's blank
+    dropdown row, and op=36 answers an empty estatuto with an HTTP-200 PHP
+    fatal (``INSERT INTO ins... near '1139  , '1 ', '1 ')'``) as the empty
+    value leaves a hole in the INSERT. Observed in production on 2026-09-12.
+
+    An empty prefill is not a damaged record. It means this item has no
+    in-progress registration to copy a selection from — the state a deleted
+    lote leaves behind, and the one ``guiasjog.js`` guards with
+    ``if (res['estatuto'] != "")`` before overriding op=151's default.
+    """
+    chosen = self._as_estatuto_id(explicit)
+    if chosen is not None:
+      logger.info("Using caller-supplied estatuto=%s for license=%s", chosen, license)
+      return chosen
+    stored = self._as_estatuto_id(prefill)
+    if stored is not None:
+      return stored
+
+    data = self._load_estatuto_options(batch, internal_id, batch.type_id)
+    options = self._parse_estatuto_options(data)
+    default = self._estatuto_default_from(data, options)
+    if default is not None:
+      logger.info(
+        "No stored estatuto for license=%s in batch %s — using SAV's op=151 "
+        "default estatuto=%s", license, batch.id, default,
+      )
+      return default
+
+    listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items())) or "none"
+    raise SavConfigError(
+      f"No estatuto for license={license} in batch {batch.id}: SAV's stored "
+      f"selection is empty and op=151 offers no single default (options: "
+      f"{listing}). Pass estatuto= explicitly — committing without one makes "
+      f"SAV fail the INSERT with a server-side SQL error."
+    )
+
+  def _load_primeira_estatuto(
+    self, batch: PlayerRegistrationBatch, userid: int,
+  ) -> int:
+    """Op=151 — pick the player's estatuto from the dropdown SAV exposes.
+
+    For type-1 the player has no SAV record yet, so SAV serves a dropdown.
+    The UI locks Portuguese FBP players to a single option, so we auto-pick
+    when exactly one real (>0) option is returned. Multi-option means a
+    non-PT player (Comunitário / Não Comunitário / Equiparado) — surface a
+    config error asking the caller to pass an explicit choice.
+
+    Type-2 does *not* share this path: op=151 returns all four options for a
+    Revalidação too, so the sole-option rule never fires there. The
+    Revalidação default comes from the response's ``id`` instead — see
+    _load_estatuto_default.
+    """
+    data = self._load_estatuto_options(
+      batch, userid, _REGISTRATIONS_TYPE_PRIMEIRA,
+    )
+    options = self._parse_estatuto_options(data)
     if len(options) == 1:
       return next(iter(options))
     if not options:

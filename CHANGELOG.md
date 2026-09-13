@@ -21,6 +21,117 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.105.0 — 2026-09-13
+
+Three bugs found while recovering 38 athletes who could not be enrolled after
+their lotes were deleted. All three were observed in production against the
+real SAV2 on 2026-09-12.
+
+### Fixed
+
+**`estatuto=` was dead code on the Revalidação path**
+`IMPACT: silent` — the parameter was accepted and discarded. Passing it changed
+nothing about the request. `add_player_to_registration_batch` forwarded
+`estatuto` only to the 1ª Inscrição branch; for a type-2 batch the step-3
+commit read `step3_prefill['estatuto']` for both the op=26 fee lookup and the
+op=36 body, so the caller's value never reached SAV. That is what made the
+stranded athletes look unrecoverable — the one documented way to supply a
+missing estatuto did nothing.
+
+An explicit `estatuto` now wins over the prefill everywhere, reaching the fee
+lookup as well as the commit, on the add path and the exam-date edit path
+alike. `update_player_in_registration_batch()` accepts it too.
+
+`DETECT:` `grep -rn "estatuto" --include=*.py .`
+`FIX:` nothing to change. If you passed `estatuto=` to a Revalidação and worked
+around it having no effect, remove the workaround — and re-check any enrolment
+you made believing the value had been applied, because it had not.
+
+**An empty `estatuto` was forwarded to SAV, which answered with a SQL error**
+`IMPACT: raises` — but from the server, not from us, and only after the write
+had been attempted. When the stored record carried no estatuto the commit body
+went out with `"estatuto": ""` and op=36 answered HTTP 200 with a PHP fatal:
+`mysqli_sql_exception: You have an error in your SQL syntax ... near
+'4704,23,0,1139  , '1 ', '1 ')' ... INSERT INTO ins...`. The empty value leaves
+a hole in SAV's INSERT. It is SAV's bug; handing it the empty value was ours.
+
+An empty estatuto is now never committed. `0` and `""` are treated as SAV's
+blank dropdown row rather than as writable values — the one place in the step-3
+commit where an explicit empty value is *not* honoured, deliberately.
+
+**A batch with players in it could still be deleted**
+`IMPACT: silent` — **and it is the bug that stranded the 38.** 0.104.0 drained
+the lote before deleting it, which was better but still one call away from the
+same unrecoverable mistake. `delete_player_registration_batch()` now refuses a
+non-empty lote outright, naming the licences that block it. Empty it yourself
+with `remove_player_from_registration_batch()` — one licence at a time, each
+verified against SAV — and then delete it.
+
+Why refuse rather than drain: `op=29` against an already-deleted lote answers
+body `'0'`, a rejection. There is no repair once the lote is gone, so emptying
+has to be an explicit act the caller takes and can see the result of.
+
+`DETECT:` `grep -rn "delete_player_registration_batch\|delete_batch" --include=*.py .`
+`FIX:` remove every player first, then delete. Callers that relied on 0.104.0's
+automatic drain must now do it themselves.
+- `SavClient.delete_player_registration_batch(batch_id)` returns `None` again,
+  not the `list[int]` 0.104.0 introduced — nothing is freed by this call any
+  more, and an always-empty list would be a lie. **Breaking against 0.104.0
+  only**; 0.103.x and earlier also returned `None`.
+- MCP `delete_batch()` dropped the `freed_licenses` key 0.104.0 added.
+- `sav enrollment delete --batch` no longer prints released licences.
+
+### Added
+
+**`allow_ineligible=True` — a documented way past the op=139 guard**
+op=139 is a listing, not a gate: SAV's own wizard accepts an enrolment for a
+licence the list omits, which is how all 38 were recovered. Until now that
+required monkeypatching a private method.
+
+- `SavClient.add_player_to_registration_batch(..., allow_ineligible=False)`.
+- `sav enrollment create --allow-ineligible`.
+- MCP `add_enrollment(..., allow_ineligible=False)` and
+  `create_enrollment_manual(..., allow_ineligible=False)`.
+
+Off by default, and the bypass logs a WARNING naming the licence. SAV omits
+players from op=139 for real reasons as well as for the deleted-lote one this
+exists for; routine use would re-enroll people who genuinely cannot be.
+
+`estatuto` is exposed alongside it on the same three surfaces, plus as
+`--field estatuto=N` on `sav enrollment create` / `sav enrollment update`.
+
+### Investigated: why those 38 had no `estatuto`
+
+The question was whether deleting the lote *cleared* the field or whether it
+only exists while a registration is in progress. It is the second, and the
+field was never on the player at all.
+
+- **`estatuto` is not part of a player's record.** Probed live on 2026-09-13:
+  neither op=30 (existing item) nor op=35 (player prefill) returns an estatuto
+  key in any form. It is per-inscrição state, reachable only through op=31's
+  step-3 prefill, which is why deleting the lote takes it with the item.
+- **An empty one is an ordinary state, not a damaged record.** `guiasjog.js`
+  POSTs **op=151 for every batch type**, selects `res['id']`, and overrides it
+  only when the prefill is non-empty — literally `if (res['estatuto'] != "")`.
+  SAV's UI expects to find nothing stored and has a fallback; this client had
+  none, so it sent the empty string.
+- **op=151 answers for a Revalidação too, with a per-player default.** Against
+  batch 632884 (type 2) it returned `id='6'` (FBP) for two athletes and
+  `id='10'` (Sem FBP Comunitário) for a third, with the same four options for
+  all three. So SAV does know each player's status — we were not asking.
+
+So Bug 2 is neither a pure recovery edge case nor quite the ordinary path: the
+empty prefill is normal and expected, and the client now handles it the way the
+browser does. The resolution order is explicit value → op=31's stored selection
+→ op=151's default → refuse. The refusal is the last resort it was asked to be,
+not the first answer.
+
+Note `_load_primeira_estatuto` could not simply be reused: it picks a lone real
+option, and op=151 returns all four for a type-2, so that rule never fires
+there. The type-2 default has to come from `id`.
+
+---
+
 ## 0.104.0 — 2026-09-12
 
 ### Fixed

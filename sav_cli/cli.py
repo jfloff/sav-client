@@ -1693,6 +1693,10 @@ _UPDATE_FIELDS: dict[str, tuple[str, type]] = {
   "concelho_id":    ("resolve_concelho", int),
   # step3 re-fires the op=36 commit; see update_player_in_registration_batch.
   "exam_date":      ("step3", str),
+  # Normally resolved from SAV (op=31's stored value, else op=151's default).
+  # Settable for the case where SAV offers neither and the commit would
+  # otherwise go out blank, which SAV answers with a server-side SQL error.
+  "estatuto":       ("step3", int),
 }
 # Aliases so users don't have to type the `_id` suffix.
 _UPDATE_FIELD_ALIASES = {"distrito": "distrito_id", "concelho": "concelho_id"}
@@ -2278,6 +2282,7 @@ def _run_manual_mode_enrollment(
   license_opt: int,
   mod4_path: str | None,
   fields,
+  allow_ineligible: bool = False,
 ) -> None:
   """Run the OCR-free enrolment path: --batch + --license, optional mod4 upload.
 
@@ -2318,7 +2323,8 @@ def _run_manual_mode_enrollment(
   try:
     with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
       client.add_player_to_registration_batch(
-        batch_id, license_opt, **field_overrides,
+        batch_id, license_opt, allow_ineligible=allow_ineligible,
+        **field_overrides,
       )
   except (SavConnectionError, SavResponseError, ValueError) as exc:
     raise SavCliError(str(exc), code=_exc_code(exc))
@@ -2401,10 +2407,18 @@ def _run_manual_mode_enrollment(
     "Supported: " + ", ".join(sorted(_UPDATE_FIELDS)) + "."
   ),
 )
+@click.option(
+  "--allow-ineligible", is_flag=True, default=False,
+  help=(
+    "Enroll a licence SAV does not list as revalidable. Recovery only, for a "
+    "player stranded by a deleted lote; SAV accepts the enrolment anyway."
+  ),
+)
 @click.pass_context
 def enrollment_create_cmd(
   ctx, pdfs, mod1_path, medical_exam, mod4_path, atestado_path, certidao_path,
   id_doc_paths, outros_paths, batch_number_opt, license_opt, detentor_signature_path, fields,
+  allow_ineligible,
 ):
   """Enroll one player into SAV from one or more supporting PDFs.
 
@@ -2461,7 +2475,7 @@ def enrollment_create_cmd(
     _run_manual_mode_enrollment(
       ctx,
       batch_number=batch_number_opt, license_opt=license_opt,
-      mod4_path=mod4_path, fields=fields,
+      mod4_path=mod4_path, fields=fields, allow_ineligible=allow_ineligible,
     )
     return
 
@@ -2568,6 +2582,7 @@ def enrollment_create_cmd(
           ctx,
           batch_number=batch_number_opt, license_opt=license_opt,
           mod4_path=mod4_candidates[0], fields=fields,
+          allow_ineligible=allow_ineligible,
         )
         return
       _run_subida_ocr_mode(
@@ -2883,7 +2898,8 @@ def enrollment_create_cmd(
       try:
         with console.status("[bold cyan]:inbox_tray: Submitting enrollment...[/]"):
           client.add_player_to_registration_batch(
-            batch_id, license, inline_subida=inline_subida, **kwargs,
+            batch_id, license, inline_subida=inline_subida,
+            allow_ineligible=allow_ineligible, **kwargs,
           )
         console.print(f"[green]:white_check_mark: Added licence {license} to batch #{batch.number}.[/]")
         submitted = True
@@ -3943,11 +3959,11 @@ def enrollment_delete_cmd(ctx, license_, batch_number):
 
   \b
     sav enrollment delete --license LICENSE       Remove one player's enrolment.
-    sav enrollment delete --batch BATCH_NUMBER    Delete the entire batch.
+    sav enrollment delete --batch BATCH_NUMBER    Delete the empty batch.
 
-  Deleting a batch removes every player from it first, so they return to the
-  enrollable pool; SAV2 strands them otherwise. If a player cannot be removed,
-  the batch is left intact rather than deleted.
+  A batch is only deletable once it holds no players: SAV2 strands anyone left
+  inside a deleted lote, with no way to release them afterwards. Remove each
+  player with --license first, then delete the batch.
   """
   if (license_ is None) == (batch_number is None):
     raise click.UsageError("Pass exactly one of --license LICENSE or --batch BATCH_NUMBER.")
@@ -3973,19 +3989,14 @@ def enrollment_delete_cmd(ctx, license_, batch_number):
 
   batch_id = _resolve_batch_id_or_raise(client, batch_number)
   if not click.confirm(
-    f"Delete entire batch {batch_number} (and every enrolment in it)?", default=False
+    f"Delete batch {batch_number}?", default=False
   ):
     raise click.Abort()
   try:
-    freed = client.delete_player_registration_batch(batch_id)
+    client.delete_player_registration_batch(batch_id)
   except (SavConnectionError, SavResponseError, ValueError) as e:
     raise SavCliError(str(e), code=_exc_code(e))
   console.print(f"[green]:white_check_mark: Batch #{batch_number} deleted.[/]")
-  if freed:
-    console.print(
-      f"[dim]{len(freed)} player(s) released and enrollable again: "
-      f"{', '.join(str(lic) for lic in freed)}[/]"
-    )
 
 
 @enrollment_grp.command("submit")

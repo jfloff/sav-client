@@ -131,7 +131,7 @@ class TestPreHttpGuards:
       lambda batch_type, batch_id, internal_id, license, send: {
         "menor_idade": 0,
         "escalao": 7,
-        "estatuto": "A",
+        "estatuto": "6",
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
@@ -175,7 +175,7 @@ class TestPreHttpGuards:
       lambda batch_type, batch_id, internal_id, license, send: {
         "menor_idade": 0,
         "escalao": 7,
-        "estatuto": "A",
+        "estatuto": "6",
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
@@ -498,7 +498,7 @@ class TestExamDateWindow:
       lambda batch_type, batch_id, internal_id, license, send: {
         "menor_idade": 0,
         "escalao": 7,
-        "estatuto": "A",
+        "estatuto": "6",
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
@@ -691,7 +691,7 @@ class TestSubidaDeEscalao:
     monkeypatch.setattr(
       client, "_save_registration_step2",
       lambda batch_type, batch_id, internal_id, license, send: {
-        "menor_idade": 0, "escalao": 7, "estatuto": "A",
+        "menor_idade": 0, "escalao": 7, "estatuto": "6",
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
@@ -1306,23 +1306,115 @@ class TestRemovePlayerFromRegistrationBatch:
       client.remove_player_from_registration_batch(999999999, 301772)
 
 
-class TestDeleteBatchDrainsPlayersFirst:
-  """Deleting a batch must release its players first.
+class TestAllowIneligible:
+  """op=139 is a listing, not a gate.
+
+  SAV's eligible list omits a player whose lote was deleted, but its wizard
+  still accepts the enrolment — proven on 2026-09-12, when all 38 stranded
+  athletes were enrolled past this guard. The bypass is opt-in because the
+  list is the right answer for every ordinary add.
+  """
+
+  def _stub(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"organizacao": "270"}
+    batch = type("BatchStub", (), {
+      "id": 1, "is_open": True, "type_id": 2, "state": "Em construção",
+      "tier": "Sub 14", "gender": "Masculino", "tier_id": 7, "club_id": 270,
+    })()
+    monkeypatch.setattr(
+      client, "list_player_registration_batches", lambda season=None: [batch],
+    )
+    # The licence SAV will not offer, and a batch it is not already in.
+    monkeypatch.setattr(client, "_list_revalidable_licenses", lambda b: set())
+    monkeypatch.setattr(
+      client, "list_player_registration_batch_items", lambda batch_id: [],
+    )
+    monkeypatch.setattr(client, "_load_player_record", lambda batch_id, license: {"id": 88})
+    monkeypatch.setattr(client, "_build_step1_send", lambda *a, **k: "step1")
+    monkeypatch.setattr(
+      client, "_save_registration_step1", lambda batch_id, internal_id, send: {},
+    )
+    monkeypatch.setattr(client, "_build_step2_send", lambda *a, **k: "step2")
+    monkeypatch.setattr(
+      client, "_save_registration_step2",
+      lambda batch_type, batch_id, internal_id, license, send: {
+        "menor_idade": 0, "escalao": 7, "estatuto": "6",
+      },
+    )
+    monkeypatch.setattr(
+      client, "_resolve_insurance_cascade", lambda internal_id, b, escalao: (11, 22),
+    )
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda b, internal_id, est: 33)
+    monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, uid: None)
+    monkeypatch.setattr(client._cache, "clear_nif_index", Mock())
+    captured = {}
+
+    def capture_commit(body):
+      captured["body"] = body
+      return {"val": 1, "resultfunction": "ok"}
+
+    monkeypatch.setattr(client, "_registration_commit", capture_commit)
+    return client, captured
+
+  def test_an_ineligible_licence_is_refused_by_default(self, monkeypatch):
+    client, captured = self._stub(monkeypatch)
+
+    with pytest.raises(ValueError, match="not eligible for revalidation"):
+      client.add_player_to_registration_batch(
+        1, 301772, exam_date=RECENT_EXAM_DATE,
+      )
+
+    assert "body" not in captured
+
+  def test_the_refusal_points_at_the_way_out(self, monkeypatch):
+    client, _ = self._stub(monkeypatch)
+
+    with pytest.raises(ValueError, match="allow_ineligible=True"):
+      client.add_player_to_registration_batch(
+        1, 301772, exam_date=RECENT_EXAM_DATE,
+      )
+
+  def test_allow_ineligible_enrols_anyway(self, monkeypatch):
+    client, captured = self._stub(monkeypatch)
+
+    client.add_player_to_registration_batch(
+      1, 301772, exam_date=RECENT_EXAM_DATE, allow_ineligible=True,
+    )
+
+    assert captured["body"]["userid"] == 88
+
+  def test_the_bypass_is_logged_as_a_warning(self, monkeypatch, caplog):
+    """It must be visible in a transcript that the guard was stepped over."""
+    client, _ = self._stub(monkeypatch)
+
+    with caplog.at_level("WARNING", logger="sav_client.sav_client"):
+      client.add_player_to_registration_batch(
+        1, 301772, exam_date=RECENT_EXAM_DATE, allow_ineligible=True,
+      )
+
+    assert any("allow_ineligible=True" in r.message for r in caplog.records)
+
+
+class TestDeleteBatchRefusesANonEmptyLote:
+  """A lote with players in it must not be deletable in one call.
 
   SAV2 keeps every licence pinned to the batch it was enrolled in even after
   op=9 removes the batch itself: the player then shows up in no batch the club
   can see, yet op=139 still refuses to offer them for a new enrolment, so they
-  cannot be registered again at all. The only way out is to remove each player
-  (op=29) *while the batch still exists*, exactly as the SAV2 UI's per-row
-  button does, and delete the empty batch afterwards.
+  cannot be registered again at all. op=29 against the deleted lote answers
+  ``'0'`` — a rejection — so there is no repair afterwards.
+
+  38 athletes were stranded this way on 2026-09-12 by 32 deletes. 0.104.0
+  drained the lote automatically inside this call; that was still one call away
+  from the same unrecoverable mistake, so emptying is now the caller's own act.
   """
 
   BATCH_ID = 12
-  REMOVE_OP = "29"
   DELETE_OP = "9"
 
-  def _client(self, monkeypatch, items, probe=None):
-    """Client whose op=29 and op=9 calls are recorded rather than sent."""
+  def _client(self, monkeypatch, items):
+    """Client whose op=9 call is recorded rather than sent."""
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"organizacao": "270", "perfil": 1, "user": "u"}
     calls: list[tuple[str, int]] = []
@@ -1344,90 +1436,49 @@ class TestDeleteBatchDrainsPlayersFirst:
     monkeypatch.setattr(
       client, "list_player_registration_batch_items", Mock(return_value=items),
     )
-    if probe is None:
-      probe = Mock(side_effect=SavRecordNotFoundError("gone"))
-    monkeypatch.setattr(client, "load_existing_registration_record", probe)
-    monkeypatch.setattr(client._cache, "forget_license_batch", Mock())
     monkeypatch.setattr(client._cache, "forget_licenses_in_batch", Mock())
     return client, calls
 
-  def test_every_player_is_removed_before_the_batch_goes(self, monkeypatch):
+  def test_a_lote_with_players_is_refused_and_never_reaches_op_9(self, monkeypatch):
     client, calls = self._client(monkeypatch, [
       {"license": 301772, "name": "A"},
       {"license": 301773, "name": "B"},
     ])
 
-    freed = client.delete_player_registration_batch(self.BATCH_ID)
+    with pytest.raises(SavResponseError) as excinfo:
+      client.delete_player_registration_batch(self.BATCH_ID)
 
-    assert calls == [
-      (self.REMOVE_OP, 301772),
-      (self.REMOVE_OP, 301773),
-      (self.DELETE_OP, self.BATCH_ID),
-    ], "op=9 must fire last, on an already-empty batch"
-    assert freed == [301772, 301773]
+    assert calls == [], "no request may be sent for a lote that still has players"
+    message = str(excinfo.value)
+    assert "301772" in message and "301773" in message, "name who is blocking it"
+    assert "remove_player_from_registration_batch" in message, "say how to proceed"
 
-  def test_an_empty_batch_is_deleted_without_any_removals(self, monkeypatch):
+  def test_an_empty_lote_is_deleted(self, monkeypatch):
     client, calls = self._client(monkeypatch, [])
 
-    assert client.delete_player_registration_batch(self.BATCH_ID) == []
+    assert client.delete_player_registration_batch(self.BATCH_ID) is None
     assert calls == [(self.DELETE_OP, self.BATCH_ID)]
 
-  def test_a_failed_removal_leaves_the_batch_standing(self, monkeypatch):
-    """The whole point: a batch we failed to delete is fixable, a player
-    stranded inside a deleted batch is not."""
-    still_enrolled = Mock(side_effect=[SavRecordNotFoundError("gone"), {"id": 88}])
-    client, calls = self._client(
-      monkeypatch,
-      [{"license": 301772, "name": "A"}, {"license": 301773, "name": "B"}],
-      probe=still_enrolled,
-    )
+  def test_the_refusal_does_not_forget_cached_licences(self, monkeypatch):
+    """The batch still exists and still holds them — the cache is not stale."""
+    client, _ = self._client(monkeypatch, [{"license": 301772, "name": "A"}])
 
-    with pytest.raises(SavResponseError, match="301773") as excinfo:
+    with pytest.raises(SavResponseError):
       client.delete_player_registration_batch(self.BATCH_ID)
 
-    assert (self.DELETE_OP, self.BATCH_ID) not in calls
-    assert "1 of 2" in str(excinfo.value), "the caller needs to know who was freed"
+    client._cache.forget_licenses_in_batch.assert_not_called()
 
-  def test_an_unverified_removal_does_not_delete_the_batch(self, monkeypatch):
-    """SAV took the removal but could not be asked whether it landed. Deleting
-    now would strand the player if it did not."""
-    broken_probe = Mock(side_effect=SavServerError("op=30 fatal"))
-    client, calls = self._client(
-      monkeypatch, [{"license": 301772, "name": "A"}], probe=broken_probe,
-    )
-
-    with pytest.raises(SavWriteUnverifiedError, match="NOT deleted"):
-      client.delete_player_registration_batch(self.BATCH_ID)
-
-    assert (self.DELETE_OP, self.BATCH_ID) not in calls
-
-  def test_an_unlistable_batch_is_not_deleted(self, monkeypatch):
-    """Without the item list there is no way to know who would be stranded."""
-    client, calls = self._client(monkeypatch, [])
-    monkeypatch.setattr(
-      client, "list_player_registration_batch_items",
-      Mock(side_effect=SavServerError("op=10 fatal")),
-    )
-
-    with pytest.raises(SavServerError):
-      client.delete_player_registration_batch(self.BATCH_ID)
-
-    assert calls == []
-
-  def test_the_batch_is_resolved_once_not_per_player(self, monkeypatch):
-    """Each removal used to re-list every batch to find the row it already
-    had, turning a 20-player batch into 60 requests."""
+  def test_a_long_roster_is_summarised_not_dumped(self, monkeypatch):
     client, _ = self._client(monkeypatch, [
-      {"license": 301772, "name": "A"},
-      {"license": 301773, "name": "B"},
-      {"license": 301774, "name": "C"},
+      {"license": 300000 + i, "name": str(i)} for i in range(25)
     ])
 
-    client.delete_player_registration_batch(self.BATCH_ID)
+    with pytest.raises(SavResponseError) as excinfo:
+      client.delete_player_registration_batch(self.BATCH_ID)
 
-    # The item listing resolves the batch too, but it is stubbed here, so this
-    # counts only the delete path itself: one lookup, not one per licence.
-    assert client.list_player_registration_batches.call_count == 1
+    message = str(excinfo.value)
+    assert "25 player(s)" in message
+    assert "15 more" in message, "the tail is counted, not listed"
 
 
 class TestStep1PrefillIsNotAWriteAck:
@@ -1522,7 +1573,7 @@ class TestStep1PrefillIsNotAWriteAck:
     monkeypatch.setattr(c, "_build_step2_send", capture_step2)
     monkeypatch.setattr(
       c, "_save_registration_step2",
-      lambda *args, **kwargs: {"menor_idade": 0, "escalao": 7, "estatuto": "A"},
+      lambda *args, **kwargs: {"menor_idade": 0, "escalao": 7, "estatuto": "6"},
     )
     monkeypatch.setattr(c, "_commit_registration_step3", lambda *args, **kwargs: 252299)
 

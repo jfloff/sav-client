@@ -111,7 +111,7 @@ def test_commit_step3_sends_exam_date(monkeypatch):
   client._cache = _Cache()
 
   uid = client._commit_registration_step3(
-    _Batch(), 1234, 301772, {"estatuto": "S", "escalao": 7, "menor_idade": 0},
+    _Batch(), 1234, 301772, {"estatuto": "6", "escalao": 7, "menor_idade": 0},
     exam_date=RECENT_EXAM_DATE, taxa_id=None,
     promote_to_tier_id=None, inline_subida=False,
     guardian_name=None, guardian_relation=None, guardian_phone=None, guardian_email=None,
@@ -143,7 +143,7 @@ def test_commit_step3_minor_requires_guardian():
 def test_exam_date_only_edit_preserves_step3_consents(monkeypatch):
   client = _bare_client()
   prefill = {
-    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
     "subida": "-1", "escalaosubida": None,
     "concordo_tratamento_dados": "1",
     "receber_comunicacoes": "1",
@@ -161,7 +161,7 @@ def test_exam_date_only_edit_preserves_step3_consents(monkeypatch):
 def test_stored_zero_consent_stays_off_on_wire(monkeypatch):
   client = _bare_client()
   prefill = {
-    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
     "concordo_tratamento_dados": "0",
     "receber_comunicacoes": "0",
     "autoriza_utilizacao_dados": "0",
@@ -177,7 +177,7 @@ def test_stored_zero_consent_stays_off_on_wire(monkeypatch):
 def test_explicit_marketing_false_overwrites_stored_one(monkeypatch):
   client = _bare_client()
   prefill = {
-    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
     "autoriza_utilizacao_dados": "1",
   }
   captured = _stub_step3_commit(monkeypatch, client, prefill)
@@ -189,7 +189,7 @@ def test_explicit_marketing_false_overwrites_stored_one(monkeypatch):
 def test_explicit_empty_guardian_phone_and_taxa_overwrite_stored_values(monkeypatch):
   client = _bare_client()
   prefill = {
-    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
     "telefone_menor": "+351912345678",
   }
   captured = _stub_step3_commit(monkeypatch, client, prefill)
@@ -202,7 +202,7 @@ def test_explicit_empty_guardian_phone_and_taxa_overwrite_stored_values(monkeypa
 def test_subida_is_preserved_unless_explicitly_cleared(monkeypatch):
   client = _bare_client()
   prefill = {
-    "estatuto": "S", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
     "subida": "6", "escalaosubida": "Sub 14",
   }
   captured = _stub_step3_commit(monkeypatch, client, prefill)
@@ -220,14 +220,14 @@ def test_minor_raises_when_preserved_guardian_block_is_empty():
   with pytest.raises(SavConfigError, match="minor"):
     _commit_step3(
       client,
-      {"menor_idade": 1, "estatuto": "S", "escalao": 7, "taxa": "1090"},
+      {"menor_idade": 1, "estatuto": "6", "escalao": 7, "taxa": "1090"},
     )
 
 
 def test_minor_raises_when_explicit_guardian_phone_is_cleared():
   client = _bare_client()
   prefill = {
-    "menor_idade": 1, "estatuto": "S", "escalao": 7, "taxa": "1090",
+    "menor_idade": 1, "estatuto": "6", "escalao": 7, "taxa": "1090",
     "nome_encarregado_menor": "Marlene Figueiredo",
     "tipo_regulacao_menor": "2",
     "telefone_menor": "+351912345678",
@@ -247,7 +247,7 @@ def test_update_existing_player_routes_exam_date_to_commit(monkeypatch):
   monkeypatch.setattr(client, "_build_step2_send", lambda prefill, **k: {})
   monkeypatch.setattr(
     client, "_save_registration_step2",
-    lambda tp, guia, uid, lic, send: {"estatuto": "S", "escalao": 7, "menor_idade": 0},
+    lambda tp, guia, uid, lic, send: {"estatuto": "6", "escalao": 7, "menor_idade": 0},
   )
   def _fake_step3(*a, **k):
     calls["commit"] = (a, k)
