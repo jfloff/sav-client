@@ -30,11 +30,36 @@ from sav_client.exceptions import (
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
-_LOGIN_PAGE = (
-  "<!DOCTYPE html><html><head><title>SAV2</title></head><body>"
-  "<form action='php/logindb.php'>"
-  "<input type='password' name='pass'></form></body></html>"
+# Shaped like the real SAV2 login page (measured against
+# ``curl -s https://sav2.fpb.pt/``): ~11.2KB total, leading newline, and a <head>
+# padded with ~2.1KB of meta/link/script so the first form marker lands *past*
+# 2000 characters and ``logindb.php`` past 10KB. A small fixture passes even with
+# the marker window set to 2000, which is how the production bug survived.
+_LOGIN_HEAD_PADDING = "\n".join(
+  f'    <meta http-equiv="Cache-Control" content="no-store" data-n="{i:03d}">'
+  for i in range(30)
 )
+_LOGIN_TAIL_PADDING = "\n".join(
+  f'    <div class="promo" data-n="{i:03d}">Federação Portuguesa de Basquetebol</div>'
+  for i in range(120)
+)
+_LOGIN_PAGE = (
+  '\n<!DOCTYPE html>\n<html>\n  \n<head>\n<meta charset="UTF-8">\n'
+  '    <meta content="width=device-width, initial-scale=1, maximum-scale=1, '
+  'user-scalable=no" name="viewport">\n'
+  f"{_LOGIN_HEAD_PADDING}\n"
+  "</head>\n<body>\n"
+  '    <input type="password" name="pass">\n'
+  f"{_LOGIN_TAIL_PADDING}\n"
+  "    <script>document.forms[0].action = 'php/logindb.php';</script>\n"
+  "</body>\n</html>\n"
+)
+
+# Guard the fixture itself: if it ever shrinks back below the old 2000-char
+# window these regression tests stop testing anything.
+assert _LOGIN_PAGE.find('type="password"') > 2000
+assert _LOGIN_PAGE.find("logindb.php") > 10000
+assert len(_LOGIN_PAGE) < 16384
 
 
 def _make_client(monkeypatch):
@@ -245,6 +270,29 @@ class TestReauthReplay:
     # Ordinary wizard HTML fragment (no login marker) is not a login page.
     assert SavClient._looks_like_login_page("<html><body>ok</body></html>") is False
     assert SavClient._looks_like_login_page("") is False
+
+  def test_markers_past_the_html_window_still_match(self):
+    # The regression: SAV2's <head> pushes every form marker past 2000 chars, so
+    # a single 2000-char window made the detector answer False on the real page
+    # and the login HTML flowed into the caller's JSON parser.
+    assert _LOGIN_PAGE.find('type="password"') > 2000
+    assert SavClient._looks_like_login_page(_LOGIN_PAGE) is True
+
+  def test_marker_beyond_marker_window_does_not_match(self):
+    # The scan stays bounded: a marker past _LOGIN_PAGE_MARKER_WINDOW is not
+    # found, so an arbitrarily long HTML reply is never read end-to-end.
+    buried = (
+      "<!DOCTYPE html><html><body>"
+      + ("x" * 20000)
+      + '<input type="password" name="pass"></body></html>'
+    )
+    assert SavClient._looks_like_login_page(buried) is False
+
+  def test_html_opener_beyond_html_window_does_not_match(self):
+    # The opener window stays small: JSON that merely mentions "<html" deep in a
+    # string field must not be mistaken for HTML.
+    payload = '{"val": 0, "msg": "' + ("y" * 3000) + '<html> logindb.php"}'
+    assert SavClient._looks_like_login_page(payload) is False
 
   def test_post_form_reauth_replays_once(self, monkeypatch):
     c = _make_client(monkeypatch)

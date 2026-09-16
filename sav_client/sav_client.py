@@ -86,6 +86,19 @@ _LOGIN_OP = "1"
 # instead of the endpoint's JSON. That interception is the bulletproof signal
 # that the request was NOT executed — so a re-login + replay is safe even for
 # write endpoints. See ``_looks_like_login_page``.
+#
+# That detector reads two different windows, because its two checks live in
+# different places on the page. The doctype/<html> opener is always at the very
+# top, so a small window is enough — and keeping it small is what stops a JSON
+# body that merely mentions "<html" from being treated as HTML. The login form
+# is not at the top: SAV2's <head> carries ~2.1KB of <meta>/<link>/<script>
+# before it, putting `type="password"` at offset ~2114 and `logindb.php` at
+# ~10653 of an ~11.2KB page. A 2000-char marker window missed every one of them,
+# which is why the re-login + replay path below never fired in production. 16KB
+# clears the real page with room to spare while still bounding how much of an
+# arbitrarily long HTML reply gets scanned.
+_LOGIN_PAGE_HTML_WINDOW = 2000     # doctype/<html> opener — always at the top.
+_LOGIN_PAGE_MARKER_WINDOW = 16384  # login form markers — mid/late in the page.
 _BATCH_MEMO_TTL = 5.0  # seconds — collapses the 3-4× back-to-back re-fetches a
                        # single enrollment submit triggers, short enough that a
                        # concurrent server-side state change is picked up quickly.
@@ -5980,14 +5993,18 @@ class SavClient:
     so replaying it could double-execute a write.
 
     Heuristic (must be HTML *and* carry a login marker to avoid false hits on
-    ordinary HTML fragments the wizard endpoints return):
+    ordinary HTML fragments the wizard endpoints return). The two checks scan
+    different windows — see ``_LOGIN_PAGE_HTML_WINDOW`` /
+    ``_LOGIN_PAGE_MARKER_WINDOW``: the opener is always at the top, the form
+    markers are ~2.1KB-10.7KB into the real page.
     """
     if not text:
       return False
-    head = text[:2000].lower()
+    head = text[:_LOGIN_PAGE_HTML_WINDOW].lower()
     is_html = ("<html" in head) or ("<!doctype html" in head)
     if not is_html:
       return False
+    body = text[:_LOGIN_PAGE_MARKER_WINDOW].lower()
     markers = (
       "logindb.php",
       'name="pass"',
@@ -5998,7 +6015,7 @@ class SavClient:
       "sessao expirou",
       "efetue login",
     )
-    return any(m in head for m in markers)
+    return any(m in body for m in markers)
 
   @staticmethod
   def _looks_like_php_fatal(text: str) -> bool:
