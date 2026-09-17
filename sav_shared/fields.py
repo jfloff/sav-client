@@ -72,9 +72,19 @@ FIELDS: list[FieldDef] = [
   FieldDef(key="genero", label="Género"),
   FieldDef(key="escalao", label="Escalão"),
 
+  # ── Estatuto FBP ─────────────────────────────────────────────────────────
+  # Submittable but never reconciled: the OCR side is a checkbox group, and
+  # the decision that fills it is made by `sav_shared.estatuto`, not by
+  # comparing a form value against a stored one. `sav_kwarg` is set so the
+  # field can be answered through `field_overrides`.
+  FieldDef(key="estatuto", label="Estatuto FBP", sav_kwarg="estatuto"),
+
   # ── Label-only: player identity not held in the op=2 profile ────────────
   FieldDef(key="nome", label="Nome Completo"),
-  FieldDef(key="nacionalidade", label="Nacionalidade"),
+  # Submittable but not reconciled, for the same reason as `estatuto`: the op=2
+  # profile has no nationality input to compare against, so this carries a
+  # `sav_kwarg` (so `field_overrides` can answer it) and no `ocr_entity`.
+  FieldDef(key="nacionalidade", label="Nacionalidade", sav_kwarg="nationality_id"),
   FieldDef(key="pais_nascimento", label="País de Nascimento"),
 
   # ── Read-only personal (cross-checked, never submitted) ─────────────────

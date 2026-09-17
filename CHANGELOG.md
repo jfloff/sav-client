@@ -21,6 +21,132 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.106.0 — 2026-09-16
+
+0.105.0 fixed how the step-3 commit *settles* an estatuto. Nothing upstream of
+that could *determine* one: this package could not decide an Estatuto FBP,
+could not carry it on a Modelo 1, and could not tell a caller what it had
+concluded. This is that half.
+
+### Added
+
+**`sav_shared.estatuto` — the Estatuto FBP decision engine**
+`resolve_estatuto(parsed, *, fpb_status=None, local_fbp_eligible=False)` returns
+a frozen `EstatutoDecision` (`value`, `label`, `source`, `reason`,
+`confidence`, a derived `needs_review`, and `to_dict()`), deciding in this
+order and stopping at the first step that answers:
+
+1. an official FPB status wins — an unrecognised one is a review request, not a
+   reason to fall through to a default;
+2. more than one Estatuto box marked on the Modelo 1 → review;
+3. apparent local FBP eligibility → review, never promotion (the parameter is
+   wired; no caller sets it yet, and it can only ever raise a review);
+4. exactly one marked box is the signed form's answer, carried with its OCR
+   confidence — below 0.60 it is reported in the reason, not dropped;
+5. nationality chooses **only** which *Sem FBP* branch applies, and only for a
+   country recognised exactly;
+6. otherwise review. There is no fallback value.
+
+**The rule the whole module exists for: `FBP` is never inferred from
+citizenship.** It means *Formação Basquetebolística Portuguesa*; a Portuguese
+passport is evidence for `Sem FBP Comunitário` and never for Portuguese
+formation. Step 5 is structurally incapable of returning 6 or 12.
+
+The country lists come from FPB Comunicado da Direção nº 091 (26/04/2024,
+effective 2024/2025) and are hardcoded with the URL in a comment, so a
+republication arrives as a reviewable diff against a cited, dated source.
+Portugal is added explicitly — the Comunicado lists countries *with agreements
+with* Portugal and so omits Portugal itself. A second, explicit list of known
+non-community countries backs the negative inference: an unrecognised
+nationality goes to review rather than to `Sem FBP Não Comunitário` by
+elimination, because an OCR error and an unlisted spelling look identical to a
+genuinely non-community country. Countries absent from the Comunicado but
+holding an EU agreement of the kind it is drawn from (Reino Unido, Suíça,
+México, África do Sul, Sudão, Líbia, Síria) are on neither list and go to
+review. Modelo 1's Nacionalidade box carries a demonym, so an explicit alias
+table maps demonym → country; nothing is fuzzy-matched.
+
+**`ESTATUTOS` in `sav_shared.lookups`, published as `estatutos`**
+The four SAV op=151 ids — 6 `FBP`, 10 `Sem FBP Comunitário`,
+11 `Sem FBP Não Comunitário`, 12 `Equiparado FBP` — with `find_estatuto_id()`
+and `estatuto_name()`, and a new `estatutos` key in `reference_data()` (so the
+`sav://lookups` resource carries them). 12 is official/historical, accepted
+from FPB and never produced by local inference.
+
+**`preview_enrollment` returns `estatuto_decision` (1ª Inscrição)**
+`{value, label, source, reason, confidence, needs_review}`. The decision is
+cached alongside the form, so `add_enrollment` commits exactly what was
+previewed. When it needs review it also appears in `needs_review`.
+
+**`add_enrollment` refuses an undetermined Estatuto on a 1ª Inscrição**
+`IMPACT: raises` — a type-1 enrolment whose Estatuto needs review now raises,
+with the decision's `reason` in the message, unless
+`field_overrides={"estatuto": 6 | 10 | 11}` (or the `estatuto=` argument)
+supplies one. `field_overrides` wins over the argument. 12 is refused from a
+caller on either channel **and for every registration type**, with a message
+saying an official Equiparado status must come from FPB — it reaches an
+enrolment only by already being on the player's SAV record. The client-level
+`add_player_to_registration_batch(estatuto=12)` is unchanged; only the MCP
+boundary refuses it.
+
+This is deliberate: SAV supplies a default of its own, so the alternative to
+raising is filing a legally meaningful classification nobody determined.
+
+`DETECT:` `grep -rn "add_enrollment" --include=*.py .` — any 1ª Inscrição call
+site. `FIX:` read `preview_enrollment`'s `estatuto_decision`; when
+`needs_review` is true, put an estatuto in `field_overrides`. Revalidação is
+unaffected.
+
+### Fixed
+
+**Every Modelo 1 this package rendered went out with Estatuto blank**
+`IMPACT: silent` — `fpb`, `semfpb_com` and `sem_fpb_naocom` were absent from
+`MOD1_FILL_MAPPING` under a comment claiming they belonged to the
+club-insurance branch. They do not: they are the Estatuto FBP group. No caller
+could set them and nothing reported them missing, so every form rendered by
+`fill_mod1` / `render_mod1` / `sav mod1 fill` since the renderer was written
+was filed with the group unticked.
+
+`values` now accepts `estatuto` (6 / 10 / 11, by id or label), the reverse
+mapping reads a filled form back into the `estatuto_fbp_*` entities, and
+`enrollment_fields()` carries the row with `enum_ref: "estatutos"`.
+
+`estatuto` is deliberately **not** in `_MOD1_REQUIRED_CORE`: a signed form may
+legitimately carry no Estatuto and have it settled before submission, and
+making it mandatory would break every existing `fill_mod1` caller. 12
+(`Equiparado FBP`) has no box on the current form and is rejected naming that
+reason rather than reported as an invalid option.
+
+`DETECT:` `grep -rn "fill_mod1\|render_mod1\|mod1 fill" --include=*.py .`
+`FIX:` nothing is required — omitting `estatuto` still renders. Re-render any
+form whose Estatuto matters and which has not yet been signed.
+
+The `Seguro FPB` insurance default is unchanged: it is a club policy with no
+per-player input, and was only ever conflated with Estatuto by that comment,
+which is now corrected.
+
+**A type-1 enrolment filed an unread nationality as Portuguese**
+`IMPACT: silent` — and this one is separate from Estatuto. SAV's type-1 wizard
+defaults `nationality_id` to Portugal (155), so a Modelo 1 whose Nacionalidade
+box was blank, unreadable, or simply not Portuguese did not merely lose
+information: it filed the player as Portuguese, which also changes their
+required-document checklist.
+
+`build_primeira_kwargs` now sets `nationality_id` only when the form positively
+says Portugal at a confidence worth trusting. Every other case leaves it unset
+and lists it in the preview's `needs_review`, for the caller to answer with a
+SAV nationality id. A `Sem FBP Comunitário` estatuto is explicitly not read as
+setting nationality — it is shared by ~147 countries and answers a different
+question.
+
+`DETECT:` `grep -rn "nationality_id" --include=*.py .`
+`FIX:` a type-1 caller that previously relied on the silent default must now
+answer `nationality_id` through `field_overrides` for any non-Portuguese or
+unread nationality. `REQUIRED_PRIMEIRA_KWARGS` gained `nationality_id`, so a
+caller iterating it sees one more required field.
+
+---
+
 ## 0.105.0 — 2026-09-13
 
 Three bugs found while recovering 38 athletes who could not be enrolled after

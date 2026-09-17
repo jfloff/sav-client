@@ -8,6 +8,7 @@ from typing import Any
 
 from sav_client.exceptions import SavError
 
+from .estatuto import LOW_CONFIDENCE, is_portuguese_nationality
 from .fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from .text import normalise_text
 
@@ -20,6 +21,13 @@ REQUIRED_PRIMEIRA_KWARGS: tuple[str, ...] = (
   "name", "birth_date", "gender_id", "nif",
   "id_type", "id_number", "id_expiry", "email",
   "morada", "cod_postal", "distrito_id", "concelho_id",
+  # Required here but not by SAV, which is the whole point — see
+  # build_primeira_kwargs. SAV's type-1 wizard defaults nationality to
+  # Portugal, so an unread or non-Portuguese one does not merely lose
+  # information: it files the player as Portuguese. Listing it as required
+  # makes an unconfirmed nationality surface in the preview's needs_review
+  # instead of being silently defaulted at commit time.
+  "nationality_id",
 )
 
 # kwarg → OCR entity used to look up confidence when the kwarg isn't in
@@ -32,6 +40,7 @@ _PRIMEIRA_KWARG_OCR_ENTITY: dict[str, str | tuple[str, ...]] = {
   "nif": "nif",
   "gender_id": ("genero_feminino", "genero_masculino"),
   "id_type": ("tipo_doc_cc", "tipo_doc_passaporte", "tipo_doc_outro"),
+  "nationality_id": "nacionalidade",
 }
 
 
@@ -302,6 +311,30 @@ def build_primeira_kwargs(
   # genero_feminino takes precedence; default to masculino when neither is
   # checked rather than dropping the field — the wizard requires a value.
   base["gender_id"] = 2 if parsed_bool(parsed, "genero_feminino") else 1
+
+  # Nationality is set ONLY when the form positively says Portugal, at a
+  # confidence worth trusting. Everything else — a blank box, a low-confidence
+  # read, any other country — is left unset, which surfaces `nationality_id` in
+  # the preview's needs_review for the caller to answer with a SAV nationality
+  # id.
+  #
+  # **Leaving it unset is not the same as leaving it unknown**, and that is the
+  # trap: SAV's type-1 wizard defaults nationality to Portugal, so an
+  # unanswered `nationality_id` is not a gap in the record, it is the assertion
+  # that the player is Portuguese. This package cannot make that assertion from
+  # a box it could not read.
+  #
+  # Note what is deliberately *not* consulted here: the Estatuto decision. A
+  # `Sem FBP Comunitário` estatuto is shared by ~147 countries and says nothing
+  # about which one; nationality and estatuto answer different questions and
+  # neither may be read off the other (see sav_shared.estatuto).
+  nationality = parsed.get("nacionalidade")
+  if (
+    nationality is not None
+    and is_portuguese_nationality(nationality.value)
+    and (nationality.confidence is None or nationality.confidence >= LOW_CONFIDENCE)
+  ):
+    base["nationality_id"] = PORTUGAL_NATIONALITY_ID
   return base
 
 
@@ -329,7 +362,7 @@ def build_primeira_preview_fields(
   parsed: dict,
   kwargs: dict[str, Any],
   *,
-  low_confidence_threshold: float = 0.60,
+  low_confidence_threshold: float = LOW_CONFIDENCE,
 ) -> tuple[list[dict], list[str]]:
   """Echo a type-1 kwargs dict as preview field rows (no SAV reconciliation).
 

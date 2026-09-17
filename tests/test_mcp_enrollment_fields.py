@@ -53,14 +53,19 @@ def test_required_rules_follow_mod1_constants():
   assert all(rows[key]["required_when"] == "minor" for key in _MOD1_GUARDIAN_KEYS)
 
 
-def test_data_assinatura_is_the_only_optional_field():
-  """The signature date belongs to the hand-completed block, so it is the one
-  field no rule makes mandatory. If a second row ever turns up optional, a
-  required field has quietly dropped out of the mandatory-fill constants."""
+def test_only_the_two_known_fields_are_optional():
+  """Two fields are optional by rule, and a third appearing means a required
+  field has quietly dropped out of the mandatory-fill constants.
+
+  `data_assinatura` belongs to the hand-completed signature block.
+  `estatuto` is optional because a signed Modelo 1 may legitimately carry no
+  Estatuto and have it settled before submission — making it mandatory would
+  reject forms the federation itself accepts, and break every existing
+  `fill_mod1` caller that passes none."""
   rows = server_module.enrollment_fields()
 
   optional = [row["id"] for row in rows if row["required_when"] == "optional"]
-  assert optional == ["data_assinatura"]
+  assert optional == ["estatuto", "data_assinatura"]
 
 
 def test_every_label_comes_from_a_field_definition():

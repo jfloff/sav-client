@@ -46,7 +46,16 @@ from .fields import (
   RECONCILE_READONLY as _RECONCILE_READONLY,
   RECONCILE_TEXT    as _RECONCILE_TEXT,
 )
-from .lookups import distrito_name, find_distrito_id, find_id_by_name
+from .lookups import (
+  ESTATUTO_EQUIPARADO_FBP,
+  ESTATUTO_FBP,
+  ESTATUTO_SEM_FBP_COMUNITARIO,
+  ESTATUTO_SEM_FBP_NAO_COMUNITARIO,
+  ESTATUTOS,
+  distrito_name,
+  find_distrito_id,
+  find_id_by_name,
+)
 
 
 # tipo_inscricao SAV2 int values → OCR entity name.  When neither checkbox is
@@ -804,10 +813,16 @@ _ON_STATE = "/On"
 # Club policy: every rendered Modelo 1 ships with the "Seguro FPB" (federation
 # insurance) box pre-ticked — the club insures every player through the FPB
 # policy, so this is not a per-player choice and callers never pass it in.
-# "Seguro Clube", "semfpb_com" and "sem_fpb_naocom" belong to the club-insurance
-# branch and stay /Off. Not a MOD1_FILL_MAPPING entry (those map caller-supplied
-# values; this has no input) — kept as its own constant so switching the default,
-# or later making it caller-selectable, is a one-line change.
+# "Seguro Clube" is the other half of that same insurance group and stays /Off.
+# Not a MOD1_FILL_MAPPING entry (those map caller-supplied values; this has no
+# input) — kept as its own constant so switching the default, or later making it
+# caller-selectable, is a one-line change.
+#
+# `fpb`, `semfpb_com` and `sem_fpb_naocom` have nothing to do with insurance: an
+# earlier version of this comment claimed they were part of the club-insurance
+# branch, and because of that they were never mapped and every Modelo 1 this
+# package rendered went out with the Estatuto group blank. They are the Estatuto
+# FBP group and are mapped below.
 _DEFAULT_TICKED_BOX = "Seguro FPB"
 
 # int value → PDF checkbox field name. The ints come straight from the inbound
@@ -829,6 +844,29 @@ _GUARDIAN_ID_TYPE_PDF_FIELD: dict[int, str] = {
   _ID_TYPE["tipo_doc_cc"]:         "titular do Cartão Cidadão",
   _ID_TYPE["tipo_doc_passaporte"]: "passaporte_2",
   _ID_TYPE["tipo_doc_outro"]:      "Outro_2",
+}
+
+# Estatuto FBP — the SAV op=151 ids (sav_shared.lookups.ESTATUTOS) mapped onto
+# the form's three boxes. `Equiparado FBP` (12) is deliberately absent: it is an
+# official/historical status with no box on the current Modelo 1, so a caller
+# passing it is told so rather than having it silently dropped (see
+# _checkbox_problem). Names resolve exactly — sav_shared.estatuto explains why
+# nothing about an estatuto is fuzzy-matched.
+_ESTATUTO_PDF_FIELD: dict[int, str] = {
+  ESTATUTO_FBP:                     "fpb",
+  ESTATUTO_SEM_FBP_COMUNITARIO:     "semfpb_com",
+  ESTATUTO_SEM_FBP_NAO_COMUNITARIO: "sem_fpb_naocom",
+}
+_ESTATUTO_NAME_FIELD: dict[str, str] = {
+  "fbp": "fpb",
+  "comfbp": "fpb",
+  "comformacaobasquetebolisticaportuguesa": "fpb",
+  "semfbpcomunitario": "semfpb_com",
+  "semfbpcom": "semfpb_com",
+  "comunitario": "semfpb_com",
+  "semfbpnaocomunitario": "sem_fpb_naocom",
+  "semfbpnaocom": "sem_fpb_naocom",
+  "naocomunitario": "sem_fpb_naocom",
 }
 
 # tipo_inscricao ints match the inbound _INSCRICAO_FIELD map (1=1ª, 2=Revalidação).
@@ -944,6 +982,9 @@ MOD1_FILL_MAPPING: dict[str, object] = {
   "associacao":             _Text("associacao"),
   "genero":                 _CheckGroup(by_int=_GENERO_PDF_FIELD, by_name=_GENERO_NAME_FIELD),
   "escalao":                _CheckGroup(by_name=_ESCALAO_NAME_FIELD),
+  # Optional, and deliberately not in _MOD1_REQUIRED_CORE: a signed form may
+  # legitimately leave Estatuto blank and have it settled before submission.
+  "estatuto":               _CheckGroup(by_int=_ESTATUTO_PDF_FIELD, by_name=_ESTATUTO_NAME_FIELD),
 
   # ── Player identity ──────────────────────────────────────────────────────────
   "nome":                   _Text("Nome Completo"),
@@ -1166,6 +1207,7 @@ _MOD1_ENUM_REFS: dict[str, str] = {
   "tipo_inscricao":    "registration_types",
   "genero":            "genero",
   "escalao":           "player_registration_tiers",
+  "estatuto":          "estatutos",
   "tipo":              "id_types",
   "guardian_id_type":  "id_types",
   "guardian_relation": "guardian_relations",
@@ -1277,6 +1319,27 @@ def player_is_minor(birth_date: object, ref_date: object = None) -> bool | None:
   return _age_on(born, _to_date(ref_date) or date.today()) < _MOD1_MINOR_AGE
 
 
+def _checkbox_problem(key: str, value: object) -> str:
+  """Why a checkbox-group value resolved to no box on the form.
+
+  Generic for every group but one: `estatuto=12` ("Equiparado FBP") is a real
+  SAV status that simply has no box printed on the current Modelo 1, so the
+  bare "not a valid option" would send the caller looking for a typo that
+  isn't there.
+  """
+  try:
+    is_equiparado = key == "estatuto" and int(value) == ESTATUTO_EQUIPARADO_FBP  # type: ignore[arg-type]
+  except (TypeError, ValueError):
+    is_equiparado = False
+  if is_equiparado:
+    return (
+      f"estatuto={value!r} ({ESTATUTOS[ESTATUTO_EQUIPARADO_FBP]}) has no box on "
+      f"the current Modelo 1 — it is an official status FPB assigns, not one "
+      f"this form can express. Leave estatuto blank and record it with FPB."
+    )
+  return f"{key}={value!r} is not a valid option"
+
+
 def _mod1_unusable_values(values: dict) -> list[str]:
   """Problems for present-but-unusable values (would silently render blank):
   checkbox options that don't resolve, bad postal codes, and dates that are not
@@ -1289,7 +1352,7 @@ def _mod1_unusable_values(values: dict) -> list[str]:
       continue
     if isinstance(spec, _CheckGroup):
       if _resolve_checkbox(spec, value) is None:
-        problems.append(f"{key}={value!r} is not a valid option")
+        problems.append(_checkbox_problem(key, value))
     elif isinstance(spec, _Date):
       try:
         require_iso(value, field=key)
@@ -1564,6 +1627,10 @@ _MOD1_READ_CHECK: dict[str, str] = {
   "titular do Cartão Cidadão": "tipo_doc_encarregado_cc",
   "passaporte_2":              "tipo_doc_encarregado_passaporte",
   "Outro_2":                   "tipo_doc_encarregado_outro",
+  # estatuto FBP
+  "fpb":            "estatuto_fbp_fbp",
+  "semfpb_com":     "estatuto_fbp_sem_comunitario",
+  "sem_fpb_naocom": "estatuto_fbp_sem_nao_comunitario",
   # escalão
   "BabyBasket": "escalao_baby_basket",
   "Mini8":      "escalao_mini8",

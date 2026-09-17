@@ -1940,7 +1940,8 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   tipo, numi, dataval, email, tele, morada, localidade_txt, codpostal,
   distrito, concelho, guardian_name, guardian_relation, guardian_id_type,
   guardian_id_number, guardian_id_expiry, guardian_phone, guardian_email,
-  consent_data, consent_communications, consent_marketing, data_assinatura.
+  consent_data, consent_communications, consent_marketing, data_assinatura,
+  estatuto.
 
   The Época is read from SAV's active season and cannot be supplied in VALUES.
 
@@ -1954,7 +1955,13 @@ def mod1_fill_cmd(values_path, out_path, player_signature_path,
   Checkbox groups accept an int code or a name: tipo_inscricao (1=1ª Inscrição,
   2=Revalidação), genero (1=Masculino, 2=Feminino, or the name), escalao (name,
   e.g. "Sub 14"), tipo / guardian_id_type (1=Cartão Cidadão, 2=Passaporte,
-  3=Outro), guardian_relation (1=pai, 2=mãe, 3=tutor).
+  3=Outro), guardian_relation (1=pai, 2=mãe, 3=tutor), estatuto (6=FBP,
+  10=Sem FBP Comunitário, 11=Sem FBP Não Comunitário).
+
+  estatuto (Estatuto FBP) is the one optional field: a signed Modelo 1 may
+  legitimately leave it blank and have it settled before submission. 12
+  (Equiparado FBP) is a real SAV status with no box on this form and is
+  rejected with that explanation.
   """
   if values_path == "-":
     raw = click.get_text_stream("stdin").read()

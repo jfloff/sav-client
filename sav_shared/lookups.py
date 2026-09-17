@@ -293,6 +293,51 @@ def tier_for_birth_date(
   return None
 
 
+# ── Estatuto FBP (SAV2 op=151 dropdown) ────────────────────────────────────────
+#
+# The player's FPB status: whether they carry Formação Basquetebolística
+# Portuguesa, and when they do not, which "Sem FBP" branch applies. SAV's op=151
+# dropdown offers exactly these four and nothing else (captured live 2026-09-13
+# — see tests/test_estatuto_resolution.py), and the step-3 commit writes the id.
+#
+# `Equiparado FBP` (12) is official/historical and has **no box on the current
+# Modelo 1**. It is accepted from FPB and never produced by local inference —
+# see `sav_shared.estatuto`, which owns that rule.
+
+ESTATUTO_FBP = 6
+ESTATUTO_SEM_FBP_COMUNITARIO = 10
+ESTATUTO_SEM_FBP_NAO_COMUNITARIO = 11
+ESTATUTO_EQUIPARADO_FBP = 12
+
+ESTATUTOS: dict[int, str] = {
+  ESTATUTO_FBP:                     "FBP",
+  ESTATUTO_SEM_FBP_COMUNITARIO:     "Sem FBP Comunitário",
+  ESTATUTO_SEM_FBP_NAO_COMUNITARIO: "Sem FBP Não Comunitário",
+  ESTATUTO_EQUIPARADO_FBP:          "Equiparado FBP",
+}
+
+
+def find_estatuto_id(name: str | None) -> int | None:
+  """Estatuto label → SAV2 estatuto id. ``None`` when it matches no label.
+
+  Accent- and case-insensitive but otherwise **exact** — deliberately not
+  fuzzy. Estatuto is a legally meaningful classification, so an OCR typo has
+  to come back as "unrecognised" (which the decision engine turns into a
+  review) rather than being rounded to the nearest label.
+  """
+  return find_id_by_name(name, ESTATUTOS)
+
+
+def estatuto_name(estatuto_id: int | str | None) -> str:
+  """SAV2 estatuto id → label. Empty string for missing/unknown."""
+  if estatuto_id in (None, ""):
+    return ""
+  try:
+    return ESTATUTOS.get(int(estatuto_id), "")
+  except (ValueError, TypeError):
+    return ""
+
+
 # ── ID document types (tipo_identificacao) ─────────────────────────────────────
 
 ID_TYPES: dict[int, str] = {
@@ -451,6 +496,7 @@ def reference_data(season_start_year: int | None = None) -> dict:
   result = {
     "genero": _id_name_list(GENERO),
     "registration_types": _id_name_list(REGISTRATION_TYPE_LABELS),
+    "estatutos": _id_name_list(ESTATUTOS),
     "distritos": _id_name_list(DISTRITOS),
     "id_types": _id_name_list(ID_TYPES),
     "guardian_relations": _id_name_list(GUARDIAN_RELATIONS),

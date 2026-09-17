@@ -103,7 +103,10 @@ from sav_shared.fpb_mod4 import (
     read_detentor_signature,
 )
 from sav_shared.games import filter_games, game_sort_key
+from sav_shared.estatuto import resolve_estatuto
 from sav_shared.lookups import (
+    ESTATUTO_EQUIPARADO_FBP,
+    ESTATUTOS,
     GENERO,
     REGISTRATION_TYPE_LABELS,
     TIER_AGE_RANGE_IN_SEASON,
@@ -1088,7 +1091,7 @@ def fill_mod1(
     is no season parameter, and season-like keys in values are rejected.
 
     values: a dict keyed by these enrollment field keys —
-    tipo_inscricao, license, clube, associacao, genero, escalao, nome,
+    tipo_inscricao, license, clube, associacao, genero, escalao, estatuto, nome,
     nacionalidade, pais_nascimento, nif, nasc, tipo, numi, dataval, email, tele,
     morada, localidade_txt, codpostal, distrito, concelho, guardian_name,
     guardian_relation, guardian_id_type, guardian_id_number, guardian_id_expiry,
@@ -1100,11 +1103,19 @@ def fill_mod1(
     full only for a minor (derived from nasc) and must be empty otherwise.
     Invalid input raises an error listing every problem.
 
+    estatuto (Estatuto FBP) is **optional**: a signed Modelo 1 may legitimately
+    leave it blank and have it settled before submission, so omitting it is
+    valid and renders the group unticked. It accepts 6 (FBP), 10 (Sem FBP
+    Comunitário) or 11 (Sem FBP Não Comunitário), by id or by label. 12
+    (Equiparado FBP) is a real SAV status with no box on this form and is
+    rejected with that explanation rather than silently dropped.
+
     Text fields take strings; dates must be "YYYY-MM-DD" and any other format
     is rejected rather than converted; consent_* take booleans;
     distrito/concelho/nacionalidade/pais_nascimento are names. Checkbox groups
     accept an int code or a name: tipo_inscricao (1=1ª Inscrição, 2=Revalidação),
-    genero (1=Masculino, 2=Feminino), escalao (name, e.g. "Sub 14"), tipo /
+    genero (1=Masculino, 2=Feminino), escalao (name, e.g. "Sub 14"),
+    estatuto (6=FBP, 10=Sem FBP Comunitário, 11=Sem FBP Não Comunitário), tipo /
     guardian_id_type (1=Cartão Cidadão, 2=Passaporte, 3=Outro), guardian_relation
     (1=pai, 2=mãe, 3=tutor).
 
@@ -1565,6 +1576,105 @@ def _append_minor_guardian_review(preview: dict, birth_date: object) -> None:
             "final_value": None, "status": "needs_review",
         })
         needs_review.append(kwarg)
+
+
+def _append_estatuto_review(preview: dict, decision) -> None:
+    """Add the Estatuto decision to a type-1 preview, as a row and a payload.
+
+    `estatuto_decision` is the contract drive-to-sav renders (value / label /
+    source / reason / confidence / needs_review). The matching `fields` row and
+    `needs_review` entry are what make it answerable: a decision that needs
+    review is supplied through `field_overrides={"estatuto": ...}`, the same
+    channel as every other reviewable field, and add_enrollment refuses the
+    submission until it is.
+    """
+    preview["estatuto_decision"] = decision.to_dict()
+    preview["fields"].append({
+        "kwarg": "estatuto",
+        "label": ENROLLMENT_FIELD_META.get("estatuto", ("estatuto", ""))[0],
+        "sav_value": None,
+        "ocr_value": decision.label or None,
+        "final_value": None if decision.needs_review else decision.value,
+        "status": "needs_review" if decision.needs_review else "ocr",
+        **(
+            {"confidence": round(decision.confidence, 2)}
+            if decision.confidence is not None else {}
+        ),
+    })
+    if decision.needs_review:
+        preview["needs_review"].append("estatuto")
+
+
+def _require_submittable_estatuto(value: object) -> int:
+    """Validate a caller-supplied estatuto id for a 1ª Inscrição.
+
+    6 / 10 / 11 are the statuses a club can assert from a signed Modelo 1.
+    12 (`Equiparado FBP`) is refused: it is an official status FPB assigns and
+    has no box on the form, so a caller sending it is asserting something only
+    the federation can.
+    """
+    try:
+        estatuto_id = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"estatuto must be a SAV estatuto id; got {value!r}."
+        ) from None
+    if estatuto_id == ESTATUTO_EQUIPARADO_FBP:
+        raise ValueError(
+            f"estatuto={estatuto_id} ({ESTATUTOS[ESTATUTO_EQUIPARADO_FBP]}) "
+            f"cannot be supplied here — an official Equiparado status must "
+            f"come from FPB, which then carries it on the player's record. "
+            f"Pass one of: "
+            + ", ".join(
+                f"{k}={v!r}" for k, v in ESTATUTOS.items()
+                if k != ESTATUTO_EQUIPARADO_FBP
+            )
+            + "."
+        )
+    if estatuto_id not in ESTATUTOS:
+        raise ValueError(
+            f"estatuto={value!r} is not a SAV estatuto id. Pass one of: "
+            + ", ".join(
+                f"{k}={v!r}" for k, v in ESTATUTOS.items()
+                if k != ESTATUTO_EQUIPARADO_FBP
+            )
+            + "."
+        )
+    return estatuto_id
+
+
+def _settle_primeira_estatuto(form: dict[str, Any]) -> int | None:
+    """The Estatuto to commit for a 1ª Inscrição the caller did not answer.
+
+    Reads the decision `preview_enrollment` cached on the form rather than
+    recomputing it, so what is committed is exactly what the caller was shown.
+
+    A decision that needs review is **refused**, carrying its reason: the
+    federation record would otherwise take whatever SAV's own default happens
+    to be, under a status this package could not determine. The caller answers
+    with `field_overrides={"estatuto": 6 | 10 | 11}`.
+
+    Returns None when preview never ran a decision (an older cached form), which
+    leaves the client's existing op=151 fallback in charge — the 0.105.0
+    behaviour, unchanged.
+    """
+    decision = form.get("estatuto_decision")
+    if decision is None:
+        return None
+    if decision.needs_review:
+        raise ValueError(
+            "This 1ª Inscrição has no determined Estatuto FBP, so it cannot be "
+            "committed: " + decision.reason + " Supply one with "
+            'field_overrides={"estatuto": <id>} — '
+            + ", ".join(
+                f"{k}={v!r}" for k, v in ESTATUTOS.items()
+                if k != ESTATUTO_EQUIPARADO_FBP
+            )
+            + ". An official "
+            + ESTATUTOS[ESTATUTO_EQUIPARADO_FBP]
+            + " status must come from FPB and cannot be asserted here."
+        )
+    return decision.value
 
 
 def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> dict:
@@ -2548,6 +2658,24 @@ def preview_enrollment(
     supplied, the response also includes a `medical_exam` sidecar with the
     parsed step-3 exam metadata.
 
+    1ª Inscrição also returns `estatuto_decision` — ``{value, label, source,
+    reason, confidence, needs_review}`` — the determined Estatuto FBP and the
+    evidence behind it. `reason` is a full sentence written to be shown to a
+    human. The decision is cached alongside the form, so add_enrollment commits
+    exactly what was previewed; when `needs_review` is true it also appears in
+    `needs_review` and add_enrollment refuses the submission until
+    `field_overrides={"estatuto": 6 | 10 | 11}` answers it.
+
+    Note that `estatuto_decision` never answers the nationality question and
+    nationality never answers the estatuto one. `Sem FBP Comunitário` is shared
+    by every country on FPB's community/cooperation list, and Portuguese
+    nationality is evidence for that status but is never evidence of Portuguese
+    basketball formation. `nationality_id` is a separate needs_review field,
+    listed whenever the form's nationality is not confirmed Portuguese at
+    adequate confidence — because SAV's type-1 wizard defaults it to Portugal,
+    leaving it unanswered files the player as Portuguese rather than leaving a
+    gap.
+
     The response always states the enrollment route so it can be confirmed
     before submit: `reg_type` (1/2) + `reg_type_label`, `inline_subida` (true
     when mod4_id is supplied → the player is also promoted right away), and a
@@ -2625,8 +2753,13 @@ def preview_enrollment(
         concelhos = client.list_concelhos(distrito_id) if distrito_id else {}
         kwargs = build_primeira_kwargs(parsed, concelhos=concelhos)
         fields, needs_review = build_primeira_preview_fields(parsed, kwargs)
+        # local_fbp_eligible is the wired-but-unused hook: nothing in this
+        # package can yet check the three-seasons-through-Sub-20 rule, and the
+        # parameter can only ever raise a review, never grant FBP.
+        estatuto_decision = resolve_estatuto(parsed, local_fbp_eligible=False)
         form["primeira_kwargs"] = kwargs
         form["primeira_concelhos"] = concelhos
+        form["estatuto_decision"] = estatuto_decision
         form["previewed"] = True
         preview = {
             "player": {
@@ -2641,6 +2774,7 @@ def preview_enrollment(
             "inline_subida": inline_subida,
             "enrollment_route": enrollment_route,
         }
+        _append_estatuto_review(preview, estatuto_decision)
         _append_minor_guardian_review(preview, kwargs.get("birth_date"))
     else:
         if license in (None, 0):
@@ -2719,9 +2853,23 @@ def add_enrollment(
     Renamed from `submit_enrollment` in 0.101.0, because that name read as
     "submit the batch" and the two operations are not interchangeable.
 
-    estatuto: the player's FBP status id. Leave unset — SAV resolves it from
-    its own stored selection or its op=151 default. Supply it only when an
-    enrolment fails saying no estatuto could be determined.
+    estatuto: the player's FBP status id (6 = FBP, 10 = Sem FBP Comunitário,
+    11 = Sem FBP Não Comunitário). `field_overrides={"estatuto": ...}` is the
+    same channel and takes precedence over this argument.
+
+    For a Revalidação, leave it unset — SAV resolves it from its own stored
+    selection or its op=151 default; supply it only when an enrolment fails
+    saying no estatuto could be determined.
+
+    For a 1ª Inscrição, preview_enrollment returns an `estatuto_decision`, and
+    this call **refuses** to commit when that decision needs review: the error
+    carries the decision's reason and the ids you may pass. That is deliberate
+    — Estatuto is a legally meaningful FPB classification, and an enrolment
+    committed under SAV's default is a wrong classification filed silently.
+
+    12 (Equiparado FBP) is refused from a caller on either channel. It is an
+    official status FPB assigns, with no box on the Modelo 1; it reaches an
+    enrolment only by already being on the player's SAV record.
 
     allow_ineligible: enroll a licence SAV does not list as revalidable.
     Recovery only, for a player stranded by a lote deleted before 0.105.0.
@@ -2854,6 +3002,17 @@ def add_enrollment(
             )
     if field_overrides:
         kwargs.update(_validate_overrides(field_overrides))
+    # `estatuto` travels as its own argument to the client, so it must not also
+    # ride in **kwargs — two channels for one parameter is a TypeError at the
+    # call. field_overrides wins over the `estatuto` argument: it is the channel
+    # preview_enrollment's needs_review list points the caller at.
+    override_estatuto = kwargs.pop("estatuto", None)
+    if override_estatuto is not None:
+        estatuto = _require_submittable_estatuto(override_estatuto)
+    elif estatuto is not None:
+        estatuto = _require_submittable_estatuto(estatuto)
+    elif reg_type == 1:
+        estatuto = _settle_primeira_estatuto(form)
     manual_exam_override = bool(
         field_overrides and field_overrides.get("exam_date") not in (None, "")
     )
