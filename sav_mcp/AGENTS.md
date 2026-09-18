@@ -195,7 +195,7 @@ The canonical pipeline. Each step's output feeds the next.
        For a minor, the four guardian fields not already carrying a value are appended to
        needs_review here so they're collected before submit. Call resolve_player explicitly
        first only when you need to show the candidate list before previewing.
-       A 1ª Inscrição also returns estatuto_decision (see below).
+       A 1ª Inscrição also reports estatuto_decision when SAV states its batch rule (see below) — reporting only, never a needs_review field.
 
 4. submit_enrollment(batch_number, license, mod1_id, field_overrides={...}, medical_exam_id?)
      → {success: true, license, source_document_upload, medical_exam_upload}
@@ -236,57 +236,57 @@ These fast paths skip parse-time OCR, not every possible OCR call. At `submit_en
 
 The `missing_guardian_fields` response from `submit_enrollment` is now a fallback only (for when a minor's guardian fields were still absent at submit time); re-call `submit_enrollment` with the added fields if you hit it.
 
-### Estatuto FBP — decided up front, never defaulted
+### Estatuto FBP — SAV decides it, we report it
 
-For a 1ª Inscrição, `preview_enrollment` returns `estatuto_decision`:
-`{value, label, source, reason, confidence, conflict, needs_review}`. `value` is
-the SAV estatuto id (6 `FBP`, 10 `Sem FBP Comunitário`, 11 `Sem FBP Não
-Comunitário`, 12 `Equiparado FBP`) or `null` when it could not be determined;
-`reason` is a sentence written to be shown to a human, so render it rather than
-paraphrasing. `source` says what decided it: `fpb` (an official status),
-`modelo1` (a marked box on the signed form), `sav_rule` (SAV's own per-batch
-rule — see below), `nationality` (which *Sem FBP* branch applies),
-`local_eligibility`, or `none`. `conflict` is `null` unless the signed form and
-SAV disagree; when set it names both sides and forces `needs_review`.
+**SAV picks the type-1 Estatuto itself and does not accept a choice from a club
+profile.** Its wizard reads the `mini` flag on the op=151 response — `mini` → 6
+(`FBP`), otherwise 10 (`Sem FBP Comunitário`) — and *disables the select* unless
+the session is a federation profile (`perfil == 2`). This package logs in as a
+club, so there is nothing here for an operator to decide.
 
-**`sav_rule` overrules a locally derived estatuto.** SAV's type-1 wizard picks
-the estatuto itself from the `mini` flag on its op=151 response — `mini` → 6
-(`FBP`), otherwise 10 (`Sem FBP Comunitário`) — and *disables the select* for
-any non-federation profile, so a club cannot choose. It is a constraint SAV
-enforces, not a guess, so it replaces a `nationality`/`local_eligibility`/`none`
-decision without review, and only the `reason` records that it did. It also
-explains a failure you would otherwise hit: in a Mini batch only estatuto 6 has
-a fee configured, so any other value dies at the fee step *after* the player
-record has already been created.
+For a 1ª Inscrição, `preview_enrollment` therefore *reports* rather than asks:
 
-A `modelo1` or `fpb` answer is **never** overwritten. If it disagrees with SAV's
-rule, `value` stays the form's and `conflict` is set, so `add_enrollment`
-refuses until a caller resolves it explicitly.
+```json
+{"value": 6, "label": "FBP", "source": "sav_rule",
+ "reason": "SAV's op=151 rule for batch '218' at tier 'Mini 10' selects
+            estatuto 6 (FBP) for this 1ª Inscrição. SAV enforces this itself —
+            the estatuto select is read-only for a club profile."}
+```
 
-**When `needs_review` is true, `add_enrollment` refuses the submission** and the
-error carries the reason. Answer it with `field_overrides={"estatuto": 6 | 10 |
-11}`, the same channel as any other `needs_review` field. This is deliberate:
-SAV will supply a default of its own, and Estatuto is a legally meaningful FPB
-classification, so a wrong one filed silently is worse than a refused call.
+`reason` is written to be shown to a human, so render it rather than
+paraphrasing. **`estatuto` is never listed in `needs_review` and
+`add_enrollment` never refuses over it.** When SAV does not state the rule, or
+it cannot be read, the `estatuto_decision` key is **omitted entirely** rather
+than guessed — the client still applies SAV's rule at commit time.
 
-12 (`Equiparado FBP`) is refused from a caller. It is an official status FPB
-assigns, with no box on the Modelo 1; it reaches an enrolment only by already
-being on the player's SAV record.
+A caller may still pass an explicit estatuto to `add_enrollment`
+(`field_overrides={"estatuto": <id>}` or the `estatuto=` argument), which takes
+precedence and skips the rule. 12 (`Equiparado FBP`) is refused from a caller:
+it is an official status FPB assigns, with no box on the Modelo 1, and reaches
+an enrolment only by already being on the player's SAV record.
 
-**`FBP` is never inferred from citizenship *by this package*.** It means
-*Formação Basquetebolística Portuguesa* — formed in Portuguese basketball — and
-a Portuguese passport is evidence for `Sem FBP Comunitário`, never for FBP. That
-rule governs `resolve_estatuto` and is unchanged. It does **not** constrain
-`sav_rule`: SAV assigns FBP to every player in a Mini batch whatever their
-nationality, which is consistent with FBP being about formation rather than
-citizenship, and a club cannot override it. So a foreign player in a Mini batch
-is filed as FBP — by SAV's rule, never by inference here. The
-reverse reading is wrong too: a `Sem FBP Comunitário` decision is shared by every
-country on FPB's community/cooperation list and is **not** an answer to "is this
-player Portuguese?". `nationality_id` is its own `needs_review` field, listed
+**After the commit the filed Estatuto is verified.** op=151's `id` is SAV's
+stored value for that player in that batch — `0` before the enrolment, the real
+id after — so the client re-reads it and raises `SavWriteUnverifiedError` if SAV
+stored something other than what was sent. That exception means *the enrolment
+is filed* and only its classification is unconfirmed; it is not a rejection and
+must not be answered by re-enrolling.
+
+**A marked Estatuto box on the Modelo 1 does not affect a type-1 enrolment.**
+SAV does not accept the choice, so honouring the box was never possible. The box
+is still written to the Modelo 1 PDF by `fill_mod1`, which is unchanged.
+
+**`FBP` is not a statement about citizenship.** It means *Formação
+Basquetebolística Portuguesa* — formed in Portuguese basketball — so SAV files
+every player in a Mini batch as FBP whatever their nationality, which is
+consistent with formation rather than passport. The reverse reading is wrong
+too: `Sem FBP Comunitário` is shared by every country on FPB's
+community/cooperation list and is **not** an answer to "is this player
+Portuguese?". `nationality_id` is its own, separate `needs_review` field, listed
 whenever the form's nationality is not confirmed Portuguese at adequate
 confidence — SAV's type-1 wizard defaults nationality to Portugal, so leaving it
-unanswered does not leave a gap in the record, it files the player as Portuguese.
+unanswered does not leave a gap in the record, it files the player as
+Portuguese.
 
 A Revalidação carries no `estatuto_decision`: SAV holds a stored selection, with
 its own op=151 default behind it.

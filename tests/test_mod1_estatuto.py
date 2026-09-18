@@ -12,8 +12,6 @@ and `estatuto` stays optional, so callers that pass none still render.
 """
 
 import pytest
-
-from sav_shared.estatuto import resolve_estatuto
 from sav_shared.fpb_mod1 import (
   MOD1_FILL_MAPPING,
   _MOD1_REQUIRED_CORE,
@@ -45,7 +43,12 @@ class TestRoundTrip:
   def test_fill_then_read_gives_back_the_same_entity(self, estatuto):
     fields = _render_and_read({"estatuto": estatuto})
 
-    assert resolve_estatuto(fields).value == estatuto
+    entity = {
+      ESTATUTO_FBP: "estatuto_fbp_fbp",
+      ESTATUTO_SEM_FBP_COMUNITARIO: "estatuto_fbp_sem_comunitario",
+      ESTATUTO_SEM_FBP_NAO_COMUNITARIO: "estatuto_fbp_sem_nao_comunitario",
+    }[estatuto]
+    assert fields[entity].value is True
 
   @pytest.mark.parametrize("estatuto", _ON_FORM)
   def test_exactly_one_box_is_ticked(self, estatuto):
@@ -98,11 +101,21 @@ class TestEquiparadoHasNoBox:
     assert "Equiparado FBP" in reason
 
   def test_local_inference_can_never_produce_it_either(self):
-    """Belt and braces with the engine's own test: the form cannot express 12,
-    so nothing that reads a form can conclude it."""
+    """The form has no box whose entity could represent Estatuto 12."""
     fields = _render_and_read({"estatuto": ESTATUTO_FBP})
 
-    assert resolve_estatuto(fields).value != ESTATUTO_EQUIPARADO_FBP
+    entity_to_estatuto = {
+      "estatuto_fbp_fbp": ESTATUTO_FBP,
+      "estatuto_fbp_sem_comunitario": ESTATUTO_SEM_FBP_COMUNITARIO,
+      "estatuto_fbp_sem_nao_comunitario": ESTATUTO_SEM_FBP_NAO_COMUNITARIO,
+    }
+    marked = {
+      entity_to_estatuto[entity]
+      for entity, field in fields.items()
+      if entity in entity_to_estatuto and field.value is True
+    }
+
+    assert ESTATUTO_EQUIPARADO_FBP not in marked
 
   def test_an_unknown_id_still_gets_the_generic_message(self):
     problems = validate_mod1_values({"estatuto": 99})

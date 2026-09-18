@@ -104,7 +104,6 @@ from sav_shared.fpb_mod4 import (
     read_detentor_signature,
 )
 from sav_shared.games import filter_games, game_sort_key
-from sav_shared.estatuto import apply_sav_batch_rule, resolve_estatuto
 from sav_shared.lookups import (
     ESTATUTO_EQUIPARADO_FBP,
     ESTATUTOS,
@@ -1579,35 +1578,50 @@ def _append_minor_guardian_review(preview: dict, birth_date: object) -> None:
         needs_review.append(kwarg)
 
 
-def _append_estatuto_review(preview: dict, decision) -> None:
-    """Add the Estatuto decision to a type-1 preview, as a row and a payload.
+def _append_estatuto_sav_rule(
+    preview: dict, client: SavClient, batch_number: str,
+) -> None:
+    """Report SAV's type-1 Estatuto rule without making it caller input.
 
-    `estatuto_decision` is the contract drive-to-sav renders (value / label /
-    source / reason / confidence / conflict / needs_review). The matching
-    `fields` row and
-    `needs_review` entry are what make it answerable: a decision that needs
-    review is supplied through `field_overrides={"estatuto": ...}`, the same
-    channel as every other reviewable field, and add_enrollment refuses the
-    submission until it is.
+    SAV chooses the type-1 Estatuto from the batch's ``mini`` flag and enforces
+    that choice for a club profile. The preview reports a stated choice only;
+    it never turns an unread or absent rule into a review requirement. A caller
+    may still supply an explicit Estatuto to ``add_enrollment``.
     """
-    preview["estatuto_decision"] = decision.to_dict()
-    row = {
+    try:
+        batch = _find_batch_by_number(client, batch_number)
+        estatuto = client.primeira_estatuto_for_batch(batch)
+    except (SavError, ValueError):
+        logger.debug(
+            "Could not read SAV's primeira estatuto rule for batch %s",
+            batch_number,
+            exc_info=True,
+        )
+        return
+    if estatuto is None:
+        return
+
+    label = ESTATUTOS[estatuto]
+    reason = (
+        f"SAV's op=151 rule for batch {batch.number!r} at tier "
+        f"{batch.tier!r} selects estatuto {estatuto} ({label}) for this "
+        "1ª Inscrição. SAV enforces this itself — the estatuto select is "
+        "read-only for a club profile."
+    )
+    preview["estatuto_decision"] = {
+        "value": estatuto,
+        "label": label,
+        "source": "sav_rule",
+        "reason": reason,
+    }
+    preview["fields"].append({
         "kwarg": "estatuto",
         "label": ENROLLMENT_FIELD_META.get("estatuto", ("estatuto", ""))[0],
         "sav_value": None,
-        "ocr_value": decision.label or None,
-        "final_value": None if decision.needs_review else decision.value,
-        "status": "needs_review" if decision.needs_review else "ocr",
-        **(
-            {"confidence": round(decision.confidence, 2)}
-            if decision.confidence is not None else {}
-        ),
-    }
-    if decision.conflict is not None:
-        row["conflict"] = decision.conflict
-    preview["fields"].append(row)
-    if decision.needs_review:
-        preview["needs_review"].append("estatuto")
+        "ocr_value": label,
+        "final_value": estatuto,
+        "status": "sav_rule",
+    })
 
 
 def _require_submittable_estatuto(value: object) -> int:
@@ -1646,43 +1660,6 @@ def _require_submittable_estatuto(value: object) -> int:
             + "."
         )
     return estatuto_id
-
-
-def _settle_primeira_estatuto(form: dict[str, Any]) -> int | None:
-    """The Estatuto to commit for a 1ª Inscrição the caller did not answer.
-
-    Reads the decision `preview_enrollment` cached on the form rather than
-    recomputing it, so what is committed is exactly what the caller was shown.
-
-    A decision that needs review is **refused**, carrying its reason: the
-    federation record would otherwise take whatever SAV's own default happens
-    to be, under a status this package could not determine. The caller answers
-    with `field_overrides={"estatuto": 6 | 10 | 11}`.
-
-    Returns None when preview never ran a decision (an older cached form), which
-    leaves the client's existing op=151 fallback in charge — the 0.105.0
-    behaviour, unchanged.
-    """
-    decision = form.get("estatuto_decision")
-    if decision is None:
-        return None
-    if decision.needs_review:
-        reason = decision.reason
-        if decision.conflict is not None:
-            reason += " " + decision.conflict
-        raise ValueError(
-            "This 1ª Inscrição has no determined Estatuto FBP, so it cannot be "
-            "committed: " + reason + " Supply one with "
-            'field_overrides={"estatuto": <id>} — '
-            + ", ".join(
-                f"{k}={v!r}" for k, v in ESTATUTOS.items()
-                if k != ESTATUTO_EQUIPARADO_FBP
-            )
-            + ". An official "
-            + ESTATUTOS[ESTATUTO_EQUIPARADO_FBP]
-            + " status must come from FPB and cannot be asserted here."
-        )
-    return decision.value
 
 
 def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> dict:
@@ -2673,23 +2650,19 @@ def preview_enrollment(
     supplied, the response also includes a `medical_exam` sidecar with the
     parsed step-3 exam metadata.
 
-    1ª Inscrição also returns `estatuto_decision` — ``{value, label, source,
-    reason, confidence, needs_review}`` — the determined Estatuto FBP and the
-    evidence behind it. `reason` is a full sentence written to be shown to a
-    human. The decision is cached alongside the form, so add_enrollment commits
-    exactly what was previewed; when `needs_review` is true it also appears in
-    `needs_review` and add_enrollment refuses the submission until
-    `field_overrides={"estatuto": 6 | 10 | 11}` answers it.
+    1ª Inscrição reports `estatuto_decision` when SAV states its batch rule —
+    ``{value, label, source, reason}`` — so the caller can see what SAV will
+    file. `reason` is a full sentence written to be shown to a human. This is
+    reporting only: SAV decides and enforces the Estatuto, the Estatuto field
+    is never added to `needs_review`, and an explicit caller value remains
+    available through `add_enrollment`.
 
-    Note that `estatuto_decision` never answers the nationality question and
-    nationality never answers the estatuto one. `Sem FBP Comunitário` is shared
-    by every country on FPB's community/cooperation list, and Portuguese
-    nationality is evidence for that status but is never evidence of Portuguese
-    basketball formation. `nationality_id` is a separate needs_review field,
-    listed whenever the form's nationality is not confirmed Portuguese at
-    adequate confidence — because SAV's type-1 wizard defaults it to Portugal,
-    leaving it unanswered files the player as Portuguese rather than leaving a
-    gap.
+    If SAV does not state the batch rule or the rule cannot be read, the
+    `estatuto_decision` key is omitted rather than guessed. `nationality_id` is
+    a separate needs_review field, listed whenever the form's nationality is
+    not confirmed Portuguese at adequate confidence — because SAV's type-1
+    wizard defaults it to Portugal, leaving it unanswered files the player as
+    Portuguese rather than leaving a gap.
 
     The response always states the enrollment route so it can be confirmed
     before submit: `reg_type` (1/2) + `reg_type_label`, `inline_subida` (true
@@ -2768,30 +2741,8 @@ def preview_enrollment(
         concelhos = client.list_concelhos(distrito_id) if distrito_id else {}
         kwargs = build_primeira_kwargs(parsed, concelhos=concelhos)
         fields, needs_review = build_primeira_preview_fields(parsed, kwargs)
-        # local_fbp_eligible is the wired-but-unused hook: nothing in this
-        # package can yet check the three-seasons-through-Sub-20 rule, and the
-        # parameter can only ever raise a review, never grant FBP.
-        estatuto_decision = resolve_estatuto(parsed, local_fbp_eligible=False)
-        try:
-            batch = _find_batch_by_number(client, batch_number)
-            mini = client.primeira_estatuto_mini_flag(batch)
-        except (SavError, ValueError):
-            logger.debug(
-                "Could not read SAV's primeira estatuto mini flag for batch %s",
-                batch_number,
-                exc_info=True,
-            )
-        else:
-            if mini is not None:
-                estatuto_decision = apply_sav_batch_rule(
-                    estatuto_decision,
-                    mini=mini,
-                    batch_number=batch.number,
-                    tier=batch.tier,
-                )
         form["primeira_kwargs"] = kwargs
         form["primeira_concelhos"] = concelhos
-        form["estatuto_decision"] = estatuto_decision
         form["previewed"] = True
         preview = {
             "player": {
@@ -2806,7 +2757,7 @@ def preview_enrollment(
             "inline_subida": inline_subida,
             "enrollment_route": enrollment_route,
         }
-        _append_estatuto_review(preview, estatuto_decision)
+        _append_estatuto_sav_rule(preview, client, batch_number)
         _append_minor_guardian_review(preview, kwargs.get("birth_date"))
     else:
         if license in (None, 0):
@@ -2893,11 +2844,11 @@ def add_enrollment(
     selection or its op=151 default; supply it only when an enrolment fails
     saying no estatuto could be determined.
 
-    For a 1ª Inscrição, preview_enrollment returns an `estatuto_decision`, and
-    this call **refuses** to commit when that decision needs review: the error
-    carries the decision's reason and the ids you may pass. That is deliberate
-    — Estatuto is a legally meaningful FPB classification, and an enrolment
-    committed under SAV's default is a wrong classification filed silently.
+    For a 1ª Inscrição, preview_enrollment reports the Estatuto SAV will file
+    from its batch rule. The report never blocks submission and is not cached as
+    a caller decision: when neither channel supplies `estatuto`, leaving it
+    unset lets the client's op=151 rule apply at commit time. A caller may
+    still override it explicitly through either channel.
 
     12 (Equiparado FBP) is refused from a caller on either channel. It is an
     official status FPB assigns, with no box on the Modelo 1; it reaches an
@@ -3036,15 +2987,13 @@ def add_enrollment(
         kwargs.update(_validate_overrides(field_overrides))
     # `estatuto` travels as its own argument to the client, so it must not also
     # ride in **kwargs — two channels for one parameter is a TypeError at the
-    # call. field_overrides wins over the `estatuto` argument: it is the channel
-    # preview_enrollment's needs_review list points the caller at.
+    # call. field_overrides wins over the `estatuto` argument. When neither is
+    # supplied, leave it as None so SAV's own op=151 rule applies at commit.
     override_estatuto = kwargs.pop("estatuto", None)
     if override_estatuto is not None:
         estatuto = _require_submittable_estatuto(override_estatuto)
     elif estatuto is not None:
         estatuto = _require_submittable_estatuto(estatuto)
-    elif reg_type == 1:
-        estatuto = _settle_primeira_estatuto(form)
     manual_exam_override = bool(
         field_overrides and field_overrides.get("exam_date") not in (None, "")
     )

@@ -21,6 +21,85 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.109.0 — 2026-09-18
+
+0.108.0 taught this package SAV's Estatuto rule. This removes everything that
+existed to second-guess it.
+
+SAV's type-1 wizard reads the `mini` flag on its op=151 response — `mini == 1`
+→ 6 (FBP), otherwise 10 (Sem FBP Comunitário) — and **disables the Estatuto
+select unless the session is a federation profile** (`perfil == 2`). This
+package logs in as a club (`perfil: 4`), so SAV decides and no operator here can
+choose. The OCR/nationality decision engine, its review prompts, its conflict
+field and the refusal to commit all existed to support a choice SAV does not
+accept from us — and the engine placed Portugal on the community list, so it
+resolved a Portuguese child to the one estatuto with no fee in a Mini batch and
+killed the enrolment *after* the person record had been created.
+
+### Removed
+
+**The Estatuto decision engine**
+`IMPACT: raises` — `sav_shared.estatuto` no longer exports `EstatutoDecision`,
+`resolve_estatuto`, `apply_sav_batch_rule`, `ESTATUTO_OCR_ENTITY` or any
+`SOURCE_*` constant. Importing them raises `ImportError`.
+`DETECT:` `grep -rn "resolve_estatuto\|EstatutoDecision\|SOURCE_MODELO1" .`
+`FIX:` read `estatuto_decision` off the preview instead, or call
+`SavClient.primeira_estatuto_for_batch(batch)` for SAV's answer directly.
+**Kept in the same module**: `LOW_CONFIDENCE`, `is_portuguese_nationality`,
+`resolve_country`, `nationality_branch` and the FPB country lists. They serve
+the `nationality_id` review, which is a *different field* and is unchanged.
+
+**`SavClient._load_estatuto_default`** — dead since before 0.108.0; the type-2
+path calls `_estatuto_default_from` directly.
+
+### Changed
+
+**`estatuto` is never a `needs_review` field, and `add_enrollment` never refuses
+over it**
+`IMPACT: silent` — a call that used to raise `ValueError` ("no determined
+Estatuto FBP … supply one with `field_overrides`") now enrols. `preview_enrollment`
+no longer lists `"estatuto"` in `needs_review`.
+`DETECT:` grep your code for `"estatuto"` in `needs_review` handling, and for
+catches around `add_enrollment` mentioning Estatuto.
+`FIX:` delete the prompt. Nothing needs answering; SAV decides.
+
+**`estatuto_decision` is reduced to a report**
+`IMPACT: raises` — the shape is now `{value, label, source, reason}` with
+`source` always `"sav_rule"`. The keys `needs_review`, `conflict` and
+`confidence` are **gone**, and the whole key is **omitted** when SAV does not
+state the rule or it cannot be read. The `fields` row for estatuto carries
+`status: "sav_rule"`.
+`DETECT:` grep for `estatuto_decision` and any read of its removed keys.
+`FIX:` render `reason`; stop branching on `needs_review`. Use
+`.get("estatuto_decision")` — it may be absent.
+
+**A marked Estatuto box on the Modelo 1 no longer affects a type-1 enrolment**
+`IMPACT: silent` — this reverses the conflict behaviour added earlier in
+0.108.0. SAV does not accept an Estatuto choice from a club profile, so a box
+disagreeing with SAV's rule could never be honoured; the conflict it raised was
+unanswerable except by overriding back to SAV's value. `fill_mod1` still writes
+the box to the PDF, unchanged.
+
+### Added
+
+**The filed Estatuto is verified after the commit**
+op=151's `id` is SAV's *stored* Estatuto for a player in a batch — `0` before
+the enrolment, the real id after — so it is only readable once the commit has
+landed. The client re-reads it and raises `SavWriteUnverifiedError` when SAV
+stored something other than what was sent, or returned no usable id. As with
+the `check_menor_idade` check, that exception means **the enrolment is filed**
+and only its classification is unconfirmed — it is not a rejection, so do not
+answer it by re-enrolling. Costs one op=151 request per type-1 enrolment.
+
+- `SavClient.primeira_estatuto_for_batch(batch) -> int | None` — SAV's Estatuto
+  for a batch, or `None` when SAV did not state `mini`. Needs no player.
+
+### Fixed
+
+`tests/test_estatuto_decision.py` had a broken `from tests.…` import that failed
+on a clean tree, so the offline suite was never actually green. It is fixed, and
+the suite now passes with zero failures.
+
 ## 0.108.0 — 2026-09-18
 
 A 1ª Inscrição died at the fee step — `No taxa options for primeira batch

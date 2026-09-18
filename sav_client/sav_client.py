@@ -5334,23 +5334,6 @@ class SavClient:
       if int(val) > 0
     }
 
-  def _load_estatuto_default(
-    self, batch: PlayerRegistrationBatch, userid: int,
-  ) -> int | None:
-    """SAV's own estatuto pick for this player, or None if it offers no view.
-
-    This is the fallback the browser uses and this client did not: for any
-    batch type other than 1 the step-3 handler selects ``res['id']`` straight
-    from op=151, and only overrides it when op=31's prefill estatuto is
-    non-empty. Verified live on 2026-09-13 against batch 632884 (type 2),
-    where op=151 answered ``id='6'`` (FBP) for two players and ``id='10'``
-    (Sem FBP Comunitário) for a third — a per-player value, not a constant.
-
-    Falls back to a lone real option when SAV returns no usable ``id``.
-    """
-    data = self._load_estatuto_options(batch, userid, batch.type_id)
-    return self._estatuto_default_from(data, self._parse_estatuto_options(data))
-
   @staticmethod
   def _as_estatuto_id(value: Any) -> int | None:
     """``value`` as a real estatuto id, or None if it is not one.
@@ -5444,6 +5427,20 @@ class SavClient:
     )
 
   @staticmethod
+  def _estatuto_for_mini(mini: bool) -> int:
+    """SAV's type-1 estatuto choice for a stated ``mini`` flag."""
+    return ESTATUTO_FBP if mini else ESTATUTO_SEM_FBP_COMUNITARIO
+
+  def primeira_estatuto_for_batch(
+    self, batch: PlayerRegistrationBatch,
+  ) -> int | None:
+    """Return SAV's type-1 estatuto choice for a batch, if stated."""
+    mini = self._mini_from(
+      self._load_estatuto_options(batch, 0, _REGISTRATIONS_TYPE_PRIMEIRA)
+    )
+    return None if mini is None else self._estatuto_for_mini(mini)
+
+  @staticmethod
   def _mini_from(data: dict[str, Any]) -> bool | None:
     """SAV's ``mini`` flag out of an op=151 response already fetched.
 
@@ -5477,7 +5474,7 @@ class SavClient:
     Type-2 does *not* share this path: op=151 returns all four options for a
     Revalidação too, so the sole-option rule never fires there. The
     Revalidação default comes from the response's ``id`` instead — see
-    _load_estatuto_default.
+    _estatuto_default_from.
     """
     # One op=151 serves both the flag and the options — the flag is batch-level
     # (the response does not vary by userid), so fetching it separately would
@@ -5488,7 +5485,7 @@ class SavClient:
     options = self._parse_estatuto_options(data)
     mini = self._mini_from(data)
     if mini is not None:
-      chosen = ESTATUTO_FBP if mini else ESTATUTO_SEM_FBP_COMUNITARIO
+      chosen = self._estatuto_for_mini(mini)
       if chosen not in options:
         listing = ", ".join(
           f"{i}={n!r}" for i, n in sorted(options.items())
@@ -5937,6 +5934,30 @@ class SavClient:
           f"minor={is_minor!r}; the write completed with conflicting "
           "minor-status values."
         )
+    # Estatuto postcondition. op=151's ``id`` is SAV's *stored* estatuto for
+    # this player in this batch — 0 before the commit, the real id after — so
+    # it is only readable here, and it is the one check that can catch SAV
+    # filing a different classification from the one we sent. Checked after
+    # the guardian gate above because that gate is the safety-critical one:
+    # if both are wrong, an unaccompanied minor is the failure worth naming.
+    committed_estatuto = self._as_estatuto_id(
+      self._load_estatuto_options(
+        batch, userid, _REGISTRATIONS_TYPE_PRIMEIRA,
+      ).get("id")
+    )
+    if committed_estatuto is None:
+      raise SavWriteUnverifiedError(
+        f"Primeira commit for userid={userid} in batch {batch.id} succeeded, "
+        f"but SAV returned no usable estatuto id; the enrolment is filed and "
+        f"the classification sent={estatuto} could not be confirmed."
+      )
+    if committed_estatuto != estatuto:
+      raise SavWriteUnverifiedError(
+        f"Primeira commit for userid={userid} in batch {batch.id} succeeded, "
+        f"but SAV stored estatuto={committed_estatuto} instead of sent "
+        f"estatuto={estatuto}; the enrolment is filed with an unconfirmed "
+        "classification."
+      )
     logger.info(
       "Created primeira-inscrição player %r (userid=%s) in batch %s — "
       "result: %s",

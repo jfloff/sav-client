@@ -937,6 +937,27 @@ class TestPrimeiraEstatutoRule:
 
     assert client._load_primeira_estatuto(_PrimeiraEstatutoBatch(), 277534) == expected
 
+  @pytest.mark.parametrize(
+    "mini, expected",
+    [(1, 6), (0, 10), (None, None)],
+  )
+  def test_primeira_batch_rule_maps_stated_mini_flags(
+    self, monkeypatch, mini, expected,
+  ):
+    response = self._response(mini=mini)
+    if mini is None:
+      response["mini"] = None
+    client, _ = self._client(monkeypatch, [response])
+
+    assert client.primeira_estatuto_for_batch(_PrimeiraEstatutoBatch()) == expected
+
+  def test_primeira_batch_rule_returns_none_when_mini_is_absent(self, monkeypatch):
+    response = self._response(mini=1)
+    response.pop("mini")
+    client, _ = self._client(monkeypatch, [response])
+
+    assert client.primeira_estatuto_for_batch(_PrimeiraEstatutoBatch()) is None
+
   @pytest.mark.parametrize("mini_field", [None, "absent"])
   def test_null_or_absent_mini_uses_the_legacy_sole_option(
     self, monkeypatch, mini_field,
@@ -1073,12 +1094,25 @@ class TestPrimeiraInscricao:
       lambda u, prefer_tier_id=None: subida_tier,
     )
 
-    # Modal-open op=15 hits self._http.get — stub the transport entirely.
+    # Modal-open op=15 and the post-commit op=151 read-back hit the transport.
+    # This is the real op=151 shape from production batch 634571: before an
+    # enrolment SAV returns id=0; after the commit the stored id is 6.
+    op151 = {
+      "estatutos": PRIMEIRA_ESTATUTO_OPTIONS,
+      "mini": 1,
+      "nacional": "155",
+      "id": "6",
+    }
     monkeypatch.setattr(
       client, "_http",
-      type("H", (), {"get": lambda self, *a, **k: type("R", (), {
-        "text": "1", "raise_for_status": lambda self: None,
-      })()})(),
+      type("H", (), {
+        "get": lambda self, *a, **k: type("R", (), {
+          "text": "1", "raise_for_status": lambda self: None,
+        })(),
+        "post": lambda self, *a, **k: type("R", (), {
+          "text": json.dumps(op151), "raise_for_status": lambda self: None,
+        })(),
+      })(),
     )
 
     captured = {}
@@ -1107,6 +1141,66 @@ class TestPrimeiraInscricao:
     assert body["taxa"] == "1052"
     assert body["estatuto"] == "6"
     assert body["dataexame"] == RECENT_EXAM_DATE
+
+  def test_matching_estatuto_readback_confirms_the_commit(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+
+    assert client.add_player_to_registration_batch(629084, **self.REQUIRED) == 277534
+
+  def test_different_estatuto_readback_is_unverified_after_invalidation(
+    self, monkeypatch,
+  ):
+    client, _ = self._stub_primeira(monkeypatch)
+    events = []
+
+    def commit(body):
+      events.append("commit")
+      return {"val": 1, "msg": "", "resultexame": "2026-09-30"}
+
+    def readback(batch, userid, tipo):
+      events.append("readback")
+      return {
+        "estatutos": PRIMEIRA_ESTATUTO_OPTIONS,
+        "mini": 1,
+        "nacional": "155",
+        "id": "10",
+      }
+
+    monkeypatch.setattr(client, "_primeira_commit", commit)
+    monkeypatch.setattr(client, "_load_estatuto_options", readback)
+    monkeypatch.setattr(
+      client, "_invalidate_batch_memo", lambda: events.append("invalidate"),
+    )
+
+    with pytest.raises(SavWriteUnverifiedError) as excinfo:
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+    message = str(excinfo.value)
+    assert "stored estatuto=10" in message
+    assert "sent estatuto=6" in message
+    assert events == ["commit", "invalidate", "readback"]
+
+  @pytest.mark.parametrize("stored_id", [0, "", "absent"])
+  def test_unusable_estatuto_readback_is_unverified(
+    self, monkeypatch, stored_id,
+  ):
+    client, _ = self._stub_primeira(monkeypatch)
+
+    def readback(batch, userid, tipo):
+      data = {
+        "estatutos": PRIMEIRA_ESTATUTO_OPTIONS,
+        "mini": 1,
+        "nacional": "155",
+        "id": stored_id,
+      }
+      if stored_id == "absent":
+        data.pop("id")
+      return data
+
+    monkeypatch.setattr(client, "_load_estatuto_options", readback)
+
+    with pytest.raises(SavWriteUnverifiedError, match="no usable estatuto id"):
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
 
   def test_inline_subida_populates_tier(self, monkeypatch):
     client, captured = self._stub_primeira(monkeypatch, subida_tier=(3, "Sub 16"))

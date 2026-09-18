@@ -200,7 +200,10 @@ class TestOp151Parsing:
       },
     )
 
-    assert client._load_estatuto_default(_Batch(), 1234) == 6
+    data = client._load_estatuto_options(_Batch(), 1234, _Batch.type_id)
+    options = client._parse_estatuto_options(data)
+
+    assert client._estatuto_default_from(data, options) == 6
 
   def test_four_options_and_no_id_means_no_default(self, client, monkeypatch):
     """Why _load_primeira_estatuto cannot simply be reused for Revalidação:
@@ -211,4 +214,7 @@ class TestOp151Parsing:
       lambda batch, userid, tipo: OP151_NO_DEFAULT,
     )
 
-    assert client._load_estatuto_default(_Batch(), 1234) is None
+    data = client._load_estatuto_options(_Batch(), 1234, _Batch.type_id)
+    options = client._parse_estatuto_options(data)
+
+    assert client._estatuto_default_from(data, options) is None
