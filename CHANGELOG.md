@@ -21,6 +21,69 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.107.0 — 2026-09-17
+
+The 1ª Inscrição duplicate guard rejected players who hold no licence at all,
+and routed the caller to a Revalidação that cannot be performed — there is no
+licence to revalidate. Three real players were stuck that way, unable to enrol
+by any route.
+
+`op=11` answers two questions with one flag. `existe` means "a person with this
+identifying data is on file"; `inscricaovalida` means "that person holds a valid
+enrolment". This package read only `existe`. Across 23 real candidates plus 3
+controls, `inscricaovalida` separated the two cases without a single exception.
+
+### Changed
+
+**`existe:1` + `inscricaovalida:0` now enrols instead of failing**
+`IMPACT: silent` — a call that used to raise `SavResponseError` now succeeds.
+`add_player_to_registration_batch` reuses the existing person record, skipping
+op=12 and op=20, and returns that pre-existing SAV `userid` rather than a newly
+minted one. `resolve_player` / `preview_enrollment` return an ordinary
+`{resolved: true}` where they previously returned
+`{error: "player_already_in_sav"}`.
+`DETECT:` grep your code for `player_already_in_sav`, and for `except
+SavResponseError` around `add_player_to_registration_batch`.
+`FIX:` nothing to change if you treated the error as "this player can't be
+enrolled here". If you relied on it to mean "this person is new to SAV", that
+inference was never sound and is now wrong — the returned `userid` may name a
+record that predates your call.
+
+**A reused person's address is not updated**
+`IMPACT: silent` — `morada`, `cod_postal`, `distrito_id`, `concelho_id`,
+`localidade_txt` and `country_id` are ignored when an existing record is reused;
+the player keeps whatever address SAV already holds. op=20 is a bare `INSERT`
+primary-keyed by userid and returns a duplicate-key PHP fatal for anyone who
+already has an address row (confirmed against production: `Duplicate entry
+'278342' for key 'PRIMARY'`), and no address-update op is known. The parameters
+stay required because the caller cannot know in advance whether reuse applies.
+`DETECT:` grep your logs for `address fields are ignored` — a WARNING names the
+dropped fields on every reuse.
+`FIX:` none available in this release. Verify the stored address separately if
+it matters.
+
+**The minor gate derives its own answer on the reuse path**
+Skipping op=20 removes its `menor_idade` flag, so reuse derives minor status
+from the birth date via `player_is_minor` and fails closed — an underivable age
+counts as a minor rather than opening the gate. op=27's `check_menor_idade` is
+then compared against that derivation; a disagreement, or an absent flag, raises
+`SavWriteUnverifiedError`. That exception means **the enrolment is filed** and
+only its guardian gating is unconfirmed — it is not a rejection, so do not
+re-enrol on seeing it.
+
+### Added
+
+- `sav_shared.enrollment.classify_primeira_duplicate` → `PrimeiraDuplicate`
+  (`existing_id`, `blocking`, `reusable`). The client wizard and the MCP
+  resolver share it, so a preview and its commit cannot disagree. A missing
+  `inscricaovalida` is treated as blocking: fail closed if SAV changes shape.
+  There is deliberately no `atleta` fallback for `existing_id` — `atleta` is a
+  boolean flag reading `1` on every real response, so using it as a userid would
+  enrol person id 1.
+- `sav_shared.flags.decode_sav_flag` — `_decode_sav_flag` moved out of
+  `sav_client.sav_client` so `sav_shared` can decode SAV's flags too. The
+  client keeps `_decode_sav_flag` as an alias; no call site changed.
+
 ## 0.106.0 — 2026-09-16
 
 0.105.0 fixed how the step-3 commit *settles* an estatuto. Nothing upstream of

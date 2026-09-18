@@ -256,6 +256,27 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
   assert "name or NIF search" in result["reason"]
 
 
+def test_preview_license_null_primeira_orphan_resolves(monkeypatch):
+  class StubClient:
+    def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
+      assert (gender_id, birth_date, id_number) == (1, "2015-03-01", "12345678")
+      return {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      }
+
+  parsed = {
+    "nome_completo": ParsedField(value="Player B", confidence=0.99),
+    "data_nascimento": ParsedField(value="2015-03-01", confidence=0.99),
+    "num_doc_identificacao": ParsedField(value="12345678", confidence=0.99),
+  }
+  result = server_module._resolve_primeira_player(StubClient(), {"parsed": parsed})
+
+  assert result["resolved"] is True
+  assert "error" not in result
+
+
 def test_preview_explicit_license_skips_resolution(monkeypatch):
   """With an explicit licence the resolution machinery must never run — the
   stub client deliberately lacks the listing/eligibility methods."""

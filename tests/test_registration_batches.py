@@ -13,6 +13,8 @@ from sav_client.exceptions import (
 )
 from sav_client.models import PlayerRegistrationBatch
 from sav_client.sav_client import _coerce_exam_date
+from sav_mcp import server as server_module
+from sav_parsers.types import ParsedField
 
 # SAV rejects an exam date outside its validity window (exam date + 12 months),
 # and `_coerce_exam_date` now enforces both bounds. A literal date would quietly
@@ -1046,6 +1048,304 @@ class TestPrimeiraInscricao:
     )
     with pytest.raises(SavResponseError, match="already exists in SAV"):
       client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+  def test_licensed_duplicate_player_raises(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 1, "existe": 1,
+        "id": "226686", "tipo": "1", "atleta": 1, "nacional": "155",
+      },
+    )
+
+    with pytest.raises(SavResponseError, match="already exists in SAV"):
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+  def test_no_duplicate_still_calls_create_and_address_writes(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    create_player = Mock(return_value=277534)
+    save_step2 = Mock(return_value={"val": 1, "menor_idade": 0})
+    monkeypatch.setattr(client, "_create_primeira_player", create_player)
+    monkeypatch.setattr(client, "_save_primeira_step2", save_step2)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {"existe": 0, "inscricaovalida": 0},
+    )
+
+    result = client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+    assert result == 277534
+    create_player.assert_called_once()
+    save_step2.assert_called_once()
+    assert save_step2.call_args.kwargs["userid"] == 277534
+
+  def test_reusable_orphan_skips_create_and_address_writes(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      },
+    )
+    monkeypatch.setattr(
+      client, "_create_primeira_player",
+      lambda **kw: pytest.fail("op=12 must not run for a reusable person"),
+    )
+    monkeypatch.setattr(
+      client, "_save_primeira_step2",
+      lambda **kw: pytest.fail("op=20 must not run for a reusable person"),
+    )
+    monkeypatch.setattr(
+      client, "_primeira_commit",
+      lambda body: (
+        captured.update(body=body),
+        {
+          "val": 1, "msg": "", "check_menor_idade": 1, "age": 8,
+          "modal": "", "footer": "", "resultexame": "2027/09/30",
+        },
+      )[1],
+    )
+    values = {
+      **self.REQUIRED,
+      "birth_date": "2018-01-01",
+      "guardian_name": "Pai",
+      "guardian_relation": 1,
+      "guardian_phone": "963000000",
+      "guardian_email": "p@e.pt",
+    }
+
+    result = client.add_player_to_registration_batch(629084, **values)
+
+    assert result == 278342
+    assert captured["body"]["userid"] == 278342
+
+  def test_reusable_without_id_raises_instead_of_reusing(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      },
+    )
+
+    with pytest.raises(SavResponseError, match="no userid"):
+      client.add_player_to_registration_batch(629084, **self.REQUIRED)
+
+  def test_reusable_minor_requires_guardian_without_step2_flag(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      },
+    )
+    monkeypatch.setattr(
+      client, "_create_primeira_player",
+      lambda **kw: pytest.fail("op=12 must not run for a reusable person"),
+    )
+    monkeypatch.setattr(
+      client, "_save_primeira_step2",
+      lambda **kw: pytest.fail("op=20 must not run for a reusable person"),
+    )
+    values = {**self.REQUIRED, "birth_date": "2018-01-01"}
+
+    with pytest.raises(SavConfigError, match="guardian_name"):
+      client.add_player_to_registration_batch(629084, **values)
+
+  def test_unparseable_reusable_birth_date_still_requires_guardian(self, monkeypatch):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      },
+    )
+    monkeypatch.setattr(
+      client, "_create_primeira_player",
+      lambda **kw: pytest.fail("op=12 must not run for a reusable person"),
+    )
+    monkeypatch.setattr(
+      client, "_save_primeira_step2",
+      lambda **kw: pytest.fail("op=20 must not run for a reusable person"),
+    )
+    values = {
+      **self.REQUIRED,
+      "birth_date": "not-a-date",
+      "telemovel": None,
+      "telefone": None,
+      "nationality_id": 155,
+      "naturalidade_id": 155,
+      "nome_pai": None,
+      "nome_mae": None,
+      "country_id": 155,
+      "localidade_txt": "",
+      "taxa_id": None,
+      "estatuto": None,
+      "promote_to_tier_id": None,
+      "inline_subida": False,
+      "guardian_name": None,
+      "guardian_relation": None,
+      "guardian_phone": None,
+      "guardian_email": None,
+      "consent_data": True,
+      "consent_communications": True,
+      "consent_marketing": False,
+    }
+    batch = client.list_player_registration_batches()[0]
+
+    with pytest.raises(SavConfigError, match="guardian_name"):
+      client._add_player_to_primeira_batch(batch, **values)
+
+  def test_reused_minor_commit_mismatch_invalidates_memo_before_raising(
+    self, monkeypatch,
+  ):
+    client, captured = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate",
+      lambda **kw: {
+        "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+        "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+        "naturalidade": None, "profissao": None,
+      },
+    )
+    monkeypatch.setattr(
+      client, "_create_primeira_player",
+      lambda **kw: pytest.fail("op=12 must not run for a reusable person"),
+    )
+    monkeypatch.setattr(
+      client, "_save_primeira_step2",
+      lambda **kw: pytest.fail("op=20 must not run for a reusable person"),
+    )
+    events = []
+    monkeypatch.setattr(client, "_invalidate_batch_memo", lambda: events.append("invalidate"))
+
+    def commit(body):
+      captured["body"] = body
+      events.append("commit")
+      return {
+        "val": 1, "msg": "", "check_menor_idade": 0, "age": 8,
+        "modal": "", "footer": "", "resultexame": "2027/09/30",
+      }
+
+    monkeypatch.setattr(client, "_primeira_commit", commit)
+    values = {
+      **self.REQUIRED,
+      "birth_date": "2018-01-01",
+      "guardian_name": "Pai",
+      "guardian_relation": 1,
+      "guardian_phone": "963000000",
+      "guardian_email": "p@e.pt",
+    }
+
+    with pytest.raises(SavWriteUnverifiedError, match="conflicting minor-status"):
+      client.add_player_to_registration_batch(629084, **values)
+
+    assert captured["body"]["userid"] == 278342
+    assert events == ["commit", "invalidate"]
+
+  def test_reused_commit_without_minor_flag_is_unverified_not_rejected(
+    self, monkeypatch,
+  ):
+    """An absent check_menor_idade must not read as a rejected request.
+
+    The commit has already landed by then, so telling the caller their
+    request failed — while the player sits on the federation's register —
+    is the one answer that would send them to re-enrol a filed player.
+    """
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate", lambda **kw: self.ORPHAN,
+    )
+    monkeypatch.setattr(
+      client, "_primeira_commit",
+      lambda body: {"val": 1, "msg": "", "resultexame": "2027/09/30"},
+    )
+    values = {
+      **self.REQUIRED,
+      "birth_date": "2018-01-01",
+      "guardian_name": "Pai",
+      "guardian_relation": 1,
+      "guardian_phone": "963000000",
+      "guardian_email": "p@e.pt",
+    }
+
+    with pytest.raises(SavWriteUnverifiedError, match="no 'check_menor_idade'"):
+      client.add_player_to_registration_batch(629084, **values)
+
+  # The preview and the commit must never disagree about whether a player is a
+  # duplicate: a preview that says "go ahead" followed by a commit that raises
+  # (or the reverse) is the failure mode `classify_primeira_duplicate` exists to
+  # prevent. Both directions are checked — the reusable one is the case that
+  # actually regressed, where the commit enrols but the preview refuses.
+  LICENSED = {
+    "proximopassoexiste": 0, "inscricaovalida": 1, "existe": 1,
+    "id": "226686", "tipo": "1", "atleta": 1, "nacional": "155",
+  }
+  ORPHAN = {
+    "proximopassoexiste": 0, "inscricaovalida": 0, "existe": 1,
+    "id": "278342", "tipo": "1", "atleta": 1, "nacional": "155",
+    "naturalidade": None, "profissao": None,
+  }
+
+  @pytest.mark.parametrize(
+    "payload, expect_blocked",
+    [(LICENSED, True), (ORPHAN, False)],
+    ids=["licensed-duplicate", "reusable-orphan"],
+  )
+  def test_client_and_mcp_agree_on_the_same_payload(
+    self, monkeypatch, payload, expect_blocked,
+  ):
+    client, _ = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(
+      client, "_check_primeira_player_duplicate", lambda **kw: payload,
+    )
+    monkeypatch.setattr(
+      client, "_primeira_commit",
+      lambda body: {
+        "val": 1, "msg": "", "check_menor_idade": 1, "age": 8,
+        "modal": "", "footer": "", "resultexame": "2027/09/30",
+      },
+    )
+    values = {
+      **self.REQUIRED,
+      "birth_date": "2018-01-01",
+      "guardian_name": "Pai",
+      "guardian_relation": 1,
+      "guardian_phone": "963000000",
+      "guardian_email": "p@e.pt",
+    }
+
+    try:
+      client.add_player_to_registration_batch(629084, **values)
+      client_blocked = False
+    except SavResponseError as exc:
+      assert "already exists in SAV" in str(exc)
+      client_blocked = True
+
+    class StubClient:
+      def _check_primeira_player_duplicate(self, **kw):
+        return payload
+
+    form = {
+      "parsed": {
+        "data_nascimento": ParsedField(value="2018-01-01", confidence=0.99),
+        "num_doc_identificacao": ParsedField(value="12345699", confidence=0.99),
+      },
+    }
+    resolution = server_module._resolve_primeira_player(StubClient(), form)
+    mcp_blocked = resolution.get("error") == "player_already_in_sav"
+
+    assert client_blocked is expect_blocked
+    assert mcp_blocked is expect_blocked
 
 
 # ─── live read-only ─────────────────────────────────────────────────────────

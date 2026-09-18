@@ -325,6 +325,8 @@ Batches ("Lotes" / "Guias de Inscrição") group player registration requests of
 `add_player_to_registration_batch()` dispatches by registration type:
 
 - **Type 1 — 1ª Inscrição:** requires the new-player demographic, identity-document, and address fields (`name`, `birth_date`, `gender_id`, `nif`, `id_type`, `id_number`, `id_expiry`, `email`, `morada`, `cod_postal`, `distrito_id`, and `concelho_id`). The `license` argument is ignored. It creates the SAV player and returns the new internal SAV `userid`.
+
+  **A type-1 enrolment does not always create a person.** When op=11 reports `existe:1` with `inscricaovalida:0` — someone on file from a wizard run that died before its commit — the existing record is reused and op=12/op=20 are both skipped. The returned `userid` is then that pre-existing id, not a new one. **The address fields are silently ignored on that path**: op=20 is a bare INSERT primary-keyed by userid, so it raises a duplicate-key fatal for anyone who already has an address row, and no address-update op is known. The player keeps whatever address SAV already holds. A WARNING naming the ignored fields is logged when this happens.
 - **Type 2 — Revalidação:** requires an existing `license` eligible for the batch, or a licence already enrolled in it when updating that enrolment. It returns the player's internal SAV2 id.
 - **Type 4 — Subida:** requires an existing `license` eligible for the standalone Subida batch; all kwargs other than `taxa_id` are ignored. It returns the player's licence.
 

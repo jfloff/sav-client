@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Mapping
 
 from sav_client.exceptions import SavError
 
 from .estatuto import LOW_CONFIDENCE, is_portuguese_nationality
 from .fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
+from .flags import decode_sav_flag
 from .text import normalise_text
 
 logger = logging.getLogger(__name__)
@@ -60,6 +62,60 @@ REGISTRATION_TYPE_SUBIDA = 4
 # payload). Drives the portuguese-vs-foreign-born split in
 # `compute_enrollment_checklist`.
 PORTUGAL_NATIONALITY_ID = 155
+
+
+@dataclass(frozen=True)
+class PrimeiraDuplicate:
+  """The duplicate decision for one SAV 1ª Inscrição probe response.
+
+  ``existing_id`` is SAV's person id, or ``None`` when the response carries
+  none. ``blocking`` and ``reusable`` are mutually exclusive, and both are
+  false when ``existe`` is false. See ``classify_primeira_duplicate`` for the
+  rule that produces them.
+  """
+
+  existing_id: int | None
+  blocking: bool
+  reusable: bool
+
+
+def classify_primeira_duplicate(dup: Mapping[str, Any]) -> PrimeiraDuplicate:
+  """Return the safe duplicate decision for a SAV 1ª Inscrição probe.
+
+  ``existe:1`` with ``inscricaovalida:0`` is a person left behind by a
+  wizard run that died before its commit, so that record is reusable rather
+  than blocking. A missing ``inscricaovalida`` is blocking via
+  ``absent_is=True``: fail closed if SAV changes shape or drops the key, and
+  do not silently enroll somebody who holds a licence. The two decisions are
+  mutually exclusive and both are false when ``existe`` is false.
+
+  Flag decoding tolerates non-numeric values without letting the old
+  ``int(dup.get("existe", 0))`` ``ValueError``/``TypeError`` escape.
+  Genuinely unrecognised encodings still raise ``SavResponseError`` from the
+  shared decoder, because guessing about them would be unsafe.
+
+  ``existing_id`` comes from ``id`` alone, and is ``None`` when SAV omits or
+  corrupts it. **There is deliberately no ``atleta`` fallback.** The raise
+  site this replaces used ``dup.get("id") or dup.get("atleta")``, which was
+  harmless while the value only decorated an error message — but ``atleta``
+  is a boolean "is an athlete" flag that reads ``1`` on every real response,
+  so falling back to it here would hand the reuse path person id 1 and enrol
+  a stranger. A missing id must stay missing and let the caller refuse.
+  """
+  try:
+    existing_id: int | None = int(dup.get("id"))
+  except (TypeError, ValueError):
+    existing_id = None
+
+  existe_flag = decode_sav_flag(
+    dup.get("existe"), field="existe", absent_is=False,
+  )
+  inscricao_valida = decode_sav_flag(
+    dup.get("inscricaovalida"), field="inscricaovalida", absent_is=True,
+  )
+  blocking = existe_flag and inscricao_valida
+  reusable = existe_flag and not inscricao_valida
+  return PrimeiraDuplicate(existing_id, blocking, reusable)
 
 
 def compute_enrollment_checklist(

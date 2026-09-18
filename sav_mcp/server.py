@@ -67,6 +67,7 @@ from sav_shared.enrollment import (
     REGISTRATION_TYPE_SUBIDA,
     build_primeira_kwargs,
     build_primeira_preview_fields,
+    classify_primeira_duplicate,
     compute_enrollment_checklist,
     create_and_fetch_batch,
     derive_enrollment_params,
@@ -2418,8 +2419,14 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
     """Resolve a 1ª Inscrição (type-1) form: OCR echo + pre-emptive dup guard.
 
     Shared by resolve_player and preview_enrollment. Returns the resolved OCR
-    dict, or the ``player_already_in_sav`` structured error when the op=11
-    duplicate probe hits.
+    dict, or the ``player_already_in_sav`` structured error when op=11 reports
+    a player who **holds a valid enrolment**.
+
+    ``existe:1`` with ``inscricaovalida:0`` is not that case: it is a person
+    left on file by a wizard run that died before its commit, with no licence
+    to revalidate. Those resolve normally and enrol by reusing the existing
+    person record — see ``classify_primeira_duplicate``, which the client
+    wizard shares so a preview and its commit cannot disagree.
     """
     parsed = form["parsed"]
     name_f = parsed.get("nome_completo")
@@ -2445,7 +2452,8 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
         except (SavError, ValueError):
             logger.debug("Pre-emptive op=11 failed at resolve time", exc_info=True)
             dup = {"existe": 0}
-        if int(dup.get("existe", 0)) != 0:
+        duplicate = classify_primeira_duplicate(dup)
+        if duplicate.blocking:
             existing_license = None
             nif = normalise_nif(ocr_nif) if ocr_nif else None
             if nif is not None:

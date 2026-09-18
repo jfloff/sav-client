@@ -184,6 +184,9 @@ The canonical pipeline. Each step's output feeds the next.
          {resolved: false, candidates: [...]}         ── ask user to pick, re-call with explicit license
          {resolved: false, candidates: []}            ── ask user for licence, re-call
          {resolved: false, error: "player_already_in_sav"}  ── 1ª Inscrição duplicate → use Revalidação
+             Only when the player *holds a valid enrolment*. A person on file with no
+             licence (op=11 existe:1 + inscricaovalida:0) resolves normally and enrols
+             by reusing their existing SAV record — there is nothing to revalidate.
        Field status values:
          "updated"      OCR overrides SAV
          "match"        SAV kept (OCR matched)
@@ -362,7 +365,7 @@ Two kinds of failure surface:
 
 - **Structured error dicts** (LLM-actionable, no exception raised):
   - `{error: "license_not_enrolled", license, open_batches: [...]}` — from `read_enrollment`, `update_enrollment`, `update_enrollment_with_document`, `delete_enrollment`, `list_player_documents`, `download_player_document`, `upload_player_document`, `replace_player_document`.
-  - `{resolved: false, candidates: [...]}` / `{resolved: false, error: "player_already_in_sav"}` — from `resolve_player` **and** from `preview_enrollment` when called with `license: null` and the player doesn't resolve to one licence. Ask the user to pick / switch to Revalidação, then re-call `preview_enrollment` with an explicit `license`.
+  - `{resolved: false, candidates: [...]}` / `{resolved: false, error: "player_already_in_sav"}` — from `resolve_player` **and** from `preview_enrollment` when called with `license: null` and the player doesn't resolve to one licence. Ask the user to pick / switch to Revalidação, then re-call `preview_enrollment` with an explicit `license`. `player_already_in_sav` fires only for a player who **holds a valid enrolment**; a person on file without one enrols normally by reusing their record, so do not read a resolved type-1 preview as proof the person is new to SAV.
   - `{success: false, missing_guardian_fields: [...]}` — fallback from `submit_enrollment` when a minor's guardian fields were still absent at submit time (`preview_enrollment` surfaces them in `needs_review` up front).
 - **Raised exceptions** — programming errors (unknown `mod1_id`, invalid `team`, malformed base64). Surface these to the user; they indicate a bug or a malformed input.
 

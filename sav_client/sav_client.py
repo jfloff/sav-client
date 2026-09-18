@@ -52,8 +52,11 @@ from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
 from sav_shared.dates import require_iso, to_iso
+from sav_shared.enrollment import classify_primeira_duplicate
+from sav_shared.fpb_mod1 import player_is_minor
 from sav_shared.identifiers import require_nif, to_license
 from sav_shared.text import iso_date, normalise_text
+from sav_shared.flags import decode_sav_flag as _decode_sav_flag
 
 logger = logging.getLogger(__name__)
 
@@ -241,61 +244,6 @@ def _months_earlier(ref: date, months: int) -> date:
       return date(year, month, day)
     except ValueError:
       day -= 1
-
-
-def _decode_sav_flag(
-  value: Any, *, field: str, absent_is: bool | None = None,
-) -> bool:
-  """Decode one of SAV's boolean flags without Python truthiness.
-
-  SAV is inconsistent about how it encodes these: op=31 returns
-  ``menor_idade`` as the int ``1`` while its consent flags come back as the
-  strings ``'1'`` / ``'0'`` / ``None``. ``bool('0')`` is ``True``, so reading
-  any of them with plain truthiness inverts a false value.
-
-  For ``menor_idade`` that inversion has a direction that matters: an adult
-  decoded as a minor is blocked from enrolling until guardian details are
-  invented for them, and a minor decoded as an adult walks straight past the
-  guardian check that exists to stop exactly that (see the LOAD-BEARING note
-  in ``_commit_registration_step3``). An unrecognised encoding therefore
-  raises rather than guessing in either direction.
-
-  ``absent_is`` decides what a *missing* value means, and defaults to ``None``
-  — meaning absence raises too. Treating "SAV didn't say" as "no" would
-  silently disable whatever the flag gates, which for ``menor_idade`` means
-  skipping the guardian check entirely. Pass ``absent_is=False`` only where
-  the field is genuinely optional.
-
-  Args:
-      value:      The raw flag as SAV sent it.
-      field:      Field name to name in the error.
-      absent_is:  Result for ``None``; ``None`` itself means raise instead.
-
-  Raises:
-      SavResponseError: The value is absent with no ``absent_is`` given, or is
-          encoded in a way we do not recognise.
-  """
-  if isinstance(value, bool):
-    return value
-  if value is None:
-    if absent_is is None:
-      raise SavResponseError(
-        f"SAV did not return {field!r}; refusing to assume a default for a "
-        f"flag that gates a validation check."
-      )
-    return absent_is
-  if isinstance(value, int) and value in (0, 1):
-    return bool(value)
-  if isinstance(value, str):
-    normalized = value.strip().casefold()
-    if normalized in ("1", "true", "sim"):
-      return True
-    if normalized in ("", "0", "false", "nao", "não"):
-      return False
-  raise SavResponseError(
-    f"SAV returned an unrecognised value for {field!r}; refusing to guess "
-    f"whether it means true or false."
-  )
 
 
 def _normalise_registration_blockers(raw: Any) -> list[dict[str, Any]]:
@@ -5684,7 +5632,7 @@ class SavClient:
     consent_communications: bool,
     consent_marketing: bool,
   ) -> int:
-    """Walk the 1ª Inscrição wizard and return the new SAV userid.
+    """Walk the 1ª Inscrição wizard and return the SAV userid.
 
     Mirrors the Revalidação shape but with type-1's renamed field surface
     and a different commit op. Sequence:
@@ -5692,8 +5640,11 @@ class SavClient:
         duplicate check (op=11) →
         id-doc check (op=163) →
         age gate (op=14) →
-        create player (op=12, yields userid) →
-        save address (op=20, yields menor_idade) →
+        for a new person: create player (op=12, yields userid) →
+        save address (op=20, yields menor_idade); or
+        for a reusable person: retain the op=11 userid and skip both writes.
+        Op=20 is skipped because it is a bare INSERT primary-keyed by userid,
+        so an existing person's address row causes a duplicate-key fatal.
         load estatuto (op=151) →
         taxa cascade (op=26) →
         insurance cascade (op=87 → op=175 → op=24) →
@@ -5710,39 +5661,66 @@ class SavClient:
       logger.debug("op=15 primeira modal guard failed — non-fatal", exc_info=True)
     self._primeira_batch_context_refresh(batch.id)
 
-    # Pre-create checks (server-side; treat duplicate as a hard stop)
+    # Pre-create checks (server-side; reusable orphan records may continue)
     dup = self._check_primeira_player_duplicate(
       gender_id=gender_id, birth_date=birth_date, id_number=id_number,
     )
-    if int(dup.get("existe", 0)) != 0:
-      existing_id = dup.get("id") or dup.get("atleta") or ""
+    duplicate = classify_primeira_duplicate(dup)
+    reuse = False
+    if duplicate.blocking:
       raise SavResponseError(
         f"A player matching (genero={gender_id}, datanasc={birth_date}, "
-        f"id_number={id_number}) already exists in SAV (id={existing_id!r}); "
+        f"id_number={id_number}) already exists in SAV "
+        f"(id={duplicate.existing_id!r}); "
         f"use Revalidação on the existing licence rather than 1ª Inscrição."
+      )
+    if duplicate.reusable:
+      if duplicate.existing_id is None:
+        raise SavResponseError(
+          f"A player matching (genero={gender_id}, datanasc={birth_date}, "
+          f"id_number={id_number}) exists in SAV, but SAV returned no userid "
+          "to reuse; cannot continue 1ª Inscrição."
+        )
+      reuse = True
+      logger.info(
+        "Reusing existing SAV person record (userid=%s) for 1ª Inscrição",
+        duplicate.existing_id,
+      )
+      logger.warning(
+        "Reusing SAV person userid=%s; address fields are ignored because "
+        "op=20 cannot update an existing address row: %s",
+        duplicate.existing_id,
+        ", ".join([
+          "morada", "cod_postal", "distrito_id", "concelho_id",
+          "localidade_txt", "country_id",
+        ]),
       )
     self._check_primeira_id_doc(id_number)
     self._check_primeira_birthdate_fits_tier(batch, birth_date)
     self._primeira_batch_context_refresh(batch.id)
 
-    # op=12 — create the player record; this is where userid is born.
-    userid = self._create_primeira_player(
-      batch=batch,
-      name=name, birth_date=birth_date, gender_id=gender_id,
-      email=email, telemovel=telemovel, telefone=telefone,
-      nif=nif, id_type=id_type, id_number=id_number, id_expiry=id_expiry,
-      nationality_id=nationality_id, naturalidade_id=naturalidade_id,
-      nome_pai=nome_pai, nome_mae=nome_mae,
-    )
+    if reuse:
+      userid = duplicate.existing_id          # skip op=12 AND op=20
+      step2 = None
+    else:
+      # op=12 — create the player record; this is where userid is born.
+      userid = self._create_primeira_player(
+        batch=batch,
+        name=name, birth_date=birth_date, gender_id=gender_id,
+        email=email, telemovel=telemovel, telefone=telefone,
+        nif=nif, id_type=id_type, id_number=id_number, id_expiry=id_expiry,
+        nationality_id=nationality_id, naturalidade_id=naturalidade_id,
+        nome_pai=nome_pai, nome_mae=nome_mae,
+      )
 
-    # op=20 — save address; response carries menor_idade for the guardian gate.
-    step2 = self._save_primeira_step2(
-      batch=batch, userid=userid,
-      country_id=country_id,
-      distrito_id=distrito_id, concelho_id=concelho_id,
-      localidade_txt=localidade_txt,
-      morada=morada, cod_postal=cod_postal,
-    )
+      # op=20 — save address; response carries menor_idade for the guardian gate.
+      step2 = self._save_primeira_step2(
+        batch=batch, userid=userid,
+        country_id=country_id,
+        distrito_id=distrito_id, concelho_id=concelho_id,
+        localidade_txt=localidade_txt,
+        morada=morada, cod_postal=cod_postal,
+      )
     # ── Validate guardian fields for minors ───────────────────────────────────
     #
     # LOAD-BEARING — do not relax this to make a caller pass.
@@ -5756,7 +5734,11 @@ class SavClient:
     # So this reads like ordinary form validation and is not: it is the last
     # thing standing between a caller's omission and an unaccompanied child on
     # the federation's register.
-    is_minor = _decode_sav_flag(step2.get("menor_idade"), field="menor_idade")
+    if reuse:
+      derived_is_minor = player_is_minor(birth_date)
+      is_minor = derived_is_minor if derived_is_minor is not None else True
+    else:
+      is_minor = _decode_sav_flag(step2.get("menor_idade"), field="menor_idade")
     if is_minor:
       missing = [
         n for n, v in [
@@ -5835,13 +5817,41 @@ class SavClient:
       raise SavResponseError(
         f"Primeira commit failed: {result.get('msg') or result!r}"
       )
+    # Batch row item_count/state changed — invalidate the listing memo. This
+    # happens before the reuse postcondition below because the commit has
+    # already landed by now: raising with a stale memo would leave the next
+    # batch listing reporting the pre-commit item count.
+    self._invalidate_batch_memo()
+    if reuse:
+      # The commit has already landed, so every failure below is "the write
+      # happened but we cannot confirm we gated it correctly" — never a
+      # rejection. An absent flag is therefore SavWriteUnverifiedError too,
+      # not the SavResponseError _decode_sav_flag would raise: telling a
+      # caller their request was refused when the player is on the register
+      # is the one answer that would be actively wrong here.
+      if result.get("check_menor_idade") is None:
+        raise SavWriteUnverifiedError(
+          f"Primeira commit for reused player userid={userid} succeeded but "
+          "returned no 'check_menor_idade'; the enrolment is filed and the "
+          f"derived minor={is_minor!r} could not be confirmed against SAV."
+        )
+      committed_is_minor = _decode_sav_flag(
+        result.get("check_menor_idade"),
+        field="check_menor_idade",
+        absent_is=None,
+      )
+      if committed_is_minor != is_minor:
+        raise SavWriteUnverifiedError(
+          f"Primeira commit for reused player userid={userid} returned "
+          f"check_menor_idade={committed_is_minor!r}, but derived "
+          f"minor={is_minor!r}; the write completed with conflicting "
+          "minor-status values."
+        )
     logger.info(
       "Created primeira-inscrição player %r (userid=%s) in batch %s — "
       "result: %s",
       name, userid, batch.id, result.get("resultexame") or "ok",
     )
-    # Batch row item_count/state changed — invalidate the listing memo.
-    self._invalidate_batch_memo()
     return userid
 
   @staticmethod
