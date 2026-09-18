@@ -4,7 +4,14 @@ from __future__ import annotations
 
 from typing import Any
 
-from sav_client.exceptions import SavResponseError
+# `SavResponseError` is imported lazily, inside the function, on purpose.
+# `sav_client.exceptions` cannot be reached without executing
+# `sav_client/__init__.py`, which imports `sav_client.sav_client`, which
+# imports this module — so importing it at module scope makes
+# `import sav_shared.flags` fail outright whenever a consumer's first import
+# is a `sav_shared.*` module rather than `sav_client`. That bricked every
+# drive-to-sav command in 0.107.0. The exception is only needed at raise
+# time, so binding it there costs nothing and keeps this module a leaf.
 
 
 def decode_sav_flag(
@@ -39,6 +46,8 @@ def decode_sav_flag(
       SavResponseError: The value is absent with no ``absent_is`` given, or is
           encoded in a way we do not recognise.
   """
+  from sav_client.exceptions import SavResponseError
+
   if isinstance(value, bool):
     return value
   if value is None:

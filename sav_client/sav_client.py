@@ -52,7 +52,15 @@ from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
 from sav_shared.dates import require_iso, to_iso
-from sav_shared.enrollment import classify_primeira_duplicate
+# NOTE: `sav_shared.enrollment` is NOT imported here. It imports
+# `sav_client.exceptions`, which executes `sav_client/__init__.py`, which
+# imports this module — so a module-scope import here makes
+# `import sav_shared.enrollment` fail for any consumer whose first import is a
+# `sav_shared.*` module. That shipped in 0.107.0 and bricked every
+# drive-to-sav command. `classify_primeira_duplicate` is imported inside
+# `_add_player_to_primeira_batch`, its only use site. Keep it that way, and see
+# tests/test_import_cycles.py before adding another `sav_shared` import that
+# depends on `sav_client`.
 from sav_shared.fpb_mod1 import player_is_minor
 from sav_shared.identifiers import require_nif, to_license
 from sav_shared.text import iso_date, normalise_text
@@ -5665,6 +5673,10 @@ class SavClient:
     dup = self._check_primeira_player_duplicate(
       gender_id=gender_id, birth_date=birth_date, id_number=id_number,
     )
+    # Imported here, not at module scope — see the NOTE on the sav_shared
+    # imports at the top of this file.
+    from sav_shared.enrollment import classify_primeira_duplicate
+
     duplicate = classify_primeira_duplicate(dup)
     reuse = False
     if duplicate.blocking:

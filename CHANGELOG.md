@@ -21,6 +21,29 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.107.1 — 2026-09-18
+
+### Fixed
+
+**0.107.0 could not be imported by a `sav_shared`-first consumer**
+`IMPACT: raises` — `ImportError: cannot import name 'classify_primeira_duplicate'
+from partially initialized module 'sav_shared.enrollment'`, and the same for
+`decode_sav_flag` from `sav_shared.flags`. 0.107.0 added module-scope
+`from sav_shared.enrollment import ...` and `from sav_shared.flags import ...`
+to `sav_client/sav_client.py`. Both modules import `sav_client.exceptions`,
+which cannot be reached without executing `sav_client/__init__.py`, which
+imports `sav_client.sav_client` — a cycle. Importing `sav_client` first masked
+it, which is what every test in this repo did, so the suite stayed green while
+any consumer whose first import was a `sav_shared.*` module died on startup.
+Every drive-to-sav command was affected.
+`DETECT:` `python -c "import sav_shared.enrollment"` in a fresh interpreter.
+`FIX:` upgrade to 0.107.1. No API changed — `sav_shared.flags` now binds
+`SavResponseError` at raise time instead of import time, and
+`classify_primeira_duplicate` is imported inside its single use site.
+`tests/test_import_cycles.py` now imports every public module as the first
+import in a fresh interpreter, which is the only way this class of bug is
+visible.
+
 ## 0.107.0 — 2026-09-17
 
 The 1ª Inscrição duplicate guard rejected players who hold no licence at all,
