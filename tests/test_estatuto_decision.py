@@ -28,7 +28,9 @@ from sav_shared.estatuto import (
   SOURCE_MODELO1,
   SOURCE_NATIONALITY,
   SOURCE_NONE,
+  SOURCE_SAV_RULE,
   EstatutoDecision,
+  apply_sav_batch_rule,
   is_portuguese_nationality,
   nationality_branch,
   resolve_country,
@@ -306,6 +308,7 @@ class TestEstatutoDecision:
         "community/cooperation list."
       ),
       "confidence": 0.95,
+      "conflict": None,
       "needs_review": False,
     }
 
@@ -320,6 +323,88 @@ class TestEstatutoDecision:
     ):
       assert decision.reason.endswith(".")
       assert len(decision.reason) > 20
+
+
+class TestSavBatchRule:
+  def test_mini_batch_replaces_a_nationality_decision(self):
+    decision = resolve_estatuto(_fields(nacionalidade="Brasileira"))
+
+    result = apply_sav_batch_rule(
+      decision, mini=True, batch_number="2025/12", tier="Mini 10",
+    )
+
+    assert result.value == ESTATUTO_FBP
+    assert result.source == SOURCE_SAV_RULE
+    assert result.needs_review is False
+    assert "2025/12" in result.reason
+    assert "Mini 10" in result.reason
+    assert "mini=True" in result.reason
+
+  def test_non_mini_batch_replaces_a_nationality_decision(self):
+    decision = resolve_estatuto(_fields(nacionalidade="Brasileira"))
+
+    result = apply_sav_batch_rule(
+      decision, mini=False, batch_number="2025/13", tier="Sub 14",
+    )
+
+    assert result.value == ESTATUTO_SEM_FBP_COMUNITARIO
+    assert result.source == SOURCE_SAV_RULE
+    assert result.needs_review is False
+    assert "2025/13" in result.reason
+    assert "Sub 14" in result.reason
+    assert "mini=False" in result.reason
+
+  @pytest.mark.parametrize(
+    "source, value",
+    [(SOURCE_MODELO1, ESTATUTO_FBP), (SOURCE_FPB, ESTATUTO_FBP)],
+  )
+  def test_an_official_answer_that_agrees_is_returned_unchanged(
+    self, source, value,
+  ):
+    decision = EstatutoDecision(value, ESTATUTOS[value], source, "official")
+
+    result = apply_sav_batch_rule(
+      decision, mini=True, batch_number="2025/12", tier="Mini 10",
+    )
+
+    assert result is decision
+    assert result.conflict is None
+
+  @pytest.mark.parametrize(
+    "source, value, label",
+    [
+      (SOURCE_MODELO1, ESTATUTO_SEM_FBP_COMUNITARIO, "signed form"),
+      (SOURCE_FPB, ESTATUTO_SEM_FBP_COMUNITARIO, "FPB"),
+    ],
+  )
+  def test_an_official_answer_that_disagrees_stays_but_needs_review(
+    self, source, value, label,
+  ):
+    decision = EstatutoDecision(value, ESTATUTOS[value], source, "official")
+
+    result = apply_sav_batch_rule(
+      decision, mini=True, batch_number="2025/12", tier="Mini 10",
+    )
+
+    assert result.value == value
+    assert result.source == source
+    assert result.needs_review is True
+    assert result.conflict is not None
+    assert str(value) in result.conflict
+    assert "6 (FBP)" in result.conflict
+    assert "2025/12" in result.conflict
+    assert label in result.conflict
+
+  def test_no_decision_is_replaced_by_the_rule(self):
+    decision = resolve_estatuto({})
+
+    result = apply_sav_batch_rule(
+      decision, mini=False, batch_number="2025/13", tier="Sub 14",
+    )
+
+    assert result.value == ESTATUTO_SEM_FBP_COMUNITARIO
+    assert result.source == SOURCE_SAV_RULE
+    assert result.conflict is None
 
 
 # ── The country lists ─────────────────────────────────────────────────────────

@@ -1,4 +1,5 @@
 from datetime import date, timedelta
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -898,6 +899,120 @@ class TestStandaloneSubidaCommit:
 
 
 # ─── 1ª Inscrição (type-1) wizard ───────────────────────────────────────────
+
+PRIMEIRA_ESTATUTO_OPTIONS = (
+  "<option value=0></option><option value='6'>FBP</option>"
+  "<option value='10'>Sem FBP Comunitário</option>"
+  "<option value='11'>Sem FBP Não Comunitário</option>"
+  "<option value='12'>Equiparado FBP</option><option value='0'></option>"
+)
+
+
+class _PrimeiraEstatutoBatch:
+  id = 634571
+  tier = "Mini 10"
+
+
+class TestPrimeiraEstatutoRule:
+  @staticmethod
+  def _response(*, mini, html=PRIMEIRA_ESTATUTO_OPTIONS):
+    return {"estatutos": html, "mini": mini}
+
+  @staticmethod
+  def _client(monkeypatch, responses):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    loader = Mock(side_effect=responses)
+    monkeypatch.setattr(client, "_load_estatuto_options", loader)
+    return client, loader
+
+  @pytest.mark.parametrize(
+    "mini, expected",
+    [(1, 6), (0, 10)],
+  )
+  def test_rule_selects_estatuto_from_the_mini_flag(
+    self, monkeypatch, mini, expected,
+  ):
+    response = self._response(mini=mini)
+    client, _ = self._client(monkeypatch, [response, response])
+
+    assert client._load_primeira_estatuto(_PrimeiraEstatutoBatch(), 277534) == expected
+
+  @pytest.mark.parametrize("mini_field", [None, "absent"])
+  def test_null_or_absent_mini_uses_the_legacy_sole_option(
+    self, monkeypatch, mini_field,
+  ):
+    html = "<option value=0></option><option value='6'>FBP</option>"
+    first = {"estatutos": html}
+    if mini_field is None:
+      first["mini"] = None
+    client, _ = self._client(monkeypatch, [first, first])
+
+    assert client._load_primeira_estatuto(_PrimeiraEstatutoBatch(), 277534) == 6
+
+  @pytest.mark.parametrize("mini_field", [None, "absent"])
+  def test_null_or_absent_mini_keeps_rejecting_several_options(
+    self, monkeypatch, mini_field,
+  ):
+    first = {"estatutos": PRIMEIRA_ESTATUTO_OPTIONS}
+    if mini_field is None:
+      first["mini"] = None
+    client, _ = self._client(monkeypatch, [first, first])
+
+    with pytest.raises(SavConfigError):
+      client._load_primeira_estatuto(_PrimeiraEstatutoBatch(), 277534)
+
+  @pytest.mark.parametrize(
+    "raw, expected",
+    [(1, True), (0, False), (None, None)],
+  )
+  def test_primeira_estatuto_mini_flag_decodes_true_false_or_unknown(
+    self, monkeypatch, raw, expected,
+  ):
+    response = self._response(mini=raw)
+    client, _ = self._client(monkeypatch, [response])
+
+    assert client.primeira_estatuto_mini_flag(_PrimeiraEstatutoBatch()) is expected
+
+  def test_rule_rejects_an_estatuto_not_offered_by_op151(self, monkeypatch):
+    html = (
+      "<option value=0></option>"
+      "<option value='10'>Sem FBP Comunitário</option>"
+    )
+    response = self._response(mini=1, html=html)
+    client, _ = self._client(monkeypatch, [response, response])
+
+    with pytest.raises(SavResponseError) as excinfo:
+      client._load_primeira_estatuto(_PrimeiraEstatutoBatch(), 277534)
+
+    message = str(excinfo.value)
+    assert "SAV's primeira estatuto rule" in message
+    assert "batch 634571" in message
+    assert "6" in message
+    assert "10='Sem FBP Comunitário'" in message
+
+  def test_no_taxa_names_context_without_leaking_option_markup(self, monkeypatch):
+    response = type("Response", (), {
+      "text": json.dumps({
+        "msg": "<option value='0'>- Não selecionado –</option>",
+      }),
+      "raise_for_status": lambda self: None,
+    })()
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client._http = type(
+      "Http", (), {"get": lambda self, *args, **kwargs: response},
+    )()
+
+    with pytest.raises(SavResponseError) as excinfo:
+      client._resolve_primeira_taxa_id(
+        _PrimeiraEstatutoBatch(), 277534, 10,
+      )
+
+    message = str(excinfo.value)
+    assert "634571" in message
+    assert "Mini 10" in message
+    assert "estatuto=10" in message
+    assert "Sem FBP Comunitário" in message
+    assert "<option" not in message
 
 class TestPrimeiraInscricao:
   """Type-1 wizard: dispatch + commit body shape.

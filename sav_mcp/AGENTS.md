@@ -239,13 +239,29 @@ The `missing_guardian_fields` response from `submit_enrollment` is now a fallbac
 ### Estatuto FBP — decided up front, never defaulted
 
 For a 1ª Inscrição, `preview_enrollment` returns `estatuto_decision`:
-`{value, label, source, reason, confidence, needs_review}`. `value` is the SAV
-estatuto id (6 `FBP`, 10 `Sem FBP Comunitário`, 11 `Sem FBP Não Comunitário`,
-12 `Equiparado FBP`) or `null` when it could not be determined; `reason` is a
-sentence written to be shown to a human, so render it rather than paraphrasing.
-`source` says what decided it: `fpb` (an official status), `modelo1` (a marked
-box on the signed form), `nationality` (which *Sem FBP* branch applies),
-`local_eligibility`, or `none`.
+`{value, label, source, reason, confidence, conflict, needs_review}`. `value` is
+the SAV estatuto id (6 `FBP`, 10 `Sem FBP Comunitário`, 11 `Sem FBP Não
+Comunitário`, 12 `Equiparado FBP`) or `null` when it could not be determined;
+`reason` is a sentence written to be shown to a human, so render it rather than
+paraphrasing. `source` says what decided it: `fpb` (an official status),
+`modelo1` (a marked box on the signed form), `sav_rule` (SAV's own per-batch
+rule — see below), `nationality` (which *Sem FBP* branch applies),
+`local_eligibility`, or `none`. `conflict` is `null` unless the signed form and
+SAV disagree; when set it names both sides and forces `needs_review`.
+
+**`sav_rule` overrules a locally derived estatuto.** SAV's type-1 wizard picks
+the estatuto itself from the `mini` flag on its op=151 response — `mini` → 6
+(`FBP`), otherwise 10 (`Sem FBP Comunitário`) — and *disables the select* for
+any non-federation profile, so a club cannot choose. It is a constraint SAV
+enforces, not a guess, so it replaces a `nationality`/`local_eligibility`/`none`
+decision without review, and only the `reason` records that it did. It also
+explains a failure you would otherwise hit: in a Mini batch only estatuto 6 has
+a fee configured, so any other value dies at the fee step *after* the player
+record has already been created.
+
+A `modelo1` or `fpb` answer is **never** overwritten. If it disagrees with SAV's
+rule, `value` stays the form's and `conflict` is set, so `add_enrollment`
+refuses until a caller resolves it explicitly.
 
 **When `needs_review` is true, `add_enrollment` refuses the submission** and the
 error carries the reason. Answer it with `field_overrides={"estatuto": 6 | 10 |
@@ -257,9 +273,14 @@ classification, so a wrong one filed silently is worse than a refused call.
 assigns, with no box on the Modelo 1; it reaches an enrolment only by already
 being on the player's SAV record.
 
-**`FBP` is never inferred from citizenship.** It means *Formação
-Basquetebolística Portuguesa* — formed in Portuguese basketball — and a
-Portuguese passport is evidence for `Sem FBP Comunitário`, never for FBP. The
+**`FBP` is never inferred from citizenship *by this package*.** It means
+*Formação Basquetebolística Portuguesa* — formed in Portuguese basketball — and
+a Portuguese passport is evidence for `Sem FBP Comunitário`, never for FBP. That
+rule governs `resolve_estatuto` and is unchanged. It does **not** constrain
+`sav_rule`: SAV assigns FBP to every player in a Mini batch whatever their
+nationality, which is consistent with FBP being about formation rather than
+citizenship, and a club cannot override it. So a foreign player in a Mini batch
+is filed as FBP — by SAV's rule, never by inference here. The
 reverse reading is wrong too: a `Sem FBP Comunitário` decision is shared by every
 country on FPB's community/cooperation list and is **not** an answer to "is this
 player Portuguese?". `nationality_id` is its own `needs_review` field, listed

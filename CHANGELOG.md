@@ -21,6 +21,95 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.108.0 — 2026-09-18
+
+A 1ª Inscrição died at the fee step — `No taxa options for primeira batch
+634571` — because the estatuto in play had no fee configured in that batch. The
+failure lands *after* op=12, so every attempt left an orphan person record
+behind. SAV was stating the right answer the whole time, in a response this
+package already fetched and discarded.
+
+SAV's own wizard (`js/inscricoesjogador.js:8334-8347`) picks the type-1 estatuto
+from the `mini` flag on the op=151 response — `mini == 1` → 6 (FBP), otherwise
+10 (Sem FBP Comunitário) — and *disables the select* for any non-federation
+profile. It is a rule SAV enforces, not a default it offers. Verified live
+2026-09-18: `mini: 1` for the Mini 10 batch, `mini: 0` for every Sub 14/16/18
+batch, and in the Mini batch only estatuto 6 has a fee — 10, 11 and 12 all
+return a bare placeholder.
+
+### Changed
+
+**The type-1 estatuto now follows SAV's per-batch rule**
+`IMPACT: silent` — a 1ª Inscrição that previously resolved to Sem FBP
+Comunitário from nationality now resolves to FBP in a Mini batch, and
+`estatuto_decision.source` reads `sav_rule` instead of `nationality`. This
+applies to **Portuguese and foreign players alike**: the engine placed Portugal
+on the community list, so it filed a Portuguese child as Sem FBP Comunitário —
+the estatuto with no fee — which is precisely what broke. FBP is *Formação
+Basquetebolística Portuguesa*, about formation rather than citizenship, and SAV
+assigns it to every Mini player regardless of nationality.
+`DETECT:` grep for `estatuto_decision` and for any assumption that `source`
+is one of the pre-0.108.0 values.
+`FIX:` none needed to keep enrolling. If you displayed the estatuto to an
+operator, render the new `reason` — it names the batch, tier and flag.
+
+**`resolve_estatuto` is unchanged** — it still refuses to infer FBP from
+citizenship. The new value comes from SAV stating a constraint, applied *after*
+the engine has had its say, never from local inference.
+
+**A marked Modelo 1 box is never overridden**
+When the signed form or an official FPB status disagrees with SAV's rule, the
+form's value is kept and the new `conflict` field is set naming both sides;
+`needs_review` becomes true and `add_enrollment` refuses until a caller resolves
+it with `field_overrides={"estatuto": <id>}`.
+
+**Taxa failures no longer dump SAV's option HTML**
+`_resolve_primeira_taxa_id`'s messages now name the batch, tier, estatuto id and
+label. Exception types are unchanged (`SavResponseError` for none,
+`SavConfigError` for several).
+
+### Fixed
+
+**op=27 no longer reports a server fault as a connection failure**
+`IMPACT: raises` — `_primeira_commit` parsed with a bare `json.loads` and
+wrapped any failure in `SavConnectionError`. SAV answers unhandled PHP fatals
+with HTTP 200 and a stack trace, so a commit that reached SAV and broke partway
+was indistinguishable from a request that never arrived, and the body was
+discarded. It now parses through `_parse_json_response`, raising
+`SavServerError` with the body logged at DEBUG on the `sav_client` logger and
+SAV's schema kept out of the message. A genuine transport failure still raises
+`SavConnectionError`.
+`DETECT:` grep for `except SavConnectionError` around
+`add_player_to_registration_batch`.
+`FIX:` catch `SavError` (the shared base) if you need both, and treat
+`SavServerError` as "the commit may have landed" — verify the postcondition
+rather than blindly retrying. This mattered on 2026-09-18: an enrolment failed
+here, the person record it had been working with was gone afterwards, and there
+was no way to tell whether the commit caused that.
+
+**op=151 is fetched once per enrolment, not twice**
+Internal only, no contract change. `_load_primeira_estatuto` read the response
+for the `mini` flag and then read it again for the option list. One response now
+serves both via `_mini_from`.
+
+### Added
+
+- `EstatutoDecision.conflict` (`str | None`) and `SOURCE_SAV_RULE`
+  (`"sav_rule"`). `conflict` is additive on `to_dict()`; `needs_review` now also
+  returns true when it is set.
+- `sav_shared.estatuto.apply_sav_batch_rule(decision, *, mini, batch_number, tier)`.
+- `SavClient.primeira_estatuto_mini_flag(batch)` — SAV's `mini` for a batch, or
+  `None` when SAV did not state it. Needs no player: op=151 does not depend on
+  the userid.
+
+### Known gap
+
+Every type-1 batch available for testing is `mini`, so the `mini == 0 → 10` half
+follows SAV's JS but is unverified against a real fee table. `mini` absent *or*
+null falls through to the previous sole-option behaviour rather than guessing —
+reading null as a stated `0` would select the estatuto with no fee in a Mini
+batch, which is the bug this release fixes.
+
 ## 0.107.1 — 2026-09-18
 
 ### Fixed

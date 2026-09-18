@@ -38,7 +38,7 @@ current Modelo 1, so local inference must never produce it.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 from .lookups import (
@@ -356,6 +356,7 @@ SOURCE_MODELO1 = "modelo1"
 SOURCE_LOCAL_ELIGIBILITY = "local_eligibility"
 SOURCE_NATIONALITY = "nationality"
 SOURCE_NONE = "none"
+SOURCE_SAV_RULE = "sav_rule"
 
 
 @dataclass(frozen=True)
@@ -370,9 +371,12 @@ class EstatutoDecision:
   the read that decided it, or ``None`` when the step was not an OCR read
   (an official FPB status, or no evidence at all).
 
+  ``conflict`` is a disagreement between the signed form and SAV. A caller
+  must resolve it explicitly rather than silently picking one side.
+
   ``needs_review`` is derived, never stored: a decision needs review when it
   reached no value, or when the read that produced the value was below
-  :data:`LOW_CONFIDENCE`.
+  :data:`LOW_CONFIDENCE`, or when it carries a conflict.
   """
 
   value: int | None
@@ -380,11 +384,14 @@ class EstatutoDecision:
   source: str
   reason: str
   confidence: float | None = None
+  conflict: str | None = None
 
   @property
   def needs_review(self) -> bool:
     """True when this decision must not be submitted unconfirmed."""
     if self.value is None:
+      return True
+    if self.conflict is not None:
       return True
     return self.confidence is not None and self.confidence < LOW_CONFIDENCE
 
@@ -402,6 +409,7 @@ class EstatutoDecision:
       "confidence": (
         round(self.confidence, 2) if self.confidence is not None else None
       ),
+      "conflict": self.conflict,
       "needs_review": self.needs_review,
     }
 
@@ -551,6 +559,52 @@ def resolve_estatuto(
     None, SOURCE_NONE,
     "No Estatuto box was marked and the Modelo 1 carries no readable "
     "nationality; there is not enough information to determine an Estatuto.",
+  )
+
+
+def apply_sav_batch_rule(
+  decision: EstatutoDecision, *, mini: bool,
+  batch_number: str, tier: str,
+) -> EstatutoDecision:
+  """Apply SAV's enforced 1ª Inscrição Estatuto rule to a decision.
+
+  SAV disables the Estatuto select for non-federation profiles and chooses FBP
+  for Mini batches or Sem FBP Comunitário for every other tier. This is a
+  constraint SAV enforces in its own wizard, not evidence that a caller may
+  use to infer FBP from citizenship. A marked form or official FPB answer is
+  therefore preserved when it agrees, and surfaced as an explicit conflict
+  when it does not; every other local decision is replaced by SAV's stated
+  rule so the fee step cannot receive an Estatuto SAV will not price.
+  """
+  sav_value = ESTATUTO_FBP if mini else ESTATUTO_SEM_FBP_COMUNITARIO
+  sav_label = ESTATUTOS[sav_value]
+
+  if (
+    decision.source in (SOURCE_MODELO1, SOURCE_FPB)
+    and decision.value is not None
+  ):
+    if decision.value == sav_value:
+      return decision
+    form_label = ESTATUTOS.get(decision.value, decision.label)
+    source_name = (
+      "The signed form marks"
+      if decision.source == SOURCE_MODELO1
+      else "FPB reports"
+    )
+    conflict = (
+      f"{source_name} estatuto {decision.value} ({form_label}), but SAV's "
+      f"rule requires estatuto {sav_value} ({sav_label}) for batch "
+      f"{batch_number!r} at tier {tier!r}; the caller must resolve this "
+      f"conflict explicitly."
+    )
+    return replace(decision, conflict=conflict)
+
+  return _decision(
+    sav_value,
+    SOURCE_SAV_RULE,
+    f"SAV's op=151 batch rule read mini={mini!r} for batch "
+    f"{batch_number!r} at tier {tier!r}, so this 1ª Inscrição must use "
+    f"estatuto {sav_value} ({sav_label}).",
   )
 
 

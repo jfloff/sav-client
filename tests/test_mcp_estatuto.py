@@ -13,6 +13,7 @@ does not leave a gap in the record, it files the player as Portuguese.
 
 import pytest
 
+from sav_client.exceptions import SavError
 from sav_parsers.types import DocType, ParsedField
 
 from sav_mcp import server as server_module
@@ -49,13 +50,28 @@ def _primeira_form(parsed=None):
 
 
 class _PreviewClient:
+  def __init__(self, mini=None, mini_error=None):
+    self.mini = mini
+    self.mini_error = mini_error
+
   def list_concelhos(self, distrito_id):
     return {}
 
+  def list_player_registration_batches(self):
+    return [type("Batch", (), {"number": "2025/12", "tier": "Mini 10"})()]
 
-def _preview(monkeypatch, parsed):
+  def primeira_estatuto_mini_flag(self, batch):
+    if self.mini_error is not None:
+      raise self.mini_error
+    return self.mini
+
+
+def _preview(monkeypatch, parsed, *, mini=None, mini_error=None):
   forms = {"m1": _primeira_form(parsed)}
-  monkeypatch.setattr(server_module, "_get_client", lambda: _PreviewClient())
+  monkeypatch.setattr(
+    server_module, "_get_client",
+    lambda: _PreviewClient(mini=mini, mini_error=mini_error),
+  )
   monkeypatch.setattr(server_module, "_forms", forms)
   monkeypatch.setattr(
     server_module, "_resolve_primeira_player",
@@ -75,7 +91,8 @@ class TestPreviewReturnsTheDecision:
 
     decision = preview["estatuto_decision"]
     assert set(decision) == {
-      "value", "label", "source", "reason", "confidence", "needs_review",
+      "value", "label", "source", "reason", "confidence", "conflict",
+      "needs_review",
     }
     assert decision["value"] == ESTATUTO_SEM_FBP_COMUNITARIO
     assert decision["label"] == "Sem FBP Comunitário"
@@ -147,12 +164,46 @@ class TestPreviewAndTheNationalityTrap:
   def test_a_sem_fbp_comunitario_decision_does_not_set_nationality(
     self, monkeypatch,
   ):
-    """Different fields, different questions. A Brazilian player is Sem FBP
-    Comunitário and is not Portuguese."""
-    preview, form = _preview(monkeypatch, _fields(nacionalidade="Brasileira"))
+    """SAV's batch rule deliberately overrides the engine's answer."""
+    preview, form = _preview(
+      monkeypatch, _fields(nacionalidade="Brasileira"), mini=None,
+    )
 
     assert preview["estatuto_decision"]["value"] == ESTATUTO_SEM_FBP_COMUNITARIO
+    assert preview["estatuto_decision"]["source"] == SOURCE_NATIONALITY
     assert "nationality_id" not in form["primeira_kwargs"]
+
+    preview, form = _preview(
+      monkeypatch, _fields(nacionalidade="Brasileira"), mini=True,
+    )
+
+    assert preview["estatuto_decision"]["value"] == ESTATUTO_FBP
+    assert preview["estatuto_decision"]["source"] == "sav_rule"
+    assert preview["estatuto_decision"]["needs_review"] is False
+    assert "nationality_id" not in form["primeira_kwargs"]
+
+  def test_a_mini_batch_preview_uses_savs_fbp_rule(self, monkeypatch):
+    preview, _ = _preview(
+      monkeypatch, _fields(nacionalidade="Brasileira"), mini=True,
+    )
+
+    decision = preview["estatuto_decision"]
+    assert decision["source"] == "sav_rule"
+    assert decision["value"] == ESTATUTO_FBP
+    assert decision["needs_review"] is False
+
+  def test_a_failure_reading_the_mini_flag_keeps_the_engine_decision(
+    self, monkeypatch,
+  ):
+    preview, _ = _preview(
+      monkeypatch,
+      _fields(nacionalidade="Brasileira"),
+      mini_error=SavError("flag unavailable"),
+    )
+
+    decision = preview["estatuto_decision"]
+    assert decision["value"] == ESTATUTO_SEM_FBP_COMUNITARIO
+    assert decision["source"] == SOURCE_NATIONALITY
 
 
 # ── add_enrollment ────────────────────────────────────────────────────────────
@@ -175,7 +226,12 @@ class _CommitClient:
 def _add(monkeypatch, decision_parsed, **call_kwargs):
   seen: dict = {}
   forms = {"m1": _primeira_form(decision_parsed)}
-  monkeypatch.setattr(server_module, "_get_client", lambda: _PreviewClient())
+  mini = call_kwargs.pop("mini", None)
+  mini_error = call_kwargs.pop("mini_error", None)
+  monkeypatch.setattr(
+    server_module, "_get_client",
+    lambda: _PreviewClient(mini=mini, mini_error=mini_error),
+  )
   monkeypatch.setattr(server_module, "_forms", forms)
   monkeypatch.setattr(
     server_module, "_resolve_primeira_player",
@@ -239,6 +295,18 @@ class TestAddEnrollmentRefusesAnUndeterminedEstatuto:
     """The form answered, but not legibly enough to file unconfirmed."""
     with pytest.raises(ValueError, match="no determined Estatuto FBP"):
       _add(monkeypatch, _fields(estatuto_fbp_fbp=(True, 0.41)))
+
+  def test_a_conflict_reaches_the_commit_refusal(self, monkeypatch):
+    with pytest.raises(ValueError) as excinfo:
+      _add(
+        monkeypatch,
+        _fields(estatuto_fbp_sem_comunitario=True),
+        mini=True,
+      )
+
+    message = str(excinfo.value)
+    assert "The signed form marks estatuto 10" in message
+    assert "SAV's rule requires estatuto 6" in message
 
 
 class TestAddEnrollmentAcceptsAnOverride:

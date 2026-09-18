@@ -50,7 +50,14 @@ from .cache import Cache
 from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
 from .utils import md5_hex, strip_html
 
-from sav_shared.lookups import GENERO, find_id_by_name, player_registration_tiers
+from sav_shared.lookups import (
+  ESTATUTOS,
+  ESTATUTO_FBP,
+  ESTATUTO_SEM_FBP_COMUNITARIO,
+  GENERO,
+  find_id_by_name,
+  player_registration_tiers,
+)
 from sav_shared.dates import require_iso, to_iso
 # NOTE: `sav_shared.enrollment` is NOT imported here. It imports
 # `sav_client.exceptions`, which executes `sav_client/__init__.py`, which
@@ -5422,26 +5429,77 @@ class SavClient:
       f"SAV fail the INSERT with a server-side SQL error."
     )
 
+  def primeira_estatuto_mini_flag(
+    self, batch: PlayerRegistrationBatch,
+  ) -> bool | None:
+    """Return SAV's 1ª Inscrição ``mini`` flag for a batch, if stated.
+
+    Op=151 answers this batch-level rule even without a player, so userid=0
+    is sufficient. An absent or null ``mini`` means SAV did not state the
+    rule; any stated value is decoded strictly so a false string cannot be
+    mistaken for true by Python truthiness.
+    """
+    return self._mini_from(
+      self._load_estatuto_options(batch, 0, _REGISTRATIONS_TYPE_PRIMEIRA)
+    )
+
+  @staticmethod
+  def _mini_from(data: dict[str, Any]) -> bool | None:
+    """SAV's ``mini`` flag out of an op=151 response already fetched.
+
+    Absent *or* null means SAV did not state the rule. Null is not a stated
+    ``0``: reading it as one would select Sem FBP Comunitário, the estatuto
+    with no fee in a Mini batch, which is the failure the rule exists to
+    prevent. Decoded strictly — ``bool("0")`` is ``True``.
+
+    Split out so a caller that already holds an op=151 response can read the
+    flag from it instead of fetching the same response twice.
+    """
+    mini_value = data.get("mini")
+    if mini_value is None:
+      return None
+    return _decode_sav_flag(mini_value, field="mini", absent_is=False)
+
   def _load_primeira_estatuto(
     self, batch: PlayerRegistrationBatch, userid: int,
   ) -> int:
     """Op=151 — pick the player's estatuto from the dropdown SAV exposes.
 
-    For type-1 the player has no SAV record yet, so SAV serves a dropdown.
-    The UI locks Portuguese FBP players to a single option, so we auto-pick
-    when exactly one real (>0) option is returned. Multi-option means a
-    non-PT player (Comunitário / Não Comunitário / Equiparado) — surface a
-    config error asking the caller to pass an explicit choice.
+    For type-1 the player has no SAV record yet, so SAV serves a dropdown and
+    its wizard selects ``ESTATUTO_FBP`` (FBP) for ``mini == 1`` or
+    ``ESTATUTO_SEM_FBP_COMUNITARIO`` (Sem FBP Comunitário) otherwise. The
+    dropdown still contains all four options; this method validates that
+    SAV's rule-selected id is among them.
+
+    If an older SAV response omits ``mini``, fall back to the former behavior:
+    auto-pick exactly one real (>0) option and reject zero or multiple options.
 
     Type-2 does *not* share this path: op=151 returns all four options for a
     Revalidação too, so the sole-option rule never fires there. The
     Revalidação default comes from the response's ``id`` instead — see
     _load_estatuto_default.
     """
+    # One op=151 serves both the flag and the options — the flag is batch-level
+    # (the response does not vary by userid), so fetching it separately would
+    # just repeat this request on every enrolment.
     data = self._load_estatuto_options(
       batch, userid, _REGISTRATIONS_TYPE_PRIMEIRA,
     )
     options = self._parse_estatuto_options(data)
+    mini = self._mini_from(data)
+    if mini is not None:
+      chosen = ESTATUTO_FBP if mini else ESTATUTO_SEM_FBP_COMUNITARIO
+      if chosen not in options:
+        listing = ", ".join(
+          f"{i}={n!r}" for i, n in sorted(options.items())
+        ) or "none"
+        raise SavResponseError(
+          f"SAV's primeira estatuto rule (mini={mini!r} → "
+          f"estatuto={chosen}) selected an id not offered for batch "
+          f"{batch.id}, player {userid}; offered options: {listing}."
+        )
+      return chosen
+
     if len(options) == 1:
       return next(iter(options))
     if not options:
@@ -5502,12 +5560,16 @@ class SavClient:
     if len(options) == 1:
       return next(iter(options))
     if not options:
+      estatuto_label = ESTATUTOS.get(estatuto, "unknown")
       raise SavResponseError(
-        f"No taxa options for primeira batch {batch.id}, player {userid}: {msg!r}"
+        f"No fee is configured for estatuto={estatuto} ({estatuto_label}) "
+        f"in primeira batch {batch.id} ({batch.tier}); player {userid}."
       )
     listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
+    estatuto_label = ESTATUTOS.get(estatuto, "unknown")
     raise SavConfigError(
-      f"Multiple taxa options for primeira batch {batch.id}, player {userid}: "
+      f"Multiple fees are configured for estatuto={estatuto} ({estatuto_label}) "
+      f"in primeira batch {batch.id} ({batch.tier}), player {userid}: "
       f"{listing}. Pass taxa_id= to disambiguate."
     )
 
@@ -5584,7 +5646,23 @@ class SavClient:
     return seguro_id, seguro_id, apolice
 
   def _primeira_commit(self, body: dict[str, Any]) -> dict[str, Any]:
-    """Op=27 — type-1 final commit. JSON body sent with text/plain Content-Type."""
+    """Op=27 — type-1 final commit. JSON body sent with text/plain Content-Type.
+
+    Parsed through ``_parse_json_response`` rather than a bare ``json.loads``.
+    SAV answers unhandled PHP fatals with HTTP 200 and a stack trace, so a
+    parse failure here does **not** mean the request never arrived — it means
+    the commit reached SAV and SAV broke partway. Reporting that as
+    ``SavConnectionError`` mislabels a server fault as a network one and
+    discards the body, which on 2026-09-18 left a failed enrolment
+    undiagnosable: the wizard raised "Expecting value: line 1 column 1" and
+    the person record it had just been working with was gone, with no way to
+    tell whether the commit had caused that. ``_parse_json_response`` raises
+    ``SavServerError``, logs the full body at DEBUG on the ``sav_client``
+    logger, and keeps SAV's schema out of the message.
+
+    A genuine transport failure still raises ``SavConnectionError`` — that
+    distinction is the whole point.
+    """
     try:
       resp = self._http.post(
         self._url(_REGISTRATIONS_PATH),
@@ -5594,11 +5672,11 @@ class SavClient:
         timeout=self._timeout,
       )
       resp.raise_for_status()
-      return json.loads(resp.text)
-    except (requests.exceptions.RequestException, ValueError) as exc:
+    except requests.exceptions.RequestException as exc:
       raise SavConnectionError(
         f"Primeira commit op=27 failed: {exc}"
       ) from exc
+    return self._parse_json_response(resp.text, "Primeira commit op=27 failed")
 
   def _add_player_to_primeira_batch(
     self,

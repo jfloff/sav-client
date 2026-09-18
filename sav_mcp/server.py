@@ -104,7 +104,7 @@ from sav_shared.fpb_mod4 import (
     read_detentor_signature,
 )
 from sav_shared.games import filter_games, game_sort_key
-from sav_shared.estatuto import resolve_estatuto
+from sav_shared.estatuto import apply_sav_batch_rule, resolve_estatuto
 from sav_shared.lookups import (
     ESTATUTO_EQUIPARADO_FBP,
     ESTATUTOS,
@@ -1583,14 +1583,15 @@ def _append_estatuto_review(preview: dict, decision) -> None:
     """Add the Estatuto decision to a type-1 preview, as a row and a payload.
 
     `estatuto_decision` is the contract drive-to-sav renders (value / label /
-    source / reason / confidence / needs_review). The matching `fields` row and
+    source / reason / confidence / conflict / needs_review). The matching
+    `fields` row and
     `needs_review` entry are what make it answerable: a decision that needs
     review is supplied through `field_overrides={"estatuto": ...}`, the same
     channel as every other reviewable field, and add_enrollment refuses the
     submission until it is.
     """
     preview["estatuto_decision"] = decision.to_dict()
-    preview["fields"].append({
+    row = {
         "kwarg": "estatuto",
         "label": ENROLLMENT_FIELD_META.get("estatuto", ("estatuto", ""))[0],
         "sav_value": None,
@@ -1601,7 +1602,10 @@ def _append_estatuto_review(preview: dict, decision) -> None:
             {"confidence": round(decision.confidence, 2)}
             if decision.confidence is not None else {}
         ),
-    })
+    }
+    if decision.conflict is not None:
+        row["conflict"] = decision.conflict
+    preview["fields"].append(row)
     if decision.needs_review:
         preview["needs_review"].append("estatuto")
 
@@ -1663,9 +1667,12 @@ def _settle_primeira_estatuto(form: dict[str, Any]) -> int | None:
     if decision is None:
         return None
     if decision.needs_review:
+        reason = decision.reason
+        if decision.conflict is not None:
+            reason += " " + decision.conflict
         raise ValueError(
             "This 1ª Inscrição has no determined Estatuto FBP, so it cannot be "
-            "committed: " + decision.reason + " Supply one with "
+            "committed: " + reason + " Supply one with "
             'field_overrides={"estatuto": <id>} — '
             + ", ".join(
                 f"{k}={v!r}" for k, v in ESTATUTOS.items()
@@ -2765,6 +2772,23 @@ def preview_enrollment(
         # package can yet check the three-seasons-through-Sub-20 rule, and the
         # parameter can only ever raise a review, never grant FBP.
         estatuto_decision = resolve_estatuto(parsed, local_fbp_eligible=False)
+        try:
+            batch = _find_batch_by_number(client, batch_number)
+            mini = client.primeira_estatuto_mini_flag(batch)
+        except (SavError, ValueError):
+            logger.debug(
+                "Could not read SAV's primeira estatuto mini flag for batch %s",
+                batch_number,
+                exc_info=True,
+            )
+        else:
+            if mini is not None:
+                estatuto_decision = apply_sav_batch_rule(
+                    estatuto_decision,
+                    mini=mini,
+                    batch_number=batch.number,
+                    tier=batch.tier,
+                )
         form["primeira_kwargs"] = kwargs
         form["primeira_concelhos"] = concelhos
         form["estatuto_decision"] = estatuto_decision
