@@ -3383,6 +3383,12 @@ def create_enrollment_manual(
     """
     client = _get_client()
     batch_id = client.resolve_batch_id(batch_number)
+    # Validated on the same terms as add_enrollment. This path used to splat
+    # the caller's estatuto straight through, so 12 (Equiparado FBP) — an
+    # official status only FPB assigns — and plainly invalid ids reached SAV
+    # here while being refused one function away.
+    if estatuto is not None:
+        estatuto = _require_submittable_estatuto(estatuto)
     client.add_player_to_registration_batch(
         batch_id, license, allow_ineligible=allow_ineligible,
         **({"estatuto": estatuto} if estatuto is not None else {}),

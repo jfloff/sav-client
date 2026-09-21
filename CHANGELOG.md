@@ -21,6 +21,22 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.109.1 — 2026-09-21
+
+### Fixed
+
+**`create_enrollment_manual` validated its `estatuto` the way `add_enrollment`
+already did**
+`IMPACT: raises` — this path splatted the caller's `estatuto` straight to the
+client, so `12` (`Equiparado FBP`) and plainly invalid ids reached SAV here
+while being refused one function away. It now runs the same
+`_require_submittable_estatuto` check and raises `ValueError` instead.
+`DETECT:` grep your code for `create_enrollment_manual` calls passing
+`estatuto=`.
+`FIX:` pass 6, 10 or 11, or leave it unset and let SAV resolve it. `12` is an
+official status FPB assigns, with no box on the Modelo 1; it reaches an
+enrolment only by already being on the player's SAV record.
+
 ## 0.109.0 — 2026-09-18
 
 0.108.0 taught this package SAV's Estatuto rule. This removes everything that

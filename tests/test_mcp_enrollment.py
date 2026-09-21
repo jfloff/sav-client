@@ -1,5 +1,6 @@
 """MCP server tests for the license-first enrollment surface."""
 
+import pytest
 import base64
 
 from sav_mcp import server as server_module
@@ -337,6 +338,50 @@ def test_create_enrollment_manual_returns_licence_not_internal_id(monkeypatch):
   )
   assert result == {"success": True, "license": 301772}
   assert "player_id" not in result
+
+
+class TestCreateEnrollmentManualValidatesEstatuto:
+  """The manual path validates an estatuto on the same terms as add_enrollment.
+
+  It used to splat the caller's value straight to the client, so 12
+  (Equiparado FBP) — an official status only FPB assigns, with no box on the
+  Modelo 1 — reached SAV here while being refused one function away.
+  """
+
+  def _client(self, monkeypatch, captured):
+    class StubClient:
+      def resolve_batch_id(self, number):
+        return 42
+
+      def add_player_to_registration_batch(self, batch_id, license, **kwargs):
+        captured["kwargs"] = kwargs
+        return 77
+
+    monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
+
+  def test_a_valid_estatuto_passes_through(self, monkeypatch):
+    captured = {}
+    self._client(monkeypatch, captured)
+
+    server_module.create_enrollment_manual(
+      batch_number="2025/12", license=301772, estatuto=6,
+    )
+
+    assert captured["kwargs"]["estatuto"] == 6
+
+  @pytest.mark.parametrize("bad", [12, 99, "abc"])
+  def test_an_unsubmittable_estatuto_never_reaches_the_client(
+    self, monkeypatch, bad,
+  ):
+    captured = {}
+    self._client(monkeypatch, captured)
+
+    with pytest.raises(ValueError):
+      server_module.create_enrollment_manual(
+        batch_number="2025/12", license=301772, estatuto=bad,
+      )
+
+    assert "kwargs" not in captured
 
 
 def test_update_enrollment_returns_structured_error_when_not_enrolled(monkeypatch):
