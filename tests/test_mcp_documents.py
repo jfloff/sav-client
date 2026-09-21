@@ -190,8 +190,12 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
     "sav_parsers.parse_em",
     lambda pdf: {
       "fields": {
-        "exam_date": ParsedField(value="2026-05-01", confidence=0.91),
-        "doctor_validation_present": ParsedField(value=True, confidence=0.87),
+        "athlete_name": ParsedField(value="RITA GUEDES VITORINO", confidence=0.95, bbox=_DET_BBOX),
+        "birth_date": ParsedField(value="2015-12-08", confidence=0.94, bbox=_DET_BBOX),
+        "doc_number": ParsedField(value="31727922 0 ZY2", confidence=0.93, bbox=_DET_BBOX),
+        "doctor_validation_present": ParsedField(value=True, confidence=0.87, bbox=_DET_BBOX),
+        "exam_date": ParsedField(value="2026-05-01", confidence=0.91, bbox=_DET_BBOX),
+        "exam_number": ParsedField(value="2218/2025", confidence=0.92, bbox=_DET_BBOX),
       },
       "processing_id": "proc-em-1",
     },
@@ -209,6 +213,23 @@ def test_parse_enrollment_forms_returns_medical_exam_payload(monkeypatch):
       "exam_date": "2026-05-01",
       "raw_exam_date": None,
       "exam_date_confidence": 0.91,
+      "exam_date_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
+      "birth_date": "2015-12-08",
+      "raw_birth_date": None,
+      "birth_date_confidence": 0.94,
+      "birth_date_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
+      "athlete_name": "RITA GUEDES VITORINO",
+      "athlete_name_confidence": 0.95,
+      "athlete_name_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
+      "doc_number": "31727922 0 ZY2",
+      "doc_number_confidence": 0.93,
+      "doc_number_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
+      "exam_number": "2218/2025",
+      "exam_number_confidence": 0.92,
+      "exam_number_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
+      "doctor_validation_present": True,
+      "doctor_validation_present_confidence": 0.87,
+      "doctor_validation_present_bbox": {"page": 0, "vertices": [[0.71, 0.58], [0.76, 0.58], [0.76, 0.59], [0.71, 0.59]]},
       "needs_review": False,
     }
   ]
@@ -236,6 +257,33 @@ def test_parse_enrollment_forms_returns_raw_medical_exam_date_when_unusable(monk
   assert result[0]["needs_review"] is True
 
 
+def test_parse_enrollment_forms_keeps_unusable_birth_date_and_identity_values_verbatim(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: object())
+  monkeypatch.setattr("sav_parsers.classify", lambda pdf: DocType.EXAME_MEDICO)
+  monkeypatch.setattr(
+    "sav_parsers.parse_em",
+    lambda pdf: {
+      "fields": {
+        "exam_date": ParsedField(value="2025-09-08", confidence=0.91),
+        "birth_date": ParsedField(value="07/13/2019", confidence=0.42),
+        "doc_number": ParsedField(value="31727922 0 ZY2", confidence=0.8),
+        "exam_number": ParsedField(value="2218/2025", confidence=0.81),
+      },
+      "processing_id": "proc-em-3",
+    },
+  )
+  monkeypatch.setattr(server_module, "_forms", {})
+
+  result = server_module.parse_enrollment_forms([{"pdf": _pdf_b64()}])[0]
+
+  assert result["birth_date"] is None
+  assert result["raw_birth_date"] == "07/13/2019"
+  assert result["doc_number"] == "31727922 0 ZY2"
+  assert result["exam_number"] == "2218/2025"
+  assert result["needs_review"] is False
+  assert result["birth_date_bbox"] is None
+
+
 def test_parse_enrollment_forms_accepts_exam_date_without_ocr(monkeypatch):
   def _boom(*a, **k):  # neither classification nor OCR must run
     raise AssertionError("OCR/classify must not run when exam_date is provided")
@@ -261,6 +309,23 @@ def test_parse_enrollment_forms_accepts_exam_date_without_ocr(monkeypatch):
       "exam_date": "2026-05-01",
       "raw_exam_date": None,
       "exam_date_confidence": 1.0,
+      "exam_date_bbox": None,
+      "birth_date": None,
+      "raw_birth_date": None,
+      "birth_date_confidence": None,
+      "birth_date_bbox": None,
+      "athlete_name": None,
+      "athlete_name_confidence": None,
+      "athlete_name_bbox": None,
+      "doc_number": None,
+      "doc_number_confidence": None,
+      "doc_number_bbox": None,
+      "exam_number": None,
+      "exam_number_confidence": None,
+      "exam_number_bbox": None,
+      "doctor_validation_present": None,
+      "doctor_validation_present_confidence": None,
+      "doctor_validation_present_bbox": None,
       "needs_review": False,
     }
   ]
@@ -386,6 +451,23 @@ def test_preview_enrollment_includes_medical_exam_payload(monkeypatch):
     "raw_exam_date": None,
     "exam_date_confidence": 0.93,
     "needs_review": False,
+    "exam_date_bbox": None,
+    "birth_date": None,
+    "raw_birth_date": None,
+    "birth_date_confidence": None,
+    "birth_date_bbox": None,
+    "athlete_name": None,
+    "athlete_name_confidence": None,
+    "athlete_name_bbox": None,
+    "doc_number": None,
+    "doc_number_confidence": None,
+    "doc_number_bbox": None,
+    "exam_number": None,
+    "exam_number_confidence": None,
+    "exam_number_bbox": None,
+    "doctor_validation_present": True,
+    "doctor_validation_present_confidence": 0.8,
+    "doctor_validation_present_bbox": None,
   }
 
 

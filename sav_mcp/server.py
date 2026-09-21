@@ -118,7 +118,7 @@ from sav_shared.lookups import (
     tier_birth_years_for_season,
     tipo_doc_to_doc_type,
 )
-from sav_shared.medical_exam import extract_medical_exam_info
+from sav_shared.medical_exam import bbox_to_json, extract_medical_exam_info
 from sav_shared.serializers import (
     batch_to_dict,
     club_game_to_dict,
@@ -1672,7 +1672,27 @@ def _build_medical_exam_payload(artifact_id: str, artifact: dict[str, Any]) -> d
         "exam_date": info.exam_date,
         "raw_exam_date": info.raw_exam_date,
         "exam_date_confidence": info.exam_date_confidence,
+        # Deliberately still exam_date alone. The identity fields below are
+        # additive context; a missing athlete_name is the consumer's problem to
+        # interpret, and widening this would flag exams that submit perfectly.
         "needs_review": info.exam_date is None,
+        "exam_date_bbox": bbox_to_json(info.exam_date_bbox),
+        "birth_date": info.birth_date,
+        "raw_birth_date": info.raw_birth_date,
+        "birth_date_confidence": info.birth_date_confidence,
+        "birth_date_bbox": bbox_to_json(info.birth_date_bbox),
+        "athlete_name": info.athlete_name,
+        "athlete_name_confidence": info.athlete_name_confidence,
+        "athlete_name_bbox": bbox_to_json(info.athlete_name_bbox),
+        "doc_number": info.doc_number,
+        "doc_number_confidence": info.doc_number_confidence,
+        "doc_number_bbox": bbox_to_json(info.doc_number_bbox),
+        "exam_number": info.exam_number,
+        "exam_number_confidence": info.exam_number_confidence,
+        "exam_number_bbox": bbox_to_json(info.exam_number_bbox),
+        "doctor_validation_present": info.doctor_validation_present,
+        "doctor_validation_present_confidence": info.doctor_validation_present_confidence,
+        "doctor_validation_present_bbox": bbox_to_json(info.doctor_validation_present_bbox),
     }
 
 
@@ -2277,8 +2297,10 @@ def parse_enrollment_forms(documents: list[dict]) -> list[dict]:
 
     Returns one entry per PDF with an artifact_id and canonical doc_type to
     reference in subsequent tools. fpb_modelo_1 entries also include mod1_id;
-    exame_medico entries also include medical_exam_id; fpb_modelo_4 entries
-    also include mod4_id. On error for a given PDF the entry contains an
+    exame_medico entries also include medical_exam_id and the identity fields
+    athlete_name, doc_number, birth_date, and exam_number, each with a
+    corresponding _confidence and _bbox. fpb_modelo_4 entries also include
+    mod4_id. On error for a given PDF the entry contains an
     "error" key instead.
 
     Multiple documents are parsed concurrently (each is an independent Document AI

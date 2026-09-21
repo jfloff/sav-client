@@ -21,6 +21,47 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.110.0 — 2026-09-21
+
+Pin moved to sav-parsers 0.11.2 (`43ccf15`), which added four identity
+entities to the `exame_medico` processor. This surfaces them, plus everything
+else `parse_em` already returned and this package was throwing away.
+
+### Added
+
+**Every `exame_medico` entity now reaches the row, with its confidence and its
+bounding box**
+`IMPACT: additive` — nothing that existed changed value or disappeared. An
+`exame_medico` entry from `parse_enrollment_forms`, and
+`preview_enrollment`'s `medical_exam` block, now also carry:
+
+- `athlete_name`, `doc_number`, `exam_number` — the examined athlete's name,
+  their ID/passport number, and the exam's serial number.
+- `birth_date` + `raw_birth_date` — mirrors `exam_date` exactly: strict
+  `YYYY-MM-DD` or `None`, with whatever the OCR read landing in
+  `raw_birth_date` when it is not a usable ISO date.
+- `doctor_validation_present` — previously read from the parse and dropped.
+- a `<field>_confidence` and a `<field>_bbox` for each of the six, the bbox
+  serialized as `{"page": int, "vertices": [[x, y], …]}` or `null`.
+
+`DETECT:` grep for `medical_exam_id`, `parse_enrollment_forms` and
+`preview_enrollment` call sites that compare the returned row with `==`
+against a literal dict — those break on the added keys. Reads of individual
+keys are unaffected.
+`FIX:` compare the keys you care about, or extend the literal.
+
+**`doc_number` and `exam_number` are emitted exactly as printed.** No
+digit-coercion, no space-stripping, no date-parsing. A Portuguese card prints
+`31727922 0 ZY2` and a foreign athlete carries a passport (`GF741951`) —
+normalizing breaks both. `2218/2025` is a serial; its `/2025` half is not a
+year.
+
+**`needs_review` did not change meaning.** It is still exactly
+`exam_date is None`. A missing or low-confidence identity field does not set
+it — those fields are context for the caller to judge, and an exam with no
+`athlete_name` still submits fine. If you want to gate on them, test them
+yourself.
+
 ## 0.109.1 — 2026-09-21
 
 ### Fixed

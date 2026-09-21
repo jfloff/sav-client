@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sav-client"
-version = "0.109.1"
+version = "0.110.0"
 requires-python = ">=3.11"
 dependencies = [
     "requests>=2.31",
@@ -18,7 +18,7 @@ dependencies = [
     "pypdf>=4",
     # Pinned: sav-api stops correcting anchor->slot as of 0.10.0, so an older
     # parser would place overlays on the labelled caption instead of the box.
-    "sav-parsers @ git+https://github.com/jfloff/sav-parsers.git@ac80cfe",
+    "sav-parsers @ git+https://github.com/jfloff/sav-parsers.git@43ccf15",
 ]
 
 [project.scripts]
