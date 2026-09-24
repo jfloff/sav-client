@@ -165,6 +165,52 @@ class Club:
 
 
 @dataclass(frozen=True)
+class SubidaStatus:
+  """
+  Whether a Subida de escalão is on file for a player in the current season.
+
+  Read from the "Inscrições" tab of the player detail page
+  (``jogadoresdb.php?op=2``), SAV's own per-licence registration history. It is
+  the only read-only source that shows a promotion: the search row's ``tier``,
+  the op=29 history and op=49's origin all report the *base* escalão, and the
+  batch listing drops a lote once it is validated.
+
+  Both routes count: an inline subida on a 1ª Inscrição/Revalidação (SAV
+  renders the escalão as ``"Sub 14 >> Sub 16"``) and a standalone "Subida de
+  Escalão" lote.
+
+  Attributes:
+      status:      One of:
+
+                   * ``"approved"`` — a subida row this season with an approval
+                     date.
+                   * ``"pending"`` — a subida row whose lote has been filed but
+                     not approved yet (blank approval date).
+                   * ``"none"`` — this season's rows were read and none is a
+                     subida, or the player has no row this season at all.
+                     **Not yet verified for a lote still "Em construção"**: if
+                     the player sits in an open lote, cross-check before
+                     treating ``"none"`` as conclusive.
+                   * ``"unknown"`` — SAV's answer could not be read (tab or
+                     columns missing, current season unresolved), or SAV
+                     rendered the reduced table it shows when another club holds
+                     the player's last approved registration: it has no approval
+                     date, and whether it marks an inline subida is unverified.
+                     Never treat ``"unknown"`` as ``"none"``.
+      tier_from:   Escalão before the promotion, e.g. ``"Sub 14"``; ``None``
+                   when there is no subida row.
+      tier_to:     Escalão promoted to, e.g. ``"Sub 16"``; ``None`` when there
+                   is no subida row or SAV did not render the destination.
+      approved_on: ISO approval date for ``"approved"``; ``None`` otherwise.
+  """
+
+  status: str
+  tier_from: str | None = None
+  tier_to: str | None = None
+  approved_on: str | None = None
+
+
+@dataclass(frozen=True)
 class Player:
   """
   Represents a player in the SAV2 system.
@@ -205,6 +251,8 @@ class Player:
       mobile_phone: Mobile phone number (telemóvel). Empty unless detail
                     was fetched.
       nif:          Portuguese tax number. Empty unless detail was fetched.
+      subida:       Current-season Subida de escalão, as a ``SubidaStatus``.
+                    ``None`` unless detail was fetched.
   """
 
   id: int
@@ -228,6 +276,7 @@ class Player:
   # 0 means "unknown / unresolved", same convention as the id=0 placeholder.
   tier_id: int = 0
   gender_id: int = 0
+  subida: SubidaStatus | None = None
 
   def __repr__(self) -> str:
     return (

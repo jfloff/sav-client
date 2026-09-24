@@ -647,7 +647,10 @@ def player_cmd(ctx, license_nums, with_details, clubs, association, all_clubs):
     if with_details:
       try:
         detail = client.get_player_detail(p.id, with_details=True)
-        p = replace(p, photo_url=detail.photo_url, mobile_phone=detail.mobile_phone)
+        p = replace(
+          p, photo_url=detail.photo_url, mobile_phone=detail.mobile_phone,
+          subida=detail.subida,
+        )
       except (SavConnectionError, SavResponseError):
         pass
     return p

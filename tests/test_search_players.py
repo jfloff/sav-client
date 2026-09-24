@@ -591,6 +591,7 @@ class TestWithDetailsParallel:
         photo_url=f"pic-{player_id}",
         mobile_phone=f"m-{player_id}",
         nif=f"nif-{player_id}",
+        subida=f"subida-{player_id}",
       )
 
     monkeypatch.setattr(client, "get_player_detail", fake_detail)
@@ -600,6 +601,7 @@ class TestWithDetailsParallel:
     assert [p.id for p in results] == [1, 2]           # order preserved
     assert results[0].photo_url == "pic-1"
     assert results[1].mobile_phone == "m-2"
+    assert results[1].subida == "subida-2"
     # >1 row → the pool path ran, so the fetches happened off the main thread.
     assert detail_threads and all(t != "MainThread" for t in detail_threads)
 
@@ -615,10 +617,11 @@ class TestWithDetailsParallel:
     monkeypatch.setattr(
       client, "get_player_detail",
       lambda pid, *, with_details=False: SimpleNamespace(
-        photo_url="p", mobile_phone="m", nif="n",
+        photo_url="p", mobile_phone="m", nif="n", subida="s",
       ),
     )
 
     [player] = client.search_players(club=789, with_details=True)
     assert player.photo_url == "p"
+    assert player.subida == "s"
     assert player.mobile_phone == "m"

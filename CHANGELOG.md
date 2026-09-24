@@ -21,6 +21,37 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.111.0 — 2026-09-24
+
+### Added
+
+**`subida` on every player read with `with_details=true`**
+`IMPACT: additive`. `search_players`, `get_player` and `find_player_by_nif`
+rows gain `subida: {status, tier_from, tier_to, approved_on}`: whether a
+Subida de escalão is on file for the **current** season, by either route
+(inline on a 1ª Inscrição/Revalidação, or a standalone Subida lote). It is
+parsed from the "Inscrições" tab of the `jogadoresdb.php?op=2` page, which
+`with_details` already fetched, so there is no extra request per player. The
+only addition is the season table, read once per client. `sav_client.Player` gains
+`subida: SubidaStatus | None`. The CLI's JSON output for `players`/`player`
+gains a `subida` key: `null` without `--with-details`.
+
+- `status` is `"approved"`, `"pending"` (filed, lote not yet approved),
+  `"none"`, or `"unknown"`. **Never read `"unknown"` as `"none"`**: it covers
+  an unreadable page and players whose last approved registration is at
+  another club (SAV renders them a reduced history).
+- `"none"` is unverified for a lote still "Em construção". Cross-check
+  `enrollment_status_bulk` before trusting it for a player in an open lote.
+- **`tier` is the base escalão of a promoted player, not the destination.**
+  Verified live: 18 of one club's 83 approved athletes this season are
+  promoted, and every one reads its pre-promotion `tier`. `subida.tier_to` is
+  the escalão they play in. `tier` itself is unchanged; if you read the
+  playing escalão from it, it was already wrong for promoted players.
+- A current-season `search_players` returns only *approved* registrations,
+  so pending athletes are absent from it rather than reported `"none"`.
+
+---
+
 ## 0.110.0 — 2026-09-21
 
 Pin moved to sav-parsers 0.11.2 (`43ccf15`), which added four identity

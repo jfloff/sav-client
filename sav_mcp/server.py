@@ -447,8 +447,11 @@ def search_players(
     Pass club_id=0 to search all clubs (federation-wide or scoped by association_id).
     status: "active" | "inactive" | "all"
     with_details: when true, issue one extra request per player to fill
-        photo_url, mobile_phone and nif in the returned rows. Off by default
-        because it is N+1. nif is only populated for your own club's players:
+        photo_url, mobile_phone, nif and subida in the returned rows. Off by
+        default because it is N+1. subida is the current season's Subida de
+        escalão, {status, tier_from, tier_to, approved_on}, status one of
+        "approved", "pending" (filed, not yet approved), "none" or "unknown".
+        Never read "unknown" as "none"; see sav_mcp/AGENTS.md. nif is only populated for your own club's players:
         SAV2 discloses a NIF only to the player's own club, so with club_id=0
         an empty nif means "not visible to you", not "none on file".
     """
@@ -490,7 +493,11 @@ def get_player(
     status: "active" (default) | "inactive" | "all"; passed unchanged at
         every season rung.
     season: explicit SAV2 epoch id. When supplied, bypasses the widening ladder.
-    with_details: when true, also fetch photo_url, mobile_phone and nif.
+    with_details: when true, also fetch photo_url, mobile_phone, nif and
+        subida — the current season's Subida de escalão,
+        {status, tier_from, tier_to, approved_on}, status one of "approved",
+        "pending" (filed, not yet approved), "none" or "unknown". Never
+        read "unknown" as "none"; see sav_mcp/AGENTS.md.
     Returns null if no player is found with that licence.
     """
     client = _get_client()
@@ -519,7 +526,11 @@ def find_player_by_nif(
     longer means "not currently at this club".
     status: "active" (default) | "inactive" | "all"; passed unchanged at
         every season rung.
-    with_details: when true, also fetch photo_url, mobile_phone and nif.
+    with_details: when true, also fetch photo_url, mobile_phone, nif and
+        subida — the current season's Subida de escalão,
+        {status, tier_from, tier_to, approved_on}, status one of "approved",
+        "pending" (filed, not yet approved), "none" or "unknown". Never
+        read "unknown" as "none"; see sav_mcp/AGENTS.md.
     """
     digits = normalise_nif(nif)
     if digits is None:

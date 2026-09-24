@@ -34,6 +34,13 @@ def player_to_dict(p: Any, *, with_details: bool = False) -> dict:
     out["photo_url"] = getattr(p, "photo_url", "")
     out["mobile_phone"] = getattr(p, "mobile_phone", "")
     out["nif"] = getattr(p, "nif", "")
+    subida = getattr(p, "subida", None)
+    out["subida"] = None if subida is None else {
+      "status": subida.status,
+      "tier_from": subida.tier_from,
+      "tier_to": subida.tier_to,
+      "approved_on": subida.approved_on,
+    }
   return out
 
 

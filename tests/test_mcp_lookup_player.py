@@ -131,6 +131,11 @@ def test_lookup_player_federation_wide_profile_reuses_exact_search_cache(
           '<input id="nif" value="">'
         ),
       })
+    if params == {"op": "168"}:
+      # The season table, read once so the detail can scope `subida`.
+      return json.dumps({
+        "arrayEpoca": [{"id": "100", "descricao": "2026/2027", "activa": "1"}],
+      })
     raise AssertionError(f"unexpected request: path={path!r} params={params!r}")
 
   monkeypatch.setattr(client, "_post_form", fake_post_form)
@@ -158,6 +163,11 @@ def test_lookup_player_federation_wide_profile_reuses_exact_search_cache(
   assert client._cache.get_player_id(194998) == 1949
   assert [params for _, _, params in calls].count({"op": "1"}) == 1
   assert [params for _, _, params in calls].count({"op": "2"}) == 2
+  assert [params for _, _, params in calls].count({"op": "168"}) == 1
+  # The stub page has no "Inscrições" tab, so SAV's answer is unreadable.
+  assert result["subida"] == {
+    "status": "unknown", "tier_from": None, "tier_to": None, "approved_on": None,
+  }
 
 
 class _ProbeStubClient:

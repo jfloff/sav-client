@@ -47,7 +47,10 @@ from .exceptions import (
   SavWriteUnverifiedError,
 )
 from .cache import Cache
-from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
+from .models import (
+  Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session,
+  SubidaStatus,
+)
 from .utils import md5_hex, strip_html
 
 from sav_shared.lookups import (
@@ -321,6 +324,89 @@ def _coerce_exam_date(value: str | None, *, today: date | None = None) -> str:
       f"would be issued already expired. Rejected by sav-client, not by SAV."
     )
   return parsed.isoformat()
+
+
+# SAV renders an inline subida's escalão as "<from> >> <to>".
+_SUBIDA_TIER_SEPARATOR = ">>"
+
+
+def _parse_subida_status(soup: Any, season_label: str | None) -> SubidaStatus:
+  """Read the current season's Subida de escalão from the op=2 "Inscrições" tab.
+
+  The tab (``#inscricao``) lists one row per registration, every season. A row
+  is a subida when its Tipo is "Subida de Escalão" (SAV spells it "Súbida" —
+  hence matching on normalised text) or its Escalão reads ``"A >> B"``, which
+  is how an inline subida on a 1ª Inscrição/Revalidação renders.
+
+  Columns are located by header text, never by position: SAV renders two
+  layouts. The full one carries "Data Aprovação" (blank while the lote is
+  still in flight). The reduced one, shown when another club holds the
+  player's last approved registration, has no date column; there a subida's
+  state cannot be told and whether ``>>`` renders at all is unverified, so
+  every current-season row in it reads ``"unknown"``.
+
+  Anything that stops us reading SAV's answer is ``"unknown"``, not
+  ``"none"``: a caller acting on a false "none" files a second promotion with
+  the federation.
+  """
+  if not season_label:
+    return SubidaStatus(status="unknown")
+  pane = soup.find(id="inscricao")
+  table = pane.find("table") if pane is not None else None
+  header_row = table.find("tr") if table is not None else None
+  if header_row is None:
+    return SubidaStatus(status="unknown")
+
+  headers = [
+    normalise_text(th.get_text(" ", strip=True))
+    for th in header_row.find_all(["th", "td"])
+  ]
+  columns = {name: i for i, name in enumerate(headers) if name}
+  season_col = columns.get("epoca")
+  tier_col = columns.get("escalao")
+  type_col = columns.get("tipo")
+  if season_col is None or tier_col is None or type_col is None:
+    return SubidaStatus(status="unknown")
+  date_col = columns.get("data aprovacao")
+
+  rows = []
+  for tr in table.find_all("tr"):
+    if tr is header_row:
+      continue
+    cells = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+    if len(cells) != len(headers):
+      # A row we cannot align with the header is a row we cannot read.
+      return SubidaStatus(status="unknown")
+    if cells[season_col] == season_label:
+      rows.append(cells)
+
+  if not rows:
+    return SubidaStatus(status="none")
+  if date_col is None:
+    return SubidaStatus(status="unknown")
+
+  subidas = [
+    cells for cells in rows
+    if "subida" in normalise_text(cells[type_col])
+    or _SUBIDA_TIER_SEPARATOR in cells[tier_col]
+  ]
+  if not subidas:
+    return SubidaStatus(status="none")
+
+  def _status(cells: list[str]) -> SubidaStatus:
+    tier_from, sep, tier_to = cells[tier_col].partition(_SUBIDA_TIER_SEPARATOR)
+    approved_on = to_iso(cells[date_col]) if cells[date_col] else None
+    return SubidaStatus(
+      status="approved" if approved_on else "pending",
+      tier_from=tier_from.strip() or None,
+      tier_to=(tier_to.strip() or None) if sep else None,
+      approved_on=approved_on,
+    )
+
+  # An approved subida outranks one still in flight; among equals, the latest
+  # approval wins.
+  statuses = [_status(cells) for cells in subidas]
+  return max(statuses, key=lambda st: (st.status == "approved", st.approved_on or ""))
 
 
 class SavClient:
@@ -605,7 +691,16 @@ class SavClient:
           d = self.get_player_detail(p.id, with_details=True)
           return _dc_replace(
             p, photo_url=d.photo_url, mobile_phone=d.mobile_phone, nif=d.nif,
+            subida=d.subida,
           )
+
+        # Warm the memoised season table before fanning out, so the detail
+        # workers don't each re-fetch it on a cold client. A failure here is
+        # left for get_player_detail to report as subida "unknown".
+        try:
+          self.get_current_season()
+        except SavError:
+          pass
 
         # One detail fetch per row: fan out (order-preserving via pool.map) so a
         # wide --with-details listing isn't a serial N+1. Mirrors the parallel
@@ -942,7 +1037,11 @@ class SavClient:
   def get_player_detail(self, player_id: int, *, with_details: bool = False) -> Player:
     """
     Fetch the detail page for a single player to obtain fields not returned
-    by the listing: ``photo_url`` and ``mobile_phone``.
+    by the listing: ``photo_url``, ``mobile_phone``, ``nif`` and ``subida``.
+
+    ``subida`` is the *current* season's Subida de escalão status (see
+    ``SubidaStatus``), whatever season the player row came from. It is
+    ``"unknown"`` when the current season cannot be resolved.
 
     Pass ``with_details=True`` to fetch and parse the detail page. With the
     default ``with_details=False`` this is a no-op that returns a minimal
@@ -976,7 +1075,14 @@ class SavClient:
     logger.info("Fetching photo for player id=%s", player_id)
     text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
     raw = self._parse_json_response(text, "Player detail response was not valid JSON")
-    return self._parse_player_detail_response(raw, player_id=player_id)
+    try:
+      season_label: str | None = self.get_current_season().label
+    except SavError:
+      logger.debug("Could not resolve current season for subida status", exc_info=True)
+      season_label = None
+    return self._parse_player_detail_response(
+      raw, player_id=player_id, season_label=season_label,
+    )
 
   def find_license_by_nif(self, nif: str, *, refresh: bool = False) -> int | None:
     """Return this club's licence for ``nif``, progressively and safely.
@@ -6782,14 +6888,18 @@ class SavClient:
       )
     return self._parse_clubs_html(raw["clubes"])
 
-  def _parse_player_detail_response(self, raw: dict[str, Any], *, player_id: int) -> Player:
+  def _parse_player_detail_response(
+    self, raw: dict[str, Any], *, player_id: int, season_label: str | None = None,
+  ) -> Player:
     """
     Parse the JSON envelope returned by jogadoresdb.php?op=2.
 
     The server returns ``{"msg": "<html>..."}``; we scan ``<img>`` tags for
     the player's photo and pull ``<input id="telem">`` / ``<input id="nif">``
     for the mobile phone and tax number, returning a minimal Player with id,
-    photo_url, mobile_phone and nif.
+    photo_url, mobile_phone, nif and subida. ``subida`` comes from the
+    "Inscrições" tab for ``season_label`` (e.g. ``"2026/2027"``); see
+    :func:`_parse_subida_status`.
     """
     from bs4 import BeautifulSoup
 
@@ -6819,6 +6929,7 @@ class SavClient:
       photo_url=photo_url,
       mobile_phone=mobile_phone,
       nif=nif,
+      subida=_parse_subida_status(soup, season_label),
     )
 
   def __repr__(self) -> str:

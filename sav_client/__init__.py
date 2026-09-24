@@ -13,7 +13,10 @@ from .exceptions import (
     SavServerError,
     SavWriteUnverifiedError,
 )
-from .models import Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session
+from .models import (
+    Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session,
+    SubidaStatus,
+)
 from .sav_client import SavClient
 
 __all__ = [
@@ -23,6 +26,7 @@ __all__ = [
     "Season",
     "LoginResult",
     "Player",
+    "SubidaStatus",
     "Coach",
     "Club",
     "Game",
