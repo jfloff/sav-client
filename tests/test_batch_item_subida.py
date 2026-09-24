@@ -1,4 +1,4 @@
-"""Subida status read from a lote's op=10 rows, and merged across lotes.
+"""Subida status read from a lote's op=10 rows.
 
 The op=10 HTML mirrors lote 226 as captured live on 2026-09-24: a leading icon
 column and a trailing "Subida" column holding the destination escalão of an
@@ -6,13 +6,12 @@ inline subida (blank otherwise).
 """
 
 import json
-from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from sav_client.models import PlayerRegistrationBatch
-from sav_client.sav_client import SavClient, _merge_subida
+from sav_client.sav_client import SavClient
 
 HEADER = (
   "<tr><th></th><th>Nº Licença</th><th>Nome</th><th>Data Nasc.</th>"
@@ -92,17 +91,6 @@ class TestBatchItemSubida:
     assert items[0]["subida"] == _st("unknown")
 
 
-class TestMergeSubida:
-  def test_pending_beats_unknown_beats_none(self):
-    assert _merge_subida([_st("none"), _st("pending", "Sub 14", "Sub 16")]) == (
-      _st("pending", "Sub 14", "Sub 16")
-    )
-    assert _merge_subida([_st("none"), _st("unknown")]) == _st("unknown")
-
-  def test_no_lote_is_none(self):
-    assert _merge_subida([]) == _st("none")
-
-
 def _classifying_client(monkeypatch, batches, items):
   client = SavClient.__new__(SavClient)
   client._cache = SimpleNamespace(record_license_batch=lambda *a: None)
@@ -119,28 +107,28 @@ def _classifying_client(monkeypatch, batches, items):
   return client
 
 
-class TestAcrossLotes:
-  """A licence in a blank Revalidação *and* a Subida lote must read the
-  Subida, whichever lote the listing puts first."""
+class TestStatusRows:
+  BATCHES = [_batch(12)]
+  ITEMS = {12: [{"license": 1, "name": "P", "subida": _st("pending", "Sub 16", "Sub 18")}]}
 
-  BATCHES = [_batch(12), replace(_batch(13, type_id=4), type="Subida de Escalão")]
-  ITEMS = {
-    12: [{"license": 1, "name": "P", "subida": _st("none")}],
-    13: [{"license": 1, "name": "P", "subida": _st("pending", None, "Sub 18")}],
-  }
-
-  def test_bulk_merges_every_lote(self, monkeypatch):
+  def test_pending_row_carries_its_lote_subida(self, monkeypatch):
     client = _classifying_client(monkeypatch, self.BATCHES, self.ITEMS)
     out = client.classify_enrollment_status([1])
-    assert out[1]["batch"]["number"] == "12"          # first lote still reported
-    assert out[1]["subida"] == _st("pending", None, "Sub 18")
-
-  def test_single_licence_merges_every_lote(self, monkeypatch):
-    client = _classifying_client(monkeypatch, self.BATCHES, self.ITEMS)
-    assert client.pending_subida_status(1) == _st("pending", None, "Sub 18")
+    assert out[1]["batch"]["number"] == "12"
+    assert out[1]["subida"] == _st("pending", "Sub 16", "Sub 18")
 
   def test_item_without_subida_reads_unknown(self, monkeypatch):
     client = _classifying_client(
       monkeypatch, [_batch(12)], {12: [{"license": 1, "name": "P"}]},
     )
     assert client.classify_enrollment_status([1])[1]["subida"] == _st("unknown")
+
+  def test_batch_item_subida_reads_the_row(self, monkeypatch):
+    client = _classifying_client(monkeypatch, self.BATCHES, self.ITEMS)
+    assert client.batch_item_subida(12, 1) == _st("pending", "Sub 16", "Sub 18")
+
+  def test_batch_item_subida_without_a_row_is_unknown(self, monkeypatch):
+    # The caller resolved the licence to this lote; no row means the lote
+    # changed underneath, which must not read as "no subida".
+    client = _classifying_client(monkeypatch, self.BATCHES, self.ITEMS)
+    assert client.batch_item_subida(12, 999) == _st("unknown")

@@ -450,13 +450,6 @@ def _batch_item_subida(
   return _subida_dict("pending", batch.tier or None, tier_to)
 
 
-def _merge_subida(subidas: list[dict[str, Any]]) -> dict[str, Any]:
-  """Collapse one licence's per-lote subidas: ``"pending"`` beats
-  ``"unknown"`` beats ``"none"``. Letting a blank Revalidação row mask a
-  Subida lote listed after it would report a filed promotion as not filed."""
-  rank = {"pending": 2, "unknown": 1, "none": 0}
-  return max(subidas, key=lambda st: rank.get(st["status"], 1), default=_subida_dict("none"))
-
 
 class SavClient:
   """
@@ -2185,10 +2178,10 @@ class SavClient:
     federation. ``open_batches`` on a ``not_enrolled`` row stays narrow, and
     lists only batches that can still accept a player.
 
-    ``subida`` on a pending row merges the "Subida" column of *every* lote the
-    licence sits in (see :func:`_merge_subida`), not just the lote reported
-    under ``batch``. Other statuses carry no ``subida``: an approved subida is
-    only readable from the player page (``get_player_detail``).
+    ``subida`` on a pending row is that lote row's "Subida" column (see
+    :func:`_batch_item_subida`). Other statuses carry no ``subida``: an
+    approved subida is only readable from the player page
+    (``get_player_detail``).
 
     Side effect: records each found (licence → batch) in the cache so a
     later single-player lookup starts warm.
@@ -2219,23 +2212,23 @@ class SavClient:
     open_batches = [b for b in batches if b.is_open]
 
     # licence → (batch, name) from one item scan per in-flight batch.
-    license_batch: dict[int, tuple[PlayerRegistrationBatch, str]] = {}
-    # Every lote row's subida per licence, not just the first lote's: a licence
-    # in a Revalidação *and* a Subida lote must report the Subida.
-    license_subidas: dict[int, list[dict[str, Any]]] = {}
+    # licence → (batch, name, subida). SAV holds a licence in one in-flight
+    # lote at a time — a Subida after an enrolment waits for the first lote to
+    # complete — so the first row found is the licence's only one.
+    license_batch: dict[
+      int, tuple[PlayerRegistrationBatch, str, dict[str, Any]]
+    ] = {}
     for batch in pending_batches:
       # TODO: list_player_registration_batch_items re-lists batches on every
       # call; an internal variant taking the batch object would drop this
       # pass from O(2·open batches) to O(open batches) HTTP calls.
       for item in self.list_player_registration_batch_items(batch.id):
         lic = int(item.get("license", 0))
-        if not lic:
-          continue
-        license_subidas.setdefault(lic, []).append(
-          item.get("subida") or _subida_dict("unknown"),
-        )
-        if lic not in license_batch:
-          license_batch[lic] = (batch, item.get("name", ""))
+        if lic and lic not in license_batch:
+          license_batch[lic] = (
+            batch, item.get("name", ""),
+            item.get("subida") or _subida_dict("unknown"),
+          )
           self._cache.record_license_batch(lic, batch.id)
 
     # Active roster as a licence → name map (one query for the whole club).
@@ -2258,7 +2251,7 @@ class SavClient:
     out: dict[int, dict[str, Any]] = {}
     for lic in requested:
       if lic in license_batch:
-        batch, name = license_batch[lic]
+        batch, name, subida = license_batch[lic]
         out[lic] = {
           "status": "pending",
           "batch": {
@@ -2268,7 +2261,7 @@ class SavClient:
             "state": batch.state,
           },
           "name": name,
-          "subida": _merge_subida(license_subidas[lic]),
+          "subida": subida,
         }
       elif lic in active:
         out[lic] = {"status": "enrolled", "name": active[lic]}
@@ -4682,26 +4675,21 @@ class SavClient:
       })
     return items
 
-  def pending_subida_status(self, license: int) -> dict[str, Any]:
-    """Subida status for ``license`` across every lote still in flight.
+  def batch_item_subida(self, batch_id: int, license: int) -> dict[str, Any]:
+    """Subida status of ``license``'s row in lote ``batch_id``.
 
-    Reads the "Subida" column of each pending lote the licence sits in and
-    merges them with :func:`_merge_subida`, so a licence in both a Revalidação
-    and a Subida lote reports the Subida whichever is listed first. A licence
-    in no pending lote reads ``"none"``. Approved subidas are not visible here
-    (a validated lote drops out of the listing); read them with
-    ``get_player_detail``.
+    The row's "Subida" column, mapped by :func:`_batch_item_subida`. A licence
+    with no row in the lote reads ``"unknown"``, not ``"none"``: the caller
+    resolved it to this lote, so a missing row means the lote changed under us.
+    Approved subidas are not visible here (a validated lote drops out of the
+    listing); read them with ``get_player_detail``.
 
-    Cost: one op=10 per pending lote.
+    Cost: one op=10.
     """
-    subidas = [
-      item.get("subida") or _subida_dict("unknown")
-      for batch in self.list_player_registration_batches()
-      if batch.is_pending
-      for item in self.list_player_registration_batch_items(batch.id)
-      if int(item.get("license", 0)) == int(license)
-    ]
-    return _merge_subida(subidas)
+    for item in self.list_player_registration_batch_items(batch_id):
+      if int(item.get("license", 0)) == int(license):
+        return item.get("subida") or _subida_dict("unknown")
+    return _subida_dict("unknown")
 
   def load_existing_registration_record(
     self, batch_id: int, license: int,

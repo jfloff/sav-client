@@ -3892,9 +3892,8 @@ def get_enrollment_status(
                         *mutation* tools accept, which are "Em construção"
                         only — a player in Em Validação reports "pending"
                         here but cannot be edited. Also carries `subida`
-                        ({status, tier_from, tier_to, approved_on}) merged
-                        across every lote the player sits in; see
-                        enrollment_status_bulk.
+                        ({status, tier_from, tier_to, approved_on}) read from
+                        that lote's row; see enrollment_status_bulk.
       "not_enrolled" — license is neither in an open batch nor in the
                         active roster.
 
@@ -4006,7 +4005,7 @@ def get_enrollment_status(
             "type": batch.type if batch else "",
             "state": batch.state if batch else "",
         },
-        "subida": client.pending_subida_status(license),
+        "subida": client.batch_item_subida(batch_id, license),
         "checklist": checklist,
         **({"available_doc_types": available} if available else {}),
     }
@@ -4041,8 +4040,7 @@ def enrollment_status_bulk(licenses: list[int]) -> list[dict]:
     read from the lotes the player sits in, every in-flight state including
     "Em construção": "pending" when a subida is on the lote (or the lote is a
     Subida lote), "none" when not, "unknown" when SAV's row could not be read.
-    It merges all of the player's lotes, not just the one under `batch`. An
-    approved subida is not visible here; read it with
+    An approved subida is not visible here; read it with
     get_player(with_details=true).
     """
     client = _get_client()

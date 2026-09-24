@@ -228,7 +228,7 @@ class _PendingClient:
     from sav_shared.lookups import doc_type_to_tipo_doc
     return [{"tipo_doc": doc_type_to_tipo_doc("exame_medico")}]
 
-  def pending_subida_status(self, license):
+  def batch_item_subida(self, batch_id, license):
     return {
       "status": "pending", "tier_from": "Sub 16", "tier_to": "Sub 18",
       "approved_on": None,
