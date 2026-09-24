@@ -21,6 +21,17 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.112.1 — 2026-09-24
+
+### Fixed
+
+**`rich` is now a declared dependency**
+`IMPACT: none` for MCP and library callers. `sav_cli` imports `rich`, but the
+package never declared it, so a fresh install could not import the CLI or
+collect its tests. Environments that already had `rich` are unaffected.
+
+---
+
 ## 0.112.0 — 2026-09-24
 
 ### Added
