@@ -228,6 +228,12 @@ class _PendingClient:
     from sav_shared.lookups import doc_type_to_tipo_doc
     return [{"tipo_doc": doc_type_to_tipo_doc("exame_medico")}]
 
+  def pending_subida_status(self, license):
+    return {
+      "status": "pending", "tier_from": "Sub 16", "tier_to": "Sub 18",
+      "approved_on": None,
+    }
+
 
 def _doc_type_for_tipo(tipo_doc):
   from sav_shared.lookups import tipo_doc_to_doc_type
@@ -349,3 +355,13 @@ def test_grounded_checklist_declares_its_nationality_came_from_sav(monkeypatch):
     monkeypatch.setattr(server_module, "_get_client", lambda c=client_cls: c())
     checklist = server_module.get_enrollment_status(license=301772)["checklist"]
     assert checklist["nationality_source"] == "sav_record"
+
+
+def test_pending_status_carries_the_lote_subida(monkeypatch):
+  monkeypatch.setattr(server_module, "_get_client", lambda: _PendingClient())
+  result = server_module.get_enrollment_status(license=301772)
+  assert result["status"] == "pending"
+  assert result["subida"] == {
+    "status": "pending", "tier_from": "Sub 16", "tier_to": "Sub 18",
+    "approved_on": None,
+  }

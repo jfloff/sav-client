@@ -3891,7 +3891,10 @@ def get_enrollment_status(
                         is included. Note this is wider than the batches the
                         *mutation* tools accept, which are "Em construção"
                         only — a player in Em Validação reports "pending"
-                        here but cannot be edited.
+                        here but cannot be edited. Also carries `subida`
+                        ({status, tier_from, tier_to, approved_on}) merged
+                        across every lote the player sits in; see
+                        enrollment_status_bulk.
       "not_enrolled" — license is neither in an open batch nor in the
                         active roster.
 
@@ -4003,6 +4006,7 @@ def get_enrollment_status(
             "type": batch.type if batch else "",
             "state": batch.state if batch else "",
         },
+        "subida": client.pending_subida_status(license),
         "checklist": checklist,
         **({"available_doc_types": available} if available else {}),
     }
@@ -4022,7 +4026,7 @@ def enrollment_status_bulk(licenses: list[int]) -> list[dict]:
 
     Returns one row per input licence, in the order given:
       pending      → {"license", "status", "batch": {number, type_id, type,
-                      state}, "name"}
+                      state}, "name", "subida"}
       enrolled     → {"license", "status", "name"}   (active in the roster)
       not_enrolled → {"license", "status", "open_batches": [...]}
 
@@ -4032,6 +4036,14 @@ def enrollment_status_bulk(licenses: list[int]) -> list[dict]:
     `checklist` that get_enrollment_status returns: that reads the live batch
     or the player's stored nationality, so it stays a single-player call. Use
     get_enrollment_status(license) when you need the checklist.
+
+    subida (pending rows only) is {status, tier_from, tier_to, approved_on}
+    read from the lotes the player sits in, every in-flight state including
+    "Em construção": "pending" when a subida is on the lote (or the lote is a
+    Subida lote), "none" when not, "unknown" when SAV's row could not be read.
+    It merges all of the player's lotes, not just the one under `batch`. An
+    approved subida is not visible here; read it with
+    get_player(with_details=true).
     """
     client = _get_client()
     classified = client.classify_enrollment_status(licenses)
@@ -4045,7 +4057,10 @@ def list_batch_enrollments(batch_number: str) -> list[dict]:
 
     batch_number is the human-visible batch number (as shown in the SAV2 UI).
 
-    Returns: list of {"license": int, "name": str}.
+    Returns: list of {"license": int, "name": str, "subida": {status,
+    tier_from, tier_to, approved_on}}. subida is "pending" when the row carries
+    a subida (always, in a Subida lote), "none" when not, and "unknown" when
+    SAV's row could not be read.
 
     To inspect a single player by licence, use read_enrollment(license).
     """

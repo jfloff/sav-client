@@ -188,9 +188,9 @@ class SubidaStatus:
                      not approved yet (blank approval date).
                    * ``"none"`` — this season's rows were read and none is a
                      subida, or the player has no row this season at all.
-                     **Not yet verified for a lote still "Em construção"**: if
-                     the player sits in an open lote, cross-check before
-                     treating ``"none"`` as conclusive.
+                     **Not yet verified for a lote still "Em construção"**: for
+                     a player in any in-flight lote, prefer the lote-row
+                     status (``SavClient.pending_subida_status``).
                    * ``"unknown"`` — SAV's answer could not be read (tab or
                      columns missing, current season unresolved), or SAV
                      rendered the reduced table it shows when another club holds

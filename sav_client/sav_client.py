@@ -409,6 +409,55 @@ def _parse_subida_status(soup: Any, season_label: str | None) -> SubidaStatus:
   return max(statuses, key=lambda st: (st.status == "approved", st.approved_on or ""))
 
 
+
+def _subida_dict(status: str, tier_from: str | None = None,
+                 tier_to: str | None = None) -> dict[str, Any]:
+  """A lote row's subida in the public ``{status, tier_from, tier_to,
+  approved_on}`` shape. ``approved_on`` is always None: a lote that has been
+  approved drops out of the listing, so a lote row is never approved."""
+  return {
+    "status": status, "tier_from": tier_from, "tier_to": tier_to,
+    "approved_on": None,
+  }
+
+
+def _batch_item_subida(
+  batch: PlayerRegistrationBatch, cell: str | None,
+) -> dict[str, Any]:
+  """Map an op=10 row's "Subida" cell to a subida status.
+
+  Verified live 2026-09-24 on "Em Pagamento" Revalidação lotes: the cell names
+  the destination escalão of an inline subida (lote 226: ``"Sub 18"`` on a
+  Sub 16 lote) and is blank otherwise.
+
+  * ``cell is None`` (no Subida column, or a misaligned row) → ``"unknown"``.
+  * A Subida lote (type 4) → ``"pending"`` whatever the cell says: sitting in
+    one *is* a filed standalone subida. ``tier_from`` stays None, because
+    whether a type-4 lote's own escalão is the origin or the destination is
+    unverified.
+  * Any other lote with the cell set → ``"pending"``, from the lote's escalão
+    to the cell's.
+  * Blank (or SAV's "Não selecionado" placeholder) → ``"none"``.
+  """
+  if cell is None:
+    return _subida_dict("unknown")
+  normalised = normalise_text(cell)
+  tier_to = None if normalised in ("", "nao selecionado") else cell.strip()
+  if batch.type_id == _REGISTRATIONS_TYPE_SUBIDA:
+    return _subida_dict("pending", None, tier_to)
+  if tier_to is None:
+    return _subida_dict("none")
+  return _subida_dict("pending", batch.tier or None, tier_to)
+
+
+def _merge_subida(subidas: list[dict[str, Any]]) -> dict[str, Any]:
+  """Collapse one licence's per-lote subidas: ``"pending"`` beats
+  ``"unknown"`` beats ``"none"``. Letting a blank Revalidação row mask a
+  Subida lote listed after it would report a filed promotion as not filed."""
+  rank = {"pending": 2, "unknown": 1, "none": 0}
+  return max(subidas, key=lambda st: rank.get(st["status"], 1), default=_subida_dict("none"))
+
+
 class SavClient:
   """
   Automation client for the FPB SA2.0 player registration system.
@@ -2120,7 +2169,7 @@ class SavClient:
 
     Returns a dict keyed by licence:
       "pending"      → {"status", "batch": {number, type_id, type, state},
-                        "name"}
+                        "name", "subida"}
       "enrolled"     → {"status", "name"}   (active in the club roster)
       "not_enrolled" → {"status", "open_batches": [...]}
 
@@ -2135,6 +2184,11 @@ class SavClient:
     that as "never enrolled" and file a duplicate registration with the
     federation. ``open_batches`` on a ``not_enrolled`` row stays narrow, and
     lists only batches that can still accept a player.
+
+    ``subida`` on a pending row merges the "Subida" column of *every* lote the
+    licence sits in (see :func:`_merge_subida`), not just the lote reported
+    under ``batch``. Other statuses carry no ``subida``: an approved subida is
+    only readable from the player page (``get_player_detail``).
 
     Side effect: records each found (licence → batch) in the cache so a
     later single-player lookup starts warm.
@@ -2166,13 +2220,21 @@ class SavClient:
 
     # licence → (batch, name) from one item scan per in-flight batch.
     license_batch: dict[int, tuple[PlayerRegistrationBatch, str]] = {}
+    # Every lote row's subida per licence, not just the first lote's: a licence
+    # in a Revalidação *and* a Subida lote must report the Subida.
+    license_subidas: dict[int, list[dict[str, Any]]] = {}
     for batch in pending_batches:
       # TODO: list_player_registration_batch_items re-lists batches on every
       # call; an internal variant taking the batch object would drop this
       # pass from O(2·open batches) to O(open batches) HTTP calls.
       for item in self.list_player_registration_batch_items(batch.id):
         lic = int(item.get("license", 0))
-        if lic and lic not in license_batch:
+        if not lic:
+          continue
+        license_subidas.setdefault(lic, []).append(
+          item.get("subida") or _subida_dict("unknown"),
+        )
+        if lic not in license_batch:
           license_batch[lic] = (batch, item.get("name", ""))
           self._cache.record_license_batch(lic, batch.id)
 
@@ -2206,6 +2268,7 @@ class SavClient:
             "state": batch.state,
           },
           "name": name,
+          "subida": _merge_subida(license_subidas[lic]),
         }
       elif lic in active:
         out[lic] = {"status": "enrolled", "name": active[lic]}
@@ -4533,7 +4596,10 @@ class SavClient:
     The SAV2 batch detail page renders one row per item; each row carries
     ``editJogador(license, batch, type)`` and similar onclick handlers from
     which we recover the licence. Returns a list of
-    ``{"license": int, "name": str}`` in the order the server lists them.
+    ``{"license": int, "name": str, "subida": dict}`` in the order the server
+    lists them. ``subida`` reads the row's "Subida" column; see
+    :func:`_batch_item_subida` for how it maps to the
+    ``{status, tier_from, tier_to, approved_on}`` shape.
 
     Used to detect "already enrolled" players so a re-submit can patch the
     existing item via op=30 + op=33/op=31 instead of erroring on the
@@ -4585,6 +4651,12 @@ class SavClient:
 
     from bs4 import BeautifulSoup
     soup = BeautifulSoup(body, "html.parser")
+    header_row = next((tr for tr in soup.find_all("tr") if tr.find("th")), None)
+    headers = [
+      normalise_text(th.get_text(" ", strip=True))
+      for th in (header_row.find_all(["th", "td"]) if header_row else [])
+    ]
+    subida_col = headers.index("subida") if "subida" in headers else None
     items: list[dict[str, Any]] = []
     seen: set[int] = set()
     for btn in soup.find_all(attrs={"onclick": re.compile(r"editJogador\(")}):
@@ -4598,8 +4670,38 @@ class SavClient:
       row = btn.find_parent("tr")
       cells = [c.get_text(strip=True) for c in row.find_all("td")] if row else []
       name = cells[2] if len(cells) > 2 else ""
-      items.append({"license": license, "name": name})
+      # A row that doesn't line up with the header can't be read, so its
+      # Subida cell is passed as None ("unknown"), never as blank ("none").
+      subida_cell = (
+        cells[subida_col]
+        if subida_col is not None and len(cells) == len(headers) else None
+      )
+      items.append({
+        "license": license, "name": name,
+        "subida": _batch_item_subida(batch, subida_cell),
+      })
     return items
+
+  def pending_subida_status(self, license: int) -> dict[str, Any]:
+    """Subida status for ``license`` across every lote still in flight.
+
+    Reads the "Subida" column of each pending lote the licence sits in and
+    merges them with :func:`_merge_subida`, so a licence in both a Revalidação
+    and a Subida lote reports the Subida whichever is listed first. A licence
+    in no pending lote reads ``"none"``. Approved subidas are not visible here
+    (a validated lote drops out of the listing); read them with
+    ``get_player_detail``.
+
+    Cost: one op=10 per pending lote.
+    """
+    subidas = [
+      item.get("subida") or _subida_dict("unknown")
+      for batch in self.list_player_registration_batches()
+      if batch.is_pending
+      for item in self.list_player_registration_batch_items(batch.id)
+      if int(item.get("license", 0)) == int(license)
+    ]
+    return _merge_subida(subidas)
 
   def load_existing_registration_record(
     self, batch_id: int, license: int,

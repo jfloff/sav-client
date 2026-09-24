@@ -21,6 +21,33 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.112.0 — 2026-09-24
+
+### Added
+
+**`subida` on lote rows: `enrollment_status_bulk`, `get_enrollment_status`, `list_batch_enrollments`**
+`IMPACT: additive`. The rows these return for a player in a lote now carry the
+same `subida: {status, tier_from, tier_to, approved_on}` as `get_player`.
+It comes from the "Subida" column of SAV's lote detail (op=10), which these
+calls already fetched. Status rows gain it only when `"pending"`;
+`list_batch_enrollments` rows always. `sav_client` item dicts from
+`list_player_registration_batch_items` gain a `subida` key, and
+`SavClient.pending_subida_status(license)` is new.
+
+- Covers every in-flight state, **"Em construção" included**. That closes the
+  gap `get_player`'s `"none"` documents for players in an open lote.
+- `"pending"` when the row names a promoted escalão (`tier_from` is the
+  lote's escalão), or whenever the lote is a Subida lote; `"none"` when blank;
+  `"unknown"` when the row can't be read. `approved_on` is always `null`.
+- The status calls merge **every** lote the player sits in. `batch` still
+  names only the first, so read `subida`, not `batch.type`, to decide whether a
+  Subida is filed.
+- Verified live on "Em Pagamento" Revalidação lotes. Not yet seen: a filled row
+  in an open lote, and any row in a Subida lote, so `tier_from` stays `null`
+  there until the lote's escalão is confirmed as origin or destination.
+
+---
+
 ## 0.111.0 — 2026-09-24
 
 ### Added
