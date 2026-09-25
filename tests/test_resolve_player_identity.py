@@ -316,3 +316,100 @@ def test_status_filters_the_chosen_licence_not_the_candidates(monkeypatch, clien
   assert set(searched_statuses) == {"all"}
   assert active.status == "not_found"
   assert anyone.status == "found" and anyone.player.license == 102
+
+
+class TestANifMatchIsNeverVetoed:
+  """Observed live 2026-09-25: one supplied key disagreeing with SAV turned a
+  clear NIF match into null ("no player" — a duplicate 1ª Inscrição)."""
+
+  def _client(self, monkeypatch, client, *, nif_rows, search_rows=(), profile=None):
+    _nif_result(monkeypatch, client, [int(r.license) for r in nif_rows])
+    _nifs_on_file(monkeypatch, client, {})
+
+    def search_players(**kwargs):
+      if "license" in kwargs:
+        return [r for r in nif_rows if str(r.license) == kwargs["license"]]
+      return list(search_rows)
+
+    monkeypatch.setattr(client, "search_players", search_players)
+    monkeypatch.setattr(
+      client, "load_player_profile", lambda license, club_id=None: profile or {},
+    )
+
+  def test_a_birth_date_typo_is_reported_not_fatal(self, monkeypatch, client):
+    jean = _player(316104, "Jean Pimenta", birth_date="2009-08-29")
+    self._client(monkeypatch, client, nif_rows=[jean], search_rows=[])
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Jean Pimenta", birth_date="2009-09-28",
+    )
+
+    assert result.status == "found"
+    assert result.player == jean
+    assert result.nif_on_file == "match"
+    assert result.conflicts == [
+      {"key": "birth_date", "given": "2009-09-28", "on_file": "2009-08-29"},
+    ]
+    assert result.matched_by == ["nif", "name"]
+
+  def test_a_doc_number_sav_never_stored_is_reported_with_the_one_it_holds(
+    self, monkeypatch, client,
+  ):
+    yuting = _player(315784, "Yuting Hu", birth_date="2016-08-31")
+    self._client(
+      monkeypatch, client, nif_rows=[yuting], search_rows=[],
+      profile={"numi": "EJG252806"},
+    )
+
+    result = client.resolve_player_identity(nif="123456789", id_number="23D553W08")
+
+    assert result.status == "found"
+    assert result.player == yuting
+    assert result.conflicts == [
+      {"key": "id_number", "given": "23D553W08", "on_file": "EJG252806"},
+    ]
+    assert result.matched_by == ["nif"]
+
+  def test_keys_describing_a_different_person_make_it_ambiguous(
+    self, monkeypatch, client,
+  ):
+    # The NIF is one child's; name + birth date describe another (placeholder
+    # NIF on file). Conflicting evidence about who this is: offer both.
+    nif_child = _player(301, "Rui Lopes", birth_date="2012-01-01")
+    other = _player(302, "Tiago Reis", birth_date="2014-05-05")
+    self._client(monkeypatch, client, nif_rows=[nif_child], search_rows=[other])
+    _nifs_on_file(monkeypatch, client, {302: "999999990"})
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Tiago Reis", birth_date="2014-05-05",
+    )
+
+    assert result.status == "ambiguous"
+    assert {int(p.license) for p in result.candidates} == {301, 302}
+
+  def test_an_incomplete_scan_behind_an_overriding_nif_is_unknown(
+    self, monkeypatch, client,
+  ):
+    jean = _player(316104, "Jean Pimenta", birth_date="2009-08-29")
+    self._client(monkeypatch, client, nif_rows=[jean], search_rows=[])
+    _nif_result(monkeypatch, client, [316104], complete=False)
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Jean Pimenta", birth_date="2009-09-28",
+    )
+
+    assert result.status == "unknown"
+
+
+def test_matched_by_drops_the_nif_when_sav_holds_another(monkeypatch, client):
+  child = _player(201, "Rita Costa", birth_date="2014-05-06")
+  _nif_result(monkeypatch, client, [])
+  _nifs_on_file(monkeypatch, client, {201: "111111111"})
+  monkeypatch.setattr(client, "search_players", lambda **kwargs: [child])
+
+  result = client.resolve_player_identity(
+    nif="123456789", birth_date="2014-05-06", name="Rita Costa",
+  )
+
+  assert result.nif_on_file == "different"
+  assert result.matched_by == ["name", "birth_date"]

@@ -313,7 +313,7 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 | `portuguese` | Portugal (id 155) | `fpb_modelo_1`, `exame_medico` |
 | `foreign_born` | any other / unknown | `fpb_modelo_1`, `exame_medico`, `atestado_residencia`, `certidao_matricula`, `documento_identificacao` × 2 (passaporte + título de residência — the player's or a parent's) |
 
-`fpb_modelo_4` is optional in both (only when promoting an escalão inline — Subida). reg_type 4 (standalone Subida) requires only `fpb_modelo_4`; reg_type 3 (Transferência) is not handled yet (`checklist` is null). Unknown nationality is treated as `foreign_born` on purpose — asking for the extra documents is the safe error.
+`fpb_modelo_4` is optional in both (only when promoting an escalão inline — Subida). With an inline subida, `add_enrollment`'s success response carries `subida: {offered: [{tier_id, name}], committed: {tier_id, name}}` — the tiers SAV's op=21 offered this player and the one filed. Whether that offer is player-specific is still unverified (three athletes were offered the same Sub 16 / Sub 18), so record it. reg_type 4 (standalone Subida) requires only `fpb_modelo_4`; reg_type 3 (Transferência) is not handled yet (`checklist` is null). Unknown nationality is treated as `foreign_born` on purpose — asking for the extra documents is the safe error.
 
 ## Other workflows
 
@@ -385,7 +385,8 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
   - **Several people** → `{ambiguous: true, candidates: [...], matched_by}`. Never pick from it without a second identifier (the form's licence, or `birth_date`/`name`).
   - `{error: "identity_unverifiable", ...}` → SAV's evidence was incomplete (a profile could not be read, or a federation-wide search may have hit SAV's 48-row cap). It is neither found nor not-found — **never treat it as a new player**.
   - `null` → no player matched.
-  - Every found/ambiguous answer carries `matched_by` (which keys were applied).
+  - Every found/ambiguous answer carries `matched_by`: on a found player, only the keys that **agree** with the answer (no `"nif"` when SAV holds another NIF for them).
+  - **A NIF match is never vetoed by another key.** When SAV holds the NIF for someone but a supplied `name`, `birth_date` or `id_number` disagrees with SAV (verified live: a birth-date typo; a passport SAV never stored), that person is still the answer and `conflicts: [{key, given, on_file}]` names each disagreement — for `id_number`, `on_file` is the doc number SAV holds. Treat a conflict as a typo on one side to review, never as a new player. If the other keys instead describe a *different* person, the answer is `ambiguous` with both.
   - **SAV's NIF can be missing or wrong, so the NIF is evidence, not a filter.** A found player carries **`nif_on_file`** whenever you gave a NIF. `"match"` means SAV holds that NIF for them — and when someone carries it, only they count, so an unrelated player born the same day cannot make the answer ambiguous. When no one carries it, a player can still be found by the other keys, and `nif_on_file` says why the NIF could not be confirmed:
     - `"different"` — SAV holds **another NIF**: either the placeholder `999999990` the club registered them with, or another real NIF (verified live: a player whose SAV NIF belongs to someone else). The placeholder never contradicts; a different real NIF is accepted only when a strong key matched — `name` + `birth_date`, or `id_number` — and with `birth_date` alone it still rules the candidate out.
     - `"none"` — no NIF on file (21% of one club's licences have none);

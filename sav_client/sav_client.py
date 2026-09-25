@@ -21,6 +21,8 @@ Configuration (.env keys)
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -477,6 +479,31 @@ def _batch_item_subida(
     return _subida_dict("none")
   return _subida_dict("pending", batch.tier or None, tier_to)
 
+
+
+# Subida-tier decisions recorded for the caller, per call chain. Set by
+# record_subida_picks(); a ContextVar so concurrent enrolments on
+# one client never see each other's picks.
+_SUBIDA_PICKS: contextvars.ContextVar[list[dict[str, Any]] | None] = (
+  contextvars.ContextVar("sav_subida_picks", default=None)
+)
+
+
+@contextlib.contextmanager
+def record_subida_picks():
+  """Collect every subida-tier decision made inside the ``with`` block.
+
+  Yields a list that fills with ``{offered: [{tier_id, name}],
+  requested_tier_id, committed: {tier_id, name} | None}`` — one per op=21
+  decision (``SavClient._pick_subida_tier``), in order. Scoped to the calling
+  context rather than a client, so concurrent enrolments stay separate.
+  """
+  picks: list[dict[str, Any]] = []
+  token = _SUBIDA_PICKS.set(picks)
+  try:
+    yield picks
+  finally:
+    _SUBIDA_PICKS.reset(token)
 
 
 class SavClient:
@@ -1133,24 +1160,54 @@ class SavClient:
         tier="", gender="", birth_date="", nationality="", status="",
       )
 
+    logger.info("Fetching photo for player id=%s", player_id)
+    raw = self._fetch_player_page(
+      player_id, what="Player detail response was not valid JSON",
+    )
+    return self._parse_player_detail_response(
+      raw, player_id=player_id, season_label=self._current_season_label(),
+    )
+
+  def get_player_detail_and_profile(
+    self, player_id: int,
+  ) -> tuple[Player, dict[str, Any]]:
+    """Detail fields and the reconciliation profile from ONE op=2 request.
+
+    ``get_player_detail(with_details=True)`` and ``load_player_profile`` read
+    the same page (``jogadoresdb.php?op=2``); a caller wanting both used to
+    fetch it twice (~60 KB each). Returns ``(detail, profile)`` exactly as
+    those two methods would.
+    """
+    if self.session is None:
+      raise SavResponseError(
+        "Must call login() before get_player_detail_and_profile()"
+      )
+    raw = self._fetch_player_page(
+      player_id, what="Player detail response was not valid JSON",
+    )
+    detail = self._parse_player_detail_response(
+      raw, player_id=player_id, season_label=self._current_season_label(),
+    )
+    return detail, self._parse_player_profile(raw)
+
+  def _current_season_label(self) -> str | None:
+    """The active season's label, or None when it cannot be resolved."""
+    try:
+      return self.get_current_season().label
+    except SavError:
+      logger.debug("Could not resolve current season for subida status", exc_info=True)
+      return None
+
+  def _fetch_player_page(self, player_id: int, *, what: str) -> dict[str, Any]:
+    """POST ``jogadoresdb.php?op=2`` for ``player_id`` and parse its JSON."""
     payload = {
       "user_id": player_id,
       "user": self.session.get("user", ""),
       "perfil": self.session.get("perfil", 0),
       "organizacao": self.session.get("organizacao", 0),
     }
-
-    logger.info("Fetching photo for player id=%s", player_id)
     text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
-    raw = self._parse_json_response(text, "Player detail response was not valid JSON")
-    try:
-      season_label: str | None = self.get_current_season().label
-    except SavError:
-      logger.debug("Could not resolve current season for subida status", exc_info=True)
-      season_label = None
-    return self._parse_player_detail_response(
-      raw, player_id=player_id, season_label=season_label,
-    )
+    return self._parse_json_response(text, what)
 
   def find_licenses_by_nif(self, nif: str | None) -> NifLicenses:
     """Return every own-club licence associated with ``nif``.
@@ -1402,33 +1459,47 @@ class SavClient:
     else:
       candidate_rows = []
 
-    if not search_rows and nif_result is not None:
-      session_club = int(self.session.get("organizacao") or 0) if self.session else 0
-      for license_number in nif_result.licenses:
-        candidate_rows.extend(self.search_players(
+    session_club = int(self.session.get("organizacao") or 0) if self.session else 0
+
+    def _nif_rows() -> list[Player]:
+      """Every row of the licences carrying the NIF (own club, any season)."""
+      rows: list[Player] = []
+      for license_number in (nif_result.licenses if nif_result else []):
+        rows.extend(self.search_players(
           license=str(license_number), club=session_club, season=0,
           status="all",
         ))
+      return rows
 
-    rows_by_license: dict[int, Player] = {}
-    for player in candidate_rows:
-      try:
-        license_number = int(player.license)
-      except (TypeError, ValueError):
-        continue
-      if license_number not in pool:
-        continue
-      previous = rows_by_license.get(license_number)
-      if previous is None or player.season > previous.season:
-        rows_by_license[license_number] = player
+    def _group(rows: list[Player], allowed: set[int]) -> list[list[Player]]:
+      """Newest row per allowed licence, grouped into people."""
+      by_license: dict[int, Player] = {}
+      for player in rows:
+        try:
+          license_number = int(player.license)
+        except (TypeError, ValueError):
+          continue
+        if license_number not in allowed:
+          continue
+        previous = by_license.get(license_number)
+        if previous is None or player.season > previous.season:
+          by_license[license_number] = player
+      return group_same_person(list(by_license.values()))
 
-    groups = group_same_person(list(rows_by_license.values()))
+    if not search_rows and nif_result is not None:
+      candidate_rows = _nif_rows()
+
+    groups = _group(candidate_rows, pool)
 
     # A NIF match outranks "NIF unknown": when any person carries the NIF, only
     # those people count, together with their own NIF-unknown licences (an
     # unread newer licence of the same person must not be lost). Only when no
     # one carries it do the NIF-unknown people stand — reported as unconfirmed.
     nif_confirmed: bool | None = None
+    # Set when the NIF matched a person the other keys did not describe: the
+    # NIF's answer stands, and every disagreeing key is named.
+    nif_overrode_keys = False
+    other_people: list[list[Player]] = []
     if nif_result is not None:
       if search_set is None:
         nif_confirmed = True
@@ -1440,6 +1511,17 @@ class SavClient:
         if confirmed_groups:
           groups = confirmed_groups
           nif_confirmed = True
+        elif nif_set:
+          # SAV holds this NIF for someone, but the other keys matched no one
+          # carrying it: one of them disagrees with SAV (observed live — a
+          # birth-date typo, a doc number SAV never stored). Dropping the NIF's
+          # match here used to return null, which reads as "new player". The
+          # NIF's person stands, with the disagreement reported; if the keys
+          # instead describe a *different* person, both are offered.
+          other_people = groups
+          groups = _group(_nif_rows(), nif_set)
+          nif_confirmed = True
+          nif_overrode_keys = True
         else:
           nif_confirmed = False
 
@@ -1463,14 +1545,42 @@ class SavClient:
       # _nif_unknown above.)
       return "different"
 
+    def _conflicts(player: Player) -> list[dict[str, Any]]:
+      """Each supplied key that disagrees with what SAV holds for ``player``."""
+      found: list[dict[str, Any]] = []
+      if name_key and not names_match(name_key, player.name):
+        found.append({"key": "name", "given": name_key, "on_file": player.name})
+      if date_key and date_key != player.birth_date:
+        found.append({
+          "key": "birth_date", "given": date_key, "on_file": player.birth_date,
+        })
+      if number_key and int(player.license) not in {
+        int(p.license) for p in search_rows.get("id_number", [])
+      }:
+        on_file = None
+        try:
+          # The NIF matched, so the player is at our club and the profile is
+          # readable; its `numi` is the doc number SAV holds.
+          on_file = self.load_player_profile(
+            int(player.license), club_id=session_club or None,
+          ).get("numi") or None
+        except (SavError, ValueError):
+          logger.debug(
+            "Could not read the doc number for %s", player.license, exc_info=True,
+          )
+        found.append({"key": "id_number", "given": number_key, "on_file": on_file})
+      return found
+
     # Missing evidence can hide a licence, and a hidden licence can be the
     # person's newer one. A possibly-capped federation search can hide one
-    # anywhere; an incomplete NIF scan only matters when the NIF is the sole
-    # key (with other keys, unread licences are kept as NIF-unknown). Either
-    # makes a miss, or a single-person answer, unknowable. An ambiguous answer
-    # stays ambiguous: it picks no one.
+    # anywhere; an incomplete NIF scan matters whenever the answer rests on the
+    # NIF's licences alone (the NIF was the only key, or it overrode the
+    # others) — with other keys, unread licences are kept as NIF-unknown.
+    # Either makes a miss, or a single-person answer, unknowable. An ambiguous
+    # answer stays ambiguous: it picks no one.
     uncertain = possibly_truncated or (
-      nif_result is not None and not nif_result.complete and search_set is None
+      nif_result is not None and not nif_result.complete
+      and (search_set is None or nif_overrode_keys)
     )
 
     def _match(status_: str, **fields: Any) -> IdentityMatch:
@@ -1493,8 +1603,11 @@ class SavClient:
     def _passes(player: Player) -> bool:
       return bool(self._filter_players_status([player], status_filter))
 
-    person_rows = [_newest_first(group)[0] for group in groups]
-    if len(groups) > 1:
+    # The NIF's person and a different person described by the other keys:
+    # conflicting evidence about who this is, so offer both.
+    people = groups + [g for g in other_people if g not in groups]
+    person_rows = [_newest_first(group)[0] for group in people]
+    if len(people) > 1:
       # Still ambiguous after the status filter, even with one person left:
       # a filter is not evidence of identity, so it never picks.
       kept = [row for row in person_rows if _passes(row)]
@@ -1507,9 +1620,19 @@ class SavClient:
       return _match("unknown")
     if not _passes(ordered[0]):
       return _match("not_found")
+    nif_on_file = _nif_on_file(ordered[0])
+    conflicts = _conflicts(ordered[0]) if nif_overrode_keys else []
+    # `matched_by` names only the keys that agree with the answer: not "nif"
+    # when SAV holds another NIF for the player, and not a key that conflicts.
+    disagreeing = {conflict["key"] for conflict in conflicts}
+    answer_keys = [
+      key for key in matched_by
+      if key not in disagreeing
+      and not (key == "nif" and nif_on_file != "match")
+    ]
     return _match(
       "found", player=ordered[0], other_licenses=ordered[1:],
-      nif_on_file=_nif_on_file(ordered[0]),
+      nif_on_file=nif_on_file, conflicts=conflicts, matched_by=answer_keys,
     )
 
   def build_nif_index(self, *, force: bool = False) -> dict:
@@ -2328,6 +2451,9 @@ class SavClient:
     """
     with self._batch_memo_lock:
       self._batch_memo.clear()
+    memo, lock = self._item_memo()
+    with lock:
+      memo.clear()
 
   def _require_batch(self, batch_id: int) -> PlayerRegistrationBatch:
     """Return the batch row for ``batch_id``, raising if the club has no such batch.
@@ -2405,6 +2531,20 @@ class SavClient:
       4. If no open batch contains the licence, raise
          ``LicenseNotEnrolledError`` with the open-batch list.
     """
+    return self._resolve_batch_and_item_by_license(
+      license, include_submitted=include_submitted,
+    )[0]
+
+  def _resolve_batch_and_item_by_license(
+    self, license: int, *, include_submitted: bool = False,
+  ) -> tuple[PlayerRegistrationBatch, dict[str, Any] | None]:
+    """``resolve_batch_by_license``, also returning the lote row it found.
+
+    The row is the licence's ``list_player_registration_batch_items`` item
+    when the lote was scanned, or None when a validated cache hit answered
+    without reading the lote (the op=30 probe carries no row). A caller that
+    needs the row then reads it — but a scan's row is never fetched twice.
+    """
     if license is None:
       raise ValueError("license must not be None")
 
@@ -2424,16 +2564,15 @@ class SavClient:
       if cached in scan_by_id and scan_by_id[cached].type_id == _REGISTRATIONS_TYPE_SUBIDA:
         # op=30 has no Subida-lote record and answers a PHP fatal (observed
         # live 2026-09-24), so a Subida lote is validated by its rows instead.
-        if any(
-          int(item.get("license", 0)) == int(license)
-          for item in self.list_player_registration_batch_items(cached)
-        ):
-          return scan_by_id[cached]
+        for item in self.list_player_registration_batch_items(cached):
+          if int(item.get("license", 0)) == int(license):
+            self._remember_item(cached, license, item)
+            return scan_by_id[cached], item
         self._cache.forget_license_batch(license)
       elif cached in scan_by_id:
         try:
           self.load_existing_registration_record(cached, license)
-          return scan_by_id[cached]
+          return scan_by_id[cached], None
         except SavRecordNotFoundError:
           # Probe came back well-formed but the player is no longer in
           # this batch — cache is stale. Fall through to a full scan.
@@ -2446,10 +2585,11 @@ class SavClient:
         self._cache.forget_license_batch(license)
 
     for batch in scan_batches:
-      items = self.list_player_registration_batch_items(batch.id)
-      if any(int(item.get("license", 0)) == int(license) for item in items):
-        self._cache.record_license_batch(license, batch.id)
-        return batch
+      for item in self.list_player_registration_batch_items(batch.id):
+        if int(item.get("license", 0)) == int(license):
+          self._cache.record_license_batch(license, batch.id)
+          self._remember_item(batch.id, license, item)
+          return batch, item
 
     raise LicenseNotEnrolledError(
       license=license,
@@ -2777,12 +2917,37 @@ class SavClient:
     no-subida case.
     """
     options = self._list_subida_tier_options(internal_id)
+
+    def _record(committed: tuple[int, str] | None) -> None:
+      """Log SAV's offer and the pick, and hand them to a recording caller.
+
+      Whether op=21's offer is player-specific decides which tier gets filed
+      (three different athletes were offered the same Sub 16 / Sub 18), so
+      every decision is observable, not only the failing ones.
+      """
+      logger.info(
+        "Subida tier for player %s: SAV offered %s; requested %s; committed %s.",
+        internal_id, options, prefer_tier_id, committed,
+      )
+      picks = _SUBIDA_PICKS.get()
+      if picks is not None:
+        picks.append({
+          "offered": [{"tier_id": i, "name": n} for i, n in options],
+          "requested_tier_id": prefer_tier_id,
+          "committed": (
+            {"tier_id": committed[0], "name": committed[1]} if committed else None
+          ),
+        })
+
     if not options:
+      _record(None)
       return None
     if prefer_tier_id is not None:
       for tier_id, name in options:
         if tier_id == int(prefer_tier_id):
+          _record((tier_id, name))
           return (tier_id, name)
+      _record(None)
       listing = ", ".join(f"{i}={n!r}" for i, n in options)
       raise SavConfigError(
         f"Requested subida tier_id={prefer_tier_id} is not among SAV's "
@@ -2790,7 +2955,9 @@ class SavClient:
         f"and the server disagree — pick one of the offered tiers."
       )
     if len(options) == 1:
+      _record(options[0])
       return options[0]
+    _record(None)
     listing = ", ".join(f"{i}={n!r}" for i, n in options)
     raise SavConfigError(
       f"SAV offers multiple subida tiers for player {internal_id}: "
@@ -5029,6 +5196,35 @@ class SavClient:
       })
     return items
 
+  def _item_memo(self) -> tuple[dict[tuple[int, int], tuple[float, dict[str, Any]]], Any]:
+    """The (batch_id, licence) → (time, lote row) memo and its lock.
+
+    Rows the batch resolver found, so a read that follows it
+    (``batch_item_subida``) does not re-read the same lote. Same TTL and
+    invalidation as the listing memo; a write's postcondition never reads it —
+    it always reads the lote fresh. Created lazily, like
+    ``_club_assoc_cache``.
+    """
+    memo = getattr(self, "_item_memo_store", None)
+    if memo is None:
+      memo = self._item_memo_store = ({}, threading.Lock())
+    return memo
+
+  def _remember_item(self, batch_id: int, license: int, item: dict[str, Any]) -> None:
+    """Keep a lote row the resolver just read, for the read that follows."""
+    memo, lock = self._item_memo()
+    with lock:
+      memo[(int(batch_id), int(license))] = (time.time(), item)
+
+  def _recent_item(self, batch_id: int, license: int) -> dict[str, Any] | None:
+    """A lote row read within the memo TTL, or None."""
+    memo, lock = self._item_memo()
+    with lock:
+      entry = memo.get((int(batch_id), int(license)))
+    if entry is not None and (time.time() - entry[0]) < _BATCH_MEMO_TTL:
+      return entry[1]
+    return None
+
   def batch_item_subida(self, batch_id: int, license: int) -> dict[str, Any]:
     """Subida status of ``license``'s row in lote ``batch_id``.
 
@@ -5038,8 +5234,12 @@ class SavClient:
     Approved subidas are not visible here (a validated lote drops out of the
     listing); read them with ``get_player_detail``.
 
-    Cost: one op=10.
+    Cost: one op=10 — none when the batch resolver read this row a moment
+    ago (``get_enrollment_status`` resolves the lote first).
     """
+    recent = self._recent_item(batch_id, license)
+    if recent is not None and recent.get("subida"):
+      return recent["subida"]
     for item in self.list_player_registration_batch_items(batch_id):
       if int(item.get("license", 0)) == int(license):
         return item.get("subida") or _subida_dict("unknown")
@@ -5180,19 +5380,28 @@ class SavClient:
 
     player_id = self._cache.get_player_id(int(license))
     if player_id is None:
-      results = self.search_players(license=str(license), club=club_id or 0)
+      # Every season, any status: the internal id is the same in every season,
+      # and a current-season search misses a player not enrolled this season
+      # (every Revalidação athlete) — verified live on a cold cache, licence
+      # 315784 raised "No player with license". season=0 is one row per licence.
+      results = self.search_players(
+        license=str(license), club=club_id or 0, season=0, status="all",
+      )
       if not results:
         raise SavResponseError(f"No player with license {license}")
       player_id = results[0].id
 
-    payload = {
-      "user_id":     player_id,
-      "user":        self.session.get("user", ""),
-      "perfil":      self.session.get("perfil", 0),
-      "organizacao": self.session.get("organizacao", 0),
-    }
-    text = self._post_form(_PLAYER_DETAIL_PATH, payload, params={"op": _PLAYER_DETAIL_OP})
-    raw = self._parse_json_response(text, "Player profile response was not valid JSON")
+    raw = self._fetch_player_page(
+      player_id, what="Player profile response was not valid JSON",
+    )
+    return self._parse_player_profile(raw)
+
+  def _parse_player_profile(self, raw: dict[str, Any]) -> dict[str, Any]:
+    """The reconciliation profile from a parsed op=2 response.
+
+    Field IDs in the rendered HTML are translated to the canonical keys used
+    elsewhere (see ``load_player_profile``); empty values are dropped.
+    """
     if "msg" not in raw:
       raise SavResponseError(
         f"Player profile response missing 'msg': keys={list(raw.keys())}"

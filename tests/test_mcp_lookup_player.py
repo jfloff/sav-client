@@ -47,6 +47,20 @@ class _StubClient:
     self.profile_calls.append((license, club_id))
     return {"name": "Profile Name", "nif": "999999999", "email": "x@y.test"}
 
+  # One op=2 page carries both the detail fields and the profile.
+  _DETAIL = dict(photo_url="photo.jpg", mobile_phone="912000000", nif="111111111")
+
+  def get_player_detail(self, player_id, *, with_details=False):
+    self.detail_calls = getattr(self, "detail_calls", []) + [player_id]
+    return _player(id=player_id, **self._DETAIL)
+
+  def get_player_detail_and_profile(self, player_id):
+    self.combined_calls = getattr(self, "combined_calls", []) + [player_id]
+    return (
+      _player(id=player_id, **self._DETAIL),
+      {"name": "Profile Name", "nif": "999999999", "email": "x@y.test"},
+    )
+
 
 def test_identify_player_by_nif(monkeypatch):
   stub = _StubClient()
@@ -105,7 +119,11 @@ def test_lookup_player_nests_profile_without_field_collisions(monkeypatch):
   assert result["nif"] == "111111111"
   assert result["profile"]["name"] == "Profile Name"
   assert result["profile"]["nif"] == "999999999"
-  assert stub.profile_calls == [("301772", 200)]
+  # Both flags read the op=2 page once, by the row's internal id — no
+  # separate profile load, and the search itself asked for no details.
+  assert stub.combined_calls == [301772]
+  assert stub.profile_calls == []
+  assert all(not call.get("with_details") for call in stub.calls)
 
 
 def test_lookup_player_federation_wide_profile_reuses_exact_search_cache(
@@ -169,7 +187,8 @@ def test_lookup_player_federation_wide_profile_reuses_exact_search_cache(
   }
   assert client._cache.get_player_id(194998) == 1949
   assert [params for _, _, params in calls].count({"op": "1"}) == 1
-  assert [params for _, _, params in calls].count({"op": "2"}) == 2
+  # Details and profile come from ONE op=2 page (they used to fetch it twice).
+  assert [params for _, _, params in calls].count({"op": "2"}) == 1
   assert [params for _, _, params in calls].count({"op": "168"}) == 1
   # The stub page has no "Inscrições" tab, so SAV's answer is unreadable.
   assert result["subida"] == {
@@ -501,29 +520,22 @@ def test_identify_player_surfaces_unknown_results(monkeypatch):
 
 
 def test_identify_player_nif_with_details_hydrates_found_license(monkeypatch):
-  found = _player(license="301772", photo_url="photo.jpg")
+  found = _player(license="301772", photo_url="")
   stub = _StubClient()
   stub.identity_match = IdentityMatch(
     status="found", player=found, other_licenses=[], candidates=[],
     matched_by=["nif"], placeholder_nif=False,
   )
-
-  def detail_search(**kwargs):
-    stub.calls.append(kwargs)
-    assert kwargs == {
-      "license": "301772", "club": 200, "season": 0, "status": "all",
-      "with_details": True,
-    }
-    return [_player(license="301772", photo_url="photo.jpg")]
-
-  stub.search_players = detail_search
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   result = server_module.identify_player(nif="123456789", with_details=True)
 
   assert result is not None
   assert result["photo_url"] == "photo.jpg"
-  assert stub.calls[0]["with_details"] is True
+  # The resolver's row already names the player: the detail page is read by
+  # its internal id, with no second search for the licence.
+  assert stub.detail_calls == [301772]
+  assert stub.calls == []
 
 
 def test_identify_player_by_id_number_returns_found_match(monkeypatch):
@@ -571,3 +583,31 @@ def test_identify_player_club_zero_passes_federation_scope(monkeypatch):
 
   assert result is not None
   assert stub.identity_calls[0]["club"] == 0
+
+
+def test_identify_player_reports_conflicts_on_a_nif_match(monkeypatch):
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=_player(), other_licenses=[], candidates=[],
+    matched_by=["nif", "name"], placeholder_nif=False, nif_on_file="match",
+    conflicts=[{"key": "birth_date", "given": "2009-09-28", "on_file": "2009-08-29"}],
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(
+    nif="123456789", name="Test", birth_date="2009-09-28",
+  )
+
+  assert result["license"] == "301772"
+  assert result["conflicts"] == [
+    {"key": "birth_date", "given": "2009-09-28", "on_file": "2009-08-29"},
+  ]
+
+
+def test_identify_player_omits_conflicts_when_every_key_agrees(monkeypatch):
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789")
+
+  assert "conflicts" not in result

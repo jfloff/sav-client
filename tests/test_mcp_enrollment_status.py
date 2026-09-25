@@ -6,6 +6,8 @@ checklist grounded in the player's stored nationality even when there is no
 open batch to read it from.
 """
 
+import pytest
+
 from sav_client.exceptions import LicenseNotEnrolledError, SavResponseError
 
 from sav_mcp import server as server_module
@@ -365,3 +367,40 @@ def test_pending_status_carries_the_lote_subida(monkeypatch):
     "status": "pending", "tier_from": "Sub 16", "tier_to": "Sub 18",
     "approved_on": None,
   }
+
+
+class _EnrolledClient(_NotEnrolledClient):
+  """Enrolled this season: the roster row carries the nationality label."""
+
+  def __init__(self, nationality):
+    self.nationality = nationality
+    self.profile_loads = 0
+
+  def search_players(self, license, club, status):
+    from types import SimpleNamespace
+    return [SimpleNamespace(
+      license=license, name="P", club="C", club_id=7, association="A",
+      tier="Sub 14", tier_id=5, gender="Masculino", gender_id=1,
+      birth_date="2012-01-01", nationality=self.nationality, status="FBP",
+      season="2026/2027", active=True,
+    )]
+
+  def load_player_profile(self, license, club_id=None):
+    self.profile_loads += 1
+    return {"nacional": "155"}
+
+
+@pytest.mark.parametrize("label, loads", [("Portugal", 0), ("Brasil", 0), ("Terra Incógnita", 1)])
+def test_enrolled_checklist_reads_nationality_from_the_roster_row(
+  monkeypatch, label, loads,
+):
+  # The roster row already answers "Portugal or not"; the op=2 profile is
+  # loaded only when its label does not resolve to a known country.
+  client = _EnrolledClient(label)
+  monkeypatch.setattr(server_module, "_get_client", lambda: client)
+
+  result = server_module.get_enrollment_status(license=301772, reg_type=2)
+
+  assert result["status"] == "enrolled"
+  assert client.profile_loads == loads
+  assert result["checklist"]["nationality_source"] == "sav_record"

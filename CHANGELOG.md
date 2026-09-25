@@ -21,6 +21,99 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.0 — 2026-09-25
+
+Lookups whose scope was narrower than their flow. The key case is a
+Revalidação athlete: by definition they have no row in the current season, so
+any current-season search for them comes back empty (verified live, licence
+315784, last row 2025/2026).
+
+### Fixed
+
+**Inline subida on a Revalidação always failed ("Player with licence … not found in SAV")**
+`IMPACT: raises` → now succeeds. `add_enrollment` with a `mod4_id` looked the
+player's gender up in SAV with a current-season search. It now takes the gender
+it already holds: the lote's (gender-keyed, SAV's own record), checked against
+the Modelo 1 artifact's `gender_id` — a disagreement raises `ValueError`
+instead of resolving the subida against the wrong gender's tiers.
+`DETECT: grep -rn "not found in SAV" <your code>` — a workaround for this error
+(e.g. deleting the lote and retrying without the Modelo 4) can go.
+
+**`gender_id_for_license` removed; the gender comes from the row already in hand**
+`IMPACT: raises` for library callers. It re-asked SAV for a gender the caller
+already held, with a current-season search (so a player not enrolled this
+season was "not found"), and silently answered Masculino for an unknown label.
+Now:
+- `resolve_subida_player` returns a 5th element, the SAV row it matched on —
+  `resolve_subida_target` and the CLI read the gender from it (no lookup);
+- a licence typed into the CLI by hand is looked up with
+  `sav_shared.players.resolve_license_row`, the same current → previous → all
+  seasons ladder `lookup_player` / `get_player` use (moved from sav-mcp);
+- `sav_shared.players.gender_id_of(row)` raises on an unrecognised gender.
+`DETECT: grep -rn "gender_id_for_license\|= resolve_subida_player(" <your code>`
+`FIX: unpack five values; read the gender with gender_id_of(player)`.
+
+**`load_player_profile` on a cold cache**
+`IMPACT: raises` → now succeeds. Resolving a licence to SAV's internal id used
+a current-season search, so a Revalidação athlete whose id was not cached
+raised "No player with license …" (verified live). Callers:
+`preview_enrollment`, `update_enrollment_with_document`, `get_player_profile`,
+`add_subida_enrollment`'s name, and the document checklist — which silently
+fell back to the stricter foreign-born list.
+
+**Revalidação name fallback (`resolve_player`, CLI)**
+`IMPACT: silent` — when the Modelo 1 has no usable licence, the name search
+that offers eligible candidates searched the current season only, so it could
+not find the Revalidação athletes it exists for. It now searches every season;
+the eligible-list filter still decides.
+
+**1ª Inscrição duplicate hint (`resolve_player`, `preview_enrollment`)**
+`IMPACT: silent` — SAV's op=11 detects a duplicate federation-wide, but the
+licence behind `existing_license` was looked up in your own club only. The
+doc-number / birth-date searches are now federation-wide (the NIF stays own
+club), so a player registered at another club gets their licence named.
+
+### Changed
+
+**`identify_player`: a NIF match is never vetoed by another key**
+`IMPACT: silent` — a supplied `name`, `birth_date` or `id_number` that disagreed
+with SAV turned a clear NIF match into `null` ("no player", i.e. a duplicate 1ª
+Inscrição). Verified live: a passport number SAV never stored, and a birth-date
+typo. Now the NIF's player is returned with
+`conflicts: [{key, given, on_file}]`; if the other keys describe a *different*
+person, the answer is `ambiguous` with both. `matched_by` on a found player
+lists only the keys that agree — `"nif"` is gone when `nif_on_file` is
+`"different"`.
+`DETECT: grep -rn "identify_player" <your code>` — a workaround that withholds
+`id_number` or re-asks NIF-only after a `null` can go; read `conflicts` instead.
+
+### Performance
+
+**Fewer SAV requests for the same answers**
+`IMPACT: none` — every response is unchanged; only the requests behind it
+shrink (verified live by counting them):
+- `lookup_player` / `identify_player` with `with_details` + `with_profile`
+  read the op=2 player page once, not twice (~60 KB each):
+  `SavClient.get_player_detail_and_profile(player_id)`.
+- `identify_player(with_details=true)` reads the detail page by the matched
+  row's id instead of searching the licence again.
+- `add_subida_enrollment` takes the returned `name` from the lote row instead
+  of loading the op=2 profile.
+- `get_enrollment_status` for an enrolled player reads the nationality from
+  the roster row it already fetched (op=2 only when the label does not resolve
+  to a known country); for a player in a lote it reuses the lote row the batch
+  resolver just read (a 5-second memo, cleared on every write).
+
+### Added
+
+**`add_enrollment` reports the op=21 subida offer**
+`IMPACT: additive` — with an inline subida, the success response carries
+`subida: {offered: [{tier_id, name}], committed: {tier_id, name}}`, and every
+op=21 decision is logged at INFO. `sav_client.sav_client.record_subida_picks()`
+collects the same records for library callers.
+
+---
+
 ## 0.113.0 — 2026-09-25
 
 A NIF is not one person. On one real club 5 NIFs sit on 147 licences: the

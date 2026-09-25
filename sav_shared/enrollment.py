@@ -551,7 +551,7 @@ def _canonical_tier_name_from_ocr(ocr_text: str) -> str:
 
 def resolve_subida_player(
   parsed: dict, client: Any, *, club_id: int,
-) -> tuple[int | None, list[Any], str | None, int | None]:
+) -> tuple[int | None, list[Any], str | None, int | None, Any]:
   """Resolve the player for a parsed mod4 (Subida) by licence or name.
 
   Mod4 carries no NIF — only ``licenca_nr`` (optional), ``nome_jogador``
@@ -562,11 +562,14 @@ def resolve_subida_player(
   returns nothing, we retry without the tier filter so OCR drift on the
   tier text doesn't lose an otherwise-resolvable player.
 
-  Returns ``(license, candidates, ocr_name, ocr_license)``:
+  Returns ``(license, candidates, ocr_name, ocr_license, player)``:
     - ``license`` is set when OCR licence resolves to a real SAV player, OR
       when name search returns exactly one match.
     - ``candidates`` is the name-search list (empty when license is set).
     - ``ocr_name`` / ``ocr_license`` echo what was read from the form.
+    - ``player`` is the SAV row the licence was matched on (``None`` when no
+      licence is set). It already carries the gender, so callers read it from
+      here instead of asking SAV again.
   """
   lic_field = parsed.get("licenca_nr")
   ocr_license: int | None = None
@@ -583,7 +586,7 @@ def resolve_subida_player(
       logger.debug("Subida licence lookup failed for %s", ocr_license, exc_info=True)
       hits = []
     if hits:
-      return ocr_license, [], None, ocr_license
+      return ocr_license, [], None, ocr_license, hits[0]
 
   name_field = parsed.get("nome_jogador")
   name_val = str(name_field.value).strip() if name_field and name_field.value else ""
@@ -610,9 +613,9 @@ def resolve_subida_player(
       candidates = []
 
   if len(candidates) == 1:
-    return int(candidates[0].license), [], name_val or None, ocr_license
+    return int(candidates[0].license), [], name_val or None, ocr_license, candidates[0]
 
-  return None, candidates, name_val or None, ocr_license
+  return None, candidates, name_val or None, ocr_license, None
 
 
 def resolve_subida_tier(
@@ -639,21 +642,6 @@ def resolve_subida_tier(
       f"Tier {raw_name!r} not found for {gender_label}. Available: {available}"
     )
   return match[0]
-
-
-def gender_id_for_license(client: Any, license: int) -> int:
-  """Look up a player's gender_id via the federation-wide search.
-
-  Mod4 carries no gender field — we need a roundtrip to SAV to decide which
-  tier table (Masculino / Feminino) the parsed `escalao_subida` lives in.
-  Defaults to 1 (Masculino) when the player is found but the gender string
-  doesn't match SAV's canonical labels, since SAV's tier table accepts that
-  fallback gracefully (and the alternative is failing the whole flow).
-  """
-  results = client.search_players(license=str(license), club=0)
-  if not results:
-    raise ValueError(f"Player with licence {license} not found in SAV")
-  return 2 if results[0].gender == "Feminino" else 1
 
 
 def resolve_player_candidates(
@@ -710,7 +698,13 @@ def resolve_player_candidates(
   candidates: list[Any] = []
   if name_val:
     try:
-      found = client.search_players(name=name_val, club=club_id)
+      # Every season, any status: the eligible list is mostly players with no
+      # current-season row yet (a Revalidação athlete, by definition), so a
+      # current-season name search could never find them. The eligible filter
+      # below keeps the answer safe.
+      found = client.search_players(
+        name=name_val, club=club_id, season=0, status="all",
+      )
       candidates = [p for p in found if int(p.license) in eligible_set]
     except (SavError, ValueError):
       logger.debug("Name-search fallback failed for club_id=%s", club_id, exc_info=True)

@@ -159,7 +159,9 @@ def test_found_but_ineligible_identity_falls_through_to_name_search():
   result = resolve_player_candidates(parsed, {99}, client, 200)
 
   assert result == (99, [], "Ana Silva", None)
-  assert client.search_calls == [{"name": "Ana Silva", "club": 200}]
+  assert client.search_calls == [
+    {"name": "Ana Silva", "club": 200, "season": 0, "status": "all"},
+  ]
 
 
 def test_malformed_ocr_nif_is_not_a_key():

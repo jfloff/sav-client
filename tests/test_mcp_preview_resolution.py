@@ -236,7 +236,7 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
     def resolve_player_identity(self, **kwargs):
       assert kwargs == {
         "nif": "277544319", "id_number": "12345678",
-        "birth_date": "2015-03-01", "name": None, "club": None,
+        "birth_date": "2015-03-01", "name": None, "club": 0,
       }
       return IdentityMatch(
         status="not_found", player=None, other_licenses=[], candidates=[],
@@ -275,7 +275,7 @@ def test_primeira_duplicate_with_ambiguous_nif_returns_candidate_licenses():
     def resolve_player_identity(self, **kwargs):
       assert kwargs == {
         "nif": "277544319", "id_number": "12345678",
-        "birth_date": "2015-03-01", "name": None, "club": None,
+        "birth_date": "2015-03-01", "name": None, "club": 0,
       }
       return IdentityMatch(
         status="ambiguous", player=None, other_licenses=[],

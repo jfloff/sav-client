@@ -322,6 +322,10 @@ class IdentityMatch:
   nif_on_file: Literal[
     "match", "different", "none", "unknown",
   ] | None = None
+  # When the NIF matched a person but another supplied key disagrees with
+  # SAV: one {key, given, on_file} per disagreeing key ("name", "birth_date",
+  # "id_number"). The NIF's person is still the answer.
+  conflicts: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)

@@ -45,7 +45,6 @@ from sav_shared.enrollment import (
   compute_enrollment_checklist,
   create_and_fetch_batch,
   derive_enrollment_params,
-  gender_id_for_license,
   parse_missing_guardian_fields,
   parsed_bool,
   resolve_player_candidates,
@@ -57,6 +56,7 @@ from sav_shared.enrollment import (
   validate_subida_combo,
 )
 from sav_shared.fields import ENROLLMENT_FIELD_META
+from sav_shared.players import gender_id_of, resolve_license_row
 from sav_shared.fpb_mod1 import (
   OverlayResult,
   is_filled_mod1_template,
@@ -2127,12 +2127,14 @@ def enrollment_grp():
 
 def _resolve_subida_player_or_prompt(
   parsed: dict, client: Any, club_id: int, console: Console,
-) -> int | None:
+) -> tuple[int, Any] | None:
   """Resolve the mod4 player; prompt when name search returns >1 or 0 hits.
 
-  Returns the licence to use, or None when the user aborts the prompt.
+  Returns ``(licence, player_row)``, or None when the user aborts the prompt.
+  ``player_row`` is the SAV row the licence was matched on, or None for a
+  licence typed in by hand (the caller looks that one up).
   """
-  license, candidates, ocr_name, ocr_license = resolve_subida_player(
+  license, candidates, ocr_name, ocr_license, player = resolve_subida_player(
     parsed, client, club_id=club_id,
   )
   if license is not None:
@@ -2141,7 +2143,7 @@ def _resolve_subida_player_or_prompt(
     console.print(
       f"[green]:dart: Matched player licence {license} (via {via}){name_suffix}.[/]"
     )
-    return license
+    return license, player
 
   if len(candidates) > 1:
     console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
@@ -2153,7 +2155,8 @@ def _resolve_subida_player_or_prompt(
       click.style("  Pick", fg="cyan"),
       type=click.IntRange(1, len(candidates)),
     )
-    return int(candidates[idx - 1].license)
+    chosen = candidates[idx - 1]
+    return int(chosen.license), chosen
 
   if ocr_name:
     console.print(
@@ -2169,7 +2172,7 @@ def _resolve_subida_player_or_prompt(
     if not raw:
       return None
     try:
-      return int(raw)
+      return int(raw), None
     except ValueError:
       console.print("[yellow]:warning: Not a valid number.[/]")
 
@@ -2213,18 +2216,25 @@ def _run_subida_ocr_mode(
     club_id = int(client.session.get("organizacao") or 0) if client.session else 0
     try:
       with console.status("[bold cyan]:busts_in_silhouette: Resolving player...[/]"):
-        license = _resolve_subida_player_or_prompt(
+        resolved = _resolve_subida_player_or_prompt(
           parsed, client, club_id, console,
         )
     except (SavConnectionError, SavResponseError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
-    if license is None:
+    if resolved is None:
       console.print("[yellow]:fast_forward: Skipped.[/]")
       return
+    license, player = resolved
 
     try:
-      with console.status("[bold cyan]:open_book: Looking up player gender for tier resolution...[/]"):
-        gender_id = gender_id_for_license(client, license)
+      if player is None:
+        # A licence typed in by hand: no row yet, so look it up the one way
+        # (every season, any club) — never a current-season-only search.
+        with console.status("[bold cyan]:open_book: Looking up the player...[/]"):
+          player = resolve_license_row(client, license=license)
+        if player is None:
+          raise ValueError(f"Player with licence {license} not found in SAV")
+      gender_id = gender_id_of(player)
     except (ValueError, SavConnectionError, SavResponseError) as exc:
       raise SavCliError(str(exc), code=_exc_code(exc))
 

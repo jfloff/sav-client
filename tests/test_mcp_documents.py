@@ -1067,7 +1067,7 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
     def resolve_player_identity(self, **kwargs):
       assert kwargs == {
         "nif": "277544319", "id_number": "12345699",
-        "birth_date": "2020-09-26", "name": None, "club": None,
+        "birth_date": "2020-09-26", "name": None, "club": 0,
       }
       return IdentityMatch(
         status="found", player=SimpleNamespace(license="301772"),
@@ -1348,8 +1348,9 @@ def test_add_subida_enrollment_signs_mod4(monkeypatch):
       with open(file_path, "rb") as f:
         captured["bytes"] = f.read()
 
-    def load_player_profile(self, license):
-      return {"nome": "Player A"}
+    def list_player_registration_batch_items(self, batch_id):
+      # The response's name now comes from the lote row, not an op=2 profile.
+      return [{"license": 301772, "name": "Player A"}]
 
   base = _blank_pdf_bytes()
   parsed = {"assinatura_detentor_presente": ParsedField(value=False, confidence=0.9, bbox=_DET_BBOX)}
@@ -1369,6 +1370,8 @@ def test_add_subida_enrollment_signs_mod4(monkeypatch):
   assert result["subida_document_upload"]["has_detentor_signature"] is True
   assert _xobjs(captured["bytes"]) == _xobjs(base) + 1
   assert list_calls["n"] == 1  # single listing, no double round-trip
+  # The name comes from the lote row (the stub has no load_player_profile).
+  assert result["name"] == "Player A"
 
 
 def test_add_subida_enrollment_unknown_batch_raises(monkeypatch):

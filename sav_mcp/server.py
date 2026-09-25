@@ -41,11 +41,13 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from dataclasses import replace as _dc_replace
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
+from sav_client.sav_client import record_subida_picks
 from sav_client.models import IdentityMatch, Player, Season
 from sav_client.exceptions import (
     LicenseNotEnrolledError,
@@ -61,8 +63,15 @@ from sav_shared.files import (
     load_image_bytes,
 )
 from sav_shared.dates import require_iso, to_iso
+from sav_shared.players import (
+    gender_id_of,
+    most_recent as _most_recent,
+    resolve_license_row as _resolve_rows,
+)
 from sav_shared.identifiers import normalise_nif, require_nif
+from sav_shared.estatuto import PORTUGAL, resolve_country
 from sav_shared.enrollment import (
+    PORTUGAL_NATIONALITY_ID,
     REGISTRATION_TYPE_REVALIDACAO,
     REGISTRATION_TYPE_SUBIDA,
     build_primeira_kwargs,
@@ -71,7 +80,6 @@ from sav_shared.enrollment import (
     compute_enrollment_checklist,
     create_and_fetch_batch,
     derive_enrollment_params,
-    gender_id_for_license,
     parse_missing_guardian_fields,
     parsed_bool,
     resolve_player_candidates,
@@ -319,69 +327,6 @@ def _effective_club(client: SavClient, club_id: int | None) -> int:
 
 # ── Players ───────────────────────────────────────────────────────────────────
 
-def _most_recent(players: list[Player]) -> Player | None:
-    """Return the latest-season row, or None when no rows were found.
-
-    A defensive invariant guard, not a fix for an observed bug. It was added on
-    the assumption that a licence search with ``jc_epoca=0`` returns one row per
-    season, making ``results[0]`` arbitrary. Live verification (2026-08-20, club
-    2430) refuted that: a licence-scoped all-seasons search returned a single
-    row, and the club-wide all-seasons search returned 684 rows for 684 distinct
-    licences — no duplicates. SAV2 does not *document* single-row, so this stays
-    as a cheap guard; just don't mistake it for load-bearing.
-
-    ``Player.season`` is a "YYYY/YYYY" string, so lexicographic max is
-    chronological. With one row this is identical to ``results[0]``.
-    """
-    if not players:
-        return None
-    return max(players, key=lambda player: player.season or "")
-
-
-def _resolve_rows(
-    client: SavClient,
-    *,
-    license: int,
-    club_id: int,
-    status: str,
-    season: int | None,
-    with_details: bool,
-) -> Player | None:
-    """Resolve one licence using the current → previous → all ladder."""
-    def search(rung: int | None) -> list[Player]:
-        return client.search_players(
-            license=str(license), club=club_id, status=status, season=rung,
-            with_details=with_details,
-        )
-
-    if season is not None:
-        return _most_recent(search(season))
-
-    # Keep the common current-enrollment case to one query. A player last
-    # enrolled in the previous season costs two; the all-seasons rung is
-    # deliberately the last resort.
-    current = search(None)
-    if current:
-        return _most_recent(current)
-
-    previous_season: int | None = None
-    try:
-        recent_seasons = client._recent_season_ids()
-        if len(recent_seasons) > 1:
-            previous_season = recent_seasons[1]
-    except Exception:
-        # Deliberately broad, unlike the SavError handlers elsewhere in this
-        # file: this rung is only an optimisation and the all-seasons query
-        # below returns the correct answer without it. Failing a caller's
-        # lookup because an optional shortcut broke would be the worse trade.
-        logger.debug("Could not resolve the previous SAV season", exc_info=True)
-
-    if previous_season is not None:
-        previous = search(previous_season)
-        if previous:
-            return _most_recent(previous)
-
-    return _most_recent(search(0))
 
 
 # NIF lookup rejects an unusable club with the same explanation. SAV2 only
@@ -397,27 +342,60 @@ _NIF_CLUB_REQUIRED = (
 )
 
 
+def _hydrate_player(
+    client: SavClient,
+    row: Player,
+    *,
+    club: int,
+    with_details: bool,
+    with_profile: bool,
+) -> tuple[Player, dict[str, Any] | None]:
+    """Add the op=2 detail fields and/or profile to ``row`` in one request.
+
+    ``row`` comes from a search, so it already carries SAV's internal id:
+    the detail page is fetched by that id, never by searching the licence
+    again. Both flags together read the page once (they used to read it
+    twice). Returns ``(row, profile)``; ``profile`` is None unless asked for.
+    """
+    if with_details and with_profile:
+        detail, profile = client.get_player_detail_and_profile(row.id)
+    elif with_details:
+        detail, profile = client.get_player_detail(row.id, with_details=True), None
+    elif with_profile:
+        # Prefer the club the row came from over the requested one: a
+        # club-scoped row is stamped with its source club, a federation-wide
+        # one is not (club_id stays 0). The search already cached the row's
+        # internal id, so the profile loads without another search.
+        return row, client.load_player_profile(
+            row.license, club_id=row.club_id or club or None,
+        )
+    else:
+        return row, None
+    row = _dc_replace(
+        row, photo_url=detail.photo_url, mobile_phone=detail.mobile_phone,
+        nif=detail.nif, subida=detail.subida,
+    )
+    return row, profile
+
+
 def _identity_match_to_dict(
     client: SavClient,
     match: IdentityMatch,
     *,
     club: int,
     with_details: bool,
+    with_profile: bool = False,
 ) -> dict | None:
     """Serialize one identity-resolution outcome for MCP callers."""
     if match.status == "found":
         assert match.player is not None
-        row = match.player
-        if with_details:
-            detailed_rows = client.search_players(
-                license=str(row.license), club=club, season=0, status="all",
-                with_details=True,
-            )
-            row = next(
-                (p for p in detailed_rows if p.license == match.player.license),
-                None,
-            ) or match.player
+        row, profile = _hydrate_player(
+            client, match.player, club=club,
+            with_details=with_details, with_profile=with_profile,
+        )
         result = player_to_dict(row, with_details=with_details)
+        if profile is not None:
+            result["profile"] = profile
         result.update({
             "matched_by": list(match.matched_by),
             "other_licenses": [
@@ -431,6 +409,9 @@ def _identity_match_to_dict(
         })
         if match.nif_on_file is not None:
             result["nif_on_file"] = match.nif_on_file
+        if match.conflicts:
+            # The NIF matched this player; each listed key disagrees with SAV.
+            result["conflicts"] = [dict(c) for c in match.conflicts]
         return result
 
     if match.status == "ambiguous":
@@ -628,21 +609,18 @@ def lookup_player(
         )
     row = _resolve_rows(
         client, license=license, club_id=effective_club,
-        status=status, season=None, with_details=with_details,
+        status=status, season=None, with_details=False,
     )
     if row is None:
         return None
 
+    row, profile = _hydrate_player(
+        client, row, club=effective_club,
+        with_details=with_details, with_profile=with_profile,
+    )
     result = player_to_dict(row, with_details=with_details)
-    if with_profile:
-        # Prefer the club the row came from over the requested one. A row from
-        # a club-scoped search is stamped with its source club; a federation-
-        # wide one is not (club_id deliberately stays 0). The search path has
-        # already cached the row's internal SAV id, so load_player_profile can
-        # use that id directly and its club=0 fallback search is not reached.
-        result["profile"] = client.load_player_profile(
-            row.license, club_id=row.club_id or effective_club,
-        )
+    if profile is not None:
+        result["profile"] = profile
     return result
 
 
@@ -661,7 +639,9 @@ def identify_player(
 
     Keys: ``nif``, ``id_number`` (doc. ident. number, exact), and ``name`` +
     ``birth_date`` (ISO YYYY-MM-DD, exact; the name is fuzzy and needs the
-    birth date). Supply any usable combination; more keys narrow the answer.
+    birth date). Supply any usable combination. More keys narrow between
+    candidates, but never veto a NIF match: a key that disagrees with SAV is
+    reported in ``conflicts`` instead.
     Always pass the birth date when you have it: a parent's NIF is often on
     several children's licences.
 
@@ -678,8 +658,12 @@ def identify_player(
 
     Returns:
       found → the player row (newest licence of that person) plus
-        ``matched_by``, ``other_licenses`` [{license, season, active}],
-        and, when a NIF was given, ``nif_on_file``. ``with_details`` / ``with_profile`` apply here only.
+        ``matched_by`` (only the keys that agree with the answer),
+        ``other_licenses`` [{license, season, active}], and, when a NIF was
+        given, ``nif_on_file``. When the NIF matched but another key disagrees
+        with SAV, the NIF's player is still the answer and ``conflicts`` lists
+        each disagreement as {key, given, on_file} — a typo on one side, never
+        a reason to treat the player as new. ``with_details`` / ``with_profile`` apply here only.
       ambiguous → {ambiguous: true, candidates, matched_by}:
         several different people; never pick without another key.
       {error: "identity_unverifiable"} → SAV's evidence was incomplete; neither
@@ -716,16 +700,10 @@ def identify_player(
         club=club_id,
         status=status,
     )
-    result = _identity_match_to_dict(
-        client, match, club=effective_club, with_details=with_details,
+    return _identity_match_to_dict(
+        client, match, club=effective_club,
+        with_details=with_details, with_profile=with_profile,
     )
-    if with_profile and match.status == "found" and match.player is not None:
-        assert result is not None
-        result["profile"] = client.load_player_profile(
-            match.player.license,
-            club_id=match.player.club_id or effective_club,
-        )
-    return result
 
 
 @server.tool()
@@ -2544,7 +2522,11 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
                             else None
                         ),
                         name=None,
-                        club=None,
+                        # op=11 found the duplicate federation-wide — most are
+                        # players registered at another club — so the doc-number
+                        # and birth-date searches must be too. The NIF stays own
+                        # club (SAV hides other clubs' NIFs).
+                        club=0,
                     )
                     if identity_match.status == "found":
                         assert identity_match.player is not None
@@ -2680,9 +2662,9 @@ def resolve_subida_target(mod4_id: str) -> dict:
 
       - licença from licenca_nr when present (validated via SAV);
       - else a name search inside the session's club.
-    Once a licence is known, the player's gender is fetched and the
-    destination tier_id is mapped from `escalao_subida` against the
-    gender-scoped tier table.
+    Once a licence is known, the player's gender is read from the SAV row it
+    was matched on (no second lookup), and the destination tier_id is mapped
+    from `escalao_subida` against the gender-scoped tier table.
 
     Use the result to call find_open_batch / create_batch (reg_type=4) and
     then add_subida_enrollment.
@@ -2703,7 +2685,7 @@ def resolve_subida_target(mod4_id: str) -> dict:
 
     client = _get_client()
     club_id = int(client.session.get("organizacao") or 0) if client.session else 0
-    license, candidates, ocr_name, ocr_license = resolve_subida_player(
+    license, candidates, ocr_name, ocr_license, player = resolve_subida_player(
         form["parsed"], client, club_id=club_id,
     )
     if license is None:
@@ -2723,7 +2705,7 @@ def resolve_subida_target(mod4_id: str) -> dict:
             "ocr_license": ocr_license,
         }
 
-    gender_id = gender_id_for_license(client, license)
+    gender_id = gender_id_of(player)
     tier_id = resolve_subida_tier(form["parsed"], client, gender_id=gender_id)
     tiers = client.list_player_registration_tiers(gender_id=gender_id)
     return {
@@ -2932,6 +2914,39 @@ def preview_enrollment(
     return preview
 
 
+def _enrollment_gender_id(
+    client: SavClient, form: dict[str, Any], kwargs: dict[str, Any],
+    batch_number: str,
+) -> int:
+    """The gender of the player an enrolment files, from what is already held.
+
+    Both registration types carry it: the Modelo 1 artifact stores the
+    form's ``gender_id`` at parse time (the 1ª Inscrição kwargs carry the same
+    value), and the lote is gender-keyed — it was opened from that value.
+    Asking SAV instead used to search the *current* season only, so every
+    Revalidação with an inline subida failed with "Player … not found in SAV"
+    (observed live, licence 315784: an athlete with no current-season row by
+    definition). The lote is SAV's own record, so it wins; a form that
+    disagrees with it raises rather than resolving the subida against the
+    wrong gender's tier table.
+    """
+    form_gender = form.get("gender_id") or kwargs.get("gender_id")
+    batch_gender = _find_batch_by_number(client, batch_number).gender_id
+    if batch_gender in (1, 2):
+        if form_gender in (1, 2) and int(form_gender) != int(batch_gender):
+            raise ValueError(
+                f"The Modelo 1 says gender_id={form_gender} but lote "
+                f"{batch_number} is gender_id={batch_gender}; the subida tier "
+                f"cannot be resolved against the wrong gender's tiers."
+            )
+        return int(batch_gender)
+    if form_gender in (1, 2):
+        return int(form_gender)
+    raise ValueError(
+        f"Could not determine the player's gender for lote {batch_number}."
+    )
+
+
 @server.tool()
 def add_enrollment(
     batch_number: str,
@@ -3026,6 +3041,9 @@ def add_enrollment(
       upload also carries has_license and license_warning: a Revalidação's
       supplied licence is filled when its form slot is blank, and the warning
       is set when that fill was attempted but failed.
+      success=true also carries ``subida``: with an inline subida,
+      ``{offered: [{tier_id, name}], committed: {tier_id, name}}`` — the tiers
+      SAV's op=21 offered this player and the one filed; null otherwise.
     """
     from sav_parsers import close_processing
 
@@ -3092,14 +3110,10 @@ def add_enrollment(
         # hand it to the wizard as promote_to_tier_id. _pick_subida_tier
         # enforces that the form's stated target matches what SAV offers.
         # OCR miss on escalao_subida → skip the hint and let the wizard pick.
-        # Type-1 has no licence yet, so we read gender from the OCR kwargs;
-        # type-2 looks it up against SAV.
         escalao_field = mod4["parsed"].get("escalao_subida")
         if escalao_field and escalao_field.value:
-            gender_for_subida = (
-                kwargs.get("gender_id")
-                if reg_type == 1
-                else gender_id_for_license(client, license)
+            gender_for_subida = _enrollment_gender_id(
+                client, form, kwargs, batch_number,
             )
             kwargs["promote_to_tier_id"] = resolve_subida_tier(
                 mod4["parsed"], client, gender_id=gender_for_subida,
@@ -3145,12 +3159,13 @@ def add_enrollment(
                 exc_info=True,
             )
     try:
-        client.add_player_to_registration_batch(
-            batch_id, license or 0, inline_subida=inline_subida,
-            allow_ineligible=allow_ineligible,
-            **({"estatuto": estatuto} if estatuto is not None else {}),
-            **kwargs,
-        )
+        with record_subida_picks() as subida_picks:
+            client.add_player_to_registration_batch(
+                batch_id, license or 0, inline_subida=inline_subida,
+                allow_ineligible=allow_ineligible,
+                **({"estatuto": estatuto} if estatuto is not None else {}),
+                **kwargs,
+            )
     except SavConfigError as exc:
         # Only minor/guardian errors are retry cases; they carry the field list
         # ("…missing required fields: …"). Other config errors (e.g. subida
@@ -3281,6 +3296,15 @@ def add_enrollment(
         "medical_exam_upload": medical_exam_upload,
         "inline_subida": inline_subida,
         "subida_document_upload": subida_document_upload,
+        # What SAV's op=21 offered and what was filed — the last decision the
+        # wizard made (None when no inline subida was in play).
+        "subida": (
+            {
+                "offered": subida_picks[-1]["offered"],
+                "committed": subida_picks[-1]["committed"],
+            }
+            if inline_subida and subida_picks else None
+        ),
     }
 
 
@@ -3374,16 +3398,25 @@ def add_subida_enrollment(
         ),
     )
 
-    sav_profile: dict[str, Any] = {}
+    # The name only: the lote row (op=10, a few KB) already carries it — no
+    # need to load the whole op=2 profile (~60 KB) for one field.
+    name = ""
     try:
-        sav_profile = client.load_player_profile(license)
-    except (SavConnectionError, SavResponseError):
-        logger.debug("Could not load player profile for subida response", exc_info=True)
+        name = next(
+            (
+                item.get("name", "")
+                for item in client.list_player_registration_batch_items(batch_id)
+                if int(item.get("license", 0)) == int(license)
+            ),
+            "",
+        )
+    except (SavError, ValueError):
+        logger.debug("Could not read the player's name for the subida response", exc_info=True)
 
     return {
         "success": True,
         "license": license,
-        "name": sav_profile.get("nome", ""),
+        "name": name,
         "subida_document_upload": subida_document_upload,
     }
 
@@ -3755,6 +3788,7 @@ def _normalise_available_doc_types(values: list[str] | None) -> list[str]:
 def _projected_enrollment_checklist(
     client, license: int, reg_type: int, club_id: int,
     available_doc_types: list[str] | None = None,
+    nationality_label: str | None = None,
 ) -> dict | None:
     """Document checklist for a licence that is *not* in an open batch.
 
@@ -3773,20 +3807,29 @@ def _projected_enrollment_checklist(
     Nationality lookup failures fall back to `nacional_id=None`, which
     `compute_enrollment_checklist` treats as foreign_born — the safe error,
     since it asks for more documents rather than fewer.
+
+    ``nationality_label`` is the nationality on a SAV row the caller already
+    holds (the roster row). When it resolves to a known country it answers the
+    only question the checklist asks — Portugal or not — so the op=2 profile
+    is not loaded; an unrecognised label falls back to the profile.
     """
-    try:
-        profile = client.load_player_profile(license, club_id=club_id or None)
-    except SavError:
-        logger.debug(
-            "Profile lookup failed for projected checklist (license=%s)",
-            license, exc_info=True,
-        )
-        profile = {}
-    nacional_raw = profile.get("nacional")
-    try:
-        nacional_id = int(nacional_raw) if nacional_raw not in (None, "") else None
-    except (TypeError, ValueError):
-        nacional_id = None
+    country = resolve_country(nationality_label) if nationality_label else None
+    if country is not None:
+        nacional_id = PORTUGAL_NATIONALITY_ID if country == PORTUGAL else None
+    else:
+        try:
+            profile = client.load_player_profile(license, club_id=club_id or None)
+        except SavError:
+            logger.debug(
+                "Profile lookup failed for projected checklist (license=%s)",
+                license, exc_info=True,
+            )
+            profile = {}
+        nacional_raw = profile.get("nacional")
+        try:
+            nacional_id = int(nacional_raw) if nacional_raw not in (None, "") else None
+        except (TypeError, ValueError):
+            nacional_id = None
     available = list(available_doc_types or [])
     checklist = compute_enrollment_checklist(reg_type, nacional_id, available)
     if checklist is not None:
@@ -4041,6 +4084,7 @@ def get_enrollment_status(
         )
         checklist = _projected_enrollment_checklist(
             client, license, reg_type, club_id, available,
+            nationality_label=roster_hits[0].nationality if roster_hits else None,
         )
         extra = {"available_doc_types": available} if available else {}
         if roster_hits:
@@ -4100,6 +4144,7 @@ def get_enrollment_status(
             "type": batch.type if batch else "",
             "state": batch.state if batch else "",
         },
+        # Usually served from the row the resolver just read (no second op=10).
         "subida": client.batch_item_subida(batch_id, license),
         "checklist": checklist,
         **({"available_doc_types": available} if available else {}),
