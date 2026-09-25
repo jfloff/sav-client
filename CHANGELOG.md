@@ -21,6 +21,52 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.112.2 — 2026-09-25
+
+### Fixed
+
+**Subida lotes read back as empty, so a successful standalone Subida add was reported as a failure**
+SAV renders a Subida lote's items with an `editSub(...)` button (other lotes
+use `editJogador(...)`) and emits their cells into `<tbody>` with no `<tr>`.
+The row parser matched only `editJogador`, so **every Subida lote read as
+empty**. Verified live on lote 335: op=50 answered `{"val":1,"msg":""}`, the
+lote listing counted 1 player, and the client still raised "licence … is not
+present in batch … after the commit".
+
+- `add_subida_enrollment` — `IMPACT: raises`. It no longer raises after a
+  successful add. If SAV acknowledges the add (`val == 1`) but the lote
+  doesn't list the licence, it now raises `SavWriteUnverifiedError` (a
+  `SavResponseError`): do not retry. Failure messages now include op=50's
+  `val` and `msg`; a non-JSON or PHP-fatal body is described, never quoted.
+  **If you retried, or deleted the lote, after the old error, check SAV:** the
+  add had most likely gone through.
+  `DETECT: grep -rn "is not present in batch" <your code>`
+- `list_batch_enrollments` — `IMPACT: silent`. It returned `[]` for every
+  Subida lote; it now returns the rows.
+  `DETECT: grep -rn "list_batch_enrollments" <your code>`
+- `enrollment_status_bulk` / `get_enrollment_status` — `IMPACT: silent`. A
+  player in a Subida lote was never found in it, so they read `"enrolled"` or
+  `"not_enrolled"`; they now read `"pending"`, with `batch.type_id == 4` and
+  `subida.status == "pending"`. For a Subida lote, `get_enrollment_status` no
+  longer calls op=30 (SAV fatals on it there), and its checklist carries no
+  `nationality_source`.
+  `DETECT: grep -rn "enrollment_status_bulk\|get_enrollment_status" <your code>`
+- `delete_batch` — `IMPACT: raises`. It now also refuses when the lote
+  listing's own player count is higher than the rows it can read. The
+  "empty lote" guard relied on the same parser and let a Subida lote holding a
+  player be deleted, which strands that player.
+- Subida-lote `subida` — `IMPACT: silent`. `tier_to` falls back to the lote's
+  escalão (a Subida lote is keyed by the destination; confirmed by the club,
+  and the live row reads `"Sub 14"` on a Sub 14 lote). `tier_from` stays `null`.
+- `get_player(with_details=true)` — no code change, but it is now verified that
+  a player in an "Em construção" lote reads `subida.status == "none"` there.
+  Read `enrollment_status_bulk` first, as `sav_mcp/AGENTS.md` describes.
+- The Subida eligibility check read every `<option>` in op=48's body,
+  including the fee `<select>`. A fee id (e.g. 1096) passed as an "eligible
+  licence". It now reads only the player list.
+
+---
+
 ## 0.112.1 — 2026-09-24
 
 ### Fixed

@@ -1922,8 +1922,9 @@ class TestDeleteBatchRefusesANonEmptyLote:
   BATCH_ID = 12
   DELETE_OP = "9"
 
-  def _client(self, monkeypatch, items):
-    """Client whose op=9 call is recorded rather than sent."""
+  def _client(self, monkeypatch, items, item_count=None):
+    """Client whose op=9 call is recorded rather than sent. ``item_count`` is
+    the listing's own count; it defaults to agreeing with ``items``."""
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     client.session = {"organizacao": "270", "perfil": 1, "user": "u"}
     calls: list[tuple[str, int]] = []
@@ -1938,7 +1939,10 @@ class TestDeleteBatchRefusesANonEmptyLote:
       return response
 
     monkeypatch.setattr(client, "_http", type("Http", (), {"get": _get})())
-    batch = type("BatchStub", (), {"id": self.BATCH_ID, "type_id": 2})()
+    batch = type("BatchStub", (), {
+      "id": self.BATCH_ID, "type_id": 2,
+      "item_count": len(items) if item_count is None else item_count,
+    })()
     monkeypatch.setattr(
       client, "list_player_registration_batches", Mock(return_value=[batch]),
     )
@@ -1947,6 +1951,16 @@ class TestDeleteBatchRefusesANonEmptyLote:
     )
     monkeypatch.setattr(client._cache, "forget_licenses_in_batch", Mock())
     return client, calls
+
+  def test_a_count_the_rows_cannot_account_for_is_refused(self, monkeypatch):
+    # Lote 335 on 2026-09-24: the listing counted 1 player while the row
+    # parser read none, and the guard used to trust the rows alone.
+    client, calls = self._client(monkeypatch, [], item_count=1)
+
+    with pytest.raises(SavResponseError, match="reports 1 player"):
+      client.delete_player_registration_batch(self.BATCH_ID)
+
+    assert calls == [], "no request may be sent for a lote whose players we cannot see"
 
   def test_a_lote_with_players_is_refused_and_never_reaches_op_9(self, monkeypatch):
     client, calls = self._client(monkeypatch, [

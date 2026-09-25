@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import replace as _dc_replace
@@ -410,6 +411,31 @@ def _parse_subida_status(soup: Any, season_label: str | None) -> SubidaStatus:
 
 
 
+# The edit button on an op=10 lote row: `editJogador(licence, guia, tipo)` on
+# 1ª Inscrição / Revalidação / Transferência rows, `editSub(...)` on Subida rows.
+_BATCH_ITEM_EDIT_RE = re.compile(r"\b(?:editJogador|editSub)\(\s*(\d+)\s*,\s*(\d+)")
+
+
+def _batch_item_cells(btn: Any, width: int) -> list[str]:
+  """The text of every cell on the op=10 row that holds ``btn``.
+
+  SAV wraps most rows in ``<tr>``, but emits a Subida lote's item cells straight
+  into ``<tbody>`` with no ``<tr>`` (verified live 2026-09-24), so a parser
+  looking for the row element finds none. Without a ``<tr>`` directly around
+  the button's cell, the row is that cell plus the ``width - 1`` sibling cells
+  after it, ``width`` being the header's column count.
+  """
+  td = btn.find_parent("td")
+  if td is None:
+    return []
+  if td.parent is not None and td.parent.name == "tr":
+    return [c.get_text(strip=True) for c in td.parent.find_all("td", recursive=False)]
+  if width <= 0:
+    return []
+  row = [td, *td.find_next_siblings("td", limit=width - 1)]
+  return [c.get_text(strip=True) for c in row]
+
+
 def _subida_dict(status: str, tier_from: str | None = None,
                  tier_to: str | None = None) -> dict[str, Any]:
   """A lote row's subida in the public ``{status, tier_from, tier_to,
@@ -432,9 +458,11 @@ def _batch_item_subida(
 
   * ``cell is None`` (no Subida column, or a misaligned row) → ``"unknown"``.
   * A Subida lote (type 4) → ``"pending"`` whatever the cell says: sitting in
-    one *is* a filed standalone subida. ``tier_from`` stays None, because
-    whether a type-4 lote's own escalão is the origin or the destination is
-    unverified.
+    one *is* a filed standalone subida. A Subida lote is keyed by the
+    *destination* escalão (confirmed by the club, and lote 335's row reads
+    ``"Sub 14"`` on a Sub 14 lote), so ``tier_to`` is the cell, else the lote's
+    escalão. ``tier_from`` — the player's base escalão — is not on the row, so
+    it stays None.
   * Any other lote with the cell set → ``"pending"``, from the lote's escalão
     to the cell's.
   * Blank (or SAV's "Não selecionado" placeholder) → ``"none"``.
@@ -444,7 +472,7 @@ def _batch_item_subida(
   normalised = normalise_text(cell)
   tier_to = None if normalised in ("", "nao selecionado") else cell.strip()
   if batch.type_id == _REGISTRATIONS_TYPE_SUBIDA:
-    return _subida_dict("pending", None, tier_to)
+    return _subida_dict("pending", None, tier_to or batch.tier or None)
   if tier_to is None:
     return _subida_dict("none")
   return _subida_dict("pending", batch.tier or None, tier_to)
@@ -2103,7 +2131,16 @@ class SavClient:
 
     cached = self._cache.get_batch_id_by_license(license)
     if cached is not None:
-      if cached in open_by_id:
+      if cached in open_by_id and open_by_id[cached].type_id == _REGISTRATIONS_TYPE_SUBIDA:
+        # op=30 has no Subida-lote record and answers a PHP fatal (observed
+        # live 2026-09-24), so a Subida lote is validated by its rows instead.
+        if any(
+          int(item.get("license", 0)) == int(license)
+          for item in self.list_player_registration_batch_items(cached)
+        ):
+          return open_by_id[cached]
+        self._cache.forget_license_batch(license)
+      elif cached in open_by_id:
         try:
           self.load_existing_registration_record(cached, license)
           return open_by_id[cached]
@@ -2638,11 +2675,22 @@ class SavClient:
         "Must call login() before delete_player_registration_batch()"
       )
 
-    self._require_batch(batch_id)
+    batch = self._require_batch(batch_id)
     licenses = [
       item["license"]
       for item in self.list_player_registration_batch_items(batch_id)
     ]
+    # The listing's own item count is a second, independent signal. The row
+    # parser once read every Subida lote as empty, and this guard let a lote
+    # holding a player be deleted; a count that disagrees with the rows means
+    # we cannot see them, which is exactly when deleting is unsafe.
+    if batch.item_count > len(licenses):
+      raise SavResponseError(
+        f"Batch {batch_id} reports {batch.item_count} player(s) but only "
+        f"{len(licenses)} could be read from it, so it was NOT deleted. "
+        f"Deleting a lote that still holds players strands them. Check the "
+        f"lote in SAV and remove each player first."
+      )
     if licenses:
       listing = ", ".join(str(lic) for lic in licenses[:10])
       if len(licenses) > 10:
@@ -4327,8 +4375,19 @@ class SavClient:
       body = json.loads(resp.text).get("body", body)
     except ValueError:
       pass
+    # Read only the player <select id='atleta'>. The same body carries the
+    # novataxa <select>, whose option values (fee ids such as 1096) used to be
+    # taken for licences — a fee id could pass as an "eligible" player.
+    from bs4 import BeautifulSoup
+    select = BeautifulSoup(body, "html.parser").find("select", id="atleta")
+    if select is None:
+      raise SavResponseError(
+        f"Could not list subida players for batch {batch.id}: op=48 returned "
+        f"no player list (<select id='atleta'>)."
+      )
     return {
-      int(m) for m in re.findall(r"<option value='(\d+)'", body) if int(m) > 0
+      int(o["value"]) for o in select.find_all("option")
+      if str(o.get("value", "")).isdigit() and int(o["value"]) > 0
     }
 
   def _load_subida_origin(self, license: int) -> dict[str, Any]:
@@ -4567,9 +4626,19 @@ class SavClient:
         "not list the batch items. Do not retry without checking SAV first."
       ) from exc
     if license not in enrolled:
+      answer = self._summarise_write_body(resp.text)
+      if self._write_acknowledged(resp.text):
+        # SAV's own contract says the save worked, and our read disagrees.
+        # That is not a failure we can report: a retry would file the subida
+        # twice. (This exact contradiction was once our parser's fault.)
+        raise SavWriteUnverifiedError(
+          f"Subida commit for licence {license} in batch {batch.id}: SAV "
+          f"acknowledged it ({answer}) but the batch does not list the licence "
+          f"afterwards. Do not retry without checking SAV first."
+        )
       raise SavResponseError(
         f"Subida commit failed: licence {license} is not present in batch "
-        f"{batch.id} after the commit."
+        f"{batch.id} after the commit. SAV answered op=50 with {answer}."
       )
     logger.info(
       "Added licence %s to subida batch %s (tier=%s, taxa=%s, companhia=%s).",
@@ -4652,16 +4721,19 @@ class SavClient:
     subida_col = headers.index("subida") if "subida" in headers else None
     items: list[dict[str, Any]] = []
     seen: set[int] = set()
-    for btn in soup.find_all(attrs={"onclick": re.compile(r"editJogador\(")}):
-      m = re.search(r"editJogador\((\d+)\s*,\s*(\d+)", btn.get("onclick", ""))
+    # A Subida lote (type 4) renders its items with `editSub(...)` where the
+    # other lote types use `editJogador(...)`. Matching only the latter made
+    # every Subida lote read back empty — including right after a successful
+    # op=50 add (observed live 2026-09-24, lote 335).
+    for btn in soup.find_all(attrs={"onclick": _BATCH_ITEM_EDIT_RE}):
+      m = _BATCH_ITEM_EDIT_RE.search(btn.get("onclick", ""))
       if not m:
         continue
       license = int(m.group(1))
       if license in seen:
         continue
       seen.add(license)
-      row = btn.find_parent("tr")
-      cells = [c.get_text(strip=True) for c in row.find_all("td")] if row else []
+      cells = _batch_item_cells(btn, len(headers))
       name = cells[2] if len(cells) > 2 else ""
       # A row that doesn't line up with the header can't be read, so its
       # Subida cell is passed as None ("unknown"), never as blank ("none").
@@ -6356,6 +6428,35 @@ class SavClient:
       "<b>notice</b>",
     )
     return any(m in head for m in markers)
+
+  def _summarise_write_body(self, text: str) -> str:
+    """A write response described safely enough for an exception message.
+
+    Only SAV's own ``val`` and ``msg`` (tags stripped, truncated) are quoted. A
+    PHP fatal, or any body that isn't a JSON object, is described by its shape
+    and length only: those bodies can carry SAV's table and constraint names,
+    so they are logged at DEBUG and never quoted.
+    """
+    if self._looks_like_php_fatal(text):
+      logger.debug("Raw SAV write body: %s", text)
+      return "a server-side error (body withheld; logged at DEBUG)"
+    try:
+      data = json.loads(text)
+    except ValueError:
+      logger.debug("Raw SAV write body: %s", text)
+      return f"a non-JSON body of {len(text)} bytes (withheld; logged at DEBUG)"
+    if not isinstance(data, dict):
+      return f"a JSON {type(data).__name__}, not an object"
+    msg = strip_html(str(data.get("msg") or "")).strip()[:200]
+    return f"val={data.get('val')!r}, msg={msg!r}"
+
+  def _write_acknowledged(self, text: str) -> bool:
+    """True when a write body carries SAV's ``val == 1`` success flag."""
+    try:
+      data = json.loads(text)
+    except ValueError:
+      return False
+    return isinstance(data, dict) and str(data.get("val")) == "1"
 
   def _check_write_response(self, text: str, what: str) -> None:
     """Raise when a write endpoint's body signals failure despite HTTP 200.

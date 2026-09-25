@@ -73,11 +73,12 @@ class TestBatchItemSubida:
     assert items[0]["subida"] == _st("none")
 
   def test_subida_lote_is_pending_even_when_blank(self, monkeypatch):
-    # Sitting in a type-4 lote *is* a filed standalone subida.
+    # Sitting in a type-4 lote *is* a filed standalone subida, and the lote is
+    # keyed by the destination escalão, so tier_to falls back to it.
     items = _items(
       monkeypatch, _batch(type_id=4), f"<table>{HEADER}{_row(1, '')}</table>",
     )
-    assert items[0]["subida"] == _st("pending")
+    assert items[0]["subida"] == _st("pending", None, "Sub 16")
 
   def test_missing_column_is_unknown(self, monkeypatch):
     header = HEADER.replace("<th>Subida</th>", "")

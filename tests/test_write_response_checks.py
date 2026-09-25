@@ -25,7 +25,7 @@ PHP_FATAL = (
 
 def _batch(batch_id, type_id=2):
   """Minimal stand-in for the PlayerRegistrationBatch row a write resolves first."""
-  return SimpleNamespace(id=batch_id, type_id=type_id)
+  return SimpleNamespace(id=batch_id, type_id=type_id, item_count=0)
 
 
 @pytest.fixture

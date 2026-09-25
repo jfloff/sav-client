@@ -3975,7 +3975,13 @@ def get_enrollment_status(
         (b for b in client.list_player_registration_batches() if b.id == batch_id),
         None,
     )
-    record = client.load_existing_registration_record(batch_id, license)
+    # A Subida lote has no op=30 record (SAV answers a PHP fatal), and its
+    # checklist does not depend on nationality, so the record is skipped there.
+    is_subida = bool(batch) and batch.type_id == 4
+    record = (
+        {} if is_subida
+        else client.load_existing_registration_record(batch_id, license)
+    )
     raw_docs = client.list_player_registration_documents(batch_id, license)
     doc_types = [
         (mapped.value if (mapped := tipo_doc_to_doc_type(d["tipo_doc"])) else None)
@@ -3993,7 +3999,8 @@ def get_enrollment_status(
         reg_type, nacional_id, [*doc_types, *available],
     )
     if checklist is not None:
-        checklist["nationality_source"] = "sav_record"
+        if not is_subida:
+            checklist["nationality_source"] = "sav_record"
         if available:
             checklist["counts_include_available"] = True
     return {
