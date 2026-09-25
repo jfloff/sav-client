@@ -348,23 +348,62 @@ class Cache:
     finally:
       con.close()
 
-  def get_license_by_nif(self, nif: str) -> int | None:
-    """Return the licence whose NIF matches, or None if unknown.
+  def get_licenses_by_nif(self, nif: str) -> list[int]:
+    """Return every licence whose stored NIF matches, in ascending order.
 
     Licences with no NIF on file are stored with an empty ``nif`` to mark them
-    scanned, so a blank query must never match one.
+    scanned, so a blank query must never match those rows.
     """
     if not nif:
-      return None
+      return []
     con = self._db()
     try:
-      row = con.execute(
-        "SELECT license FROM license_nif WHERE nif = ? LIMIT 1",
+      rows = con.execute(
+        "SELECT license FROM license_nif WHERE nif = ? ORDER BY license ASC",
         (nif,),
-      ).fetchone()
-      return row[0] if row else None
+      ).fetchall()
+      return [row[0] for row in rows]
     finally:
       con.close()
+
+  def shared_nif_stats(
+    self, licenses: list[int] | None,
+  ) -> tuple[int, int]:
+    """Count shared NIF groups and their licences in cached rows.
+
+    When ``licenses`` is supplied, only those licences are counted. Passing
+    ``None`` counts every NIF row in this node-local cache. Blank NIF values
+    are excluded; placeholder NIFs are included like any other value.
+    """
+    if licenses is not None and not licenses:
+      return 0, 0
+
+    con = self._db()
+    try:
+      if licenses is None:
+        rows = con.execute(
+          "SELECT license, nif FROM license_nif WHERE TRIM(nif) != ''"
+        ).fetchall()
+      else:
+        rows = []
+        for start in range(0, len(licenses), 999):
+          chunk = licenses[start:start + 999]
+          placeholders = ",".join("?" for _ in chunk)
+          rows.extend(con.execute(
+            "SELECT license, nif FROM license_nif "
+            f"WHERE license IN ({placeholders}) AND TRIM(nif) != ''",
+            chunk,
+          ).fetchall())
+    finally:
+      con.close()
+
+    licenses_by_nif: dict[str, set[int]] = {}
+    for license, nif in rows:
+      nif_value = str(nif).strip()
+      if nif_value:
+        licenses_by_nif.setdefault(nif_value, set()).add(int(license))
+    shared = [entries for entries in licenses_by_nif.values() if len(entries) > 1]
+    return len(shared), sum(len(entries) for entries in shared)
 
   def record_player_nifs(self, pairs: list[tuple[int, str]]) -> None:
     """Bulk-upsert (license, nif) pairs. No-op when pairs is empty."""
@@ -377,6 +416,29 @@ class Cache:
         pairs,
       )
       con.commit()
+    finally:
+      con.close()
+
+  def get_nifs_for_licenses(self, licenses: list[int]) -> dict[int, str]:
+    """Return the cached NIF for each licence that has a row.
+
+    A licence scanned with no NIF on file maps to ``""``; a licence never
+    scanned (or from another club, whose NIF SAV hides) is absent.
+    """
+    if not licenses:
+      return {}
+    found: dict[int, str] = {}
+    con = self._db()
+    try:
+      for start in range(0, len(licenses), 999):
+        chunk = licenses[start:start + 999]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = con.execute(
+          f"SELECT license, nif FROM license_nif WHERE license IN ({placeholders})",
+          chunk,
+        ).fetchall()
+        found.update({row[0]: row[1] for row in rows})
+      return found
     finally:
       con.close()
 

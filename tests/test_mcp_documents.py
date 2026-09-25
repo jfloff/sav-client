@@ -1,7 +1,9 @@
 import base64
+from types import SimpleNamespace
 
 import pytest
 
+from sav_client.models import IdentityMatch
 from sav_parsers.types import BBox, DocType, ParsedField
 
 from sav_mcp import server as server_module
@@ -1062,9 +1064,17 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
     def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
       return {"existe": 1, "id": 99}
 
-    def find_license_by_nif(self, nif):
-      assert nif == "277544319"
-      return 301772
+    def resolve_player_identity(self, **kwargs):
+      assert kwargs == {
+        "nif": "277544319", "id_number": "12345699",
+        "birth_date": "2020-09-26", "name": None, "club": None,
+      }
+      return IdentityMatch(
+        status="found", player=SimpleNamespace(license="301772"),
+        other_licenses=[], candidates=[],
+        matched_by=["nif", "id_number", "birth_date"],
+        placeholder_nif=False,
+      )
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
   monkeypatch.setattr(server_module, "_forms", {
@@ -1083,7 +1093,7 @@ def test_resolve_player_type1_short_circuits_on_duplicate(monkeypatch):
   result = server_module.resolve_player(batch_number="726", mod1_id="form-1")
   assert result["resolved"] is False
   assert result["error"] == "player_already_in_sav"
-  assert result["existing_license"] == 301772
+  assert result["existing_license"] == "301772"
   assert "existing_sav_id" not in result
 
 

@@ -97,7 +97,6 @@ capability      = "read"
 roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
-subject_nif     = ["nif"]
 
 [tools.get_player_profile]
 roles           = ["coach"]
@@ -126,10 +125,10 @@ roles           = ["coach"]
 self_scope      = ["parent", "player"]
 subject_license = ["license"]
 
-# Wrapper-side lookup: hydrates the caller-scope (NIF → license) at onboarding.
-# Parent/player may call it for their own NIF (subject_nif gate stops
-# enumeration); the wrapper also calls it internally with its own session.
-[tools.find_player_by_nif]
+# Parent/player may identify their own dependant by NIF (subject_nif). The
+# doc-number / name + birth-date keys are not wrapper-verified subjects; that
+# is an accepted trade-off (the club trusts its community), not an oversight.
+[tools.identify_player]
 roles       = ["coach"]
 self_scope  = ["parent", "player"]
 subject_nif = ["nif"]

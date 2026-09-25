@@ -21,6 +21,98 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.113.0 — 2026-09-25
+
+A NIF is not one person. On one real club 5 NIFs sit on 147 licences: the
+placeholder `999999990` (SAV accepts it for players without a NIF) on 120
+different people, adults' NIFs entered for 10–13 children, and one athlete
+registered twice with two licences. The NIF lookup returned the **lowest**
+licence for a shared NIF (`SELECT … LIMIT 1`), which picked an athlete's stale
+licence, and it also decided Revalidação vs 1ª Inscrição and recovered a missing
+licence from a Modelo 1 without checking the name. This release resolves a
+**person** instead, and says so when it cannot.
+
+### Removed
+
+**`find_player_by_nif` (MCP tool), and `lookup_player(nif=…)`**
+`IMPACT: raises` — the tool no longer exists, and `lookup_player` is now
+**licence only** (`license` required; `nif` is no longer a parameter).
+`DETECT: grep -rn "find_player_by_nif\|lookup_player(.*nif" <your code>`
+`FIX: identify_player(nif=…, birth_date=…, name=…)`, then `lookup_player` /
+`get_player` with the licence it returns. Pass the birth date whenever you have
+it: it is what separates siblings sharing a parent's NIF.
+
+**`SavClient.find_license_by_nif`, `Cache.get_license_by_nif`, `sav_shared.enrollment.find_player_license_by_nif`**
+`IMPACT: raises`.
+`DETECT: grep -rn "find_license_by_nif\|get_license_by_nif\|find_player_license_by_nif" <your code>`
+`FIX: SavClient.resolve_player_identity(nif=…, birth_date=…, name=…)` for a
+person, or `find_licenses_by_nif` / `Cache.get_licenses_by_nif` for every
+licence carrying the NIF. `resolve_player_from_form(parsed, client)` replaces
+the Modelo 1 wrapper.
+
+### Changed
+
+**`identify_player` returns a person, or says it cannot**
+`IMPACT: silent` for code that treats any non-null result as a player.
+- One person on several licences → the **newest** licence, plus
+  `other_licenses: [{license, season, active}]`. Same person = same name **and**
+  birth date.
+- Several people → `{ambiguous: true, candidates: [...], matched_by}`.
+- Incomplete evidence → `{error: "identity_unverifiable", ...}`: never read it
+  as "new player".
+- **SAV's NIF can be missing or wrong, so the NIF is evidence, not a filter.**
+  A NIF match outranks everyone else. When no one carries the NIF, the other
+  keys still find the player. `nif_on_file` is the only NIF field on a found
+  player: "match" (confirmed), "different" (SAV holds another NIF — the
+  placeholder 999999990, or another real NIF, verified live; a real one is
+  accepted only when name + birth date or the doc number matched), "none" (no
+  NIF on file) or "unknown" (never read, or at another club). The placeholder
+  identifies no one: given alone it answers `null`. A NIF-only miss is
+  therefore **not** proof of a new player: look the person up by name + birth
+  date first.
+- `status` judges the chosen licence instead of filtering before the pick.
+`DETECT: grep -rn "identify_player" <your code>` — check each caller handles
+`ambiguous` and `error` before reading `license`.
+
+**NIF lookups no longer stop at the first hit**
+`IMPACT: silent` (latency). A NIF lookup must find every licence carrying the
+NIF, so without a fresh coverage marker the first one on a cold cache scans the
+whole club once (minutes). Run `warm_nif_index` from a nightly job if you look
+players up by NIF interactively.
+
+**Modelo 1 flow (`derive_enrollment_params`, eligible-licence recovery, CLI)**
+`IMPACT: raises` — with neither Revalidação nor 1ª Inscrição ticked, an
+identity that matches several people (or cannot be verified) now raises
+`ValueError` asking for the box, instead of silently choosing Revalidação on
+the lowest licence. Licence recovery never auto-picks from an ambiguous
+identity; it offers the eligible candidates instead.
+
+**1ª Inscrição duplicate (`resolve_player`, `preview_enrollment`)**
+`IMPACT: silent` — the "existing licence" hint comes from the identity resolver
+(NIF + OCR'd birth date + doc number). When several players match, it is
+`null` and the new `existing_license_candidates` lists their licences.
+
+### Added
+
+- **`identify_player(nif?, id_number?, name?, birth_date?, club_id?)`** (MCP):
+  find a player from who they are — any usable combination of keys. Parents and
+  players self-scope on `nif`; the other keys are not wrapper-verified subjects
+  (an accepted trade-off, documented in `authz.toml`). `club_id=0` makes the
+  doc-number / birth-date searches one federation-wide request (verified live:
+  both match exactly across every club).
+- **`SavClient.resolve_player_identity`**, **`find_licenses_by_nif`**,
+  `IdentityMatch`, `NifLicenses`, `Cache.get_licenses_by_nif`, and
+  `sav_shared.identity` (`is_placeholder_nif`, `names_match`,
+  `group_same_person`).
+- **`search_players(birth_date=…)`**: exact ISO birth date (`nr_dtnasc`). A
+  `club=0` search by `number` or `birth_date` is now one request instead of a
+  fan-out over every club. The `number` parameter was always the doc. ident.
+  number; its docstring called it a shirt number.
+- **`warm_nif_index`**: `shared_nif_groups` / `licenses_on_shared_nifs` (counts
+  only; no NIFs or licences, because parents and players may call it).
+
+---
+
 ## 0.112.3 — 2026-09-25
 
 ### Fixed

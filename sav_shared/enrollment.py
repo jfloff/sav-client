@@ -5,10 +5,14 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Any, Mapping
 
 from sav_client.exceptions import SavError
+from sav_client.models import IdentityMatch
 
+from .dates import to_iso
+from .identifiers import normalise_nif
 from .estatuto import LOW_CONFIDENCE, is_portuguese_nationality
 from .fields import ENROLLMENT_FIELD_META, KWARG_TO_ENTITY
 from .flags import decode_sav_flag
@@ -272,21 +276,53 @@ def escalao_field_to_name(field_key: str) -> str:
   return suffix.replace("_", " ").title()
 
 
-def find_player_license_by_nif(parsed: dict, client: Any) -> int | None:
-  """Return the license of the player with the OCR'd NIF in the login's club roster.
+def resolve_player_from_form(
+  parsed: dict, client: Any,
+) -> IdentityMatch | None:
+  """Resolve form identity in the login club, returning None without keys.
 
-  Thin wrapper around :meth:`SavClient.find_license_by_nif` that pulls the
-  NIF from a parsed OCR dict. Used both to decide reg_type when neither
-  tipo_inscricao box is checked (hit → revalidação, miss → primeira) and
-  to recover a missing licença on the form when the player is already in
-  the roster.
-
-  Always scoped to the session's own club: SAV2 only exposes a player's NIF
-  to their own club, so there is no other roster to search.
+  A NIF alone is not trusted: SAV2 placeholder NIFs and NIFs shared by family
+  members can identify several people. Usable document numbers and, when a
+  valid birth date is available, the form name provide additional constraints.
+  The resolver always scopes the lookup to the session club.
   """
-  nif_field = parsed.get("nif")
-  nif = str(nif_field.value) if (nif_field and nif_field.value) else ""
-  return client.find_license_by_nif(nif)
+  def _value(key: str) -> str | None:
+    field = parsed.get(key)
+    raw = field.value if field is not None else None
+    value = str(raw).strip() if raw is not None else ""
+    return value or None
+
+  # Pass only a well-formed NIF: an OCR misread (a short or noisy read) is no
+  # key at all, and handing it on would make the resolver raise instead of
+  # treating the form as carrying no usable NIF.
+  nif = normalise_nif(_value("nif"))
+  id_number = _value("num_doc_identificacao")
+  raw_birth_date = _value("data_nascimento")
+  birth_date: str | None = None
+  if raw_birth_date:
+    normalised = to_iso(raw_birth_date)
+    try:
+      parsed_date = date.fromisoformat(normalised)
+    except ValueError:
+      pass
+    else:
+      if parsed_date.isoformat() == normalised and re.fullmatch(
+        r"\d{4}-\d{2}-\d{2}", normalised,
+      ):
+        birth_date = normalised
+
+  name = _value("nome_completo") if birth_date else None
+  if not (nif or id_number or (name and birth_date)):
+    return None
+
+  return client.resolve_player_identity(
+    nif=nif,
+    id_number=id_number,
+    birth_date=birth_date,
+    name=name,
+    club=None,
+    status="all",
+  )
 
 
 def derive_enrollment_params(
@@ -300,8 +336,9 @@ def derive_enrollment_params(
   list_player_registration_tiers(gender_id=...) for free.
 
   When neither tipo_inscricao_revalidacao nor tipo_inscricao_primeira is
-  checked on the form, the player is looked up by NIF in the login's
-  club roster — found means revalidação, miss means primeira.
+  checked on the form, a uniquely resolved player means revalidação and a
+  definitive miss means primeira. Ambiguous or unverifiable identity requires
+  an explicit form checkbox or caller-supplied registration type/licence.
 
   Raises ValueError when no tier is detected or the name doesn't match SAV.
   """
@@ -310,7 +347,21 @@ def derive_enrollment_params(
   elif parsed_bool(parsed, "tipo_inscricao_primeira"):
     reg_type = 1
   else:
-    reg_type = 2 if find_player_license_by_nif(parsed, client) is not None else 1
+    identity = resolve_player_from_form(parsed, client)
+    if identity is None or identity.status == "not_found":
+      reg_type = 1
+    elif identity.status == "found":
+      reg_type = 2
+    elif identity.status == "ambiguous":
+      raise ValueError(
+        "SAV found several players for this form's identifying data. Tick "
+        "the Revalidação / 1ª Inscrição box, or pass reg_type or a licence."
+      )
+    else:
+      raise ValueError(
+        "SAV could not verify this form's identity. Tick the Revalidação / "
+        "1ª Inscrição box, or pass reg_type or a licence."
+      )
   gender_id = 2 if parsed_bool(parsed, "genero_feminino") else 1
 
   tier_field = next(
@@ -612,11 +663,11 @@ def resolve_player_candidates(
   Resolve the player for a parsed form against an eligible-licence list.
 
   Returns ``(license, candidates, ocr_name, ocr_license)``:
-    - ``license`` is set when OCR licence matches eligible, when a NIF
-      lookup against the club roster yields an eligible licence, OR when
-      name search yields exactly one eligible candidate.
-    - ``candidates`` is the eligible-name-search list (empty when license is
-      set or when no name search ran).
+    - ``license`` is set when OCR licence matches eligible, when identity
+      resolution finds an eligible licence, or when name search yields exactly
+      one eligible candidate.
+    - ``candidates`` contains eligible identity or name-search rows when the
+      caller must ask the user to choose.
     - ``ocr_name`` / ``ocr_license`` echo what was read from the form.
   """
   eligible_set = set(eligible)
@@ -638,12 +689,21 @@ def resolve_player_candidates(
   if ocr_license is not None:
     return None, [], None, ocr_license
 
-  # No OCR licence: try the same NIF-based own-club roster lookup we use to
-  # decide reg_type. The map is cached on the client so this is free if
-  # derive_enrollment_params already ran.
-  nif_license = find_player_license_by_nif(parsed, client)
-  if nif_license is not None and nif_license in eligible_set:
-    return nif_license, [], None, None
+  # No OCR licence: use all available form identity details. An ambiguous
+  # result must remain a user choice, even if just one candidate is eligible.
+  identity = resolve_player_from_form(parsed, client)
+  if identity is not None and identity.status == "found":
+    if identity.player is not None and int(identity.player.license) in eligible_set:
+      return int(identity.player.license), [], None, None
+  elif identity is not None and identity.status == "ambiguous":
+    eligible_candidates = [
+      player for player in identity.candidates
+      if int(player.license) in eligible_set
+    ]
+    if eligible_candidates:
+      name_field = parsed.get("nome_completo")
+      name_val = str(name_field.value) if name_field and name_field.value else ""
+      return None, eligible_candidates, name_val or None, None
 
   name_field = parsed.get("nome_completo")
   name_val = str(name_field.value) if name_field and name_field.value else ""

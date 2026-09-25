@@ -16,6 +16,8 @@ class _StubClient:
       "complete": True,
       "built_at": 1_700_000_000.0,
       "from_cache": False,
+      "shared_nif_groups": 3,
+      "licenses_on_shared_nifs": 7,
     }
 
   def build_nif_index(self, *, force=False):
@@ -41,6 +43,8 @@ def test_warm_nif_index_delegates_and_serializes_built_at(monkeypatch):
     "complete": True,
     "built_at": "2023-11-14T22:13:20+00:00",
     "from_cache": False,
+    "shared_nif_groups": 3,
+    "licenses_on_shared_nifs": 7,
   }
 
 
@@ -63,6 +67,8 @@ def test_warm_nif_index_reports_incomplete_scan(monkeypatch):
     "complete": False,
     "built_at": 1_700_000_000.0,
     "from_cache": False,
+    "shared_nif_groups": 2,
+    "licenses_on_shared_nifs": 4,
   })
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
@@ -71,6 +77,8 @@ def test_warm_nif_index_reports_incomplete_scan(monkeypatch):
   assert result["error"] == "incomplete_scan"
   assert result["unresolved"] == [42]
   assert result["built_at"] == "2023-11-14T22:13:20+00:00"
+  assert result["shared_nif_groups"] == 2
+  assert result["licenses_on_shared_nifs"] == 4
   assert stub.calls == [False]
 
 
@@ -82,6 +90,8 @@ def test_warm_nif_index_reports_roster_unavailable(monkeypatch):
     "complete": False,
     "built_at": 0.0,
     "from_cache": False,
+    "shared_nif_groups": 0,
+    "licenses_on_shared_nifs": 0,
   })
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
@@ -95,9 +105,32 @@ def test_warm_nif_index_reports_roster_unavailable(monkeypatch):
     "complete": False,
     "built_at": None,
     "from_cache": False,
+    "shared_nif_groups": 0,
+    "licenses_on_shared_nifs": 0,
     "error": "roster_unavailable",
   }
   assert stub.calls == [False]
+
+
+def test_warm_nif_index_shared_stats_contain_counts_not_identity_values(monkeypatch):
+  stub = _StubClient({
+    "players_enumerated": 2,
+    "players_indexed": 2,
+    "unresolved": [],
+    "complete": True,
+    "built_at": 1_700_000_000.0,
+    "from_cache": False,
+    "shared_nif_groups": 1,
+    "licenses_on_shared_nifs": 2,
+  })
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.warm_nif_index()
+
+  assert result["shared_nif_groups"] == 1
+  assert result["licenses_on_shared_nifs"] == 2
+  assert "111111111" not in str(result)
+  assert "123456" not in str(result)
 
 
 def test_warm_nif_index_takes_no_club_id(monkeypatch):

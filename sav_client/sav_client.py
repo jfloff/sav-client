@@ -49,8 +49,8 @@ from .exceptions import (
 )
 from .cache import Cache
 from .models import (
-  Coach, Player, Club, Game, LoginResult, PlayerRegistrationBatch, Season, Session,
-  SubidaStatus,
+  Coach, IdentityMatch, NifLicenses, Player, Club, Game, LoginResult,
+  PlayerRegistrationBatch, Season, Session, SubidaStatus,
 )
 from .utils import md5_hex, strip_html
 
@@ -73,7 +73,7 @@ from sav_shared.dates import require_iso, to_iso
 # tests/test_import_cycles.py before adding another `sav_shared` import that
 # depends on `sav_client`.
 from sav_shared.fpb_mod1 import player_is_minor
-from sav_shared.identifiers import require_nif, to_license
+from sav_shared.identifiers import normalise_nif, require_nif, to_license
 from sav_shared.text import iso_date, normalise_text
 from sav_shared.flags import decode_sav_flag as _decode_sav_flag
 
@@ -664,6 +664,7 @@ class SavClient:
     name: str = "",
     license: str = "",
     number: str = "",
+    birth_date: str | None = None,
     status: str = "",
     gender: int = 0,
     tier: str | list[str] = "",
@@ -689,7 +690,8 @@ class SavClient:
         name:        Filter by player name (partial match).
         license:     Filter by licence number (exact).  When set, all other
                      filters are ignored by the server.
-        number:      Filter by shirt number.
+        number:      Filter by identification document number (exact).
+        birth_date:  Filter by exact date of birth (YYYY-MM-DD).
         status:      Filter by eligibility status: ``"active"``,
                      ``"inactive"``, or ``"all"``. Applied client-side using
                      ``Player.active`` because SAV2's player search request
@@ -729,6 +731,7 @@ class SavClient:
     Raises:
         SavResponseError:   If the response cannot be parsed.
         SavConnectionError: On network errors.
+        ValueError:         If ``birth_date`` is not ISO ``YYYY-MM-DD``.
     """
     if self.session is None:
       raise SavResponseError("Must call login() before search_players()")
@@ -741,6 +744,8 @@ class SavClient:
       raise ValueError(
         "club is required. Pass a club id/list, or 0 for all clubs."
       )
+    if birth_date is not None:
+      birth_date = require_iso(birth_date, field="birth_date")
 
     status_filter = self._parse_player_status_filter(status)
     birth_years = self._parse_birth_year_filter(birth_year)
@@ -785,7 +790,7 @@ class SavClient:
     if isinstance(tier, list):
       results = self._search_tier_list(
         tier, name=name, license=license, number=number, gender=gender,
-        season=season, association=association, club=club,
+        birth_date=birth_date, season=season, association=association, club=club,
         status=status, limit=parallel_limit,
       )
       return _post_filter(results)
@@ -797,7 +802,7 @@ class SavClient:
 
     filters = dict(
       name=name, license=license, number=number, gender=gender,
-      tier=tier, season=season,
+      birth_date=birth_date or "", tier=tier, season=season,
     )
 
     if isinstance(club, list):
@@ -805,21 +810,13 @@ class SavClient:
       return _post_filter(results)
 
     if club == 0:
-      # A licence search needs no fan-out: SAV2 searches federation-wide
-      # natively on nr_clube=0, so one request finds the player at any club.
-      # Verified live 2026-08-22 — licence 249503 with club=0 returned its one
-      # row (Chamusca Basket Clube, not the session club 2430), while the same
-      # licence with club=2430 returned nothing, so nr_clube is respected and 0
-      # really means "all clubs". The fan-out below still exists for broad
-      # searches. The verified reason is that jc_associacao is ignored when
-      # nr_clube=0 — an association-scoped probe returned rows from many other
-      # associations — so the fan-out is the only way to honour `association`,
-      # which is why this short-circuit requires association is None. A broad
-      # search may ALSO be result-capped (a name='Silva' probe returned the
-      # same 48 rows on pages 1-3), but `name` is a prefix match so 48 may just
-      # be the true total; treat the cap as unverified. Neither concern binds
-      # here: a licence search returns at most one row.
-      if license and association is None:
+      # Exact licence, document-number and birth-date searches work natively
+      # federation-wide with nr_clube=0. Verified live 2026-09-25: document-
+      # number and birth-date searches each returned matching rows from every
+      # club in one request. A response of 48+ rows may be capped; identity
+      # resolution treats it as possibly truncated. jc_associacao is ignored
+      # when nr_clube=0, so association-scoped searches still fan out by club.
+      if association is None and (license or number or birth_date):
         results = self._search_players_single(
           association=None, club=0, page=1, **filters,
         )
@@ -1020,6 +1017,7 @@ class SavClient:
     name: str = "",
     license: str = "",
     number: str = "",
+    birth_date: str = "",
     gender: int = 0,
     tier: str = "",
     season: int = 0,
@@ -1046,7 +1044,7 @@ class SavClient:
       "user": self.session.get("user", ""),
       "organizacao": self.session.get("organizacao", 0),
       "numpag": page,
-      "nr_dtnasc": "",
+      "nr_dtnasc": birth_date,
       "nr_clube": club,
     }
 
@@ -1154,42 +1152,33 @@ class SavClient:
       raw, player_id=player_id, season_label=season_label,
     )
 
-  def find_license_by_nif(self, nif: str, *, refresh: bool = False) -> int | None:
-    """Return this club's licence for ``nif``, progressively and safely.
+  def find_licenses_by_nif(self, nif: str | None) -> NifLicenses:
+    """Return every own-club licence associated with ``nif``.
 
-    SAV2 only exposes a player's NIF to their own club, so lookup cannot be
-    widened beyond the session club. A persisted licence↔NIF hit is returned
-    immediately unless ``refresh`` requests a full re-read. On a cache miss,
-    recent rosters are scanned first for the common case, then the all-seasons
-    roster establishes an authoritative miss only when every licence resolved.
+    SAV2 exposes NIFs only to the player's own club. A fresh coverage marker
+    makes cached matches exhaustive. Otherwise recent rosters are scanned
+    first and season 0 is scanned last; already-resolved licences are skipped,
+    and fetched NIFs plus confirmed no-NIF rows are persisted. This lookup
+    always scans every roster profile needed to resolve all matches.
 
-    Args:
-        nif: Player tax identifier to find.
-        refresh: Re-fetch every roster profile before re-probing the cache.
-
-    Returns:
-        The matching licence, or None when the NIF is blank, no session club
-        exists, or exhaustive coverage establishes that it is absent.
+    Blank input returns an empty complete result. Without a session club the
+    lookup raises ``ValueError`` because it cannot run. A result is complete
+    only when a fresh marker existed or the all-seasons roster was enumerated
+    and every profile fetch resolved; otherwise its licences are partial.
     """
-    nif = nif.strip() if nif else ""
-    if not nif:
-      return None
-
-    if not refresh:
-      hit = self._cache.get_license_by_nif(nif)
-      if hit is not None:
-        return hit
+    query_nif = (nif or "").strip()
+    if not query_nif:
+      return NifLicenses(licenses=[], complete=True)
 
     club_id = int(self.session.get("organizacao") or 0) if self.session else 0
     if not club_id:
-      return None
+      raise ValueError("a session club is required to find licences by NIF")
 
-    if refresh:
-      self.build_nif_index(force=True)
-      return self._cache.get_license_by_nif(nif)
-
-    if self._cache.get_nif_index(club_id, self._nif_index_ttl) is not None:
-      return None
+    marker = self._cache.get_nif_index(club_id, self._nif_index_ttl)
+    if marker is not None:
+      return NifLicenses(
+        licenses=self._cache.get_licenses_by_nif(query_nif), complete=True,
+      )
 
     try:
       recent_seasons = self._recent_season_ids()
@@ -1205,8 +1194,6 @@ class SavClient:
     full_roster_count = 0
     any_unresolved = False
     for season in [*recent_seasons, 0]:
-      # season=0 is SAV's all-seasons roster; recent seasons only order the
-      # cheap common case and can never establish complete club coverage.
       licenses = self._enumerate_club_licenses(
         None if season == 0 else [season]
       )
@@ -1223,25 +1210,307 @@ class SavClient:
 
       known = self._cache.known_nif_licenses(licenses)
       licenses = [license for license in licenses if license not in known]
-      result = self._scan_licenses(licenses, stop_on_nif=nif)
-      # Save useful work before returning a hit: subsequent searches can skip
-      # every profile that completed before the early-exit cancellation. A
-      # licence with no NIF on file is recorded as an empty row for the same
-      # reason — it is a scanned fact, and without the row every later scan
-      # would fetch that profile again forever.
+      result = self._scan_licenses(licenses, stop_on_nif=None)
       self._cache.record_player_nifs(
         result.pairs + [(license, "") for license in result.no_nif]
       )
       if result.unresolved:
         any_unresolved = True
-      if result.hit is not None:
-        return result.hit
 
-    # Only an all-seasons enumeration covers the club, and even one profile
-    # whose NIF could not be read makes an otherwise-absent NIF non-authoritative.
-    if full_roster_enumerated and not any_unresolved:
+    complete = full_roster_enumerated and not any_unresolved
+    if complete:
       self._cache.record_nif_index(club_id, full_roster_count)
-    return None
+    return NifLicenses(
+      licenses=self._cache.get_licenses_by_nif(query_nif),
+      complete=complete,
+    )
+
+  def resolve_player_identity(
+    self,
+    *,
+    nif: str | None = None,
+    id_number: str | None = None,
+    birth_date: str | None = None,
+    name: str | None = None,
+    club: int | None = None,
+    status: str = "all",
+  ) -> IdentityMatch:
+    """Resolve one person using intersected NIF, document-number and DOB keys.
+
+    At least one usable NIF, ``id_number``, or the pair ``name`` and
+    ``birth_date`` is required; a name without a birth date raises. Placeholder
+    NIF 999999990 is ignored and reported with ``placeholder_nif=True``. A
+    placeholder-only request returns ``not_found``.
+
+    The document-number and birth-date keys each yield a licence set, and those
+    sets are intersected. A NIF is not intersected. When any person carries
+    the NIF, only those people count (with their own NIF-unknown licences) and
+    a found player has ``nif_on_file="match"``. Otherwise the NIF cannot
+    confirm anyone, and:
+
+    * a licence whose NIF on file is the placeholder or blank, was never
+      scanned, or is hidden at another club is "NIF unknown" and stays a
+      candidate — else a player registered with the placeholder could never be
+      found by their real NIF;
+    * a licence with a *different real* NIF stays a candidate only when a
+      strong key matched (name + birth date, or the exact doc number), because
+      SAV's NIF can simply be wrong; with a birth date alone it is ruled out.
+
+    A found player then carries ``nif_on_file`` saying why the NIF could not be
+    confirmed: "different" (SAV holds another NIF, the placeholder included),
+    "none" or "unknown". NIF lookup is always
+    limited to the session club, regardless of ``club``. Document-number and
+    birth-date searches use ``club`` when supplied, otherwise the session club;
+    ``club=0`` searches federation-wide. Birth-date rows are exact ISO-date
+    matches, and a supplied name further filters them with accent- and
+    case-insensitive fuzzy matching. A birth date by itself is not a usable
+    lookup key; it can narrow a NIF or document-number search, or pair with a
+    name. ``matched_by`` lists the keys actually applied, including ``name``
+    when it filters birth-date results.
+
+    NIF-only matches are hydrated by searching each matching licence in the
+    session club. Matching rows are grouped by normalised name and exact birth
+    date. One group returns ``found`` with its newest-season licence as
+    ``player`` and the remaining licences newest-first in ``other_licenses``;
+    season strings break first, then higher licence numbers break ties.
+    Multiple groups return ``ambiguous`` with the newest row per person in
+    ``candidates``. No groups return ``not_found`` unless the evidence is
+    incomplete. A federation-wide document-number or birth-date search
+    returning 48 or more rows (possibly truncated), or an incomplete NIF scan
+    when the NIF is the only key, makes a miss or an apparent single-person
+    result ``unknown``: the evidence we could not see may hold that person's
+    newer licence.
+
+    Args:
+        nif: Portuguese NIF; the known placeholder is ignored as a key.
+        id_number: Exact identification document number.
+        birth_date: Exact birth date in ISO ``YYYY-MM-DD`` format.
+        name: Optional fuzzy name constraint, which requires ``birth_date``.
+        club: Club ID for document-number/date searches, or ``0`` federation-wide.
+        status: ``"all"`` (default), ``"active"`` or ``"inactive"``. Applied to
+            the chosen person's newest licence (and to ambiguous candidates)
+            after grouping, never to the searches, so it cannot change which
+            licence is chosen.
+
+    Raises:
+        ValueError: If ``name`` has no birth date, no usable key is supplied,
+            or a supplied birth date is not ISO.
+    """
+    from sav_shared.identity import group_same_person, is_placeholder_nif, names_match
+
+    raw_nif = (nif or "").strip()
+    normalised_nif = normalise_nif(raw_nif) if raw_nif else None
+    placeholder_nif = is_placeholder_nif(raw_nif) if raw_nif else False
+    nif_key = normalised_nif if normalised_nif and not placeholder_nif else None
+    number_key = str(id_number).strip() if id_number is not None else ""
+    date_key = str(birth_date).strip() if birth_date is not None else ""
+    name_key = str(name).strip() if name is not None else ""
+
+    if name_key and not date_key:
+      raise ValueError("birth_date is required when name is provided")
+    if placeholder_nif and not (nif_key or number_key or (name_key and date_key)):
+      return IdentityMatch(
+        status="not_found", player=None, other_licenses=[], candidates=[],
+        matched_by=[], placeholder_nif=True,
+      )
+    if not (nif_key or number_key or (name_key and date_key)):
+      raise ValueError(
+        "identity lookup requires a usable nif, id_number, or name and birth_date"
+      )
+    if date_key and not (nif_key or number_key or name_key):
+      raise ValueError(
+        "identity lookup requires a usable nif, id_number, or name and birth_date"
+      )
+
+    query_club = club
+    if query_club is None:
+      query_club = int(self.session.get("organizacao") or 0) if self.session else 0
+      if not query_club:
+        raise ValueError("a session club is required for identity searches")
+
+    matched_by: list[str] = []
+    licence_sets: list[set[int]] = []
+    nif_result: NifLicenses | None = None
+    search_rows: dict[str, list[Player]] = {}
+    possibly_truncated = False
+
+    if nif_key:
+      nif_result = self.find_licenses_by_nif(nif_key)
+      matched_by.append("nif")
+
+    if number_key:
+      number_rows = self.search_players(
+        number=number_key, club=query_club, season=0, status="all",
+      )
+      if query_club == 0 and len(number_rows) >= 48:
+        possibly_truncated = True
+      search_rows["id_number"] = number_rows
+      licence_sets.append({int(p.license) for p in number_rows if p.license > 0})
+      matched_by.append("id_number")
+
+    if date_key:
+      birth_rows = self.search_players(
+        birth_date=date_key, club=query_club, season=0, status="all",
+      )
+      if query_club == 0 and len(birth_rows) >= 48:
+        possibly_truncated = True
+      if name_key:
+        birth_rows = [p for p in birth_rows if names_match(name_key, p.name)]
+        matched_by.append("name")
+      search_rows["birth_date"] = birth_rows
+      licence_sets.append({int(p.license) for p in birth_rows if p.license > 0})
+      matched_by.append("birth_date")
+
+    # The doc-number / birth-date keys are intersected with each other. The NIF
+    # is NOT intersected: it can only rule a candidate out when SAV holds a
+    # *different real* NIF for them. A placeholder or blank NIF on file, a
+    # licence never scanned, or one at another club (SAV hides its NIF) is
+    # "NIF unknown" — it cannot contradict. Otherwise a player the club
+    # registered with the placeholder could never be found by their real NIF,
+    # and "not found" reads as "new player" (a duplicate 1ª Inscrição).
+    search_set: set[int] | None = (
+      set.intersection(*licence_sets) if licence_sets else None
+    )
+    nif_set = set(nif_result.licenses) if nif_result is not None else set()
+    cached_nifs: dict[int, str] = {}
+    if search_set is None:
+      pool = nif_set
+    elif nif_result is None:
+      pool = search_set
+    else:
+      cached_nifs = self._cache.get_nifs_for_licenses(sorted(search_set))
+
+      def _nif_unknown(license_number: int) -> bool:
+        on_file = cached_nifs.get(license_number)
+        return on_file is None or on_file == "" or is_placeholder_nif(on_file)
+
+      # A strong key (name + birth date, or the exact doc number) outweighs a
+      # contradicting NIF: SAV's NIF can simply be wrong (verified live — a
+      # player whose SAV NIF belongs to someone else). Then the NIF can only
+      # promote a candidate, never exclude one. With a weaker key (a birth date
+      # alone) a different real NIF still rules the candidate out.
+      strong_key = bool(name_key or number_key)
+      pool = {
+        lic for lic in search_set
+        if lic in nif_set or _nif_unknown(lic) or strong_key
+      }
+
+    if "birth_date" in search_rows:
+      candidate_rows = search_rows["birth_date"]
+    elif "id_number" in search_rows:
+      candidate_rows = search_rows["id_number"]
+    else:
+      candidate_rows = []
+
+    if not search_rows and nif_result is not None:
+      session_club = int(self.session.get("organizacao") or 0) if self.session else 0
+      for license_number in nif_result.licenses:
+        candidate_rows.extend(self.search_players(
+          license=str(license_number), club=session_club, season=0,
+          status="all",
+        ))
+
+    rows_by_license: dict[int, Player] = {}
+    for player in candidate_rows:
+      try:
+        license_number = int(player.license)
+      except (TypeError, ValueError):
+        continue
+      if license_number not in pool:
+        continue
+      previous = rows_by_license.get(license_number)
+      if previous is None or player.season > previous.season:
+        rows_by_license[license_number] = player
+
+    groups = group_same_person(list(rows_by_license.values()))
+
+    # A NIF match outranks "NIF unknown": when any person carries the NIF, only
+    # those people count, together with their own NIF-unknown licences (an
+    # unread newer licence of the same person must not be lost). Only when no
+    # one carries it do the NIF-unknown people stand — reported as unconfirmed.
+    nif_confirmed: bool | None = None
+    if nif_result is not None:
+      if search_set is None:
+        nif_confirmed = True
+      else:
+        confirmed_groups = [
+          group for group in groups
+          if any(int(p.license) in nif_set for p in group)
+        ]
+        if confirmed_groups:
+          groups = confirmed_groups
+          nif_confirmed = True
+        else:
+          nif_confirmed = False
+
+    def _newest_first(players: list[Player]) -> list[Player]:
+      """Order same-person rows by newest season, then higher licence."""
+      return sorted(players, key=lambda p: (p.season, p.license), reverse=True)
+
+    def _nif_on_file(player: Player) -> str | None:
+      """Why an unconfirmed NIF could not be checked against SAV."""
+      if nif_confirmed is None:
+        return None
+      if nif_confirmed:
+        return "match"
+      on_file = cached_nifs.get(int(player.license))
+      if on_file is None:
+        return "unknown"
+      if on_file == "":
+        return "none"
+      # The placeholder on file is reported as what it is to the caller: a NIF
+      # that is not theirs. (For matching it still never contradicts — see
+      # _nif_unknown above.)
+      return "different"
+
+    # Missing evidence can hide a licence, and a hidden licence can be the
+    # person's newer one. A possibly-capped federation search can hide one
+    # anywhere; an incomplete NIF scan only matters when the NIF is the sole
+    # key (with other keys, unread licences are kept as NIF-unknown). Either
+    # makes a miss, or a single-person answer, unknowable. An ambiguous answer
+    # stays ambiguous: it picks no one.
+    uncertain = possibly_truncated or (
+      nif_result is not None and not nif_result.complete and search_set is None
+    )
+
+    def _match(status_: str, **fields: Any) -> IdentityMatch:
+      base = dict(
+        player=None, other_licenses=[], candidates=[], matched_by=matched_by,
+        placeholder_nif=placeholder_nif,
+      )
+      base.update(fields)
+      return IdentityMatch(status=status_, **base)
+
+    if not groups:
+      return _match("unknown" if uncertain else "not_found")
+
+    # `status` is applied only after grouping. Every search above ran with
+    # status="all" so that no licence of the person is hidden before the
+    # newest one is chosen — filtering first could drop a newer inactive
+    # licence and "find" an older active one.
+    status_filter = self._parse_player_status_filter(status)
+
+    def _passes(player: Player) -> bool:
+      return bool(self._filter_players_status([player], status_filter))
+
+    person_rows = [_newest_first(group)[0] for group in groups]
+    if len(groups) > 1:
+      # Still ambiguous after the status filter, even with one person left:
+      # a filter is not evidence of identity, so it never picks.
+      kept = [row for row in person_rows if _passes(row)]
+      if not kept:
+        return _match("not_found")
+      return _match("ambiguous", candidates=_newest_first(kept))
+
+    ordered = _newest_first(groups[0])
+    if uncertain:
+      return _match("unknown")
+    if not _passes(ordered[0]):
+      return _match("not_found")
+    return _match(
+      "found", player=ordered[0], other_licenses=ordered[1:],
+      nif_on_file=_nif_on_file(ordered[0]),
+    )
 
   def build_nif_index(self, *, force: bool = False) -> dict:
     """Exhaustively build or reuse this club's persisted NIF coverage index.
@@ -1261,7 +1530,9 @@ class SavClient:
     Returns:
         Counts and completion metadata for this build attempt. ``complete``
         is true only when a coverage marker was already fresh or this call
-        resolved the entire all-seasons roster.
+        resolved the entire all-seasons roster. The result includes counts of
+        shared NIF groups and the licences on those NIFs; a fresh-marker hit
+        computes those counts over all rows in the node-local cache.
 
     Raises:
         ValueError: If there is no session club to enumerate.
@@ -1274,6 +1545,9 @@ class SavClient:
       marker = self._cache.get_nif_index(club_id, self._nif_index_ttl)
       if marker is not None:
         built_at, player_count = marker
+        shared_nif_groups, licenses_on_shared_nifs = (
+          self._cache.shared_nif_stats(None)
+        )
         return {
           "club_id": club_id,
           "players_enumerated": player_count,
@@ -1283,10 +1557,13 @@ class SavClient:
           "complete": True,
           "built_at": built_at,
           "from_cache": True,
+          "shared_nif_groups": shared_nif_groups,
+          "licenses_on_shared_nifs": licenses_on_shared_nifs,
         }
 
     licenses = self._enumerate_club_licenses(seasons=None)
     if licenses is None:
+      shared_nif_groups, licenses_on_shared_nifs = self._cache.shared_nif_stats([])
       return {
         "club_id": club_id,
         "players_enumerated": 0,
@@ -1296,9 +1573,12 @@ class SavClient:
         "complete": False,
         "built_at": 0.0,
         "from_cache": False,
+        "shared_nif_groups": shared_nif_groups,
+        "licenses_on_shared_nifs": licenses_on_shared_nifs,
       }
 
     players_enumerated = len(licenses)
+    enumerated_licenses = licenses.copy()
     # A forced refresh must re-read known profiles too, so a corrected NIF can
     # replace an immutable-cache row. An ordinary build skips them.
     if not force:
@@ -1307,6 +1587,9 @@ class SavClient:
     result = self._scan_licenses(licenses)
     self._cache.record_player_nifs(
       result.pairs + [(license, "") for license in result.no_nif]
+    )
+    shared_nif_groups, licenses_on_shared_nifs = (
+      self._cache.shared_nif_stats(enumerated_licenses)
     )
 
     # Only a licence we could not read blocks coverage. A licence with no NIF
@@ -1329,6 +1612,8 @@ class SavClient:
       "complete": complete,
       "built_at": built_at,
       "from_cache": False,
+      "shared_nif_groups": shared_nif_groups,
+      "licenses_on_shared_nifs": licenses_on_shared_nifs,
     }
 
   def _enumerate_club_licenses(

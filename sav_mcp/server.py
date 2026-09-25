@@ -46,7 +46,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from sav_client import SavClient
-from sav_client.models import Player, Season
+from sav_client.models import IdentityMatch, Player, Season
 from sav_client.exceptions import (
     LicenseNotEnrolledError,
     SavConfigError,
@@ -60,7 +60,7 @@ from sav_shared.files import (
     ensure_pdf,
     load_image_bytes,
 )
-from sav_shared.dates import require_iso
+from sav_shared.dates import require_iso, to_iso
 from sav_shared.identifiers import normalise_nif, require_nif
 from sav_shared.enrollment import (
     REGISTRATION_TYPE_REVALIDACAO,
@@ -384,14 +384,10 @@ def _resolve_rows(
     return _most_recent(search(0))
 
 
-# Every NIF entry point rejects an unusable club with the same explanation.
-# This is a SAV2 platform limit, not one of ours: SAV2 only exposes a player's
-# NIF to their own club, so there is no federation-wide NIF data to index in
-# the first place, and no other club's roster we could search. Our own-club
-# index (SavClient.find_license_by_nif) is shaped by that limit rather than the
-# cause of it — which is why no amount of pre-warming makes another club work
-# here. Raised both when the session has no club at all and when a caller asks
-# for a club that is not the session's own.
+# NIF lookup rejects an unusable club with the same explanation. SAV2 only
+# exposes a player's NIF to their own club, so there is no federation-wide NIF
+# roster to search. Raised when the session has no club or a caller asks for a
+# club other than the session's own.
 _NIF_CLUB_REQUIRED = (
     "NIF resolution is always scoped to your own club: SAV2 only exposes a "
     "player's NIF to their own club, so another club's id has nothing to "
@@ -401,29 +397,61 @@ _NIF_CLUB_REQUIRED = (
 )
 
 
-def _resolve_by_nif(
+def _identity_match_to_dict(
     client: SavClient,
+    match: IdentityMatch,
     *,
-    nif: str,
-    status: str,
+    club: int,
     with_details: bool,
-) -> Player | None:
-    """Resolve a NIF against the session's own club roster.
+) -> dict | None:
+    """Serialize one identity-resolution outcome for MCP callers."""
+    if match.status == "found":
+        assert match.player is not None
+        row = match.player
+        if with_details:
+            detailed_rows = client.search_players(
+                license=str(row.license), club=club, season=0, status="all",
+                with_details=True,
+            )
+            row = next(
+                (p for p in detailed_rows if p.license == match.player.license),
+                None,
+            ) or match.player
+        result = player_to_dict(row, with_details=with_details)
+        result.update({
+            "matched_by": list(match.matched_by),
+            "other_licenses": [
+                {
+                    "license": player.license,
+                    "season": player.season,
+                    "active": player.active,
+                }
+                for player in match.other_licenses
+            ],
+        })
+        if match.nif_on_file is not None:
+            result["nif_on_file"] = match.nif_on_file
+        return result
 
-    Not parameterised by club: SAV2 only exposes a player's NIF to their own
-    club, so the session club is the only roster a NIF can be resolved in.
-    """
-    digits = normalise_nif(nif)
-    club_id = _effective_club(client, None)
-    if digits is None or not club_id:
-        return None
-    license = client.find_license_by_nif(digits)
-    if license is None:
-        return None
-    return _resolve_rows(
-        client, license=license, club_id=club_id, status=status,
-        season=None, with_details=with_details,
-    )
+    if match.status == "ambiguous":
+        return {
+            "ambiguous": True,
+            "candidates": [player_to_dict(player) for player in match.candidates],
+            "matched_by": list(match.matched_by),
+        }
+
+    if match.status == "unknown":
+        return {
+            "error": "identity_unverifiable",
+            "matched_by": list(match.matched_by),
+            "detail": (
+                "SAV's evidence was incomplete (a profile could not be read, "
+                "or a federation-wide search may have been capped); this is "
+                "neither found nor not-found — do not treat it as a new player"
+            ),
+        }
+
+    return None
 
 
 @server.tool()
@@ -510,41 +538,6 @@ def get_player(
 
 
 @server.tool()
-def find_player_by_nif(
-    nif: str,
-    status: str = "active",
-    with_details: bool = False,
-) -> dict | None:
-    """
-    Resolve a player by Portuguese NIF (9 digits) — inverse of get_player.
-
-    Returns the same shape as get_player, or null if no player row matches.
-    Always searches the session's own club: SAV2 only exposes a player's NIF to
-    their own club, so there is no club to choose and a session without a club
-    raises rather than silently returning null. Resolution widens from the
-    current season to the previous season and finally all seasons, so null no
-    longer means "not currently at this club".
-    status: "active" (default) | "inactive" | "all"; passed unchanged at
-        every season rung.
-    with_details: when true, also fetch photo_url, mobile_phone, nif and
-        subida — the current season's Subida de escalão,
-        {status, tier_from, tier_to, approved_on}, status one of "approved",
-        "pending" (filed, not yet approved), "none" or "unknown". Never
-        read "unknown" as "none"; see sav_mcp/AGENTS.md.
-    """
-    digits = normalise_nif(nif)
-    if digits is None:
-        return None
-    client = _get_client()
-    if not _effective_club(client, None):
-        raise ValueError(_NIF_CLUB_REQUIRED)
-    row = _resolve_by_nif(
-        client, nif=digits, status=status, with_details=with_details,
-    )
-    return player_to_dict(row, with_details=with_details) if row else None
-
-
-@server.tool()
 def warm_nif_index(force: bool = False) -> dict:
     """Exhaustively index the session club's NIFs into the node-local cache.
 
@@ -558,12 +551,16 @@ def warm_nif_index(force: bool = False) -> dict:
     importer or nightly job pay that cost outside a user request. There is no
     partial mode — a partial scan cannot support the authoritative "this player
     is new" answer the index exists to give, so narrowing lives inside
-    find_player_by_nif instead, where it needs no pre-warming.
+    lookup_player instead, where it needs no pre-warming.
 
     ``complete`` is the field to check. It is false when the roster could not
     be listed, or when any profile's NIF could not be read; ``unresolved``
     then names those licences. Only a complete scan lets a later NIF miss be
-    treated as authoritative.
+    treated as authoritative. ``shared_nif_groups`` counts NIFs attached to
+    more than one licence, and ``licenses_on_shared_nifs`` counts the
+    associated licences. These are counts only; the result never discloses
+    NIF values or licence numbers. A fresh-marker cache hit counts all NIF
+    rows in the node-local cache.
     """
     client = _get_client()
     if not _effective_club(client, None):
@@ -595,67 +592,44 @@ def warm_nif_index(force: bool = False) -> dict:
 
 @server.tool()
 def lookup_player(
-    nif: str | None = None,
-    license: int | None = None,
+    license: int,
     club_id: int | None = None,
     status: str = "active",
     with_profile: bool = False,
     with_details: bool = False,
 ) -> dict | None:
-    """Resolve exactly one NIF or licence, optionally with its full profile.
+    """Resolve one player by licence, optionally with their full profile.
 
-    The season ladder widens from current to previous to all seasons. A null
-    result therefore means no matching row was found, not "not currently at
-    this club". ``profile`` remains nested because it has fields such as nif
-    and name whose provenance differs from the roster row.
+    Licence only — to find a player's licence from a NIF, document number, or
+    name and birth date, use ``identify_player``. The season ladder widens from
+    current to previous to all seasons, so null means no matching row was
+    found, not "not currently at this club". ``with_details`` adds photo_url,
+    mobile_phone, nif and subida. ``with_profile`` adds SAV's raw profile fields
+    under a nested ``profile`` key; it stays nested because its fields have
+    different provenance from the roster row.
 
     club_id defaults to the session's own club when omitted. club_id=0 searches
-    federation-wide, and only for a licence: SAV2 matches a licence across every
-    club natively, so this is a single request per ladder rung — no more
-    expensive than a club-scoped lookup. The roster row keeps ``club_id=0``
-    when SAV2 does not provide a source-club id; the internal player id is
-    cached during that search so ``with_profile`` does not need another wide
-    search.
-    A nif is always resolved against your own club because SAV2 only exposes a
-    player's NIF to their own club, so a nif with any other club_id (including
-    club_id=0), or with no resolvable session club, raises instead of silently
-    returning null.
+    federation-wide: SAV2 matches a licence across every club natively, so this
+    is a single request per ladder rung — no more expensive than a club-scoped
+    lookup. The roster row keeps ``club_id=0`` when SAV2 does not provide a
+    source-club id; the internal player id is cached during that search so
+    ``with_profile`` does not need another wide search.
     """
-    if (nif is None) == (license is None):
-        raise ValueError("exactly one of nif or license must be supplied")
-
-    if nif is not None:
-        digits = normalise_nif(nif)
-        if digits is None:
-            return None
-
     client = _get_client()
     session_club = _effective_club(client, None)
     effective_club: int = _effective_club(client, club_id)
-
-    if nif is not None:
-        # An explicit club_id is only accepted as a spelling of "my club": any
-        # other id would silently return null, since SAV2 only exposes a
-        # player's NIF to their own club.
-        if not session_club or effective_club != session_club:
-            raise ValueError(_NIF_CLUB_REQUIRED)
-        row = _resolve_by_nif(
-            client, nif=digits, status=status, with_details=with_details,
+    # An explicit club_id=0 is a deliberate federation-wide request; a missing
+    # one with no session club is just an unusable lookup.
+    if club_id is None and not session_club:
+        raise ValueError(
+            "lookup_player needs a club: no club_id was given and the session "
+            "club could not be resolved. Pass club_id=0 to search "
+            "federation-wide."
         )
-    else:
-        assert license is not None
-        # An explicit club_id=0 is a deliberate federation-wide request; a
-        # missing one with no session club is just an unusable lookup.
-        if club_id is None and not session_club:
-            raise ValueError(
-                "lookup_player needs a club: no club_id was given and the "
-                "session club could not be resolved. Pass club_id=0 to search "
-                "federation-wide."
-            )
-        row = _resolve_rows(
-            client, license=license, club_id=effective_club,
-            status=status, season=None, with_details=with_details,
-        )
+    row = _resolve_rows(
+        client, license=license, club_id=effective_club,
+        status=status, season=None, with_details=with_details,
+    )
     if row is None:
         return None
 
@@ -668,6 +642,88 @@ def lookup_player(
         # use that id directly and its club=0 fallback search is not reached.
         result["profile"] = client.load_player_profile(
             row.license, club_id=row.club_id or effective_club,
+        )
+    return result
+
+
+@server.tool()
+def identify_player(
+    nif: str | None = None,
+    id_number: str | None = None,
+    name: str | None = None,
+    birth_date: str | None = None,
+    club_id: int | None = None,
+    status: str = "active",
+    with_profile: bool = False,
+    with_details: bool = False,
+) -> dict | None:
+    """Find a player — and their licence — from who they are.
+
+    Keys: ``nif``, ``id_number`` (doc. ident. number, exact), and ``name`` +
+    ``birth_date`` (ISO YYYY-MM-DD, exact; the name is fuzzy and needs the
+    birth date). Supply any usable combination; more keys narrow the answer.
+    Always pass the birth date when you have it: a parent's NIF is often on
+    several children's licences.
+
+    The NIF is looked up in your own club only (SAV2 hides other clubs' NIFs),
+    and it is evidence, not a filter, because SAV's NIF can be missing or
+    wrong. A found player carries ``nif_on_file``: "match" (SAV holds this NIF
+    for them — a match outranks everyone else), "different" (SAV holds another
+    NIF, the placeholder 999999990 included; a real one is accepted only when
+    name + birth date or the doc number matched), "none" (no NIF on file), or
+    "unknown" (never read, or at another club). So a NIF-only miss is not proof of
+    a new player: try name + birth date first. ``club_id`` scopes the
+    doc-number / birth-date searches: default your club, 0 federation-wide in
+    one request.
+
+    Returns:
+      found → the player row (newest licence of that person) plus
+        ``matched_by``, ``other_licenses`` [{license, season, active}],
+        and, when a NIF was given, ``nif_on_file``. ``with_details`` / ``with_profile`` apply here only.
+      ambiguous → {ambiguous: true, candidates, matched_by}:
+        several different people; never pick without another key.
+      {error: "identity_unverifiable"} → SAV's evidence was incomplete; neither
+        found nor not-found — do not treat it as a new player.
+      null → no player matched — also for a malformed NIF, or the placeholder
+        999999990, given alone: neither identifies anyone.
+    ``status`` judges the chosen licence, never the search, so it cannot make
+    an older licence win over a newer inactive one.
+    """
+    digits = normalise_nif(nif) if nif is not None else None
+    has_nif = digits is not None
+    has_id_number = bool(id_number and str(id_number).strip())
+    has_name = bool(name and str(name).strip())
+    has_birth_date = bool(birth_date and str(birth_date).strip())
+    if has_name and not has_birth_date:
+        raise ValueError("name needs birth_date")
+    if not (has_nif or has_id_number or (has_name and has_birth_date)):
+        if nif is not None and not has_nif:
+            return None  # a malformed NIF alone identifies no one
+        raise ValueError(
+            "identify_player needs nif, id_number, or name and birth_date"
+        )
+
+    client = _get_client()
+    session_club = _effective_club(client, None)
+    if has_nif and not session_club:
+        raise ValueError(_NIF_CLUB_REQUIRED)
+    effective_club = _effective_club(client, club_id)
+    match = client.resolve_player_identity(
+        nif=digits,
+        id_number=id_number,
+        birth_date=birth_date,
+        name=name,
+        club=club_id,
+        status=status,
+    )
+    result = _identity_match_to_dict(
+        client, match, club=effective_club, with_details=with_details,
+    )
+    if with_profile and match.status == "found" and match.player is not None:
+        assert result is not None
+        result["profile"] = client.load_player_profile(
+            match.player.license,
+            club_id=match.player.club_id or effective_club,
         )
     return result
 
@@ -2472,28 +2528,57 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
         duplicate = classify_primeira_duplicate(dup)
         if duplicate.blocking:
             existing_license = None
+            existing_license_candidates: list[int] = []
             nif = normalise_nif(ocr_nif) if ocr_nif else None
             if nif is not None:
                 try:
-                    existing_license = client.find_license_by_nif(nif)
+                    # OCR dates arrive in either order; the identity search
+                    # takes ISO only, so normalise (tolerant read) and drop a
+                    # date that still isn't ISO rather than lose the lookup.
+                    iso_birth = to_iso(ocr_birth) if ocr_birth else ""
+                    identity_match = client.resolve_player_identity(
+                        nif=nif,
+                        id_number=ocr_id,
+                        birth_date=(
+                            iso_birth if re.fullmatch(r"\d{4}-\d{2}-\d{2}", iso_birth)
+                            else None
+                        ),
+                        name=None,
+                        club=None,
+                    )
+                    if identity_match.status == "found":
+                        assert identity_match.player is not None
+                        existing_license = identity_match.player.license
+                    elif identity_match.status == "ambiguous":
+                        existing_license_candidates = [
+                            player.license
+                            for player in identity_match.candidates
+                        ]
                 except (SavError, ValueError):
                     logger.debug(
-                        "Could not resolve duplicate player's licence by NIF",
+                        "Could not resolve duplicate player's identity",
                         exc_info=True,
                     )
-            reason = (
-                "A player matching the OCR'd identifying data already exists "
-                "in SAV. 1ª Inscrição is for players not yet in the federation "
-                "— use Revalidação on the existing licence."
-                if existing_license is not None
-                else (
+            if existing_license is not None:
+                reason = (
+                    "A player matching the OCR'd identifying data already exists "
+                    "in SAV. 1ª Inscrição is for players not yet in the federation "
+                    "— use Revalidação on the existing licence."
+                )
+            elif existing_license_candidates:
+                reason = (
+                    "Multiple players match the OCR'd identifying data already in "
+                    "SAV. Choose the correct licence from existing_license_candidates "
+                    "and use Revalidação."
+                )
+            else:
+                reason = (
                     "A player matching the OCR'd identifying data already exists "
                     "in SAV. 1ª Inscrição is for players not yet in the federation. "
                     "Find the existing licence with a name or NIF search, then use "
                     "Revalidação."
                 )
-            )
-            return {
+            result = {
                 "resolved": False,
                 "license": None,
                 "reg_type": 1,
@@ -2501,6 +2586,9 @@ def _resolve_primeira_player(client: SavClient, form: dict[str, Any]) -> dict:
                 "reason": reason,
                 "existing_license": existing_license,
             }
+            if existing_license_candidates:
+                result["existing_license_candidates"] = existing_license_candidates
+            return result
 
     return {
         "resolved": True,

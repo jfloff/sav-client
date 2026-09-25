@@ -254,6 +254,58 @@ class TestSearchPlayers:
     assert singles[0]["license"] == "249503"
     assert singles[0]["association"] is None
 
+  def test_birth_date_is_sent_as_exact_iso_op1_filter(self, monkeypatch):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    captured = {}
+
+    def fake_post(path, payload, params=None):
+      captured.update(path=path, payload=payload, params=params)
+      return "<table><tbody></tbody></table>"
+
+    monkeypatch.setattr(client, "_post_form", fake_post)
+
+    client.search_players(birth_date="2010-02-03", club=456, season=0)
+
+    assert captured["params"] == {"op": "1"}
+    assert captured["payload"]["nr_dtnasc"] == "2010-02-03"
+
+  def test_birth_date_must_be_iso(self):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+
+    with pytest.raises(ValueError, match="birth_date must be YYYY-MM-DD"):
+      client.search_players(birth_date="03-02-2010", club=456)
+
+  @pytest.mark.parametrize(
+    "filters",
+    [{"number": "AB12345"}, {"birth_date": "2010-02-03"}],
+  )
+  def test_exact_identity_searches_with_club_zero_use_one_request(
+    self, monkeypatch, filters,
+  ):
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client.session = {"epoca_id": 123, "organizacao": 456}
+    singles = []
+
+    monkeypatch.setattr(
+      client, "_search_players_single",
+      lambda **kwargs: singles.append(kwargs) or [],
+    )
+    monkeypatch.setattr(
+      client, "_search_all_clubs",
+      lambda **kwargs: (_ for _ in ()).throw(
+        AssertionError("exact identity lookup must not fan out by club")
+      ),
+    )
+
+    client.search_players(**filters, club=0, season=0)
+
+    assert len(singles) == 1
+    assert singles[0]["club"] == 0
+    for key, value in filters.items():
+      assert singles[0][key] == value
+
   def test_license_search_with_association_still_fans_out(self, monkeypatch):
     """jc_associacao is ignored when nr_clube=0, so scoping needs the fan-out."""
     client = SavClient("https://sav2.fpb.pt", "user", "pass")

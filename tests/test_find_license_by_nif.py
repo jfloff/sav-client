@@ -1,14 +1,13 @@
 """Offline coverage for staged, persistent NIF roster indexing."""
 
 from collections import Counter
-from threading import Event
-from time import sleep
 from types import SimpleNamespace
 
 import pytest
 
 from sav_client import SavClient
 from sav_client.exceptions import SavError
+from sav_client.models import NifLicenses
 
 
 @pytest.fixture
@@ -51,7 +50,7 @@ def _stub_rosters(
   return search_calls, profile_calls
 
 
-def test_recent_roster_hit_never_scans_all_seasons(monkeypatch, client):
+def test_recent_nif_is_returned_after_all_seasons_coverage(monkeypatch, client):
   search_calls, profile_calls = _stub_rosters(
     monkeypatch,
     client,
@@ -59,9 +58,8 @@ def test_recent_roster_hit_never_scans_all_seasons(monkeypatch, client):
     {101: "111111111", 102: "222222222"},
   )
 
-  assert client.find_license_by_nif("222222222") == 102
-  assert search_calls == [20, 19]
-  assert 0 not in search_calls
+  assert client.find_licenses_by_nif("222222222") == NifLicenses([102], True)
+  assert search_calls == [20, 19, 0]
   assert profile_calls == Counter({101: 1, 102: 1})
 
 
@@ -79,7 +77,7 @@ def test_historical_hit_escalates_without_refetching_recent_profiles(
     },
   )
 
-  assert client.find_license_by_nif("333333333") == 103
+  assert client.find_licenses_by_nif("333333333") == NifLicenses([103], True)
   assert search_calls == [20, 19, 0]
   assert profile_calls == Counter({101: 1, 102: 1, 103: 1})
 
@@ -91,10 +89,12 @@ def test_fresh_full_marker_makes_miss_without_http(monkeypatch, client):
   monkeypatch.setattr(client, "search_players", search)
   monkeypatch.setattr(client, "load_player_profile", profile)
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], True)
 
 
-def test_refresh_bypasses_positive_cache_and_markers(monkeypatch, client):
+def test_forced_index_rebuild_bypasses_cached_profiles_and_marker(
+  monkeypatch, client,
+):
   client._cache.record_player_nifs([(101, "111111111")])
   client._cache.record_nif_index(200, 1)
   search_calls, profile_calls = _stub_rosters(
@@ -104,8 +104,10 @@ def test_refresh_bypasses_positive_cache_and_markers(monkeypatch, client):
     {101: "222222222"},
   )
 
-  assert client.find_license_by_nif("111111111", refresh=True) is None
-  assert client._cache.get_license_by_nif("222222222") == 101
+  result = client.build_nif_index(force=True)
+  assert result["complete"] is True
+  assert client._cache.get_licenses_by_nif("111111111") == []
+  assert client._cache.get_licenses_by_nif("222222222") == [101]
   assert search_calls == [0]
   assert profile_calls == Counter({101: 1})
 
@@ -123,9 +125,9 @@ def test_roster_failure_records_no_marker_and_retries(monkeypatch, client):
     lambda *args, **kwargs: pytest.fail("profiles require a roster"),
   )
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], False)
   assert client._cache.get_nif_index(200, ttl=300) is None
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], False)
   assert search_calls == [20, 19, 0, 20, 19, 0]
 
 
@@ -147,6 +149,34 @@ def test_full_build_writes_single_club_marker(monkeypatch, client):
   assert client._cache.get_nif_index(200, ttl=300) is not None
   assert search_calls == [0]
   assert profile_calls == Counter({101: 1, 102: 1})
+
+
+def test_build_reports_shared_nif_counts_for_enumerated_roster_and_cache(
+  monkeypatch, client,
+):
+  search_calls, _ = _stub_rosters(
+    monkeypatch,
+    client,
+    {0: (101, 102, 103, 104)},
+    {
+      101: "111111111", 102: "111111111",
+      103: "999999990", 104: "999999990",
+    },
+  )
+  client._cache.record_player_nifs([
+    (900, "222222222"), (901, "222222222"),
+  ])
+
+  built = client.build_nif_index()
+  cached = client.build_nif_index()
+
+  assert built["shared_nif_groups"] == 2
+  assert built["licenses_on_shared_nifs"] == 4
+  assert built["from_cache"] is False
+  assert cached["from_cache"] is True
+  assert cached["shared_nif_groups"] == 3
+  assert cached["licenses_on_shared_nifs"] == 6
+  assert search_calls == [0]
 
 
 def test_successful_primeira_enrolment_clears_club_marker(monkeypatch, client):
@@ -181,73 +211,6 @@ def test_successful_primeira_enrolment_clears_club_marker(monkeypatch, client):
   assert client._cache.get_nif_index(200, ttl=300) is None
 
 
-def test_early_exit_stops_large_roster_scan(monkeypatch, client):
-  licenses = list(range(1000, 1040))
-  target_started = Event()
-
-  def hold_non_target(license):
-    if license == 1001:
-      target_started.set()
-    else:
-      target_started.wait()
-      sleep(0.01)
-
-  search_calls, profile_calls = _stub_rosters(
-    monkeypatch,
-    client,
-    {20: tuple(licenses)},
-    {license: str(license) for license in licenses},
-    before_profile=hold_non_target,
-  )
-
-  assert client.find_license_by_nif("1001") == 1001
-  assert search_calls == [20]
-  assert len(profile_calls) < 40
-  untouched = set(licenses) - set(profile_calls)
-  assert untouched
-  assert all(profile_calls.get(license, 0) == 0 for license in untouched)
-
-
-def test_early_exit_persists_resolved_profiles_for_next_lookup(
-  monkeypatch, client,
-):
-  """A cancelled scan still banks what it resolved.
-
-  A single-player roster would pass this trivially, so use one big enough that
-  the first lookup genuinely exits early with work left undone.
-  """
-  licenses = list(range(1000, 1040))
-  target_started = Event()
-
-  def hold_non_target(license):
-    if license == 1001:
-      target_started.set()
-    else:
-      target_started.wait()
-      sleep(0.01)
-
-  _, profile_calls = _stub_rosters(
-    monkeypatch,
-    client,
-    {20: tuple(licenses), 19: (), 0: tuple(licenses)},
-    {license: str(license) for license in licenses},
-    before_profile=hold_non_target,
-  )
-
-  assert client.find_license_by_nif("1001") == 1001
-  first_round = sum(profile_calls.values())
-  assert first_round < len(licenses)
-
-  assert client.find_license_by_nif("1039") == 1039
-  second_round = sum(profile_calls.values()) - first_round
-
-  # The second lookup reuses the first one's persisted rows instead of
-  # re-scanning the roster. It is not free: profiles still in flight when the
-  # first hit landed were paid for but discarded, so they are fetched again.
-  assert second_round < len(licenses)
-  assert profile_calls[1001] == 1
-
-
 def test_raising_profile_fetch_blocks_marker_and_is_retried(
   monkeypatch, client,
 ):
@@ -259,11 +222,11 @@ def test_raising_profile_fetch_blocks_marker_and_is_retried(
     failures={102: SavError("temporary profile failure")},
   )
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], False)
   assert client._cache.get_nif_index(200, ttl=300) is None
   first_attempts = profile_calls[102]
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], False)
   assert profile_calls[102] > first_attempts
   assert client._cache.get_nif_index(200, ttl=300) is None
 
@@ -282,7 +245,7 @@ def test_no_nif_on_file_is_covered_not_unresolved(monkeypatch, client):
     {101: "111111111"},
   )
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], True)
   assert client._cache.get_nif_index(200, ttl=300) is not None
 
   result = client.build_nif_index()
@@ -294,7 +257,7 @@ def test_no_nif_on_file_is_covered_not_unresolved(monkeypatch, client):
 
   # The empty row marks 102 scanned; a blank query must not match it.
   assert client._cache.known_nif_licenses([102]) == {102}
-  assert client._cache.get_license_by_nif("") is None
+  assert client._cache.get_licenses_by_nif("") == []
 
 
 def test_exhaustive_miss_writes_marker_and_next_miss_uses_no_http(
@@ -307,7 +270,7 @@ def test_exhaustive_miss_writes_marker_and_next_miss_uses_no_http(
     {101: "111111111", 102: "222222222"},
   )
 
-  assert client.find_license_by_nif("999999999") is None
+  assert client.find_licenses_by_nif("999999999") == NifLicenses([], True)
   assert client._cache.get_nif_index(200, ttl=300) is not None
 
   monkeypatch.setattr(
@@ -319,4 +282,84 @@ def test_exhaustive_miss_writes_marker_and_next_miss_uses_no_http(
     lambda *args, **kwargs: pytest.fail("unexpected HTTP"),
   )
 
-  assert client.find_license_by_nif("888888888") is None
+  assert client.find_licenses_by_nif("888888888") == NifLicenses([], True)
+
+
+def test_cache_returns_every_license_for_a_nif_in_ascending_order(client):
+  client._cache.record_player_nifs([
+    (102, "123456789"),
+    (101, "123456789"),
+    (103, ""),
+  ])
+
+  assert client._cache.get_licenses_by_nif("123456789") == [101, 102]
+  assert client._cache.get_licenses_by_nif("") == []
+
+
+def test_find_licenses_by_nif_scans_all_matches_without_early_exit(
+  monkeypatch, client,
+):
+  search_calls, profile_calls = _stub_rosters(
+    monkeypatch,
+    client,
+    {20: (102, 101), 19: (103,), 0: (101, 102, 103)},
+    {
+      101: "123456789",
+      102: "123456789",
+      103: "987654321",
+    },
+  )
+
+  result = client.find_licenses_by_nif("123456789")
+
+  assert result == NifLicenses(licenses=[101, 102], complete=True)
+  assert search_calls == [20, 19, 0]
+  assert profile_calls == Counter({101: 1, 102: 1, 103: 1})
+  assert client._cache.get_nif_index(200, ttl=300) is not None
+
+
+def test_find_licenses_by_nif_fresh_marker_uses_cached_matches_without_http(
+  monkeypatch, client,
+):
+  client._cache.record_player_nifs([
+    (202, "123456789"),
+    (201, "123456789"),
+  ])
+  client._cache.record_nif_index(200, 2)
+  monkeypatch.setattr(
+    client, "search_players", lambda **kwargs: pytest.fail("unexpected HTTP"),
+  )
+  monkeypatch.setattr(
+    client,
+    "load_player_profile",
+    lambda *args, **kwargs: pytest.fail("unexpected HTTP"),
+  )
+
+  result = client.find_licenses_by_nif("123456789")
+
+  assert result == NifLicenses(licenses=[201, 202], complete=True)
+
+
+def test_find_licenses_by_nif_unresolved_profile_leaves_coverage_unknown(
+  monkeypatch, client,
+):
+  _stub_rosters(
+    monkeypatch,
+    client,
+    {0: (101, 102)},
+    {101: "123456789"},
+    failures={102: SavError("temporary profile failure")},
+  )
+
+  result = client.find_licenses_by_nif("123456789")
+
+  assert result == NifLicenses(licenses=[101], complete=False)
+  assert client._cache.get_nif_index(200, ttl=300) is None
+
+
+def test_find_licenses_by_nif_blank_and_missing_session_club(monkeypatch, client):
+  client.session = {"organizacao": 0}
+
+  assert client.find_licenses_by_nif(None) == NifLicenses([], complete=True)
+  with pytest.raises(ValueError, match="session club is required"):
+    client.find_licenses_by_nif("123456789")

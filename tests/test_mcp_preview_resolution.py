@@ -1,8 +1,11 @@
 """MCP server tests for ensure_open_batch, the preview_enrollment resolution
 fold-in (license: null), and the minor-guardian needs_review surfacing."""
 
+from types import SimpleNamespace
+
 import pytest
 
+from sav_client.models import IdentityMatch
 from sav_parsers.types import DocType, ParsedField
 
 from sav_mcp import server as server_module
@@ -230,9 +233,16 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
       assert (gender_id, birth_date, id_number) == (1, "2015-03-01", "12345678")
       return {"existe": 1, "id": 555}
 
-    def find_license_by_nif(self, nif):
-      assert nif == "277544319"
-      return None
+    def resolve_player_identity(self, **kwargs):
+      assert kwargs == {
+        "nif": "277544319", "id_number": "12345678",
+        "birth_date": "2015-03-01", "name": None, "club": None,
+      }
+      return IdentityMatch(
+        status="not_found", player=None, other_licenses=[], candidates=[],
+        matched_by=["nif", "id_number", "birth_date"],
+        placeholder_nif=False,
+      )
 
   monkeypatch.setattr(server_module, "_get_client", lambda: StubClient())
   parsed = {
@@ -254,6 +264,44 @@ def test_preview_license_null_primeira_duplicate_guard(monkeypatch):
   assert result["existing_license"] is None
   assert "existing_sav_id" not in result
   assert "name or NIF search" in result["reason"]
+
+
+def test_primeira_duplicate_with_ambiguous_nif_returns_candidate_licenses():
+  class StubClient:
+    def _check_primeira_player_duplicate(self, *, gender_id, birth_date, id_number):
+      assert (gender_id, birth_date, id_number) == (1, "2015-03-01", "12345678")
+      return {"existe": 1, "id": 555}
+
+    def resolve_player_identity(self, **kwargs):
+      assert kwargs == {
+        "nif": "277544319", "id_number": "12345678",
+        "birth_date": "2015-03-01", "name": None, "club": None,
+      }
+      return IdentityMatch(
+        status="ambiguous", player=None, other_licenses=[],
+        candidates=[
+          SimpleNamespace(license="301772"),
+          SimpleNamespace(license="301773"),
+        ],
+        matched_by=["nif", "id_number", "birth_date"],
+        placeholder_nif=False,
+      )
+
+  parsed = {
+    "nome_completo": ParsedField(value="Player B", confidence=0.99),
+    "data_nascimento": ParsedField(value="2015-03-01", confidence=0.99),
+    "num_doc_identificacao": ParsedField(value="12345678", confidence=0.99),
+    "nif": ParsedField(value="277544319", confidence=0.99),
+  }
+
+  result = server_module._resolve_primeira_player(
+    StubClient(), {"parsed": parsed},
+  )
+
+  assert result["resolved"] is False
+  assert result["existing_license"] is None
+  assert result["existing_license_candidates"] == ["301772", "301773"]
+  assert "Multiple players" in result["reason"]
 
 
 def test_preview_license_null_primeira_orphan_resolves(monkeypatch):

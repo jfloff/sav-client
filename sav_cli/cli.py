@@ -45,11 +45,11 @@ from sav_shared.enrollment import (
   compute_enrollment_checklist,
   create_and_fetch_batch,
   derive_enrollment_params,
-  find_player_license_by_nif,
   gender_id_for_license,
   parse_missing_guardian_fields,
   parsed_bool,
   resolve_player_candidates,
+  resolve_player_from_form,
   resolve_subida_player,
   resolve_subida_tier,
   try_replace_document,
@@ -1381,8 +1381,8 @@ def _resolve_enroll_player(
   params — in that case the caller should add/update against the returned
   batch instead, since SAV2 won't allow re-adding to a second one.
 
-  For revalidação (reg_type=2), uses NIF-based license lookup directly,
-  skipping manual entry prompts.
+  For revalidação (reg_type=2), a uniquely resolved form identity can offer
+  its licence before manual entry; ambiguous identities remain user choices.
   """
   console = _console()
   try:
@@ -1399,16 +1399,35 @@ def _resolve_enroll_player(
     console.print(f"[green]:dart: Matched player licence {license}{name_suffix}.[/]")
     return license, batch
 
-  # Already-enrolled fallback: licence-first, then NIF, against open batches
-  # matching the same (type, tier, gender). Returning the matching batch lets
-  # the caller route the wizard's edit path (op=30 + op=33/op=31).
+  # Already-enrolled fallback: licence-first, then a found form identity,
+  # against matching open batches. Returning that batch lets the caller route
+  # the wizard's edit path (op=30 + op=33/op=31).
   enrolled_license: int | None = None
   if ocr_license is not None:
     enrolled_license = ocr_license
 
-  nif_license = find_player_license_by_nif(parsed, client)
-  if enrolled_license is None and nif_license is not None:
-    enrolled_license = nif_license
+  identity = resolve_player_from_form(parsed, client)
+  identity_license: int | None = None
+  if (
+    identity is not None and identity.status == "found"
+    and identity.player is not None
+  ):
+    identity_license = int(identity.player.license)
+  elif identity is not None and identity.status == "ambiguous":
+    console.print(
+      "[yellow]:warning: SAV found several players for this form's identity:[/]"
+    )
+    for player in identity.candidates:
+      console.print(
+        f"  {player.name}  (licence {player.license}, season {player.season})"
+      )
+  elif identity is not None and identity.status == "unknown":
+    console.print(
+      "[yellow]:warning: SAV could not verify the form's identity.[/]"
+    )
+
+  if enrolled_license is None and identity_license is not None:
+    enrolled_license = identity_license
 
   if enrolled_license is not None:
     with console.status("[bold cyan]:link: Checking other open batches for an existing enrolment...[/]"):
@@ -1422,22 +1441,28 @@ def _resolve_enroll_player(
         console.print("[cyan]:repeat: Already enrolled in this batch — updating.[/]")
       return enrolled_license, target
 
-  # For revalidação, surface the NIF-based license before prompting for manual entry.
-  # Only offer if from NIF lookup (ocr_license may be misread).
+  # For revalidação, surface a uniquely resolved identity before prompting.
+  # Only offer an identity-derived licence when SAV returned a found result.
   # Note: this license may not be eligible for this specific batch; if so, submit
   # will fail and the user will need to manually add them to the eligible list or
   # use a different batch.
-  if reg_type == 2 and nif_license is not None and ocr_license is None:
+  if reg_type == 2 and identity_license is not None and ocr_license is None:
     console.print(
-      f"[cyan]:information_source: Found in club roster via NIF:[/] licence {nif_license}"
+      f"[cyan]:information_source: Found in club roster by NIF/identity:[/] "
+      f"licence {identity_license}"
     )
     if click.confirm("  Use this licence?", default=True):
-      return nif_license, batch
+      return identity_license, batch
 
-  if len(candidates) > 1:
-    console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
+  if candidates:
+    if len(candidates) > 1:
+      console.print(f"[yellow]:warning: Multiple players match {ocr_name!r}:[/]")
+    else:
+      console.print("[yellow]:warning: Ambiguous identity; choose a player:[/]")
     for i, p in enumerate(candidates, 1):
-      console.print(f"  {i}.  {p.name}  (licence {p.license})")
+      console.print(
+        f"  {i}.  {p.name}  (licence {p.license}, season {p.season})"
+      )
     idx = click.prompt("  Pick", type=click.IntRange(1, len(candidates)))
     return int(candidates[idx - 1].license), batch
 

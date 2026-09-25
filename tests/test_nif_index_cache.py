@@ -54,6 +54,35 @@ def test_known_nif_licenses_chunks_large_inputs(cache):
   }
 
 
+def test_shared_nif_stats_counts_groups_and_licenses(cache):
+  cache.record_player_nifs([
+    (101, "111111111"),
+    (102, "111111111"),
+    (103, "222222222"),
+    (104, "222222222"),
+    (105, "222222222"),
+    (106, "999999990"),
+    (107, "999999990"),
+    (108, ""),
+    (109, "   "),
+  ])
+
+  assert cache.shared_nif_stats([101, 102, 103, 104, 105, 108, 109]) == (
+    2, 5,
+  )
+  assert cache.shared_nif_stats(None) == (3, 7)
+
+
+def test_shared_nif_stats_excludes_unselected_licenses(cache):
+  cache.record_player_nifs([
+    (101, "111111111"),
+    (102, "111111111"),
+    (103, "222222222"),
+  ])
+
+  assert cache.shared_nif_stats([101, 103]) == (0, 0)
+
+
 def test_invalidate_wipes_nif_index(cache):
   cache.record_nif_index(10, 50)
 

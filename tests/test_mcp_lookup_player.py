@@ -5,7 +5,7 @@ import json
 import pytest
 
 from sav_client import SavClient
-from sav_client.models import Player
+from sav_client.models import IdentityMatch, Player
 from sav_mcp import server as server_module
 
 
@@ -25,15 +25,19 @@ class _StubClient:
   def __init__(self):
     self.session = {"epoca_id": 100, "organizacao": 200}
     self.calls: list[dict] = []
-    self.nif_calls: list[str] = []
+    self.identity_calls: list[dict] = []
     self.profile_calls: list[tuple[str, int | None]] = []
+    self.identity_match: IdentityMatch | None = None
 
   def _recent_season_ids(self):
     return [100, 99]
 
-  def find_license_by_nif(self, nif, *, refresh=False):
-    self.nif_calls.append(nif)
-    return 301772
+  def resolve_player_identity(self, **kwargs):
+    self.identity_calls.append(kwargs)
+    return self.identity_match or IdentityMatch(
+      status="found", player=_player(), other_licenses=[], candidates=[],
+      matched_by=["nif"], placeholder_nif=False,
+    )
 
   def search_players(self, **kwargs):
     self.calls.append(kwargs)
@@ -44,16 +48,20 @@ class _StubClient:
     return {"name": "Profile Name", "nif": "999999999", "email": "x@y.test"}
 
 
-def test_lookup_player_by_nif(monkeypatch):
+def test_identify_player_by_nif(monkeypatch):
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  result = server_module.lookup_player(nif="123 456 789")
+  result = server_module.identify_player(nif="123 456 789")
 
   assert result is not None
   assert result["license"] == "301772"
-  assert stub.nif_calls == ["123456789"]
-  assert stub.calls[0]["license"] == "301772"
+  assert result["matched_by"] == ["nif"]
+  assert stub.identity_calls == [{
+    "nif": "123456789", "id_number": None, "birth_date": None,
+    "name": None, "club": None, "status": "active",
+  }]
+  assert stub.calls == []
 
 
 def test_lookup_player_by_license(monkeypatch):
@@ -63,26 +71,25 @@ def test_lookup_player_by_license(monkeypatch):
   result = server_module.lookup_player(license=301772, status="all")
 
   assert result is not None
-  assert stub.nif_calls == []
+  assert stub.identity_calls == []
   assert stub.calls[0]["license"] == "301772"
   assert stub.calls[0]["status"] == "all"
 
 
-@pytest.mark.parametrize(
-  "kwargs",
-  [
-    {},
-    {"nif": "123456789", "license": 301772},
-  ],
-)
-def test_lookup_player_rejects_both_or_neither(monkeypatch, kwargs):
+def test_lookup_player_is_licence_only(monkeypatch):
+  """Identity keys moved to identify_player: lookup_player takes a licence."""
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  with pytest.raises(ValueError, match="exactly one"):
-    server_module.lookup_player(**kwargs)
+  with pytest.raises(TypeError):
+    server_module.lookup_player()
+  with pytest.raises(TypeError):
+    server_module.lookup_player(nif="123456789")
+  with pytest.raises(TypeError):
+    server_module.lookup_player(license=301772, birth_date="2012-06-08")
 
   assert stub.calls == []
+  assert stub.identity_calls == []
 
 
 def test_lookup_player_nests_profile_without_field_collisions(monkeypatch):
@@ -249,47 +256,48 @@ def test_lookup_player_explicit_club_id_is_still_scoped(monkeypatch):
   assert stub.calls == [(300, None)]
 
 
-def test_lookup_player_nif_with_club_zero_raises(monkeypatch):
+def test_identify_player_nif_with_club_zero_scopes_only_the_searches(monkeypatch):
+  """The NIF is always resolved in the session club; club_id=0 only widens
+  the doc-number / birth-date searches (a player registered elsewhere)."""
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  with pytest.raises(ValueError, match="scoped to your own club"):
-    server_module.lookup_player(nif="123456789", club_id=0)
+  server_module.identify_player(nif="123456789", club_id=0)
+
+  assert stub.identity_calls[0]["nif"] == "123456789"
+  assert stub.identity_calls[0]["club"] == 0
 
 
-def test_lookup_player_nif_with_another_club_raises(monkeypatch):
-  """SAV2 only exposes a player's NIF to their own club, so another club's
-  id would silently resolve to null — raise instead."""
+def test_identify_player_nif_with_another_club_scopes_only_the_searches(monkeypatch):
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  with pytest.raises(ValueError, match="scoped to your own club"):
-    server_module.lookup_player(nif="123456789", club_id=300)
+  server_module.identify_player(nif="123456789", club_id=300)
 
-  assert stub.nif_calls == []
+  assert stub.identity_calls[0]["club"] == 300
 
 
-def test_lookup_player_nif_with_own_club_id_is_accepted(monkeypatch):
+def test_identify_player_nif_with_own_club_id_is_accepted(monkeypatch):
   """club_id=<session club> is just an explicit spelling of "my club"."""
   stub = _StubClient()
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
-  result = server_module.lookup_player(nif="123456789", club_id=200)
+  result = server_module.identify_player(nif="123456789", club_id=200)
 
   assert result is not None
   assert result["license"] == "301772"
-  assert stub.nif_calls == ["123456789"]
+  assert stub.identity_calls[0]["nif"] == "123456789"
 
 
-def test_lookup_player_nif_without_session_club_raises(monkeypatch):
+def test_identify_player_nif_without_session_club_raises(monkeypatch):
   stub = _StubClient()
   stub.session = {"epoca_id": 100}  # no "organizacao"
   monkeypatch.setattr(server_module, "_get_client", lambda: stub)
 
   with pytest.raises(ValueError, match="scoped to your own club"):
-    server_module.lookup_player(nif="123456789")
+    server_module.identify_player(nif="123456789")
 
-  assert stub.nif_calls == []
+  assert stub.identity_calls == []
 
 
 def test_lookup_player_license_without_session_club_raises(monkeypatch):
@@ -311,3 +319,255 @@ def test_lookup_player_with_profile_uses_resolved_club_id(monkeypatch):
 
   assert result is not None
   assert stub.profile_calls == [("301772", 500)]
+
+
+def test_identify_player_nif_passes_active_status_without_season_ladder(monkeypatch):
+  """Port of the old active-default season-rung case.
+
+  Identity resolution gets the requested status directly and searches all
+  identity evidence; lookup_player no longer walks a one-licence season ladder.
+  """
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=_player(), other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789")
+
+  assert result is not None
+  assert result["license"] == "301772"
+  assert result["tier"] == "Sub 14"
+  assert stub.identity_calls[0]["status"] == "active"
+  assert stub.calls == []
+
+
+def test_identify_player_nif_status_all_is_passed_to_identity_resolver(monkeypatch):
+  pending = _player(
+    license="301772", tier="Sub 16", season="2024/2025", active=False,
+  )
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=pending, other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789", status="all")
+
+  assert result is not None
+  assert result["tier"] == "Sub 16"
+  assert result["season"] == "2024/2025"
+  assert stub.identity_calls[0]["status"] == "all"
+  assert stub.calls == []
+
+
+def test_identify_player_nif_can_return_a_lapsed_identity_match(monkeypatch):
+  lapsed = _player(
+    license="301772", tier="Sub 18", season="2022/2023", active=True,
+  )
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=lapsed, other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789", status="active")
+
+  assert result is not None
+  assert result["season"] == "2022/2023"
+  assert result["tier"] == "Sub 18"
+  assert stub.identity_calls[0]["status"] == "active"
+  assert stub.calls == []
+
+
+def test_identify_player_nif_not_found_returns_none(monkeypatch):
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="not_found", player=None, other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  assert server_module.identify_player(nif="123456789", status="all") is None
+  assert stub.identity_calls[0]["status"] == "all"
+  assert stub.calls == []
+
+
+def test_identify_player_malformed_nif_returns_none_before_client_lookup(monkeypatch):
+  monkeypatch.setattr(
+    server_module, "_get_client",
+    lambda: pytest.fail("malformed NIF must short-circuit before client lookup"),
+  )
+
+  assert server_module.identify_player(nif="123") is None
+
+
+def test_identify_player_nif_shared_by_same_person_returns_other_licenses(monkeypatch):
+  older = _player(license="201001", season="2023/2024", active=False)
+  newest = _player(license="301772", season="2025/2026", active=True)
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=newest, other_licenses=[older], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789")
+
+  assert result is not None
+  assert result["license"] == "301772"
+  assert result["other_licenses"] == [
+    {"license": "201001", "season": "2023/2024", "active": False},
+  ]
+  assert result["matched_by"] == ["nif"]
+  assert "placeholder_nif" not in result  # nif_on_file is the only NIF field
+
+
+def test_identify_player_nif_siblings_are_ambiguous_then_birth_date_narrows(
+  monkeypatch,
+):
+  older_sibling = _player(
+    license="301772", name="Ana Silva", birth_date="2012-06-08",
+  )
+  younger_sibling = _player(
+    license="301773", name="Rita Silva", birth_date="2014-06-08",
+  )
+  stub = _StubClient()
+
+  def resolve(**kwargs):
+    stub.identity_calls.append(kwargs)
+    if kwargs["birth_date"] == "2014-06-08":
+      return IdentityMatch(
+        status="found", player=younger_sibling, other_licenses=[],
+        candidates=[], matched_by=["nif", "birth_date"],
+        placeholder_nif=False,
+      )
+    return IdentityMatch(
+      status="ambiguous", player=None, other_licenses=[],
+      candidates=[younger_sibling, older_sibling], matched_by=["nif"],
+      placeholder_nif=False,
+    )
+
+  stub.resolve_player_identity = resolve
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  ambiguous = server_module.identify_player(nif="123456789")
+  resolved = server_module.identify_player(
+    nif="123456789", birth_date="2014-06-08",
+  )
+
+  assert ambiguous == {
+    "ambiguous": True,
+    "candidates": [
+      server_module.player_to_dict(younger_sibling),
+      server_module.player_to_dict(older_sibling),
+    ],
+    "matched_by": ["nif"],
+  }
+  assert resolved is not None
+  assert resolved["license"] == "301773"
+  assert resolved["matched_by"] == ["nif", "birth_date"]
+  assert stub.identity_calls[1]["birth_date"] == "2014-06-08"
+
+
+def test_identify_player_placeholder_nif_alone_is_a_plain_miss(monkeypatch):
+  """999999990 identifies no one: alone it answers null, like any NIF miss."""
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="not_found", player=None, other_licenses=[], candidates=[],
+    matched_by=[], placeholder_nif=True,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  assert server_module.identify_player(nif="999999990") is None
+
+
+def test_identify_player_surfaces_unknown_results(monkeypatch):
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="unknown", player=None, other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789")
+
+  assert result["error"] == "identity_unverifiable"
+  assert result["matched_by"] == ["nif"]
+  assert "neither found nor not-found" in result["detail"]
+
+
+def test_identify_player_nif_with_details_hydrates_found_license(monkeypatch):
+  found = _player(license="301772", photo_url="photo.jpg")
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=found, other_licenses=[], candidates=[],
+    matched_by=["nif"], placeholder_nif=False,
+  )
+
+  def detail_search(**kwargs):
+    stub.calls.append(kwargs)
+    assert kwargs == {
+      "license": "301772", "club": 200, "season": 0, "status": "all",
+      "with_details": True,
+    }
+    return [_player(license="301772", photo_url="photo.jpg")]
+
+  stub.search_players = detail_search
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(nif="123456789", with_details=True)
+
+  assert result is not None
+  assert result["photo_url"] == "photo.jpg"
+  assert stub.calls[0]["with_details"] is True
+
+
+def test_identify_player_by_id_number_returns_found_match(monkeypatch):
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=_player(), other_licenses=[], candidates=[],
+    matched_by=["id_number"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(id_number="12345678")
+
+  assert result is not None
+  assert result["license"] == "301772"
+  assert result["matched_by"] == ["id_number"]
+  assert stub.identity_calls == [{
+    "nif": None, "id_number": "12345678", "birth_date": None,
+    "name": None, "club": None, "status": "active",
+  }]
+
+
+def test_identify_player_requires_id_number_or_name_and_birth_date(monkeypatch):
+  stub = _StubClient()
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  with pytest.raises(ValueError, match="name needs birth_date"):
+    server_module.identify_player(name="Ana Silva")
+  with pytest.raises(ValueError, match="needs nif, id_number, or name and birth_date"):
+    server_module.identify_player()
+
+  assert stub.identity_calls == []
+
+
+def test_identify_player_club_zero_passes_federation_scope(monkeypatch):
+  stub = _StubClient()
+  stub.identity_match = IdentityMatch(
+    status="found", player=_player(), other_licenses=[], candidates=[],
+    matched_by=["name", "birth_date"], placeholder_nif=False,
+  )
+  monkeypatch.setattr(server_module, "_get_client", lambda: stub)
+
+  result = server_module.identify_player(
+    name="Roster Name", birth_date="2012-06-08", club_id=0,
+  )
+
+  assert result is not None
+  assert stub.identity_calls[0]["club"] == 0

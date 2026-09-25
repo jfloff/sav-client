@@ -164,7 +164,8 @@ client.search_players(season=0, club=0)                # all seasons
 |-------|------|---------|-------|
 | `name` | `str` | `""` | Partial match |
 | `license` | `str` | `""` | Exact; overrides others server-side |
-| `number` | `str` | `""` | Shirt number |
+| `number` | `str` | `""` | Identification document number (CC / passport), exact match (`jc_findByNumber`) |
+| `birth_date` | `str\|None` | `None` | Exact birth date, **ISO `YYYY-MM-DD` only** (sent as `nr_dtnasc`; SAV matches nothing for `DD-MM-YYYY`, so anything else raises) |
 | `status` | `str` | `""` | Eligibility status: `"active"`, `"inactive"`, or `"all"` |
 | `gender` | `int` | `0` | 0 = any |
 | `tier` | `str\|list[str]` | `""` | List runs in parallel |
@@ -192,19 +193,32 @@ Fetch `photo_url` and `mobile_phone` for a single player. Returns a stub when `w
 detail = client.get_player_detail(player.id, with_details=True)
 ```
 
-### `find_license_by_nif(nif, *, refresh=False) → int | None`
+### `find_licenses_by_nif(nif) → NifLicenses`
 
-Resolve a player by Portuguese NIF. **Always the session's own club** — SAV2 discloses a NIF only to the player's own club, so there is no other roster to search and no `club_id` parameter. SAV2 has no NIF search, so resolution means fetching profiles until one matches.
+Every own-club licence carrying `nif`, as `NifLicenses(licenses: list[int], complete: bool)`. **Always the session's own club** — SAV2 discloses a NIF only to the player's own club; no session club raises `ValueError` (a lookup that cannot run must not read as a miss). SAV2 has no NIF search, so resolution means reading profiles.
 
-It scans current season → previous season → all seasons and **stops the moment the NIF resolves**, cancelling the rest. Every profile resolved along the way is persisted, so each call leaves the index warmer than it found it and the next call re-fetches strictly less. A hit is cheap; a *miss* still scans the whole club once.
+A NIF is **not** one licence: the placeholder `999999990` sits on 120 people at one club, a parent's NIF on several children, and one athlete can hold two licences. So this never stops at the first hit. With a fresh coverage marker it is a local query (`complete=True`); without one it scans current season → previous → all seasons, skipping licences already known, and persists everything it reads. `complete` is true only when the whole all-seasons roster was enumerated and every profile resolved — only then may a caller treat a miss, or a single hit, as the whole truth.
 
-**Read a `None` carefully.** It means one of: the NIF was blank, there is no session club, or the club was scanned to exhaustion without a match. Only the last is authoritative, and the client tracks the difference — after an exhaustive clean scan a coverage marker makes later misses free for `nif_index_ttl` (default 7 days, a `SavClient(...)` kwarg). If *any* licence could not be resolved, no marker is written and the next miss re-scans, deliberately: callers map a miss to "new player" (`derive_enrollment_params` picks `reg_type = 1`), so a marker written over an incomplete scan creates duplicate federation records.
+Replaces `find_license_by_nif` (removed in 0.113.0), which returned the lowest licence for a shared NIF.
 
-`refresh=True` re-reads every profile, so a corrected NIF can replace a cached row.
+### `resolve_player_identity(*, nif=None, id_number=None, birth_date=None, name=None, club=None, status="all") → IdentityMatch`
+
+Resolve **one person**, never one arbitrary licence. `id_number` (exact doc-number search) and `birth_date` (exact birth-date search, narrowed by a fuzzy `name` match) yield licence sets that are intersected. `nif` (→ `find_licenses_by_nif`, own club only) is **not** intersected: it rules a candidate out only when SAV holds a *different real* NIF for them. When any person carries the NIF, only those people count (`nif_on_file="match"`). Otherwise placeholder / blank / never-scanned / other-club licences stay candidates, and so does a licence with a *different real* NIF when a strong key (name + birth date, or doc number) matched — SAV's NIF can be wrong. These report `nif_on_file` (`"different"` — the placeholder included —, `"none"`, `"unknown"`). A NIF-only miss is not proof of a new player. `name` needs `birth_date`; the placeholder NIF is ignored as a key (`placeholder_nif=True`). `club=None` is the session club; `club=0` is one federation-wide request for the doc-number / birth-date searches.
+
+`IdentityMatch.status`:
+
+| status | meaning |
+|---|---|
+| `found` | one person (same normalised name **and** birth date) — `player` is their newest licence (latest season, then higher licence), `other_licenses` the rest |
+| `ambiguous` | several people — `candidates` holds one newest row per person; never pick from it without another key |
+| `not_found` | no one matched (`placeholder_nif=True` when the placeholder was the only key — the MCP layer reports that as a plain `null`) |
+| `unknown` | evidence incomplete — an incomplete NIF scan, or a federation-wide search that may have hit SAV's 48-row cap. Neither found nor not-found: **never treat it as a new player** |
+
+`status` (`"all"` by default) judges the chosen licence, never the searches, so it cannot make an older licence win over a newer inactive one.
 
 ### `build_nif_index(*, force=False) → dict`
 
-Pre-pay the scan above for the whole club. **Exhaustive by design — there is no partial mode** (`scope` was removed in 0.92.0): a partial scan cannot support the authoritative miss the index exists to give. Slow and offline-only — one profile POST per not-yet-indexed licence across all seasons, 8-way concurrent, minutes on a large club.
+Pre-pay the `find_licenses_by_nif` scan for the whole club. The result also carries `shared_nif_groups` / `licenses_on_shared_nifs` — how many NIFs sit on more than one licence (counts only, no NIFs or licences). **Exhaustive by design — there is no partial mode** (`scope` was removed in 0.92.0): a partial scan cannot support the authoritative miss the index exists to give. Slow and offline-only — one profile POST per not-yet-indexed licence across all seasons, 8-way concurrent, minutes on a large club.
 
 ```python
 result = client.build_nif_index()

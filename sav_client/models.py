@@ -9,7 +9,7 @@ library update.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 
 @dataclass(frozen=True)
@@ -284,6 +284,44 @@ class Player:
       f"Player(id={self.id}, license={self.license!r}, "
       f"name={self.name!r}, tier={self.tier!r}, active={self.active})"
     )
+
+
+@dataclass(frozen=True)
+class NifLicenses:
+  """Licences found for one NIF and whether the club scan was exhaustive.
+
+  Attributes:
+      licenses: Matching licences in ascending order.
+      complete: Whether club coverage was exhaustive for this lookup.
+  """
+
+  licenses: list[int]
+  complete: bool
+
+
+@dataclass(frozen=True)
+class IdentityMatch:
+  """Outcome of resolving a person from one or more identity attributes.
+
+  ``player`` and ``other_licenses`` describe a unique person; ``candidates``
+  contains one representative row per person for an ambiguous result. For
+  unknown or absent answers, ``player`` is ``None`` and candidate lists are
+  empty.
+  """
+
+  status: Literal["found", "ambiguous", "not_found", "unknown"]
+  player: Player | None
+  other_licenses: list[Player]
+  candidates: list[Player]
+  matched_by: list[str]
+  placeholder_nif: bool
+  # Set on a found player when a NIF was a key — how SAV's NIF on file compares
+  # with it: "match" (confirmed), "different" (SAV holds another real NIF —
+  # usually SAV's record is wrong; the placeholder 999999990 included), "none"
+  # (no NIF on file), or "unknown" (never read, or hidden at another club).
+  nif_on_file: Literal[
+    "match", "different", "none", "unknown",
+  ] | None = None
 
 
 @dataclass(frozen=True)
