@@ -2124,26 +2124,31 @@ class SavClient:
       raise ValueError("license must not be None")
 
     batches = self.list_player_registration_batches()
-    open_batches = [
+    # Two lists, as in classify_enrollment_status: `scan_batches` is where the
+    # licence may already sit (widened to every in-flight state for reads);
+    # `open_batches` is what a not-enrolled player could still join, and never
+    # widens — a submitted lote has left the club and accepts no one.
+    scan_batches = [
       b for b in batches if (b.is_pending if include_submitted else b.is_open)
     ]
-    open_by_id = {b.id: b for b in open_batches}
+    open_batches = [b for b in batches if b.is_open]
+    scan_by_id = {b.id: b for b in scan_batches}
 
     cached = self._cache.get_batch_id_by_license(license)
     if cached is not None:
-      if cached in open_by_id and open_by_id[cached].type_id == _REGISTRATIONS_TYPE_SUBIDA:
+      if cached in scan_by_id and scan_by_id[cached].type_id == _REGISTRATIONS_TYPE_SUBIDA:
         # op=30 has no Subida-lote record and answers a PHP fatal (observed
         # live 2026-09-24), so a Subida lote is validated by its rows instead.
         if any(
           int(item.get("license", 0)) == int(license)
           for item in self.list_player_registration_batch_items(cached)
         ):
-          return open_by_id[cached]
+          return scan_by_id[cached]
         self._cache.forget_license_batch(license)
-      elif cached in open_by_id:
+      elif cached in scan_by_id:
         try:
           self.load_existing_registration_record(cached, license)
-          return open_by_id[cached]
+          return scan_by_id[cached]
         except SavRecordNotFoundError:
           # Probe came back well-formed but the player is no longer in
           # this batch — cache is stale. Fall through to a full scan.
@@ -2155,20 +2160,12 @@ class SavClient:
         # The cached batch is closed or no longer visible — forget it.
         self._cache.forget_license_batch(license)
 
-    for batch in open_batches:
+    for batch in scan_batches:
       items = self.list_player_registration_batch_items(batch.id)
       if any(int(item.get("license", 0)) == int(license) for item in items):
         self._cache.record_license_batch(license, batch.id)
         return batch
 
-    # TODO: when include_submitted is True this advertises submitted batches as
-    # joinable — the exact hazard 0.102.2 called out and fixed for
-    # classify_enrollment_status, where the two lists (batches scanned vs
-    # batches offered) were deliberately separated. Here they are still one
-    # list, so read_enrollment, list_player_documents and
-    # download_player_document tell a caller to add a player to a lote that has
-    # already left the club. Fixing it changes what three existing tools
-    # return, so it wants its own change and changelog entry.
     raise LicenseNotEnrolledError(
       license=license,
       open_batches=[

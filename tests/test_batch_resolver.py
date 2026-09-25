@@ -391,6 +391,44 @@ def test_resolve_batch_id_by_license_raises_when_not_enrolled(monkeypatch, tmp_c
   assert numbers == ["2025/12", "2025/13"]
 
 
+def test_widened_read_scans_submitted_lotes_but_offers_only_open_ones(
+  monkeypatch, tmp_cache,
+):
+  """A read scans every in-flight lote, but the `open_batches` it offers a
+  not-enrolled player must stay joinable: a lote in "Em Pagamento" has left
+  the club. Offering it told callers to add a player where SAV accepts no one.
+  """
+  from dataclasses import replace
+
+  from sav_client.exceptions import LicenseNotEnrolledError
+  from sav_client.sav_client import SavClient
+
+  client = SavClient.__new__(SavClient)
+  client._cache = tmp_cache
+  open_lote = _batch(12, "2025/12")
+  submitted = replace(_batch(13, "2025/13"), state_id=8, state="Em Pagamento")
+  scanned: list[int] = []
+
+  monkeypatch.setattr(
+    client, "list_player_registration_batches",
+    lambda: [open_lote, submitted], raising=False,
+  )
+
+  def _items(batch_id):
+    scanned.append(batch_id)
+    return []
+
+  monkeypatch.setattr(
+    client, "list_player_registration_batch_items", _items, raising=False,
+  )
+
+  with pytest.raises(LicenseNotEnrolledError) as excinfo:
+    client.resolve_batch_id_by_license(301772, include_submitted=True)
+
+  assert scanned == [12, 13]                     # the read still looked everywhere
+  assert [b["number"] for b in excinfo.value.open_batches] == ["2025/12"]
+
+
 # ─── resolve_batch_by_license (returns the batch object) ─────────────────────
 
 def test_resolve_batch_by_license_returns_batch_on_scan(monkeypatch, tmp_cache):

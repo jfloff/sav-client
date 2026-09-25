@@ -21,6 +21,25 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.112.3 — 2026-09-25
+
+### Fixed
+
+**`open_batches` on a not-enrolled answer offered lotes that had already been submitted**
+`IMPACT: silent`. `read_enrollment`, `get_enrollment_status`,
+`list_player_documents`, `download_player_document` and the CLI search every
+in-flight lote for the licence ("Em Validação", "Em Pagamento", "Devolvida"
+too). They also built the `open_batches` they offer a not-enrolled player from
+that same wide list, so they suggested adding the player to lotes that had
+left the club and accept no one. The search stays wide; `open_batches` now
+lists only "Em construção" lotes, matching `enrollment_status_bulk` (fixed
+the same way in 0.102.2). Verified live: of five lotes, four in "Em
+Pagamento", only the open one is offered now.
+`DETECT: grep -rn "open_batches" <your code>`. If you picked a lote from it
+to add a player, you may have been handed one SAV would refuse.
+
+---
+
 ## 0.112.2 — 2026-09-25
 
 ### Fixed
