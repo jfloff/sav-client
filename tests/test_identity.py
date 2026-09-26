@@ -94,13 +94,25 @@ def test_different_documents_never_match(given, on_file):
     assert not id_numbers_match(given, on_file, doc_type=doc_type)
 
 
-def test_other_types_and_an_unknown_type_compare_exactly():
+@pytest.mark.parametrize("given, on_file", [
+  ("ejg252806", "EJG252806"), ("EJG 252 806", "EJG252806"),
+  ("EJG-252.806", "ejg252806"), (" AB/1234567 ", "ab1234567"),
+])
+@pytest.mark.parametrize("doc_type", [2, 3, 5, None])
+def test_other_documents_ignore_case_and_separators(given, on_file, doc_type):
+  from sav_shared.identity import id_numbers_match
+  assert id_numbers_match(given, on_file, doc_type=doc_type)
+
+
+def test_other_types_and_an_unknown_type_compare_every_character():
   from sav_shared.identity import cc_civil_number, id_numbers_match
   assert id_numbers_match(" EJG252806 ", "EJG252806", doc_type=2)
   assert not id_numbers_match("EJG252806", "EJG25280", doc_type=2)
+  assert not id_numbers_match("EJG252806", "EJG252807", doc_type=2)
   # Unknown type: conservative — a CC base against a full number is reported.
   assert not id_numbers_match("15932997", "15932997 3ZW6", doc_type=None)
   # A passport of 8 digits is not silently truncated either.
   assert not id_numbers_match("12345678", "123456789", doc_type=2)
   assert cc_civil_number("1593") is None
   assert cc_civil_number("159329973ZW") is None
+  assert cc_civil_number("15932997-3zw6") == "15932997"

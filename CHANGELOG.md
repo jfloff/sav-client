@@ -21,6 +21,22 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.2 — 2026-09-26
+
+### Fixed
+
+**Passport and other doc numbers ignore case and separators**
+`IMPACT: silent` — `identify_player` compared non-CC doc numbers as literal
+strings, so `ejg252806` vs `EJG252806`, or `EJG 252 806`, was reported as an
+`id_number` conflict. Case and separators (spaces, dots, dashes, slashes) no
+longer count; every character still does, so a different document is still
+reported (verified live: `E2203397` vs `N1F62X3D0`). The same applies when
+SAV's document type is unknown. The Cartão de Cidadão rule is unchanged.
+`DETECT: grep -rn "\.upper()\|\.lower()\|replace(\" \"" <your code>` — a local
+normalisation of doc numbers before calling `identify_player` can go.
+
+---
+
 ## 0.114.1 — 2026-09-26
 
 ### Fixed

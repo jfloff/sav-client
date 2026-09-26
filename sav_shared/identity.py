@@ -79,8 +79,7 @@ def cc_civil_number(value: str | None) -> str | None:
   (spaces, dots, dashes) are ignored. Anything that is not an 8-digit civil
   number, alone or with a card tail, returns None — never a guess.
   """
-  compact = re.sub(r"[\s.\-]+", "", str(value or "")).upper()
-  match = _CC_NUMBER.fullmatch(compact)
+  match = _CC_NUMBER.fullmatch(_compact_id(value))
   return match.group(1) if match else None
 
 
@@ -90,15 +89,18 @@ def id_numbers_match(given: str | None, on_file: str | None, *, doc_type: int | 
   * ``doc_type`` 1 (Cartão de Cidadão): the 8-digit civil numbers are equal.
     SAV's form stores only the civil number today (``validanumid`` accepts
     exactly 8 characters), but older records hold the full card number.
-  * Any other type (passport, residence permit, …): the whole string, exact
-    apart from surrounding whitespace — a different document is a different
-    number.
-  * ``doc_type`` None (unknown): exact, the conservative answer. A CC civil
-    number against a full card number then reads as *not* matching, so the
-    caller sees it reported rather than silently accepted.
+  * Any other type (passport, residence permit, …): every character counts,
+    but case and separators (spaces, dots, dashes, slashes) do not — the Sheet
+    holds ``860ww7029`` style values, and case or spacing carries no meaning in
+    a document number. Nothing is ever dropped, so a different document is
+    still a different number.
+  * ``doc_type`` None (unknown): the same whole-number comparison, the
+    conservative answer. A CC civil number against a full card number then
+    reads as *not* matching, so the caller sees it reported rather than
+    silently accepted.
   """
-  left = str(given or "").strip()
-  right = str(on_file or "").strip()
+  left = _compact_id(given)
+  right = _compact_id(on_file)
   if not left or not right:
     return False
   if doc_type == CARTAO_CIDADAO:
@@ -106,3 +108,8 @@ def id_numbers_match(given: str | None, on_file: str | None, *, doc_type: int | 
     if left_cc and right_cc:
       return left_cc == right_cc
   return left == right
+
+
+def _compact_id(value: str | None) -> str:
+  """A doc number with separators removed and letters upper-cased."""
+  return re.sub(r"[\s.\-/]+", "", str(value or "")).upper()
