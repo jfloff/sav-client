@@ -1,3 +1,4 @@
+import pytest
 from sav_client.models import Player
 from sav_shared.identity import (
   PLACEHOLDER_NIFS,
@@ -54,3 +55,52 @@ def test_group_same_person_uses_normalised_name_and_exact_birth_date_stably():
   )
 
   assert groups == [[first, same_person], [different_birth_date], [other_person]]
+
+
+# Cartão de Cidadão: the civil number the club holds vs the full card number
+# SAV holds on older records — every spelling observed live on 2026-09-26.
+SAV_CC_SPELLINGS = [
+  ("15932997", "15932997 3ZW6"),
+  ("30110167", "30110167 1ZX6"),
+  ("30543973", "305439731 ZW4"),
+  ("30927726", "30927726 4 ZX1"),
+  ("30561190", "30561190 9ZX4"),
+  ("31028623", "31028623 9 ZX0"),
+  ("31045528", "31045528 6 ZX6"),
+]
+
+
+@pytest.mark.parametrize("given, on_file", SAV_CC_SPELLINGS)
+def test_cc_civil_number_reads_every_sav_spelling(given, on_file):
+  from sav_shared.identity import cc_civil_number
+  assert cc_civil_number(on_file) == given
+  assert cc_civil_number(given) == given
+
+
+@pytest.mark.parametrize("given, on_file", SAV_CC_SPELLINGS)
+def test_a_cc_civil_number_matches_the_full_card_number(given, on_file):
+  from sav_shared.identity import id_numbers_match
+  assert id_numbers_match(given, on_file, doc_type=1)
+  # A renewed card (new check digit / version) is the same person.
+  assert id_numbers_match(on_file, given + " 0ZZ9", doc_type=1)
+
+
+@pytest.mark.parametrize("given, on_file", [
+  ("E2203397", "N1F62X3D0"), ("860ww7029", "GF112738"), ("23D553W08", "EJG252806"),
+])
+def test_different_documents_never_match(given, on_file):
+  from sav_shared.identity import id_numbers_match
+  for doc_type in (1, 2, 3, None):
+    assert not id_numbers_match(given, on_file, doc_type=doc_type)
+
+
+def test_other_types_and_an_unknown_type_compare_exactly():
+  from sav_shared.identity import cc_civil_number, id_numbers_match
+  assert id_numbers_match(" EJG252806 ", "EJG252806", doc_type=2)
+  assert not id_numbers_match("EJG252806", "EJG25280", doc_type=2)
+  # Unknown type: conservative — a CC base against a full number is reported.
+  assert not id_numbers_match("15932997", "15932997 3ZW6", doc_type=None)
+  # A passport of 8 digits is not silently truncated either.
+  assert not id_numbers_match("12345678", "123456789", doc_type=2)
+  assert cc_civil_number("1593") is None
+  assert cc_civil_number("159329973ZW") is None

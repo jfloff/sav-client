@@ -21,6 +21,40 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.1 — 2026-09-26
+
+### Fixed
+
+**Cartão de Cidadão numbers compared as the civil number, not the literal string**
+`IMPACT: silent` — `identify_player` reported an `id_number` conflict for what
+is one document: the club holds the 8-digit civil number (`15932997`), while
+older SAV records hold the full card number with its check digit and version,
+spaced inconsistently (`15932997 3ZW6`, `305439731 ZW4`, `30927726 4 ZX1`;
+verified live on 7 licences). For SAV `tipo` 1 the 8-digit civil numbers are now
+compared; the card's check digit and version change on renewal. Passports and
+residence permits still compare whole, and an unreadable document type stays
+conservative (the conflict is kept). Real differences are still reported
+(verified live: `E2203397` vs `N1F62X3D0`).
+`DETECT: grep -rn "canonical_id_number\|first 8 digits\|id_number" <your code>`
+— a local workaround that reduces CC numbers before comparing, or drops
+`id_number` conflicts, can go.
+
+**A doc number that finds nobody no longer vetoes name + birth date**
+`IMPACT: silent` — SAV's doc-number search is an exact string match, so
+`identify_player(name, birth_date, id_number)` whose number SAV spells
+differently (or doesn't hold) returned `null` — "no player" — for a player the
+name and birth date found. Now the number only adds evidence: it is checked
+against the answer's profile and reported in `conflicts` when it differs.
+
+**`id_number` alone that finds nobody: `identity_unverifiable` for a CC number**
+`IMPACT: silent` — a CC civil number cannot find a record stored as the full
+card number, so a miss proves nothing; it answered `null`. It now answers
+`{error: "identity_unverifiable"}`. A passport that finds nobody is still `null`.
+`DETECT: grep -rn "identify_player(id_number" <your code>` — pass name + birth
+date with the number.
+
+---
+
 ## 0.114.0 — 2026-09-25
 
 Lookups whose scope was narrower than their flow. The key case is a

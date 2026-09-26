@@ -1353,7 +1353,10 @@ class SavClient:
         ValueError: If ``name`` has no birth date, no usable key is supplied,
             or a supplied birth date is not ISO.
     """
-    from sav_shared.identity import group_same_person, is_placeholder_nif, names_match
+    from sav_shared.identity import (
+      cc_civil_number, group_same_person, id_numbers_match, is_placeholder_nif,
+      names_match,
+    )
 
     raw_nif = (nif or "").strip()
     normalised_nif = normalise_nif(raw_nif) if raw_nif else None
@@ -1390,6 +1393,7 @@ class SavClient:
     nif_result: NifLicenses | None = None
     search_rows: dict[str, list[Player]] = {}
     possibly_truncated = False
+    id_search_inconclusive = False
 
     if nif_key:
       nif_result = self.find_licenses_by_nif(nif_key)
@@ -1402,8 +1406,19 @@ class SavClient:
       if query_club == 0 and len(number_rows) >= 48:
         possibly_truncated = True
       search_rows["id_number"] = number_rows
-      licence_sets.append({int(p.license) for p in number_rows if p.license > 0})
       matched_by.append("id_number")
+      # SAV's doc-number search is an exact, whole-string match (verified live:
+      # "15932997" does not find a record stored as "15932997 3ZW6"). So a
+      # search that finds nobody proves nothing on its own: SAV may hold
+      # another spelling of the same number, or a different document. With
+      # other keys it must not veto them — it is checked against the answer's
+      # SAV profile instead (see _id_number_conflict). Alone, a Cartão de
+      # Cidadão-shaped number that finds nobody is "unknown", not "not found".
+      other_keys = bool(nif_key or (name_key and date_key))
+      if number_rows or not other_keys:
+        licence_sets.append({int(p.license) for p in number_rows if p.license > 0})
+      if not number_rows and not other_keys and cc_civil_number(number_key):
+        id_search_inconclusive = True
 
     if date_key:
       birth_rows = self.search_players(
@@ -1486,8 +1501,11 @@ class SavClient:
           by_license[license_number] = player
       return group_same_person(list(by_license.values()))
 
-    if not search_rows and nif_result is not None:
-      candidate_rows = _nif_rows()
+    # Rows come from the searches that narrowed the answer. When none did (only
+    # a NIF, or a doc number that found nobody and so does not veto), the
+    # NIF's own licences are the candidates.
+    if search_set is None:
+      candidate_rows = _nif_rows() if nif_result is not None else []
 
     groups = _group(candidate_rows, pool)
 
@@ -1554,22 +1572,37 @@ class SavClient:
         found.append({
           "key": "birth_date", "given": date_key, "on_file": player.birth_date,
         })
-      if number_key and int(player.license) not in {
+      found.extend(_id_number_conflict(player))
+      return found
+
+    def _id_number_conflict(player: Player) -> list[dict[str, Any]]:
+      """The supplied doc number against the one SAV holds for ``player``.
+
+      Empty when no number was given, when the doc-number search itself found
+      this licence, or when the numbers are the same document — for a Cartão de
+      Cidadão, the same 8-digit civil number (the card's check digit and version
+      change on renewal). SAV's own ``tipo`` on the profile decides the type;
+      a profile that cannot be read keeps the conflict, with ``on_file`` None.
+      """
+      if not number_key or int(player.license) in {
         int(p.license) for p in search_rows.get("id_number", [])
       }:
-        on_file = None
-        try:
-          # The NIF matched, so the player is at our club and the profile is
-          # readable; its `numi` is the doc number SAV holds.
-          on_file = self.load_player_profile(
-            int(player.license), club_id=session_club or None,
-          ).get("numi") or None
-        except (SavError, ValueError):
-          logger.debug(
-            "Could not read the doc number for %s", player.license, exc_info=True,
-          )
-        found.append({"key": "id_number", "given": number_key, "on_file": on_file})
-      return found
+        return []
+      on_file = None
+      doc_type: int | None = None
+      try:
+        profile = self.load_player_profile(
+          int(player.license), club_id=session_club or None,
+        )
+        on_file = profile.get("numi") or None
+        doc_type = int(profile["tipo"]) if str(profile.get("tipo", "")).isdigit() else None
+      except (SavError, ValueError):
+        logger.debug(
+          "Could not read the doc number for %s", player.license, exc_info=True,
+        )
+      if on_file is not None and id_numbers_match(number_key, on_file, doc_type=doc_type):
+        return []
+      return [{"key": "id_number", "given": number_key, "on_file": on_file}]
 
     # Missing evidence can hide a licence, and a hidden licence can be the
     # person's newer one. A possibly-capped federation search can hide one
@@ -1578,7 +1611,7 @@ class SavClient:
     # others) — with other keys, unread licences are kept as NIF-unknown.
     # Either makes a miss, or a single-person answer, unknowable. An ambiguous
     # answer stays ambiguous: it picks no one.
-    uncertain = possibly_truncated or (
+    uncertain = possibly_truncated or id_search_inconclusive or (
       nif_result is not None and not nif_result.complete
       and (search_set is None or nif_overrode_keys)
     )
@@ -1621,7 +1654,12 @@ class SavClient:
     if not _passes(ordered[0]):
       return _match("not_found")
     nif_on_file = _nif_on_file(ordered[0])
-    conflicts = _conflicts(ordered[0]) if nif_overrode_keys else []
+    # A NIF that overrode the other keys reports each of them; otherwise only
+    # a doc number that did not itself find the answer is checked (it no
+    # longer vetoes — see the doc-number search above).
+    conflicts = (
+      _conflicts(ordered[0]) if nif_overrode_keys else _id_number_conflict(ordered[0])
+    )
     # `matched_by` names only the keys that agree with the answer: not "nif"
     # when SAV holds another NIF for the player, and not a key that conflicts.
     disagreeing = {conflict["key"] for conflict in conflicts}

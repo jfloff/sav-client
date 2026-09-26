@@ -637,11 +637,21 @@ def identify_player(
 ) -> dict | None:
     """Find a player — and their licence — from who they are.
 
-    Keys: ``nif``, ``id_number`` (doc. ident. number, exact), and ``name`` +
+    Keys: ``nif``, ``id_number`` (doc. ident. number), and ``name`` +
     ``birth_date`` (ISO YYYY-MM-DD, exact; the name is fuzzy and needs the
     birth date). Supply any usable combination. More keys narrow between
     candidates, but never veto a NIF match: a key that disagrees with SAV is
     reported in ``conflicts`` instead.
+
+    ``id_number``: SAV's doc-number search is an exact string match, so it can
+    only *add* evidence. A number that finds nobody never vetoes the other
+    keys; it is checked against the answer's SAV profile instead. For a Cartão
+    de Cidadão (SAV's ``tipo`` 1) the 8-digit civil number is compared — the
+    card's check digit and version change on renewal, and older SAV records
+    hold the full card number ("15932997 3ZW6") where the club holds
+    "15932997". Other documents compare whole. Given alone, a CC number that
+    finds nobody is ``identity_unverifiable`` (SAV may hold another spelling);
+    add name + birth date to find the player.
     Always pass the birth date when you have it: a parent's NIF is often on
     several children's licences.
 

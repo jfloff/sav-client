@@ -413,3 +413,88 @@ def test_matched_by_drops_the_nif_when_sav_holds_another(monkeypatch, client):
 
   assert result.nif_on_file == "different"
   assert result.matched_by == ["name", "birth_date"]
+
+
+class TestCartaoDeCidadaoNumbers:
+  """The club holds the 8-digit civil number; SAV's older records hold the
+  full card number, and its doc-number search is an exact string match."""
+
+  def _client(self, monkeypatch, client, *, row, profile, id_rows=(), nif=True):
+    _nif_result(monkeypatch, client, [int(row.license)] if nif else [])
+    _nifs_on_file(monkeypatch, client, {int(row.license): "123456789"} if nif else {})
+
+    def search_players(**kwargs):
+      if "number" in kwargs:
+        return list(id_rows)
+      return [row]
+
+    monkeypatch.setattr(client, "search_players", search_players)
+    monkeypatch.setattr(client, "load_player_profile", lambda license, club_id=None: profile)
+
+  def test_the_civil_number_matches_a_full_number_on_file(self, monkeypatch, client):
+    row = _player(301301, "Ana Silva", birth_date="2009-02-28")
+    self._client(monkeypatch, client, row=row, profile={"tipo": "1", "numi": "15932997 3ZW6"})
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Ana Silva", birth_date="2009-02-28", id_number="15932997",
+    )
+
+    assert result.status == "found"
+    assert result.conflicts == []
+    assert "id_number" in result.matched_by
+
+  def test_a_passport_is_still_compared_whole(self, monkeypatch, client):
+    row = _player(315784, "Ana Silva", birth_date="2009-02-28")
+    self._client(monkeypatch, client, row=row, profile={"tipo": "2", "numi": "EJG252806"})
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Ana Silva", birth_date="2009-02-28", id_number="23D553W08",
+    )
+
+    assert result.status == "found"
+    assert result.conflicts == [
+      {"key": "id_number", "given": "23D553W08", "on_file": "EJG252806"},
+    ]
+    assert "id_number" not in result.matched_by
+
+  def test_an_unreadable_type_keeps_the_conflict(self, monkeypatch, client):
+    row = _player(301301, "Ana Silva", birth_date="2009-02-28")
+    self._client(monkeypatch, client, row=row, profile={"numi": "15932997 3ZW6"})
+
+    result = client.resolve_player_identity(
+      nif="123456789", name="Ana Silva", birth_date="2009-02-28", id_number="15932997",
+    )
+
+    assert result.conflicts == [
+      {"key": "id_number", "given": "15932997", "on_file": "15932997 3ZW6"},
+    ]
+
+  def test_a_doc_number_that_finds_nobody_no_longer_vetoes_name_and_birth_date(
+    self, monkeypatch, client,
+  ):
+    # No NIF: name + birth date find her; the exact doc-number search cannot.
+    row = _player(301301, "Ana Silva", birth_date="2009-02-28")
+    self._client(
+      monkeypatch, client, row=row, nif=False,
+      profile={"tipo": "1", "numi": "15932997 3ZW6"},
+    )
+
+    result = client.resolve_player_identity(
+      name="Ana Silva", birth_date="2009-02-28", id_number="15932997",
+    )
+
+    assert result.status == "found"
+    assert result.player == row
+    assert result.conflicts == []
+
+  def test_a_cc_number_alone_that_finds_nobody_is_unknown(self, monkeypatch, client):
+    row = _player(301301, "Ana Silva")
+    self._client(monkeypatch, client, row=row, nif=False, profile={})
+
+    assert client.resolve_player_identity(id_number="15932997").status == "unknown"
+
+  def test_a_passport_alone_that_finds_nobody_is_not_found(self, monkeypatch, client):
+    row = _player(301301, "Ana Silva")
+    self._client(monkeypatch, client, row=row, nif=False, profile={})
+
+    assert client.resolve_player_identity(id_number="EJG252806").status == "not_found"
