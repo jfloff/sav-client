@@ -155,9 +155,10 @@ def _get_client() -> SavClient:
 
 
 # ── Reference-data resources ──────────────────────────────────────────────────
-# Static SAV lookups (genders, escalões, distritos, id/guardian/doc types, tier
-# eligibility) an app builds its UI/backend around. Exposed as MCP resources
-# rather than tools: reference data a client loads once, not an action. These
+# Static SAV lookups (genders, escalões, distritos, nationalities,
+# id/guardian/doc types, tier eligibility) an app builds its UI/backend around.
+# Exposed as MCP resources rather than tools: reference data a client loads
+# once, not an action. These
 # sit outside authz.toml (its drift check governs @server.tool only) — safe
 # because the data is federation-public and non-sensitive, the same tier already
 # opened to every role via list_associations / list_clubs / list_tiers.
@@ -167,11 +168,13 @@ def _get_client() -> SavClient:
 def lookups_resource() -> dict:
     """All federation-public SAV lookups plus tier eligibility.
 
-    Genders, registration types, distritos, ID/guardian/document types, and the
-    per-gender escalão (tier) ids — the dropdown and validation values an app
-    builds its UI/backend around. Tier age windows carry the eligible birth
-    years for the *current* season (resolved server-side). For another season
-    (e.g. next-season planning) read ``sav://lookups/{season_start_year}``.
+    Genders, registration types, nationalities, distritos,
+    ID/guardian/document types, and the per-gender escalão (tier) ids — the
+    dropdown and validation values an app builds its UI/backend around.
+    Nationalities mirror SAV's checked-in dropdown snapshot.
+    Tier age windows carry the eligible birth years for the *current* season
+    (resolved server-side). For another season (e.g. next-season planning)
+    read ``sav://lookups/{season_start_year}``.
     """
     season = _get_client().get_current_season().start_year
     return reference_data(season_start_year=season)
@@ -3956,13 +3959,15 @@ def enrollment_fields() -> list[dict]:
     it: a guessed date convention is how a wrong date reaches the federation.
 
     ``enum_ref`` names the key into the ``sav://lookups`` bundle that
-    enumerates the field's legal values, so validate enums against the live
+    enumerates the field's legal values, so validate enums against the served
     bundle rather than a second copy of the table. It is deliberately
     independent of ``type``: ``distrito`` is free text on the form
     (``type: "text"``) but is submitted as a ``distrito_id`` from the
     ``distritos`` table, so it carries ``enum_ref: "distritos"``.
-    ``concelho`` carries ``null`` because concelhos are distrito-dependent and
-    fetched live from SAV, so the bundle has no such key.
+    ``nacionalidade`` carries ``"nationalities"``: its legal numeric
+    ``nationality_id`` values mirror SAV's checked-in dropdown. ``concelho``
+    carries ``null`` because concelhos are distrito-dependent and fetched live
+    from SAV, so the bundle has no such key.
 
     Every field carries a ``label`` (Portuguese, as printed on the form). A
     ``null`` ``enum_ref`` or ``field_overrides_key`` means no such value exists

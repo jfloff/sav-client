@@ -13,6 +13,7 @@ from sav_shared.lookups import (
   GENERO,
   GUARDIAN_RELATIONS,
   ID_TYPES,
+  NATIONALITIES,
   PLAYER_REGISTRATION_TIERS,
   REGISTRATION_TYPE_LABELS,
   TIER_AGE_RANGE_IN_SEASON,
@@ -29,7 +30,7 @@ class TestBundleShape:
   def test_all_sections_present(self):
     data = reference_data()
     for key in (
-      "genero", "registration_types", "distritos", "id_types",
+      "genero", "registration_types", "distritos", "nationalities", "id_types",
       "guardian_relations", "doc_types", "player_registration_tiers",
       "tier_ages_in_season",
     ):
@@ -55,6 +56,12 @@ class TestIdNameLists:
     assert [d["id"] for d in distritos] == list(DISTRITOS)
     assert all(isinstance(d["id"], int) for d in distritos)
 
+  def test_nationalities_preserve_sav_ids_and_names(self):
+    nationalities = reference_data()["nationalities"]
+
+    assert [row["id"] for row in nationalities] == list(NATIONALITIES)
+    assert nationalities[0] == {"id": 155, "name": "Portugal"}
+
   def test_covers_every_source_entry(self):
     data = reference_data()
     assert len(data["distritos"]) == len(DISTRITOS)
@@ -62,6 +69,7 @@ class TestIdNameLists:
     assert len(data["id_types"]) == len(ID_TYPES)
     assert len(data["guardian_relations"]) == len(GUARDIAN_RELATIONS)
     assert len(data["genero"]) == len(GENERO)
+    assert len(data["nationalities"]) == len(NATIONALITIES)
 
 
 class TestDocTypes:

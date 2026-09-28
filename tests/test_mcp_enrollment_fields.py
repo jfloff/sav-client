@@ -181,6 +181,14 @@ def test_distrito_is_text_with_a_distritos_reference():
   assert rows["concelho"]["enum_ref"] is None
 
 
+def test_nationality_points_to_the_checked_in_sav_lookup():
+  rows = _rows_by_id()
+
+  assert rows["nacionalidade"]["type"] == "text"
+  assert rows["nacionalidade"]["enum_ref"] == "nationalities"
+  assert rows["nacionalidade"]["field_overrides_key"] == "nationality_id"
+
+
 def test_field_override_keys_preserve_submission_names():
   """The submission vocabulary must remain distinct from the form-facing field ids where SAV requires it."""
   rows = _rows_by_id()

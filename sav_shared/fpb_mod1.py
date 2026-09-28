@@ -1211,6 +1211,7 @@ _MOD1_ENUM_REFS: dict[str, str] = {
   "tipo":              "id_types",
   "guardian_id_type":  "id_types",
   "guardian_relation": "guardian_relations",
+  "nacionalidade":     "nationalities",
   "distrito":          "distritos",
 }
 

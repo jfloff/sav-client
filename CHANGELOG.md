@@ -21,6 +21,21 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.3 — 2026-09-28
+
+### Added
+
+**MCP exports SAV's nationality IDs**
+`IMPACT: additive` — `sav://lookups` and
+`sav://lookups/{season_start_year}` now carry
+`nationalities: [{id, name}]`, from a checked-in snapshot of SAV's own 222-row
+nationality dropdown. `enrollment_fields()` now points `nacionalidade` at that
+table with `enum_ref: "nationalities"`, so a caller can translate a new
+player's stated nationality into the numeric `nationality_id` required by
+`field_overrides`. The explicit-season resource remains entirely static.
+
+---
+
 ## 0.114.2 — 2026-09-26
 
 ### Fixed
