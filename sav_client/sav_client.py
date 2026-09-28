@@ -6320,8 +6320,10 @@ class SavClient:
     also sends ``subida`` / ``subida_escalao`` (defaulting to -1/0 when no
     inline subida) since the available taxa can differ for promotion cases.
 
-    Auto-picks a single real option; raises with the listing when ambiguous
-    so the caller passes ``taxa_id`` explicitly.
+    Auto-picks a single real option. When the only extra options are refugee
+    exemptions, defaults to the one ordinary fee; callers can still select a
+    refugee exemption explicitly with ``taxa_id``. Other ambiguities raise
+    with the listing so the caller passes ``taxa_id`` explicitly.
     """
     import re
 
@@ -6359,6 +6361,13 @@ class SavClient:
         f"No fee is configured for estatuto={estatuto} ({estatuto_label}) "
         f"in primeira batch {batch.id} ({batch.tier}); player {userid}."
       )
+    ordinary_options = {
+      fee_id: label
+      for fee_id, label in options.items()
+      if "refugiado" not in label.casefold()
+    }
+    if len(ordinary_options) == 1 and len(ordinary_options) < len(options):
+      return next(iter(ordinary_options))
     listing = ", ".join(f"{i}={n!r}" for i, n in sorted(options.items()))
     estatuto_label = ESTATUTOS.get(estatuto, "unknown")
     raise SavConfigError(

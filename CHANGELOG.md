@@ -21,6 +21,22 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.4 — 2026-09-28
+
+### Fixed
+
+**A refugee exemption no longer makes the ordinary 1ª Inscrição fee ambiguous**
+`IMPACT: silent` — when SAV offers one ordinary fee plus one or more fees whose
+label identifies them as `Refugiado`, omitting `taxa_id` now selects the
+ordinary fee instead of raising `SavConfigError`. Other multi-fee combinations
+remain ambiguous and still raise. An explicit `taxa_id` remains authoritative,
+including when the caller intentionally selects the refugee exemption.
+`DETECT: grep -rn "taxa_id" <your code>` — callers that supplied the ordinary
+fee only to work around this ambiguity may remove that override; callers that
+select a refugee exemption must keep it.
+
+---
+
 ## 0.114.3 — 2026-09-28
 
 ### Added

@@ -1035,6 +1035,48 @@ class TestPrimeiraEstatutoRule:
     assert "Sem FBP Comunitário" in message
     assert "<option" not in message
 
+  def test_taxa_defaults_to_the_ordinary_fee_over_refugee_exemption(
+    self, monkeypatch,
+  ):
+    response = type("Response", (), {
+      "text": json.dumps({
+        "msg": (
+          "<option value='1141'>Sub18 Masc Sem FBP Comunitário | Sub 18 M</option>"
+          "<option value='1152'>Isento Refugiado Sub18M (proteção temp) | Sub 18 M</option>"
+        ),
+      }),
+      "raise_for_status": lambda self: None,
+    })()
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client._http = type(
+      "Http", (), {"get": lambda self, *args, **kwargs: response},
+    )()
+
+    assert client._resolve_primeira_taxa_id(
+      _PrimeiraEstatutoBatch(), 279040, 10,
+    ) == 1141
+
+  def test_taxa_keeps_rejecting_multiple_ordinary_fees(self, monkeypatch):
+    response = type("Response", (), {
+      "text": json.dumps({
+        "msg": (
+          "<option value='1141'>Sub18 Masc Sem FBP Comunitário | Sub 18 M</option>"
+          "<option value='1142'>Outra taxa normal | Sub 18 M</option>"
+          "<option value='1152'>Isento Refugiado Sub18M | Sub 18 M</option>"
+        ),
+      }),
+      "raise_for_status": lambda self: None,
+    })()
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client._http = type(
+      "Http", (), {"get": lambda self, *args, **kwargs: response},
+    )()
+
+    with pytest.raises(SavConfigError, match="Multiple fees are configured"):
+      client._resolve_primeira_taxa_id(
+        _PrimeiraEstatutoBatch(), 279040, 10,
+      )
+
 class TestPrimeiraInscricao:
   """Type-1 wizard: dispatch + commit body shape.
 
@@ -1141,6 +1183,16 @@ class TestPrimeiraInscricao:
     assert body["taxa"] == "1052"
     assert body["estatuto"] == "6"
     assert body["dataexame"] == RECENT_EXAM_DATE
+
+  def test_explicit_taxa_id_bypasses_the_default(self, monkeypatch):
+    client, captured = self._stub_primeira(monkeypatch)
+    monkeypatch.setattr(client._cache, "clear_nif_index", Mock())
+
+    client.add_player_to_registration_batch(
+      629084, taxa_id=1152, **self.REQUIRED,
+    )
+
+    assert captured["body"]["taxa"] == "1152"
 
   def test_matching_estatuto_readback_confirms_the_commit(self, monkeypatch):
     client, _ = self._stub_primeira(monkeypatch)

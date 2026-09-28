@@ -424,7 +424,7 @@ client.add_player_to_registration_batch(                                      # 
 | `nome_pai`, `nome_mae` | `str` | `None` | Step 1 parent overrides |
 | `morada`, `cod_postal`, `localidade_txt` | `str` | `None` | Step 2 address overrides |
 | `distrito_id`, `concelho_id` | `int` | `None` | Step 2 address overrides |
-| `taxa_id` | `int` | auto | Auto-picked when only one option exists; required when ambiguous |
+| `taxa_id` | `int` | auto | Auto-picks the sole ordinary fee when the only alternatives are refugee exemptions; required for other ambiguities or to select an exemption |
 | `exam_date` | `str` | required | `YYYY-MM-DD`, in the past and ≤ 12 months old (see below). Medical exam is always assumed done (`exame=1`) |
 | `promote_to_tier_id` | `int` | `None` | Subida only; usually unset |
 | `guardian_name`, `guardian_relation`, `guardian_phone`, `guardian_email` | mixed | `None` | **Required when player is a minor** |
