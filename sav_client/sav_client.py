@@ -2908,21 +2908,25 @@ class SavClient:
       return [active.id]
     return [active.id, previous.id]
 
-  def _list_subida_tier_options(self, internal_id: int) -> list[tuple[int, str]]:
-    """Op=21 — return every selectable (tier_id, name) for the player's
+  def _list_subida_tier_options(self, batch_id: int) -> list[tuple[int, str]]:
+    """Op=21 — return every selectable (tier_id, name) for the lote's
     escalaosubida dropdown. Empty list when SAV only exposes the
     "- Não selecionado –" placeholder.
 
-    The subida tier is player-specific and server-computed (it is not the
-    batch tier). The response is ``{"msg": "<option…>", "val": 1}`` with the
-    same ``<option value='..'>`` shape as op=3.
+    op=21's ``id`` is the lote (guia) id, not a player id: SAV's own wizard
+    sends ``"php/incricoesdb.php?op=21&id=" + guia`` in ``js/main.js``
+    (``showPossiveisEscaloes`` and ``editShowPossiveisEscaloes``). The offer
+    is the escalões above the lote's tier, in the lote's gender; a player id
+    gets the offer of whichever lote shares that number. The response is
+    ``{"msg": "<option…>", "val": 1}`` with the same ``<option value='..'>``
+    shape as op=3.
     """
     import re
 
     try:
       resp = self._http.get(
         self._url(_REGISTRATIONS_PATH),
-        params={"op": _REGISTRATIONS_SUBIDA_TIERS_OP, "id": internal_id},
+        params={"op": _REGISTRATIONS_SUBIDA_TIERS_OP, "id": batch_id},
         timeout=self._timeout,
         headers={"Accept": "*/*"},
       )
@@ -2936,7 +2940,7 @@ class SavClient:
     return [(int(i), name.strip()) for i, name in options if int(i) != 0]
 
   def _pick_subida_tier(
-    self, internal_id: int, prefer_tier_id: int | None = None,
+    self, batch_id: int, prefer_tier_id: int | None = None,
   ) -> tuple[int, str] | None:
     """Decide which subida tier to commit, given SAV's offered options and
     an optional caller hint (the mod4-derived tier from
@@ -2954,18 +2958,16 @@ class SavClient:
     Returns the ``(tier_id, name)`` to be committed, or ``None`` for the
     no-subida case.
     """
-    options = self._list_subida_tier_options(internal_id)
+    options = self._list_subida_tier_options(batch_id)
 
     def _record(committed: tuple[int, str] | None) -> None:
-      """Log SAV's offer and the pick, and hand them to a recording caller.
-
-      Whether op=21's offer is player-specific decides which tier gets filed
-      (three different athletes were offered the same Sub 16 / Sub 18), so
-      every decision is observable, not only the failing ones.
+      """Log SAV's offer for the lote and the pick, and hand them to a
+      recording caller, so every decision is observable, not only the
+      failing ones.
       """
       logger.info(
-        "Subida tier for player %s: SAV offered %s; requested %s; committed %s.",
-        internal_id, options, prefer_tier_id, committed,
+        "Subida tier for lote %s: SAV offered %s; requested %s; committed %s.",
+        batch_id, options, prefer_tier_id, committed,
       )
       picks = _SUBIDA_PICKS.get()
       if picks is not None:
@@ -2989,7 +2991,7 @@ class SavClient:
       listing = ", ".join(f"{i}={n!r}" for i, n in options)
       raise SavConfigError(
         f"Requested subida tier_id={prefer_tier_id} is not among SAV's "
-        f"offered options for player {internal_id}: {listing}. The form "
+        f"offered options for lote {batch_id}: {listing}. The form "
         f"and the server disagree — pick one of the offered tiers."
       )
     if len(options) == 1:
@@ -2998,7 +3000,7 @@ class SavClient:
     _record(None)
     listing = ", ".join(f"{i}={n!r}" for i, n in options)
     raise SavConfigError(
-      f"SAV offers multiple subida tiers for player {internal_id}: "
+      f"SAV offers multiple subida tiers for lote {batch_id}: "
       f"{listing}. Pass promote_to_tier_id= to disambiguate (or supply a "
       f"mod4 whose escalao_subida names the desired tier)."
     )
@@ -3981,7 +3983,7 @@ class SavClient:
       )
     else:
       sub_tier = (
-        self._pick_subida_tier(internal_id, prefer_tier_id=promote_to_tier_id)
+        self._pick_subida_tier(batch.id, prefer_tier_id=promote_to_tier_id)
         if inline_subida else None
       )
       if inline_subida and sub_tier is None:
@@ -6657,7 +6659,7 @@ class SavClient:
     # promote_to_tier_id comes from the mod4's escalao_subida resolution and
     # is enforced against SAV's offered options by _pick_subida_tier.
     sub_tier = (
-      self._pick_subida_tier(userid, prefer_tier_id=promote_to_tier_id)
+      self._pick_subida_tier(batch.id, prefer_tier_id=promote_to_tier_id)
       if inline_subida else None
     )
     if inline_subida and sub_tier is None:

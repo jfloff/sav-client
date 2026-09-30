@@ -21,6 +21,26 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.5 — 2026-09-30
+
+### Fixed
+
+**Subida tier options are fetched for the lote, not the player**
+`IMPACT: silent` — op=21 is keyed on the lote (guia) id, as in SAV's own
+wizard, and its offer is the escalões above the lote's tier, in the lote's
+gender. The client was sending the player's internal id (or, for a 1ª
+Inscrição, the new userid), so SAV answered for whichever lote shared that
+number. A Mini 12 Feminino player was offered the Masculino `Sub 16 / Sub 18`.
+`add_enrollment`'s `subida.offered` now lists the lote's real options. With a
+Modelo 4 hint the filed tier always had to match the form's tier, so a
+mismatch raised rather than filing a wrong tier. With no hint, the tier was
+auto-picked from the wrong offer: re-check Subidas filed that way.
+`SavConfigError` messages and the INFO log now name the lote instead of the
+player.
+`DETECT: grep -rn "subida.*offered\|Subida tier for player\|offered options for player" <your code>`
+
+---
+
 ## 0.114.4 — 2026-09-28
 
 ### Fixed

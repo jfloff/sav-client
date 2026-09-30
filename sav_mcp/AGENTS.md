@@ -319,7 +319,7 @@ For 1ª Inscrição (reg_type 1) and Revalidação (reg_type 2) the document set
 | `portuguese` | Portugal (id 155) | `fpb_modelo_1`, `exame_medico` |
 | `foreign_born` | any other / unknown | `fpb_modelo_1`, `exame_medico`, `atestado_residencia`, `certidao_matricula`, `documento_identificacao` × 2 (passaporte + título de residência — the player's or a parent's) |
 
-`fpb_modelo_4` is optional in both (only when promoting an escalão inline — Subida). With an inline subida, `add_enrollment`'s success response carries `subida: {offered: [{tier_id, name}], committed: {tier_id, name}}` — the tiers SAV's op=21 offered this player and the one filed. Whether that offer is player-specific is still unverified (three athletes were offered the same Sub 16 / Sub 18), so record it. reg_type 4 (standalone Subida) requires only `fpb_modelo_4`; reg_type 3 (Transferência) is not handled yet (`checklist` is null). Unknown nationality is treated as `foreign_born` on purpose — asking for the extra documents is the safe error.
+`fpb_modelo_4` is optional in both (only when promoting an escalão inline — Subida). With an inline subida, `add_enrollment`'s success response carries `subida: {offered: [{tier_id, name}], committed: {tier_id, name}}` — the tiers SAV's op=21 offered for the lote and the one filed. The offer is keyed on the lote and lists the escalões above the lote's tier, in the lote's gender. reg_type 4 (standalone Subida) requires only `fpb_modelo_4`; reg_type 3 (Transferência) is not handled yet (`checklist` is null). Unknown nationality is treated as `foreign_born` on purpose — asking for the extra documents is the safe error.
 
 ## Other workflows
 

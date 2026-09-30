@@ -700,12 +700,13 @@ class TestSubidaDeEscalao:
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
     monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
+    captured = {}
     monkeypatch.setattr(
       client, "_pick_subida_tier",
-      lambda internal_id, prefer_tier_id=None: subida_tier,
+      lambda batch_id, prefer_tier_id=None: (
+        captured.update(subida_batch_id=batch_id), subida_tier,
+      )[1],
     )
-
-    captured = {}
 
     def capture_commit(body):
       captured["body"] = body
@@ -721,6 +722,8 @@ class TestSubidaDeEscalao:
     )
     assert captured["body"]["sub"] == "6"
     assert captured["body"]["escalaosubida_txt"] == "Sub 14"
+    # op=21 is keyed on the lote, not the player's internal id (88).
+    assert captured["subida_batch_id"] == 1
 
   def test_no_subida_sends_minus_one(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
@@ -749,6 +752,19 @@ class TestSubidaDeEscalao:
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
     self._stub_op21(monkeypatch, client, self.SUBIDA_MSG)
     assert client._list_subida_tier_options(88) == [(6, "Sub 14")]
+
+  def test_list_subida_options_sends_lote_id(self, monkeypatch):
+    # SAV's wizard sends op=21&id=<guia>; a player id gets another lote's offer.
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    sent = {}
+    resp = type("Resp", (), {
+      "text": '{"msg":"","val":1}', "raise_for_status": lambda self: None,
+    })()
+    monkeypatch.setattr(client, "_http", type("H", (), {
+      "get": lambda self, *a, **k: (sent.update(params=k["params"]), resp)[1],
+    })())
+    client._list_subida_tier_options(638034)
+    assert sent["params"] == {"op": "21", "id": 638034}
 
   def test_list_subida_options_returns_empty_when_only_placeholder(self, monkeypatch):
     client = SavClient("https://sav2.fpb.pt", "user", "pass")
@@ -1131,9 +1147,12 @@ class TestPrimeiraInscricao:
       client, "_resolve_primeira_insurance_cascade",
       lambda b, u: (4583, 4583, "100.268/1-2-16"),
     )
+    subida_calls = []
     monkeypatch.setattr(
       client, "_pick_subida_tier",
-      lambda u, prefer_tier_id=None: subida_tier,
+      lambda batch_id, prefer_tier_id=None: (
+        subida_calls.append(batch_id), subida_tier,
+      )[1],
     )
 
     # Modal-open op=15 and the post-commit op=151 read-back hit the transport.
@@ -1157,7 +1176,7 @@ class TestPrimeiraInscricao:
       })(),
     )
 
-    captured = {}
+    captured = {"subida_batch_ids": subida_calls}
     monkeypatch.setattr(
       client, "_primeira_commit",
       lambda body: (captured.update(body=body), {"val": 1, "msg": "", "resultexame": "2026-09-30"})[1],
@@ -1261,6 +1280,8 @@ class TestPrimeiraInscricao:
     )
     assert captured["body"]["subida"] == "3"
     assert captured["body"]["escalaosubida_txt"] == "Sub 16"
+    # op=21 is keyed on the lote, not the new player's userid (277534).
+    assert captured["subida_batch_ids"] == [629084]
 
   def test_inline_subida_with_no_option_raises(self, monkeypatch):
     client, captured = self._stub_primeira(monkeypatch, subida_tier=None)

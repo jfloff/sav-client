@@ -139,7 +139,7 @@ class TestProfileLicenceResolution:
 class TestSubidaTierObservability:
   def _client(self, monkeypatch, options):
     client = SavClient("https://example.invalid", "user", "pass")
-    monkeypatch.setattr(client, "_list_subida_tier_options", lambda internal_id: options)
+    monkeypatch.setattr(client, "_list_subida_tier_options", lambda batch_id: options)
     return client
 
   def test_a_committed_pick_is_recorded(self, monkeypatch):

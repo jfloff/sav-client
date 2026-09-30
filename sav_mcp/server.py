@@ -3057,7 +3057,7 @@ def add_enrollment(
       is set when that fill was attempted but failed.
       success=true also carries ``subida``: with an inline subida,
       ``{offered: [{tier_id, name}], committed: {tier_id, name}}`` — the tiers
-      SAV's op=21 offered this player and the one filed; null otherwise.
+      SAV's op=21 offered for the lote and the one filed; null otherwise.
     """
     from sav_parsers import close_processing
 
