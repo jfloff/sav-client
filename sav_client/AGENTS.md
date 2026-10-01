@@ -205,6 +205,11 @@ Replaces `find_license_by_nif` (removed in 0.113.0), which returned the lowest l
 
 Resolve **one person**, never one arbitrary licence. `id_number` (exact doc-number search) and `birth_date` (exact birth-date search, narrowed by a fuzzy `name` match) yield licence sets that are intersected. `nif` (→ `find_licenses_by_nif`, own club only) is **not** intersected: it rules a candidate out only when SAV holds a *different real* NIF for them. When any person carries the NIF, only those people count (`nif_on_file="match"`). Otherwise placeholder / blank / never-scanned / other-club licences stay candidates, and so does a licence with a *different real* NIF when a strong key (name + birth date, or doc number) matched — SAV's NIF can be wrong. These report `nif_on_file` (`"different"` — the placeholder included —, `"none"`, `"unknown"`). A NIF-only miss is not proof of a new player. A NIF match is never vetoed by another key: when SAV holds the NIF for someone but a supplied name / birth date / doc number disagrees, that person is still `found`, with `IdentityMatch.conflicts` listing `{key, given, on_file}` per disagreement (and `ambiguous` if the other keys describe a different person). `matched_by` lists only the keys that agree. `name` needs `birth_date`; the placeholder NIF is ignored as a key (`placeholder_nif=True`). `club=None` is the session club; `club=0` is one federation-wide request for the doc-number / birth-date searches.
 
+SAV2 discloses the doc number (`numi`), doc type and NIF only to the player's own club: an other-club `op=2` profile has just name, birth date, nationality and birthplace. The doc-number **search** (`jc_findByNumber`) still matches every club with `club=0`. Verified live 2026-10-01: number `30013029` found licence 296273 at another club. Two consequences:
+
+- When the doc-number search did not find an other-club answer, `conflicts` carries `{key: "id_number", on_file: None}`. The number couldn't be read back, so it is unchecked, not a known disagreement.
+- A club-scoped search returns the licence's last row *at that club*. Licence 296273 came back as the session club, 2025/2026, when club-scoped, and as its new club, 2026/2027, with `club=0`. For a player who may have moved, search with `club=0`.
+
 `IdentityMatch.status`:
 
 | status | meaning |

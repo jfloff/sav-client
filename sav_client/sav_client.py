@@ -1341,7 +1341,12 @@ class SavClient:
     "none" or "unknown". NIF lookup is always
     limited to the session club, regardless of ``club``. Document-number and
     birth-date searches use ``club`` when supplied, otherwise the session club;
-    ``club=0`` searches federation-wide. Birth-date rows are exact ISO-date
+    ``club=0`` searches federation-wide. SAV2 shows a doc number only to the
+    player's own club, but its doc-number search still matches every club
+    (verified live: licence 296273, at another club, found by number with
+    ``club=0``). A club-scoped search returns the licence's last row at that
+    club, so a player who left reads as still there; only ``club=0`` shows
+    their current club and season. Birth-date rows are exact ISO-date
     matches, and a supplied name further filters them with accent- and
     case-insensitive fuzzy matching. A birth date by itself is not a usable
     lookup key; it can narrow a NIF or document-number search, or pair with a

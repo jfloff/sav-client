@@ -670,6 +670,13 @@ def identify_player(
     doc-number / birth-date searches: default your club, 0 federation-wide in
     one request.
 
+    SAV2 shows a doc number only to the player's own club, but its doc-number
+    search matches every club: ``club_id=0`` + ``id_number`` finds a player
+    registered elsewhere. Club-scoped, a player who left your club comes back
+    as your club's old row; pass ``club_id=0`` to see their current club and
+    season. An ``id_number`` conflict with ``on_file: null`` means the number
+    could not be read back (another club's player), not that it disagrees.
+
     Returns:
       found → the player row (newest licence of that person) plus
         ``matched_by`` (only the keys that agree with the answer),

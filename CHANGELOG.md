@@ -21,6 +21,22 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.7 — 2026-10-01
+
+### Documented
+
+**Doc-number search is federation-wide; the doc number itself is own-club only**
+No code change. Verified live: SAV2 hides an other-club player's doc number,
+doc type and NIF in `op=2`, but `jc_findByNumber` with `club=0` still matches
+them (licence 296273 at another club, found by number). A club-scoped search
+returns the licence's last row *at that club*, so a player who left reads as
+still yours. Use `club_id=0` for anyone who may have moved. An `id_number`
+conflict with `on_file: null` means the number could not be read, not that it
+disagrees. Now stated in `identify_player`, `resolve_player_identity` and both
+`AGENTS.md` files.
+
+---
+
 ## 0.114.6 — 2026-10-01
 
 ### Fixed
