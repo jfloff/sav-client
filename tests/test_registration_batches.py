@@ -138,7 +138,7 @@ class TestPreHttpGuards:
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
-    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto, **kw: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
 
     def fail_commit(*args, **kwargs):
@@ -182,7 +182,7 @@ class TestPreHttpGuards:
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
-    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto, **kw: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
 
     def fail_commit(*args, **kwargs):
@@ -505,7 +505,7 @@ class TestExamDateWindow:
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
-    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto, **kw: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
 
     def fail_commit(*args, **kwargs):
@@ -698,9 +698,14 @@ class TestSubidaDeEscalao:
       },
     )
     monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch_obj, escalao: (11, 22))
-    monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch_obj, internal_id, estatuto: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, internal_id: None)
     captured = {}
+    monkeypatch.setattr(
+      client, "_resolve_taxa_id",
+      lambda batch_obj, internal_id, estatuto, **kw: (
+        captured.update(taxa_kw=kw), 33,
+      )[1],
+    )
     monkeypatch.setattr(
       client, "_pick_subida_tier",
       lambda batch_id, prefer_tier_id=None: (
@@ -720,10 +725,14 @@ class TestSubidaDeEscalao:
     client.add_player_to_registration_batch(
       1, 301772, exam_date=RECENT_EXAM_DATE, inline_subida=True,
     )
-    assert captured["body"]["sub"] == "6"
+    # SAV's op=36 takes the subida as a flag (sub) plus the tier id (esc).
+    assert captured["body"]["sub"] == "1"
+    assert captured["body"]["esc"] == "6"
     assert captured["body"]["escalaosubida_txt"] == "Sub 14"
     # op=21 is keyed on the lote, not the player's internal id (88).
     assert captured["subida_batch_id"] == 1
+    # The fee list is looked up for the subida being filed.
+    assert captured["taxa_kw"] == {"subida_tier": (6, "Sub 14")}
 
   def test_no_subida_sends_minus_one(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
@@ -731,7 +740,9 @@ class TestSubidaDeEscalao:
       1, 301772, exam_date=RECENT_EXAM_DATE, inline_subida=False,
     )
     assert captured["body"]["sub"] == "-1"
+    assert "esc" not in captured["body"]
     assert captured["body"]["escalaosubida_txt"] == "- Não selecionado –"
+    assert captured["taxa_kw"] == {"subida_tier": None}
 
   def test_subida_with_no_option_raises(self, monkeypatch):
     client, captured = self._stub_enroll(monkeypatch, subida_tier=None)
@@ -1072,6 +1083,33 @@ class TestPrimeiraEstatutoRule:
       _PrimeiraEstatutoBatch(), 279040, 10,
     ) == 1141
 
+  def test_taxa_sends_subida_flag_and_tier_in_their_own_slots(self, monkeypatch):
+    # SAV's form: loadTaxa without a subida, editloadTaxasubida once a subida
+    # tier is picked (esc=2, escalao and subida_escalao = the tier).
+    sent = {}
+    response = type("Response", (), {
+      "text": json.dumps({"msg": "<option value='1141'>Taxa | Sub 16 M</option>"}),
+      "raise_for_status": lambda self: None,
+    })()
+    client = SavClient("https://sav2.fpb.pt", "user", "pass")
+    client._http = type("Http", (), {
+      "get": lambda self, *a, **k: (sent.update(k["params"]), response)[1],
+    })()
+
+    keys = ("esc", "escalao", "nivel", "subida", "subida_escalao")
+    client._resolve_primeira_taxa_id(
+      _PrimeiraEstatutoBatch(), 279040, 10, subida_tier=(3, "Sub 16"),
+    )
+    assert {k: sent.get(k) for k in keys} == {
+      "esc": 2, "escalao": 3, "nivel": 0, "subida": 1, "subida_escalao": 3,
+    }
+
+    sent.clear()
+    client._resolve_primeira_taxa_id(_PrimeiraEstatutoBatch(), 279040, 10)
+    assert {k: sent.get(k) for k in keys} == {
+      "esc": 1, "escalao": None, "nivel": None, "subida": -1, "subida_escalao": 0,
+    }
+
   def test_taxa_keeps_rejecting_multiple_ordinary_fees(self, monkeypatch):
     response = type("Response", (), {
       "text": json.dumps({
@@ -1139,9 +1177,10 @@ class TestPrimeiraInscricao:
       lambda **kw: {"val": 1, "menor_idade": 1 if minor else 0},
     )
     monkeypatch.setattr(client, "_load_primeira_estatuto", lambda b, u: 6)
+    taxa_calls = []
     monkeypatch.setattr(
       client, "_resolve_primeira_taxa_id",
-      lambda b, u, est, **kw: 1052,
+      lambda b, u, est, **kw: (taxa_calls.append(kw), 1052)[1],
     )
     monkeypatch.setattr(
       client, "_resolve_primeira_insurance_cascade",
@@ -1176,7 +1215,7 @@ class TestPrimeiraInscricao:
       })(),
     )
 
-    captured = {"subida_batch_ids": subida_calls}
+    captured = {"subida_batch_ids": subida_calls, "taxa_calls": taxa_calls}
     monkeypatch.setattr(
       client, "_primeira_commit",
       lambda body: (captured.update(body=body), {"val": 1, "msg": "", "resultexame": "2026-09-30"})[1],
@@ -1195,7 +1234,9 @@ class TestPrimeiraInscricao:
     # `sub`), `companhia` (not `comp`), plus new `seguro`/`apolice` keys.
     assert body["tipo"] == 1
     assert body["subida"] == "-1"
+    assert "escalaosubida" not in body
     assert body["escalaosubida_txt"] == "- Não selecionado –"
+    assert captured["taxa_calls"] == [{"subida_tier": None}]
     assert body["seguro"] == "4583"
     assert body["companhia"] == "4583"
     assert body["apolice"] == "100.268/1-2-16"
@@ -1278,8 +1319,11 @@ class TestPrimeiraInscricao:
     client.add_player_to_registration_batch(
       629084, inline_subida=True, **self.REQUIRED,
     )
-    assert captured["body"]["subida"] == "3"
+    # op=27 takes the subida as a flag (subida) plus the tier id (escalaosubida).
+    assert captured["body"]["subida"] == "1"
+    assert captured["body"]["escalaosubida"] == "3"
     assert captured["body"]["escalaosubida_txt"] == "Sub 16"
+    assert captured["taxa_calls"] == [{"subida_tier": (3, "Sub 16")}]
     # op=21 is keyed on the lote, not the new player's userid (277534).
     assert captured["subida_batch_ids"] == [629084]
 
@@ -1927,7 +1971,7 @@ class TestAllowIneligible:
     monkeypatch.setattr(
       client, "_resolve_insurance_cascade", lambda internal_id, b, escalao: (11, 22),
     )
-    monkeypatch.setattr(client, "_resolve_taxa_id", lambda b, internal_id, est: 33)
+    monkeypatch.setattr(client, "_resolve_taxa_id", lambda b, internal_id, est, **kw: 33)
     monkeypatch.setattr(client, "_registration_precommit", lambda batch_id, uid: None)
     monkeypatch.setattr(client._cache, "clear_nif_index", Mock())
     captured = {}

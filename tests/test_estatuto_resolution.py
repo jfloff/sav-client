@@ -82,7 +82,7 @@ def commit(client, monkeypatch):
   )
   monkeypatch.setattr(client, "_registration_precommit", lambda guia, uid: None)
 
-  def _taxa(batch, internal_id, estatuto):
+  def _taxa(batch, internal_id, estatuto, **kw):
     seen["taxa_estatuto"] = estatuto
     return 55
 

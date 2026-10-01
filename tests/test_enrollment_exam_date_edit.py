@@ -10,7 +10,7 @@ from datetime import date, timedelta
 
 import pytest
 
-from sav_client.exceptions import SavConfigError
+from sav_client.exceptions import SavConfigError, SavResponseError
 from sav_client.sav_client import SavClient
 
 from sav_mcp import server as server_module
@@ -30,6 +30,7 @@ class _Batch:
   state = "Em construção"
   tier = "Sub-14"
   gender = "M"
+  gender_id = 1
   number = 5
   type = "Revalidação"
 
@@ -56,7 +57,7 @@ def _stub_step3_commit(monkeypatch, client, prefill):
     client, "_resolve_insurance_cascade",
     lambda internal_id, batch, escalao: (1, 99),
   )
-  monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch, internal_id, estatuto: 55)
+  monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch, internal_id, estatuto, **kw: 55)
   monkeypatch.setattr(client, "_registration_precommit", lambda guia, uid: None)
   def _capture_commit(body):
     captured["body"] = body
@@ -72,7 +73,13 @@ def _stub_step3_commit(monkeypatch, client, prefill):
   return captured
 
 
-def _commit_step3(client, prefill, **overrides):
+class _FemininoBatch(_Batch):
+  tier = "Mini 12"
+  gender = "F"
+  gender_id = 2
+
+
+def _commit_step3(client, prefill, batch=None, **overrides):
   kwargs = {
     "exam_date": RECENT_EXAM_DATE,
     "taxa_id": None,
@@ -87,7 +94,9 @@ def _commit_step3(client, prefill, **overrides):
     "consent_marketing": None,
   }
   kwargs.update(overrides)
-  return client._commit_registration_step3(_Batch(), 1234, 301772, prefill, **kwargs)
+  return client._commit_registration_step3(
+    batch or _Batch(), 1234, 301772, prefill, **kwargs,
+  )
 
 
 def test_commit_step3_sends_exam_date(monkeypatch):
@@ -95,7 +104,7 @@ def test_commit_step3_sends_exam_date(monkeypatch):
   captured: dict = {}
 
   monkeypatch.setattr(client, "_resolve_insurance_cascade", lambda internal_id, batch, escalao: (1, 99))
-  monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch, internal_id, estatuto: 55)
+  monkeypatch.setattr(client, "_resolve_taxa_id", lambda batch, internal_id, estatuto, **kw: 55)
   monkeypatch.setattr(client, "_registration_precommit", lambda guia, uid: None)
 
   def _fake_commit(body):
@@ -201,18 +210,48 @@ def test_explicit_empty_guardian_phone_and_taxa_overwrite_stored_values(monkeypa
 
 def test_subida_is_preserved_unless_explicitly_cleared(monkeypatch):
   client = _bare_client()
+  # op=31 stores the subida as a flag plus the destination tier id.
   prefill = {
     "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
-    "subida": "6", "escalaosubida": "Sub 14",
+    "subida": "1", "escalaosubida": "6",
   }
   captured = _stub_step3_commit(monkeypatch, client, prefill)
-  _commit_step3(client, prefill)
-  assert captured["body"]["sub"] == "6"
+  _commit_step3(client, prefill, batch=_FemininoBatch())
+  assert captured["body"]["sub"] == "1"
+  assert captured["body"]["esc"] == "6"
   assert captured["body"]["escalaosubida_txt"] == "Sub 14"
 
   captured = _stub_step3_commit(monkeypatch, client, prefill)
-  _commit_step3(client, prefill, inline_subida=False)
+  _commit_step3(client, prefill, batch=_FemininoBatch(), inline_subida=False)
   assert captured["body"]["sub"] == "-1"
+  assert "esc" not in captured["body"]
+
+
+def test_stored_no_subida_is_preserved_without_a_tier(monkeypatch):
+  client = _bare_client()
+  prefill = {
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "subida": "-1", "escalaosubida": None,
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  _commit_step3(client, prefill)
+  assert captured["body"]["sub"] == "-1"
+  assert "esc" not in captured["body"]
+  assert captured["body"]["escalaosubida_txt"] == "- Não selecionado –"
+
+
+def test_stored_subida_without_a_usable_tier_is_not_resent(monkeypatch):
+  # SAV's form refuses a subida with no escalão; re-sending one would file it
+  # broken, so the edit stops instead of guessing.
+  client = _bare_client()
+  prefill = {
+    "estatuto": "6", "escalao": 7, "menor_idade": 0, "taxa": "1090",
+    "subida": "1", "escalaosubida": None,
+  }
+  captured = _stub_step3_commit(monkeypatch, client, prefill)
+  with pytest.raises(SavResponseError, match="no usable escalão"):
+    _commit_step3(client, prefill)
+  assert "body" not in captured
 
 
 def test_minor_raises_when_preserved_guardian_block_is_empty():
@@ -479,3 +518,39 @@ def test_update_path_still_preserves_a_genuine_stored_taxa(monkeypatch):
 
   assert captured["body"]["taxa"] == "1090"
   assert http.taxa_lookups == []
+
+
+def test_taxa_lookup_carries_the_subida_like_savs_form(monkeypatch):
+  """SAV's form re-fetches the fee list for the destination tier once a
+  subida tier is picked (editloadTaxasubida); without one it sends
+  subida=-1. Without the subida, op=26 answers for the lote's own tier."""
+  keys = ("esc", "escalao", "nivel", "subida", "subida_escalao")
+  client = _bare_client()
+  prefill = {
+    "estatuto": "6", "escalao": 11, "menor_idade": 0, "taxa": "-1",
+    "subida": "1", "escalaosubida": "6",
+  }
+  _, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill, batch=_FemininoBatch())
+  assert [{k: p.get(k) for k in keys} for p in http.taxa_lookups] == [
+    {"esc": 2, "escalao": 6, "nivel": 0, "subida": 1, "subida_escalao": 6},
+  ]
+
+  client = _bare_client()
+  _, http = _stub_step3_commit_with_real_taxa(
+    monkeypatch, client, prefill, _TAXA_ONE_OPTION,
+  )
+  _commit_step3(client, prefill, batch=_FemininoBatch(), inline_subida=False)
+  assert [{k: p.get(k) for k in keys} for p in http.taxa_lookups] == [
+    {"esc": 1, "escalao": None, "nivel": None, "subida": -1, "subida_escalao": 0},
+  ]
+
+
+def test_taxa_subida_params_flags_a_levelled_tier():
+  # SAV sets nivel=1 when the subida option's label carries a "|" level.
+  from sav_client.sav_client import _taxa_subida_params
+
+  assert _taxa_subida_params((18, "Sénior | Nacional"))["nivel"] == 1
+  assert _taxa_subida_params((18, "Sénior"))["nivel"] == 0

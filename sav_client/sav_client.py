@@ -449,6 +449,29 @@ def _subida_dict(status: str, tier_from: str | None = None,
   }
 
 
+def _taxa_subida_params(subida_tier: tuple[int, str] | None) -> dict[str, Any]:
+  """The op=26 fee-list params that depend on the inline subida.
+
+  Mirrors SAV's own step-3 form (``showInscricao`` in js/inscricoesjogador.js,
+  shared by the 1ª Inscrição and Revalidação wizards). With no subida it calls
+  ``loadTaxa``: ``esc=1&subida=-1&subida_escalao=0``. Picking a subida tier
+  re-fetches the fees through ``editloadTaxasubida``: ``esc=2``, ``escalao``
+  and ``subida_escalao`` set to the destination tier, ``subida=1``, and
+  ``nivel=1`` when the tier's label carries a ``|`` level suffix. The fee
+  list is then the destination tier's, which is what gets filed.
+  """
+  if not subida_tier:
+    return {"esc": 1, "subida": -1, "subida_escalao": 0}
+  tier_id, tier_name = subida_tier
+  return {
+    "esc": 2,
+    "escalao": tier_id,
+    "nivel": 1 if "|" in tier_name else 0,
+    "subida": 1,
+    "subida_escalao": tier_id,
+  }
+
+
 def _batch_item_subida(
   batch: PlayerRegistrationBatch, cell: str | None,
 ) -> dict[str, Any]:
@@ -3665,8 +3688,9 @@ class SavClient:
                                1ª Inscrição / Revalidação (the inline rider, not
                                a standalone type-4 Subida batch). When True, the
                                target tier is fetched from SAV (op=21) and sent
-                               as sub/escalaosubida_txt; raises SavConfigError if
-                               SAV offers no option.
+                               as the subida flag plus the tier id and its
+                               label; raises SavConfigError if SAV offers no
+                               option.
           guardian_*:          Required when the player is a minor; raises
                                SavConfigError otherwise.
           consent_*:           GDPR consents.
@@ -3971,16 +3995,33 @@ class SavClient:
       consent_marketing, "autoriza_utilizacao_dados", "consent_marketing",
     )
 
+    # SAV keeps the subida as two fields: ``subida`` is a yes/no flag (1 / -1)
+    # and ``escalaosubida`` the destination tier id. Its wizard sends them to
+    # op=36 as ``sub`` and ``esc``, the latter only when the flag is 1
+    # (editTerminarInsc in js/inscricoesjogador.js). Sending the tier id as
+    # ``sub`` files no subida at all.
+    subida_tier: tuple[int, str] | None
     if inline_subida is None:
       preserved.append("inline_subida")
-      stored_subida = step3_prefill.get("subida")
-      subida_id = str(stored_subida) if stored_subida is not None else "-1"
-      stored_subida_text = step3_prefill.get("escalaosubida")
-      subida_text = (
-        str(stored_subida_text)
-        if stored_subida_text not in (None, "")
-        else "- Não selecionado –"
-      )
+      stored_flag = step3_prefill.get("subida")
+      stored_tier = step3_prefill.get("escalaosubida")
+      if str(stored_flag).strip() != "1":
+        subida_tier = None
+      else:
+        try:
+          stored_tier_id = int(stored_tier)
+        except (TypeError, ValueError):
+          stored_tier_id = 0
+        tier_name = player_registration_tiers(batch.gender_id).get(stored_tier_id)
+        if tier_name is None:
+          # SAV's own form refuses a subida without a tier, and the label
+          # cannot be guessed; re-sending either would file a broken subida.
+          raise SavResponseError(
+            f"Stored subida for licence {license} in batch {batch.id} has no "
+            f"usable escalão (escalaosubida={stored_tier!r}); cannot preserve it. "
+            f"Pass inline_subida explicitly."
+          )
+        subida_tier = (stored_tier_id, tier_name)
     else:
       sub_tier = (
         self._pick_subida_tier(batch.id, prefer_tier_id=promote_to_tier_id)
@@ -3996,8 +4037,7 @@ class SavClient:
           "Subida de escalão for licence %s → %s (id=%s)",
           license, sub_tier[1], sub_tier[0],
         )
-      subida_id = str(sub_tier[0]) if sub_tier else "-1"
-      subida_text = sub_tier[1] if sub_tier else "- Não selecionado –"
+      subida_tier = sub_tier
 
     if preserved:
       logger.info(
@@ -4059,7 +4099,9 @@ class SavClient:
     # ``taxa`` key at all. An edit over an item that already has a real fee
     # preserves it above and does not reach this path.
     if taxa_id is None:
-      taxa_id = self._resolve_taxa_id(batch, internal_id, estatuto)
+      taxa_id = self._resolve_taxa_id(
+        batch, internal_id, estatuto, subida_tier=subida_tier,
+      )
 
     # ── Pre-commit hook + final commit ────────────────────────────────────────
     self._registration_precommit(batch.id, internal_id)
@@ -4072,10 +4114,12 @@ class SavClient:
       "transf": 0,
       "estatuto": str(estatuto),
       "exame": "1",
-      "sub": subida_id,
+      "sub": "1" if subida_tier else "-1",
       "obs": "",
       "dataexame": exam_date,
-      "escalaosubida_txt": subida_text,
+      "escalaosubida_txt": (
+        subida_tier[1] if subida_tier else "- Não selecionado –"
+      ),
       "taxa": str(taxa_id),
       "comp": str(companhia_id),
       "nomeEncarregado": guardian_name if guardian_name is not None else "",
@@ -4086,6 +4130,9 @@ class SavClient:
       "comunicacoes": 1 if consent_communications else 0,
       "marketing": 1 if consent_marketing else 0,
     }
+
+    if subida_tier:
+      commit_body["esc"] = str(subida_tier[0])
 
     result = self._registration_commit(commit_body)
     if result.get("val") != 1:
@@ -5749,9 +5796,15 @@ class SavClient:
     batch: PlayerRegistrationBatch,
     internal_id: int,
     estatuto: str | int,
+    *,
+    subida_tier: tuple[int, str] | None = None,
   ) -> int:
     """
     Resolve the registration fee (taxa) id via the op=162 → op=26 cascade.
+
+    ``subida_tier`` is the inline subida being filed, if any; the fee list
+    then comes from the destination tier, as in SAV's own form (see
+    _taxa_subida_params).
 
     op=162 is a per-batch pre-check that returns ``"1"`` when taxa selection
     is required; we fire it for parity with the browser flow. op=26 returns
@@ -5782,8 +5835,8 @@ class SavClient:
           "op": _REGISTRATIONS_LOAD_TAXA_OP,
           "estatuto": estatuto,
           "guia": batch.id,
-          "esc": 1,  # observed constant; meaning unclear (likely a UI flag)
           "user": internal_id,
+          **_taxa_subida_params(subida_tier),
         },
         timeout=self._timeout,
       )
@@ -6315,12 +6368,11 @@ class SavClient:
     userid: int,
     estatuto: int,
     *,
-    subida_tier_id: int = -1,
-    subida_escalao_id: int = 0,
+    subida_tier: tuple[int, str] | None = None,
   ) -> int:
-    """Op=26 — same taxa endpoint Revalidação uses, but the type-1 wizard
-    also sends ``subida`` / ``subida_escalao`` (defaulting to -1/0 when no
-    inline subida) since the available taxa can differ for promotion cases.
+    """Op=26 — same taxa endpoint and subida params Revalidação uses (see
+    _taxa_subida_params): with an inline subida the fee list is the
+    destination tier's.
 
     Auto-picks a single real option. When the only extra options are refugee
     exemptions, defaults to the one ordinary fee; callers can still select a
@@ -6336,10 +6388,8 @@ class SavClient:
           "op": _REGISTRATIONS_LOAD_TAXA_OP,
           "estatuto": estatuto,
           "guia": batch.id,
-          "esc": 1,
-          "subida": subida_tier_id,
-          "subida_escalao": subida_escalao_id,
           "user": userid,
+          **_taxa_subida_params(subida_tier),
         },
         timeout=self._timeout,
       )
@@ -6673,8 +6723,7 @@ class SavClient:
     if taxa_id is None:
       taxa_id = self._resolve_primeira_taxa_id(
         batch, userid, estatuto,
-        subida_tier_id=int(sub_tier[0]) if sub_tier else -1,
-        subida_escalao_id=0,
+        subida_tier=sub_tier,
       )
 
     # Insurance cascade
@@ -6689,7 +6738,9 @@ class SavClient:
       "userid": userid,
       "tipo": _REGISTRATIONS_TYPE_PRIMEIRA,
       "exame": "1",
-      "subida": str(sub_tier[0]) if sub_tier else "-1",
+      # op=27 keys, from terminarInsc in js/inscricoesjogador.js: ``subida`` is
+      # the flag and ``escalaosubida`` the tier id, sent only with a subida.
+      "subida": "1" if sub_tier else "-1",
       "obs": "",
       "dataexame": exam_date,
       "escalaosubida_txt": sub_tier[1] if sub_tier else "- Não selecionado –",
@@ -6706,6 +6757,8 @@ class SavClient:
       "comunicacoes": 1 if consent_communications else 0,
       "marketing": 1 if consent_marketing else 0,
     }
+    if sub_tier:
+      commit_body["escalaosubida"] = str(sub_tier[0])
 
     result = self._primeira_commit(commit_body)
     if int(result.get("val", 0)) != 1:

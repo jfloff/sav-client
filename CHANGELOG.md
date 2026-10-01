@@ -21,6 +21,35 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.114.6 — 2026-10-01
+
+### Fixed
+
+**Inline subidas are filed with SAV's yes/no flag, not the tier id**
+`IMPACT: silent` — SAV stores an inline subida as two fields: a flag
+(`1` = yes, `-1` = no) and the destination tier id. The client sent the tier
+id in the flag's slot and never sent the tier, so SAV accepted the commit and
+filed **no subida**, while the log and `add_enrollment`'s `subida.committed`
+reported one. This affected both the Revalidação commit (op=36, now `sub` +
+`esc`) and the 1ª Inscrição commit (op=27, now `subida` + `escalaosubida`).
+The fee lookup (op=26) now carries the subida the way SAV's own form does.
+With a subida it sends `esc=2&escalao=<tier>&subida=1&subida_escalao=<tier>`
+(plus `nivel`), so the fee list is the destination tier's; without one it
+sends `esc=1&subida=-1&subida_escalao=0`. Before, the Revalidação lookup sent
+no subida at all and the 1ª Inscrição lookup sent the pair inverted, so both
+offered the lote's own-tier fees. **With an inline subida, an auto-picked
+`taxa_id` may now differ, and a `taxa_id` you pass must come from the
+destination tier's list.**
+**Every inline subida filed before this release has no subida in SAV and must
+be set by hand.** Find them in your records of `subida.committed`, or in the
+`Subida tier for lote … committed (…)` INFO log. An exam-date edit
+(`inline_subida` omitted) now re-sends the stored subida as flag + tier. It
+raises `SavResponseError` when SAV holds the flag without a usable tier,
+rather than re-sending a broken subida.
+`DETECT: grep -rn "subida.*committed\|inline_subida\|promote_to_tier_id\|taxa_id" <your code>`
+
+---
+
 ## 0.114.5 — 2026-09-30
 
 ### Fixed
