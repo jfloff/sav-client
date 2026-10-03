@@ -134,32 +134,33 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
   home / our_score / opp_score / opponent are relative to ``club_name`` (not the
   sheet's home/away). The club's side is found by matching its name against the
   team strings: SAV2 appends team suffixes (" - B", "/MVP", …), so a normalised
-  containment match is used. If the club name is blank/unresolvable, neither
-  side matches, or both sides match, ``ValueError`` is raised with the game
-  identifier and both team strings. Guessing in those cases could silently
-  swap the club's score and opponent, so an explicit error is safer than a
-  degenerate home-side fallback.
+  containment match is used. When both sides match, the game is between two of
+  the club's own teams (e.g. "X - B" vs "X"): the row is written from the home
+  team's side and carries ``internal: True``, a key no other row has. If the
+  club name is blank/unresolvable or neither side matches, ``ValueError`` is
+  raised with the game identifier and both team strings. Guessing there could
+  silently swap the club's score and opponent, so an explicit error is safer
+  than a degenerate home-side fallback.
   """
   club_key = normalise_text(club_name)
   away_is_ours = bool(club_key) and club_key in normalise_text(g.away)
   home_is_ours = bool(club_key) and club_key in normalise_text(g.home)
-  if not club_key or home_is_ours == away_is_ours:
+  if not home_is_ours and not away_is_ours:
     source_id = str(g.id) if g.id else g.number
     if not club_key:
       reason = f"club name {club_name!r} is blank or unresolved"
-    elif home_is_ours:
-      reason = f"club name {club_name!r} matches both sides"
     else:
       reason = f"club name {club_name!r} matches neither side"
     raise ValueError(
       f"Cannot determine club side for game {source_id!r} (number {g.number!r}): "
       f"{reason}; home={g.home!r}, away={g.away!r}"
     )
+  # An internal game (both sides ours) is oriented from the home team.
   ours_home = home_is_ours
 
   home_score = _score_to_int(g.home_score)
   away_score = _score_to_int(g.away_score)
-  return {
+  row = {
     "source_id": str(g.id) if g.id else g.number,
     "escalao": g.level or g.tier,
     "gender": g.gender or None,
@@ -173,6 +174,9 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
     "our_score": (home_score if ours_home else away_score),
     "opp_score": (away_score if ours_home else home_score),
   }
+  if home_is_ours and away_is_ours:
+    row["internal"] = True
+  return row
 
 
 def club_to_dict(c: Any) -> dict:

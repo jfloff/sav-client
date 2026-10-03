@@ -214,11 +214,45 @@ class TestClubGameSerializer:
     with pytest.raises(ValueError, match="Home Lions.*Away Tigers"):
       club_game_to_dict(game, club_name=club_name)
 
-  def test_both_matches_raise_as_ambiguous(self):
-    game = _game("14", "20-06-2026", home="Club United", away="Club United B")
+  @pytest.mark.parametrize("home, away", [
+    (f"{CLUB} - B", CLUB),
+    (f"{CLUB} - C", CLUB),
+    (f"{CLUB} - C", f"{CLUB} - B"),
+    (f"{CLUB} / MVP", CLUB),
+  ])
+  def test_both_matches_orient_from_home_as_internal(self, home, away):
+    # Two of the club's own teams: written from the home team's side.
+    game = _game("14", "20-06-2026", home=home, away=away,
+                 home_score="55", away_score="62")
 
-    with pytest.raises(ValueError, match="matches both sides"):
-      club_game_to_dict(game, club_name="Club United")
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["internal"] is True
+    assert row["home"] is True
+    assert row["opponent"] == away
+    assert row["our_score"] == 55
+    assert row["opp_score"] == 62
+
+  def test_ordinary_game_has_no_internal_key(self):
+    game = _game("23", "20-06-2026", home="Foes", away=CLUB)
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert "internal" not in row
+
+  def test_mcp_returns_internal_game_as_status_row(self, monkeypatch):
+    internal = _game("24", "04-10-2026", home=f"{CLUB} - B", away=CLUB)
+    ordinary = _game("25", "05-10-2026", home=CLUB, away="Foes")
+    _stub(monkeypatch, [internal, ordinary])
+
+    result = server_module.list_games(status="scheduled")
+
+    assert [r["source_id"] for r in result] == ["24", "25"]
+    assert "error" not in result[0]
+    assert result[0]["status"] == "scheduled"
+    assert result[0]["internal"] is True
+    assert result[0]["opponent"] == CLUB
+    assert "internal" not in result[1]
 
   def test_mcp_keeps_unmatchable_fixture_as_error_row(self, monkeypatch):
     good = _game("15", "20-06-2026", home=CLUB, away="Foes",

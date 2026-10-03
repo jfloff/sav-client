@@ -952,6 +952,9 @@ def list_games(
       status_raw — SAV's original fixture-status label
       has_result — true iff both scores are valid integers; independent of status
       our_score / opp_score — ints from the club's perspective, null when absent
+      internal   — present (true) only when both teams are the club's own
+                   (e.g. "X - B" vs "X"); the row is then oriented from the
+                   home team, so opponent is the away team
 
     If the club's side cannot be determined, the fixture is preserved as the
     explicit error row ``{source_id, error}``; it has no status fields and is

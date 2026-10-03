@@ -21,6 +21,26 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.116.0 — 2026-10-03
+
+### Changed
+
+**Games between two of the club's own teams are full rows, not error rows**
+`IMPACT: silent` — when both team strings contained the club name (e.g.
+`Rio Maior Basket - B` vs `Rio Maior Basket`, or `- C` vs `- B`),
+`list_games` returned `{source_id, error: "... matches both sides ..."}`. It
+now returns a full row written from the **home** team's side, with
+`home: true`, `opponent` = the away team, `our_score` = the home score and
+`opp_score` = the away score. It also carries `internal: true`. Only these rows
+have that key; ordinary rows are unchanged. A fixture where neither side
+matches, or the club name is blank, still produces an error row. Callers that
+skipped error rows will now see these games, and status filters now include
+them. A tally of wins and losses will count each internal game as one win
+*and* one loss unless it checks `internal`.
+`DETECT: grep -rn "matches both sides\|\"error\" in\|our_score" <your code>`
+
+---
+
 ## 0.115.0 — 2026-10-01
 
 ### Added
