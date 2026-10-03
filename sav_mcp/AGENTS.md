@@ -104,6 +104,10 @@ tier age windows calculated for that season, without a SAV request.
 | Em Validação | no |
 | Em Pagamento | no |
 
+A Devolvida batch carries `return_reason` (the federation's "Motivo") on
+`list_batches`, `get_batch` and the pending `get_enrollment_status` batch;
+it is null in every other state. `enrollment_status_bulk` does not carry it.
+
 ### Game statuses
 MCP game tools expose the same canonical `status`: `scheduled` (`Marcado`),
 `played` (`Realizado`), `not_scheduled` (`Não Marcado`), `postponed`

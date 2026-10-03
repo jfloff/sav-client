@@ -197,11 +197,13 @@ def coach_to_dict(c: Any, *, with_details: bool = False) -> dict:
   return out
 
 
-def batch_to_dict(b: Any) -> dict:
+def batch_to_dict(b: Any, *, return_reason: str | None = None) -> dict:
+  """Serialise a batch; ``return_reason`` is the caller's op=10 read, if any."""
   return {
     "number": b.number,
     "type": b.type, "tier": b.tier, "gender": b.gender,
     "state": b.state, "state_date": b.state_date,
     "item_count": b.item_count, "season": b.season,
     "is_open": b.is_open,
+    "return_reason": return_reason,
   }

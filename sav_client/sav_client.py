@@ -30,7 +30,7 @@ import re
 import threading
 import time
 from dataclasses import replace as _dc_replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 from urllib.parse import urljoin
@@ -51,8 +51,8 @@ from .exceptions import (
 )
 from .cache import Cache
 from .models import (
-  Coach, IdentityMatch, NifLicenses, Player, Club, Game, LoginResult,
-  PlayerRegistrationBatch, Season, Session, SubidaStatus,
+  BatchStateChange, Coach, IdentityMatch, NifLicenses, Player, Club, Game,
+  LoginResult, PlayerRegistrationBatch, Season, Session, SubidaStatus,
 )
 from .utils import md5_hex, strip_html
 
@@ -173,6 +173,9 @@ _REGISTRATIONS_SAVE_STEP2_OP = "31"
 # The browser fires op=116 only for type-1/2 batches; type-3/4 skips it.
 _REGISTRATIONS_SUBMIT_PRECHECK_OP = "116"
 _REGISTRATIONS_SUBMIT_OP = "8"
+# guiasdb, not incricoesdb: guiasdb op=8 marks irregularities; op=10 is a read.
+_BATCHES_PATH = "php/guiasdb.php"
+_BATCH_STATE_HISTORY_OP = "10"
 # op=33 prefill keys consumed by _build_step2_send. Keep this separate from
 # the op=31 set below: these responses feed different wizard steps.
 _REGISTRATIONS_STEP1_PREFILL_KEYS = (
@@ -247,6 +250,17 @@ _DEFAULT_TIMEOUT = 30
 # SAV computes a licence's validity as the medical exam date + 12 months
 # (op=36 returns it as `resultfunction`, e.g. dataexame 2026-08-01 -> 2027/08/31).
 _EXAM_VALIDITY_MONTHS = 12
+
+
+def _dmy_hms_to_iso(value: str) -> str:
+  """SAV's ``DD-MM-YYYY HH:MM:SS`` as ISO ``YYYY-MM-DDTHH:MM:SS``.
+
+  Tolerant like every read: text that doesn't parse comes back unchanged.
+  """
+  try:
+    return datetime.strptime(value.strip(), "%d-%m-%Y %H:%M:%S").isoformat()
+  except ValueError:
+    return value
 
 
 def _months_earlier(ref: date, months: int) -> date:
@@ -2534,6 +2548,69 @@ class SavClient:
     if batch is None:
       raise ValueError(f"Batch id={batch_id} not found")
     return batch
+
+  def get_batch_state_history(self, batch_id: int) -> list[BatchStateChange]:
+    """Return a batch's state history, oldest first (guiasdb op=10).
+
+    This is SAV's "Histórico Estados Guia" modal. It is the only place a
+    return reason ("Motivo") can be read from with just the batch id: the
+    notification view (guiasdb op=21) needs the notification and devolução
+    ids as well, and fatals without them. A batch returned more than once has
+    one "Devolvido" row per return, each with its own reason, and the rows
+    stay after the batch is resubmitted.
+
+    Raises:
+        SavResponseError:   If the response is not the expected JSON.
+        SavConnectionError: On network errors.
+    """
+    if self.session is None:
+      raise SavResponseError("Must call login() before get_batch_state_history()")
+
+    from bs4 import BeautifulSoup
+
+    raw = self._post_form(
+      _BATCHES_PATH,
+      {"guiaid": batch_id},
+      params={"op": _BATCH_STATE_HISTORY_OP},
+    )
+    data = self._parse_json_response(
+      raw, f"Could not parse state history for batch {batch_id}"
+    )
+    # Valid JSON without `msg` would parse to an empty history, which reads as
+    # "never changed state" rather than as the error it is.
+    if "msg" not in data:
+      raise SavResponseError(
+        f"State history response for batch {batch_id} carried no 'msg' payload"
+      )
+
+    history: list[BatchStateChange] = []
+    soup = BeautifulSoup(data.get("msg") or "", "html.parser")
+    for row in soup.find_all("tr"):
+      cells = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+      if len(cells) == 3:
+        history.append(BatchStateChange(
+          state=cells[0], user=cells[1], changed_at=_dmy_hms_to_iso(cells[2]),
+        ))
+      elif len(cells) == 1 and history:
+        # The reason is a full-width row under the state it explains.
+        reason = re.sub(r"^\s*Motivo\s*:\s*", "", cells[0]).strip()
+        if reason:
+          history[-1] = _dc_replace(history[-1], reason=reason)
+    return history
+
+  def get_batch_return_reason(self, batch_id: int) -> str | None:
+    """Return why the batch was last sent back ("Devolvida"), or None.
+
+    Reads the reason from the most recent "Devolvido" row of
+    :meth:`get_batch_state_history`. None when the batch was never returned or
+    SAV recorded no reason. The history keeps old returns, so a batch that was
+    returned and later resubmitted still answers here; gate on
+    ``PlayerRegistrationBatch.is_returned`` when you only want current ones.
+    """
+    for change in reversed(self.get_batch_state_history(batch_id)):
+      if change.state.strip().lower().startswith("devolvid"):
+        return change.reason
+    return None
 
   def resolve_batch_id(self, number: str) -> int:
     """Translate a human-visible batch number (`numero_guia`) to internal batch_id.

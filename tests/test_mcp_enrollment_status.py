@@ -208,6 +208,7 @@ class _Batch:
   type_id = 2
   type = "Revalidação"
   state = "Aberta"
+  is_returned = False
 
 
 class _PendingClient:

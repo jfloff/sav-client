@@ -1518,10 +1518,14 @@ def list_batches(season: int | None = None) -> list[dict]:
 
     Includes all states (Em construção, Devolvida, Em Validação, Em Pagamento).
     season defaults to the current season when omitted.
+
+    return_reason is why the federation sent a "Devolvida" batch back (e.g.
+    "Modelo 1 - Falta assinatura/carimbo clube."), and null for every other
+    state or when SAV recorded no reason.
     """
     client = _get_client()
     batches = client.list_player_registration_batches(season=season)
-    return [batch_to_dict(b) for b in batches]
+    return [_batch_dict(client, b) for b in batches]
 
 
 @server.tool()
@@ -1530,15 +1534,25 @@ def get_batch(batch_number: str, season: int | None = None) -> dict | None:
     Fetch a single registration batch by its human-visible number.
 
     season defaults to the current season; pass 0 to search across all seasons.
-    Returns the batch details (same shape as list_batches entries) or null if
-    no batch matches.
+    Returns the batch details (same shape as list_batches entries, including
+    return_reason for a "Devolvida" batch) or null if no batch matches.
     """
     client = _get_client()
     batches = client.list_player_registration_batches(season=season)
     batch = next((b for b in batches if b.number == batch_number), None)
     if batch is None:
         return None
-    return batch_to_dict(batch)
+    return _batch_dict(client, batch)
+
+
+def _batch_dict(client: SavClient, batch: Any) -> dict:
+    """``batch_to_dict`` plus the return reason when the batch is Devolvida.
+
+    The reason costs one op=10 read, so it is fetched only for returned
+    batches; the others carry ``return_reason: null`` without a request.
+    """
+    reason = client.get_batch_return_reason(batch.id) if batch.is_returned else None
+    return batch_to_dict(batch, return_reason=reason)
 
 
 # ── Enrollment workflow ───────────────────────────────────────────────────────
@@ -4048,6 +4062,8 @@ def get_enrollment_status(
                         here but cannot be edited. Also carries `subida`
                         ({status, tier_from, tier_to, approved_on}) read from
                         that lote's row; see enrollment_status_bulk.
+                        `batch.return_reason` says why a "Devolvida"
+                        batch was sent back (null otherwise).
       "not_enrolled" — license is neither in an open batch nor in the
                         active roster.
 
@@ -4166,6 +4182,10 @@ def get_enrollment_status(
             "type_id": reg_type,
             "type": batch.type if batch else "",
             "state": batch.state if batch else "",
+            "return_reason": (
+                client.get_batch_return_reason(batch.id)
+                if batch and batch.is_returned else None
+            ),
         },
         # Usually served from the row the resolver just read (no second op=10).
         "subida": client.batch_item_subida(batch_id, license),

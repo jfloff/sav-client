@@ -14,8 +14,8 @@ from .exceptions import (
     SavWriteUnverifiedError,
 )
 from .models import (
-    Coach, IdentityMatch, NifLicenses, Player, Club, Game, LoginResult,
-    PlayerRegistrationBatch, Season, Session, SubidaStatus,
+    BatchStateChange, Coach, IdentityMatch, NifLicenses, Player, Club, Game,
+    LoginResult, PlayerRegistrationBatch, Season, Session, SubidaStatus,
 )
 from .sav_client import SavClient
 
@@ -33,6 +33,7 @@ __all__ = [
     "Club",
     "Game",
     "PlayerRegistrationBatch",
+    "BatchStateChange",
     # exceptions
     "SavError",
     "SavConfigError",

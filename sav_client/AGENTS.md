@@ -101,13 +101,15 @@ class PlayerRegistrationBatch:
     club_id: int; club: str
     tier_id: int; tier: str        # e.g. (5, "Sub 14")
     gender_id: int; gender: str    # 1/Masculino, 2/Feminino
-    state_id: int; state: str      # 1=Em construção (open) + Devolvida/Em Validação/Em Pagamento
+    state_id: int; state: str      # 1=Em construção (open), 8=Em Pagamento, 9=Em Validação, Devolvida (id unknown)
     state_date: str   # ISO
     item_count: int   # players currently in the batch
     season_id: int; season: str
 
     @property
     def is_open(self) -> bool: ...   # True iff state_id == 1
+    @property
+    def is_returned(self) -> bool: ...  # state is Devolvida (matched on the label)
 
 @dataclass(frozen=True)
 class Season:
@@ -358,6 +360,26 @@ All batches visible to the authenticated club (every state). `season=None` uses 
 ```python
 batches = client.list_player_registration_batches()
 open_revalidations = [b for b in batches if b.is_open and b.type_id == 2]
+```
+
+### `get_batch_state_history(batch_id) → list[BatchStateChange]`
+
+SAV's "Histórico Estados Guia" (guiasdb op=10), oldest first. Each row is
+`BatchStateChange(state, user, changed_at, reason)`; `changed_at` is ISO
+`YYYY-MM-DDTHH:MM:SS`, and `reason` is set on a return ("Devolvido" in the
+history, "Devolvida" in the listing). Returns stay in the history after the
+batch is resubmitted.
+
+### `get_batch_return_reason(batch_id) → str | None`
+
+The reason on the most recent return, or None if the batch was never returned
+or SAV recorded no reason. It answers for past returns too, so gate on
+`batch.is_returned` when you want only batches currently Devolvida.
+
+```python
+for b in client.list_player_registration_batches():
+    if b.is_returned:
+        print(b.number, client.get_batch_return_reason(b.id))
 ```
 
 ### `resolve_batch_id(number) → int`

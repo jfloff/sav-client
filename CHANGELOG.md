@@ -21,6 +21,25 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.115.0 — 2026-10-01
+
+### Added
+
+**Why a batch was returned (Devolvida)**
+`list_batches`, `get_batch` and the pending `get_enrollment_status` batch gain
+`return_reason`, the federation's "Motivo" (e.g. `"Modelo 1 - Falta
+assinatura/carimbo clube."`). It is null in every other state and when SAV
+recorded no reason. Each Devolvida batch costs one extra request (guiasdb
+op=10); other states cost nothing. `enrollment_status_bulk` does not carry it.
+The client gains `get_batch_state_history(batch_id)` → `BatchStateChange` rows,
+`get_batch_return_reason(batch_id)`, and `PlayerRegistrationBatch.is_returned`.
+The reason comes from the state history, not the notification view
+(guiasdb op=21), which needs the notification and devolução ids and fatals
+without them. The history keeps past returns, so `get_batch_return_reason`
+also answers for a batch that was returned and later resubmitted.
+
+---
+
 ## 0.114.7 — 2026-10-01
 
 ### Documented

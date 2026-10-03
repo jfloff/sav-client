@@ -399,8 +399,8 @@ class PlayerRegistrationBatch:
       club_id, club:               Owning club.
       tier_id, tier:               Tier/escalão (e.g. id=5, name="Sub 14").
       gender_id, gender:           1=Masculino, 2=Feminino.
-      state_id, state:             1=Em construção, 9=Em Validação; Devolvida and
-                                    Em Pagamento (ids unknown).
+      state_id, state:             1=Em construção, 8=Em Pagamento,
+                                    9=Em Validação; Devolvida (id unknown).
       state_date:   ISO date the batch entered its current state.
       item_count:   Number of players currently in the batch.
       season_id, season: Season epoch.
@@ -445,12 +445,42 @@ class PlayerRegistrationBatch:
     """
     return True
 
+  @property
+  def is_returned(self) -> bool:
+    """True when the federation sent the batch back ('Devolvida').
+
+    Matched on the label because the state id has not been observed. The
+    reason lives in the batch's state history, not in the listing row — read
+    it with ``SavClient.get_batch_return_reason``.
+    """
+    return self.state.strip().lower().startswith("devolvid")
+
   def __repr__(self) -> str:
     return (
       f"PlayerRegistrationBatch(id={self.id}, number={self.number!r}, "
       f"type={self.type!r}, tier={self.tier!r}, gender={self.gender!r}, "
       f"state={self.state!r}, items={self.item_count})"
     )
+
+
+@dataclass(frozen=True)
+class BatchStateChange:
+  """
+  One row of a batch's state history (guiasdb op=10, "Histórico Estados Guia").
+
+  Attributes:
+      state:      State the batch entered, as SAV labels it in the history
+                  ("Devolvido" here, where the listing says "Devolvida").
+      user:       Who made the change — the club, or a federation officer.
+      changed_at: ISO datetime (``YYYY-MM-DDTHH:MM:SS``); SAV's raw text if it
+                  could not be parsed.
+      reason:     The "Motivo" SAV records for a return, else None.
+  """
+
+  state: str
+  user: str
+  changed_at: str
+  reason: str | None = None
 
 
 @dataclass(frozen=True)
