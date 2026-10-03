@@ -233,6 +233,38 @@ class TestClubGameSerializer:
     assert row["our_score"] == 55
     assert row["opp_score"] == 62
 
+  def test_home_game_team_is_home_string(self):
+    game = _game("26", "20-06-2026", home=CLUB, away="Foes")
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["team"] == CLUB
+    assert row["opponent"] == "Foes"
+
+  def test_away_game_team_is_away_string(self):
+    game = _game("27", "20-06-2026", home="Foes", away=CLUB)
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["team"] == CLUB
+    assert row["opponent"] == "Foes"
+
+  def test_team_keeps_its_suffix(self):
+    game = _game("28", "20-06-2026", home="Foes", away=f"{CLUB} - B")
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["team"] == f"{CLUB} - B"
+
+  def test_internal_game_team_is_home_and_opponent_is_away(self):
+    game = _game("29", "20-06-2026", home=f"{CLUB} - B", away=CLUB)
+
+    row = club_game_to_dict(game, club_name=CLUB)
+
+    assert row["internal"] is True
+    assert row["team"] == f"{CLUB} - B"
+    assert row["opponent"] == CLUB
+
   def test_ordinary_game_has_no_internal_key(self):
     game = _game("23", "20-06-2026", home="Foes", away=CLUB)
 

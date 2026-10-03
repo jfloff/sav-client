@@ -21,6 +21,22 @@ ones that do not survive being remembered later.
 
 ---
 
+## 0.117.0 — 2026-10-03
+
+### Added
+
+**`list_games` rows name the club's own team**
+Every `list_games` row gains `team`: the club's own team string exactly as on
+the sheet, suffix included (`"Rio Maior Basket - B"`, `".../MVP"`). It is the
+home team string when `home` is true and the away one otherwise. A club with
+several teams in one competition can now tell which played; previously only
+`opponent` was given, so callers labelled every game with the bare club name.
+For an internal game (`internal: true`), `team` is the home team and
+`opponent` the away team, matching the home-side orientation. Error rows
+(`{source_id, error}`) are unchanged. Existing fields are unchanged.
+
+---
+
 ## 0.116.0 — 2026-10-03
 
 ### Changed

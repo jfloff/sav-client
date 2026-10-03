@@ -131,8 +131,9 @@ def _game_starts_at(g: Any) -> str:
 def club_game_to_dict(g: Any, *, club_name: str) -> dict:
   """Serialize a Game from the queried club's perspective.
 
-  home / our_score / opp_score / opponent are relative to ``club_name`` (not the
-  sheet's home/away). The club's side is found by matching its name against the
+  home / our_score / opp_score / opponent / team are relative to ``club_name``
+  (not the sheet's home/away); ``team`` is the club's own team string verbatim,
+  suffix included. The club's side is found by matching its name against the
   team strings: SAV2 appends team suffixes (" - B", "/MVP", …), so a normalised
   containment match is used. When both sides match, the game is between two of
   the club's own teams (e.g. "X - B" vs "X"): the row is written from the home
@@ -165,6 +166,7 @@ def club_game_to_dict(g: Any, *, club_name: str) -> dict:
     "escalao": g.level or g.tier,
     "gender": g.gender or None,
     "starts_at": _game_starts_at(g),
+    "team": g.home if ours_home else g.away,
     "opponent": g.away if ours_home else g.home,
     "home": ours_home,
     "venue": g.venue or None,

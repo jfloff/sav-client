@@ -938,11 +938,13 @@ def list_games(
         today-10 days and date_to = today. Returned dates are YYYY-MM-DD.
 
     Each row is relative to the queried club (home / our_score / opp_score /
-    opponent are the club's, not the sheet's home/away):
+    team / opponent are the club's, not the sheet's home/away):
       source_id  — stable FPB game id (for idempotent upsert)
       escalao    — tier label as on the sheet (e.g. "Sub 14 M", "Sen M")
       gender     — "Masculino" / "Feminino" (or null)
       starts_at  — ISO YYYY-MM-DDTHH:MM ("" when not yet scheduled)
+      team       — the club's own team as on the sheet, suffix included
+                   (e.g. "Rio Maior Basket - B"); tells a club's teams apart
       opponent   — the other team's name
       home       — true when the club plays at home
       venue      — pavilion / location, or null
@@ -954,7 +956,8 @@ def list_games(
       our_score / opp_score — ints from the club's perspective, null when absent
       internal   — present (true) only when both teams are the club's own
                    (e.g. "X - B" vs "X"); the row is then oriented from the
-                   home team, so opponent is the away team
+                   home team, so team is the home team and opponent the
+                   away team
 
     If the club's side cannot be determined, the fixture is preserved as the
     explicit error row ``{source_id, error}``; it has no status fields and is
